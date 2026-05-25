@@ -163,6 +163,23 @@ impl RouteTable {
     }
 }
 
+// SAFETY: RouteTable contains Py<PyAny> handles (handlers, hooks, ws_handlers,
+// fallback) which PyO3 does NOT impl Send/Sync on, because Python object
+// access is GIL-protected. We assert Send + Sync here because:
+//
+// 1. RouteTable is read-only after pyronova's startup: routes are pushed
+//    in `register_route` during app construction, then frozen by
+//    `FrozenRoutes` / `Arc<RouteTable>` for the runtime. There is no
+//    interior mutability of the Py<PyAny> fields during request handling.
+// 2. Every read site that calls into a Python object via these handles
+//    holds the GIL (either main interp for gil=True routes, or the
+//    sub-interp GIL for the rest). Crossing-thread access to Py<PyAny>
+//    is therefore always GIL-protected at the use site.
+// 3. The Arc reference-count operations on Arc<RouteTable> are themselves
+//    atomic and don't touch Python.
+//
+// Per arc finding router-3: the previous `unsafe impl` lacked this
+// rationale, leaving future readers to re-derive safety from scratch.
 unsafe impl Send for RouteTable {}
 unsafe impl Sync for RouteTable {}
 
