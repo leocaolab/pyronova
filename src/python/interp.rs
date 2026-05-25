@@ -176,6 +176,19 @@ unsafe fn pyronova_recv_inner(args: *mut ffi::PyObject) -> *mut ffi::PyObject {
             let py_headers = py_str_dict(&headers_map);
             if py_params.is_none() || py_headers.is_none() {
                 // response_tx not inserted → dropped → oneshot Err on Tokio side
+                //
+                // arc finding interp-1: returning Py_None on alloc failure
+                // is indistinguishable from the "channel closed, exit
+                // gracefully" sentinel — workers silently exit under
+                // memory pressure with no log, no exception, no trace.
+                // Surface via tracing::error so the OOM condition is at
+                // least observable in logs before the worker disappears.
+                tracing::error!(
+                    target: "pyronova::app",
+                    "pyronova_recv: Python dict allocation failed (params/headers); \
+                     returning channel-closed sentinel — worker will exit silently. \
+                     Likely cause: OOM under memory pressure."
+                );
                 ffi::Py_INCREF(ffi::Py_None());
                 return ffi::Py_None();
             }
@@ -184,6 +197,11 @@ unsafe fn pyronova_recv_inner(args: *mut ffi::PyObject) -> *mut ffi::PyObject {
 
             let tuple = ffi::PyTuple_New(9);
             if tuple.is_null() {
+                tracing::error!(
+                    target: "pyronova::app",
+                    "pyronova_recv: PyTuple_New(9) returned null (likely OOM); \
+                     returning channel-closed sentinel — worker will exit silently."
+                );
                 ffi::PyErr_Clear();
                 ffi::Py_INCREF(ffi::Py_None());
                 return ffi::Py_None();
@@ -231,6 +249,12 @@ unsafe fn pyronova_recv_inner(args: *mut ffi::PyObject) -> *mut ffi::PyObject {
                 }
                 // py_params / py_headers still owned by PyObjRef — dropped here.
                 ffi::Py_DECREF(tuple);
+                tracing::error!(
+                    target: "pyronova::app",
+                    "pyronova_recv: per-item Python object allocation failed; \
+                     returning channel-closed sentinel — worker will exit silently. \
+                     Likely cause: OOM (arc finding interp-1)."
+                );
                 ffi::PyErr_Clear();
                 ffi::Py_INCREF(ffi::Py_None());
                 return ffi::Py_None();
@@ -1479,7 +1503,17 @@ def _attach_pyronova_request_helpers(t):\n    from urllib.parse import parse_qs\
         if ffi::PyBytes_Check(result.as_ptr()) != 0 {
             let ptr = ffi::PyBytes_AsString(result.as_ptr());
             let size = ffi::PyBytes_Size(result.as_ptr());
-            if ptr.is_null() {
+            // PyBytes_Size returns -1 on error (Py_ssize_t). Cast to
+            // usize without checking would yield usize::MAX and feed
+            // an enormous slice to from_raw_parts → UB (arc interp-2).
+            // Treat any negative as failure, matching PyBytes_Check
+            // having already validated the type (a successful Check
+            // followed by a -1 Size implies torn state / corruption,
+            // not a normal program path — bail instead of UB).
+            if ptr.is_null() || size < 0 {
+                if !ffi::PyErr_Occurred().is_null() {
+                    ffi::PyErr_Clear();
+                }
                 return Err("failed to extract bytes".to_string());
             }
             let bytes = std::slice::from_raw_parts(ptr as *const u8, size as usize);
@@ -2256,7 +2290,33 @@ pub(crate) unsafe fn rebind_tstate_to_current_thread(
     let fresh = ffi::PyThreadState_New(interp);
     if fresh.is_null() {
         // Fall back to creator tstate (leak will reappear but we stay alive).
-        return creator_tstate;
+        //
+        // NEVER silently regress: this path reintroduces the ~1 KB/req
+        // leak that v1.5 closed (commit fc45a7f, see file header doc
+        // and docs/memory-leak-investigation-2026-04-19.md). If this
+        // ever fires under load, every subsequent request on this
+        // worker re-opens the leak — invisibly until /proc/self/status
+        // shows RSS growth. Emit ERROR so the regression is observable
+        // before it shows up as a memory incident in production.
+        tracing::error!(
+            target: "pyronova::app",
+            "rebind_tstate_to_current_thread: PyThreadState_New returned null \
+             (likely interp shutdown or OOM). Falling back to creator tstate. \
+             The v1.5 per-request memory leak fix is INACTIVE on this worker \
+             until restart — expect ~1 KB/req RSS growth under sustained load."
+        );
+        // Honor the success path's calling contract: caller expects the
+        // returned tstate to be SAVED (GIL released, no pending Python
+        // error). Without these two calls the failure path returned an
+        // attached tstate with the GIL still held and any error
+        // PyThreadState_New left pending — the next `PyEval_RestoreThread`
+        // on this worker would hit undefined behavior (debug: assert;
+        // release: deadlock), and the lingering exception would surface
+        // in the next handler call.
+        if !ffi::PyErr_Occurred().is_null() {
+            ffi::PyErr_Clear();
+        }
+        return ffi::PyEval_SaveThread();
     }
     // Swap to fresh tstate. Returns the previous current tstate = creator.
     let prev = ffi::PyThreadState_Swap(fresh);
