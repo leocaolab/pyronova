@@ -49,6 +49,11 @@
 
 use std::sync::OnceLock;
 
+// arc finding leak-detect-2: record_drop's mutex .unwrap() panics on
+// poisoning, cascading one panic in this diagnostic module into all
+// subsequent drops failing. Use unwrap_or_else(|e| e.into_inner()) at
+// every site that locks the per-type tally Mutex.
+
 use metrics_util::debugging::{DebuggingRecorder, Snapshotter};
 use pyo3::ffi;
 
@@ -61,10 +66,22 @@ fn ensure_recorder_installed() -> &'static Snapshotter {
     SNAPSHOTTER.get_or_init(|| {
         let recorder = DebuggingRecorder::new();
         let snap = recorder.snapshotter();
-        // `install()` can fail only if another recorder was installed
-        // first. In that case we silently accept the foreign recorder —
-        // the diagnostic will be empty but nothing crashes.
-        let _ = recorder.install();
+        // `install()` consumes the recorder. On success the global
+        // recorder is registered (our recorder stays alive). On failure
+        // (another recorder was registered first) the recorder is
+        // dropped here — `snap` may still be usable if metrics_util's
+        // snapshotter holds an Arc to the internal storage, but the
+        // diagnostic will be empty either way (no records flow to it).
+        // Pre-fix this failure was silent (`let _ = ...`); now surface
+        // it so an empty leak diagnostic isn't mysterious (arc finding
+        // leak-detect-1).
+        if let Err(e) = recorder.install() {
+            eprintln!(
+                "[leak_detect] DebuggingRecorder::install() failed: {e}; \
+                 leak diagnostic will be empty (another metrics recorder \
+                 is already installed in this process)"
+            );
+        }
         snap
     })
 }
@@ -173,7 +190,10 @@ fn intern(s: &str) -> &'static str {
     static TABLE: OnceLock<Mutex<std::collections::HashMap<String, &'static str>>> =
         OnceLock::new();
     let t = TABLE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    let mut g = t.lock().unwrap();
+    // Recover from poisoning — leak diagnostics must not cascade a
+    // single panic into permanent failure of the whole module
+    // (arc leak-detect-2).
+    let mut g = t.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&cached) = g.get(s) {
         return cached;
     }
