@@ -439,13 +439,32 @@ impl PyronovaApp {
                 extra_tls_ports
                     .iter()
                     .filter_map(|&p| {
-                        format!("{host}:{p}")
-                            .parse::<SocketAddr>()
-                            .ok()
-                            .map(|sa| (sa, Arc::clone(acc)))
+                        let parsed = format!("{host}:{p}").parse::<SocketAddr>().ok();
+                        if parsed.is_none() {
+                            // arc src-app-3: previously silently dropped.
+                            tracing::warn!(
+                                target: "pyronova::server",
+                                port = p,
+                                "extra TLS port could not be parsed into SocketAddr; \
+                                 dropped — operator may believe this port is TLS-protected"
+                            );
+                        }
+                        parsed.map(|sa| (sa, Arc::clone(acc)))
                     })
                     .collect()
             } else {
+                if !extra_tls_ports.is_empty() {
+                    // arc src-app-4: TLS ports configured but no cert =
+                    // ports are never opened. Operators expect TLS on
+                    // these; silent no-op is dangerous (security UX).
+                    tracing::warn!(
+                        target: "pyronova::server",
+                        ports = ?extra_tls_ports,
+                        "extra_tls_ports configured but tls_cert/tls_key not set; \
+                         these ports will NOT be opened as TLS — provide cert+key \
+                         or remove the port list to silence this warning"
+                    );
+                }
                 vec![]
             };
 
@@ -779,7 +798,19 @@ impl PyronovaApp {
                     });
                 }
 
-                signal::ctrl_c().await.ok();
+                // ctrl_c() returns Err if signal handler registration
+                // failed (e.g. main thread can't take SIGINT in some
+                // embedded contexts). Pre-fix this silently fell through
+                // to immediate shutdown — server appeared to start then
+                // die seconds later with no diagnostic (arc app-1/-2).
+                if let Err(e) = signal::ctrl_c().await {
+                    tracing::error!(
+                        target: "pyronova::server",
+                        error = %e,
+                        "ctrl_c signal handler registration failed; falling \
+                         through to immediate shutdown"
+                    );
+                }
                 tracing::info!(target: "pyronova::server", "Shutting down gracefully...");
                 println!("\n  Shutting down gracefully...");
                 crate::monitor::stop_rss_sampler();
@@ -1024,7 +1055,19 @@ impl PyronovaApp {
                     });
                 }
 
-                signal::ctrl_c().await.ok();
+                // ctrl_c() returns Err if signal handler registration
+                // failed (e.g. main thread can't take SIGINT in some
+                // embedded contexts). Pre-fix this silently fell through
+                // to immediate shutdown — server appeared to start then
+                // die seconds later with no diagnostic (arc app-1/-2).
+                if let Err(e) = signal::ctrl_c().await {
+                    tracing::error!(
+                        target: "pyronova::server",
+                        error = %e,
+                        "ctrl_c signal handler registration failed; falling \
+                         through to immediate shutdown"
+                    );
+                }
                 tracing::info!(target: "pyronova::server", "Shutting down gracefully...");
                 println!("\n  Shutting down gracefully...");
                 crate::monitor::stop_rss_sampler();
