@@ -78,13 +78,26 @@ pub(crate) fn create_reuseport_listener(addr: SocketAddr) -> Result<std::net::Tc
         use std::os::unix::io::AsRawFd;
         let fd = socket.as_raw_fd();
         let secs: libc::c_int = 10;
-        unsafe {
+        let rc = unsafe {
             libc::setsockopt(
                 fd,
                 libc::IPPROTO_TCP,
                 libc::TCP_DEFER_ACCEPT,
                 &secs as *const _ as *const libc::c_void,
                 std::mem::size_of_val(&secs) as libc::socklen_t,
+            )
+        };
+        // Silent failure here disables the DoS mitigation the doc
+        // comment above describes (cold-connect floods burning FDs).
+        // Log so the missing optimization is observable instead of
+        // mysteriously absent at scale (arc finding listener-2).
+        if rc != 0 {
+            let errno = std::io::Error::last_os_error();
+            tracing::warn!(
+                target: "pyronova::server",
+                ?errno,
+                "setsockopt(TCP_DEFER_ACCEPT) failed; cold-connect DoS \
+                 mitigation is disabled on this socket"
             );
         }
     }
