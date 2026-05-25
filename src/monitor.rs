@@ -146,11 +146,17 @@ pub fn spawn_rss_sampler() {
             tracing::debug!(target: "pyronova::server", "RSS sampler stopped");
         })
         .expect("failed to spawn RSS sampler");
-    if let Ok(mut slot) = RSS_SAMPLER_HANDLE.lock() {
-        // Drop any previous handle (shouldn't happen — spawn is guarded
-        // by METRICS_INIT call_once — but belt + suspenders).
-        *slot = Some(handle);
-    }
+    // Recover from poisoning rather than silently drop the handle.
+    // Pre-fix a poisoned mutex made the handle un-stored → stop_rss_sampler
+    // couldn't join → the sampler thread outlived Py_Finalize and
+    // could segfault on freed code pages — the exact race the module
+    // comment warns against (arc finding monitor-1).
+    let mut slot = RSS_SAMPLER_HANDLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // Drop any previous handle (shouldn't happen — spawn is guarded
+    // by METRICS_INIT call_once — but belt + suspenders).
+    *slot = Some(handle);
 }
 
 /// Signal the RSS sampler to stop AND join the thread. Blocks up to
@@ -161,12 +167,16 @@ pub fn spawn_rss_sampler() {
 /// code pages segfaults.
 pub fn stop_rss_sampler() {
     RSS_SAMPLER_RUNNING.store(false, Ordering::Release);
+    // Same poison-recovery rationale as the install side (arc monitor-1).
     let handle = RSS_SAMPLER_HANDLE
         .lock()
-        .ok()
-        .and_then(|mut slot| slot.take());
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     if let Some(h) = handle {
-        let _ = h.join();
+        if let Err(panic) = h.join() {
+            tracing::error!(target: "pyronova::server", ?panic,
+                "RSS sampler thread panicked");
+        }
     }
 }
 
