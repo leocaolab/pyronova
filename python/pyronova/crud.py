@@ -105,6 +105,22 @@ def register_crud(
     if prefix.endswith("/"):
         raise ValueError("prefix must not end with '/'")
 
+    if not columns:
+        # Fail fast at registration. Without this, col_list = ", ".join([])
+        # produces "" and SQL becomes "SELECT  FROM {table}" — runtime DB
+        # syntax error far from the misconfig site (arc finding crud-5).
+        raise ValueError("columns must not be empty")
+    if len(set(columns)) != len(columns):
+        # Duplicates would generate `SELECT id, name, id FROM ...` and
+        # fail at query time (arc finding crud-6).
+        raise ValueError(f"columns must be unique, got duplicates in {columns!r}")
+    if not callable(id_type):
+        # id_type's Callable type hint isn't runtime-enforced. Catch
+        # the misconfig at registration instead of failing in every
+        # request handler with cryptic 'X object is not callable'
+        # (arc findings crud-9, crud-2).
+        raise TypeError(f"id_type must be callable, got {type(id_type).__name__}")
+
     _validate_ident(table, "table")
     for c in columns:
         _validate_ident(c, "column")
