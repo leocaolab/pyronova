@@ -44,13 +44,25 @@ static PG_POOL: OnceLock<sqlx::PgPool> = OnceLock::new();
 static PG_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 pub(crate) fn runtime() -> &'static Runtime {
-    PG_RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("pyronova-db")
-            .enable_all()
-            .build()
-            .expect("failed to build pg runtime")
+    // .expect() panic crosses FFI into Python → UB. The arc db-4 fix
+    // recommendation was a signature change to PyResult, but `runtime()`
+    // is called from many internal sites; keeping the &'static return.
+    // Build failure during init is fatal anyway — converting to abort
+    // via `eprintln + std::process::abort()` makes the failure mode
+    // explicit and avoids the unwind-into-FFI UB. In practice tokio
+    // multi_thread Builder::build only fails on syscall exhaustion
+    // (threads, fds) at process startup, which is unrecoverable.
+    PG_RUNTIME.get_or_init(|| match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("pyronova-db")
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("[pyronova-db] fatal: failed to build pg runtime: {e}");
+            std::process::abort();
+        }
     })
 }
 
@@ -284,14 +296,26 @@ impl PgCursor {
     /// Pull the next row as a dict, or raise StopIteration at EOF,
     /// or raise RuntimeError on a database error.
     fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let rx_opt = { self.rx.lock().unwrap().take() };
+        // .unwrap() on poisoned mutex panics across FFI → UB per PyO3.
+        // Convert poisoning to PyRuntimeError so Python sees a normal
+        // exception (arc finding db-3). Same pattern on the put-back
+        // path below.
+        let rx_opt = {
+            self.rx
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("cursor mutex poisoned: {e}")))?
+                .take()
+        };
         let Some(mut rx) = rx_opt else {
             return Err(PyStopIteration::new_err("cursor exhausted"));
         };
         let msg = py.detach(|| rx.blocking_recv());
         match msg {
             Some(CursorMsg::Row(row)) => {
-                *self.rx.lock().unwrap() = Some(rx);
+                *self
+                    .rx
+                    .lock()
+                    .map_err(|e| PyRuntimeError::new_err(format!("cursor mutex poisoned: {e}")))? = Some(rx);
                 row_to_dict(py, &row)
             }
             Some(CursorMsg::Err(e)) => Err(PyRuntimeError::new_err(e)),
