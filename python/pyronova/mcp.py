@@ -194,7 +194,14 @@ class MCPServer:
         is_notification = "id" not in req
         req_id = req.get("id")
         method = req.get("method", "")
+        # JSON-RPC 2.0 §5.1: when present, `params` MUST be a Structured
+        # value (Object or Array). A non-Structured value (e.g. number,
+        # string) is an Invalid Request — without this check, handlers
+        # later call `.get()` on a non-dict and crash with AttributeError
+        # (arc finding mcp-1). Treat absent as empty dict.
         params = req.get("params", {})
+        if not isinstance(params, (dict, list)):
+            return self._error_response(req_id, -32600, "Invalid Request: params must be Object or Array")
 
         handler_map = {
             "initialize": self._handle_initialize,
