@@ -84,12 +84,16 @@ pub(crate) fn run_inmem_bench(
         .map(|arc| unsafe { &*Arc::into_raw(arc) } as &'static RouteTable)
         .collect();
 
-    let mut handles = Vec::with_capacity(n_threads);
+    let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(n_threads);
     #[allow(clippy::needless_range_loop)] // i indexes 3 parallel slices
     for i in 0..n_threads {
         let core_id = core_ids.get(i).copied();
         let worker = workers.remove(0);
         let routes: &'static RouteTable = per_worker_static[i];
+        // Extra clone for spawn-failure cleanup path (arc bench-2).
+        // Closure consumes its own `shutdown` clone; this one stays in
+        // the outer scope so map_err can cancel before joining handles.
+        let shutdown_cleanup = shutdown.clone();
         let shutdown = shutdown.clone();
         let bridge = main_bridge.clone();
         let total = Arc::clone(&total);
@@ -137,7 +141,20 @@ pub(crate) fn run_inmem_bench(
                     shutdown.cancelled().await;
                 });
             })
-            .map_err(|e| format!("spawn inmem-{i}: {e}"))?;
+            .map_err(|e| {
+                // Pre-fix the `?` propagated immediately, leaving
+                // threads 0..i-1 blocked on shutdown.cancelled().await
+                // forever (arc bench-2). Cancel before bailing so
+                // already-spawned workers can exit, then join them.
+                shutdown_cleanup.cancel();
+                for h in handles.drain(..) {
+                    if let Err(panic) = h.join() {
+                        tracing::error!(target: "pyronova::server", ?panic,
+                            "bench worker thread panicked during spawn-failure cleanup");
+                    }
+                }
+                format!("spawn inmem-{i}: {e}")
+            })?;
         handles.push(handle);
     }
 
@@ -151,7 +168,16 @@ pub(crate) fn run_inmem_bench(
     shutdown.cancel();
 
     for h in handles {
-        let _ = h.join();
+        // Log a panicked bench worker rather than silently dropping the
+        // Err — pre-fix a worker crash made the bench report "success"
+        // with N-1 actual workers (arc bench-1).
+        if let Err(panic) = h.join() {
+            tracing::error!(
+                target: "pyronova::server",
+                ?panic,
+                "bench worker thread panicked"
+            );
+        }
     }
     Ok((end - start, elapsed))
 }
@@ -292,12 +318,15 @@ pub(crate) fn run_loopback_bench(
     let routes_static: &'static RouteTable = unsafe { &*Arc::into_raw(Arc::clone(&routes)) };
 
     // --- Server threads (mirrors run_tpc_subinterp_per_thread_listener) ---
-    let mut handles = Vec::with_capacity(n_threads + 1);
+    let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(n_threads + 1);
     for i in 0..n_threads {
         let core_id = core_ids.get(i).copied();
         let worker = workers.remove(0);
         let routes_arc_c = Arc::clone(&routes);
         let shutdown_c = shutdown.clone();
+        // Extra clone retained in outer scope for spawn-failure cleanup
+        // (arc bench-2 — lb-srv variant).
+        let shutdown_cleanup = shutdown.clone();
         let bridge = main_bridge.clone();
 
         let h = std::thread::Builder::new()
@@ -329,7 +358,19 @@ pub(crate) fn run_loopback_bench(
                     .await;
                 });
             })
-            .map_err(|e| format!("spawn lb-srv-{i}: {e}"))?;
+            .map_err(|e| {
+                // Cancel + join already-spawned threads on spawn fail
+                // so they don't block forever on shutdown.cancelled()
+                // (arc bench-2 — loopback variant).
+                shutdown_cleanup.cancel();
+                for h in handles.drain(..) {
+                    if let Err(panic) = h.join() {
+                        tracing::error!(target: "pyronova::server", ?panic,
+                            "bench lb-srv thread panicked during spawn-failure cleanup");
+                    }
+                }
+                format!("spawn lb-srv-{i}: {e}")
+            })?;
         handles.push(h);
     }
 
@@ -378,7 +419,16 @@ pub(crate) fn run_loopback_bench(
     shutdown.cancel();
 
     for h in handles {
-        let _ = h.join();
+        // Log a panicked bench worker rather than silently dropping the
+        // Err — pre-fix a worker crash made the bench report "success"
+        // with N-1 actual workers (arc bench-1).
+        if let Err(panic) = h.join() {
+            tracing::error!(
+                target: "pyronova::server",
+                ?panic,
+                "bench worker thread panicked"
+            );
+        }
     }
     Ok((end - start, elapsed, port))
 }
