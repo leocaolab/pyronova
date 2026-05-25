@@ -174,7 +174,19 @@ pub(crate) async fn handle_request(
             if let Ok(data) = result.as_mut() {
                 crate::compression::maybe_compress(data, &accept_encoding);
             }
-            full_body(build_response(result)?)
+            // Don't propagate build_response errors via `?` — that would
+            // skip apply_cors below, breaking CORS-protected APIs when
+            // response construction fails (e.g. invalid header chars
+            // from a handler). Convert to a 500 with CORS still applied,
+            // matching the 404/413/504 paths above.
+            match build_response(result) {
+                Ok(r) => full_body(r),
+                Err(e) => {
+                    let mut r = full_body(crate::response::error_response(&e.to_string()));
+                    apply_cors(&mut r, routes.cors_config.as_ref());
+                    return Ok(r);
+                }
+            }
         }
         HandlerResult::PyronovaStream(info) => build_stream_response(info),
     };
