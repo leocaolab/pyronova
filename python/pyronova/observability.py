@@ -96,19 +96,31 @@ def install_metrics(app: "Pyronova", path: str) -> None:
         if req.path == path:
             return resp
 
-        status = resp.status_code
-        state.incr("_m:req:total", 1)
-        state.incr(f"_m:req:class:{status // 100}xx", 1)
-        method = req.method.upper()
-        if method in _TRACKED_METHODS:
-            state.incr(f"_m:req:method:{method}", 1)
+        # Observability MUST NOT break the request. Wrap every counter
+        # touch so a transient state.incr failure (DashMap contention,
+        # value-type drift, etc.) logs and continues instead of raising
+        # into the response path (arc finding observability-2).
+        try:
+            status = resp.status_code
+            state.incr("_m:req:total", 1)
+            state.incr(f"_m:req:class:{status // 100}xx", 1)
+            method = req.method.upper()
+            if method in _TRACKED_METHODS:
+                state.incr(f"_m:req:method:{method}", 1)
 
-        start = getattr(_tls, "metrics_start_ns", None)
-        _tls.metrics_start_ns = None
-        if start is not None:
-            elapsed_us = max(0, (time.monotonic_ns() - start) // 1000)
-            state.incr("_m:lat:sum_us", int(elapsed_us))
-            state.incr("_m:lat:count", 1)
+            start = getattr(_tls, "metrics_start_ns", None)
+            _tls.metrics_start_ns = None
+            if start is not None:
+                elapsed_us = max(0, (time.monotonic_ns() - start) // 1000)
+                state.incr("_m:lat:sum_us", int(elapsed_us))
+                state.incr("_m:lat:count", 1)
+        except Exception:
+            # Log via stdlib (routed to Rust tracing in sub-interps);
+            # do NOT propagate.
+            import logging
+            logging.getLogger("pyronova.observability").exception(
+                "metrics _after hook failed; request unaffected"
+            )
         return resp
 
     app.before_request(_before)
