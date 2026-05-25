@@ -188,6 +188,15 @@ class Pyronova:
     @max_body_size.setter
     def max_body_size(self, size: int) -> None:
         """Set max request body size. Example: ``app.max_body_size = 50 * 1024 * 1024``"""
+        # Type hint is unenforced; explicit check so a non-int / negative
+        # value fails here (clear ValueError) instead of passing through
+        # to Rust and producing opaque behavior (arc finding app-10).
+        if not isinstance(size, int) or isinstance(size, bool):
+            raise TypeError(
+                f"max_body_size must be int, got {type(size).__name__}"
+            )
+        if size < 0:
+            raise ValueError(f"max_body_size must be non-negative, got {size}")
         self._max_body_size = size
         self._engine.set_max_body_size(size)
 
@@ -919,13 +928,27 @@ class Pyronova:
         """
         # Priority: param > env var > default
         host = host or os.environ.get("PYRONOVA_HOST", "127.0.0.1")
-        port = port if port is not None else int(os.environ.get("PYRONOVA_PORT", "8000"))
-        _w_env = os.environ.get("PYRONOVA_WORKERS")
-        if workers is None and _w_env:
-            workers = int(_w_env)
-        _iw_env = os.environ.get("PYRONOVA_IO_WORKERS")
-        if io_workers is None and _iw_env:
-            io_workers = int(_iw_env)
+
+        # Env-var int parsing surfaces actionable errors. Bare int()
+        # raises "invalid literal for int()" — opaque about which env
+        # var was bad (arc findings app-1, app-7).
+        def _env_int(name: str, default: str | None = None) -> int | None:
+            v = os.environ.get(name, default)
+            if v is None:
+                return None
+            try:
+                return int(v)
+            except ValueError:
+                raise ValueError(
+                    f"environment variable {name}={v!r} is not a valid integer"
+                ) from None
+
+        if port is None:
+            port = _env_int("PYRONOVA_PORT", "8000")
+        if workers is None:
+            workers = _env_int("PYRONOVA_WORKERS")
+        if io_workers is None:
+            io_workers = _env_int("PYRONOVA_IO_WORKERS")
         if workers is not None and workers < 1:
             raise ValueError(f"workers must be >= 1, got {workers}")
         if io_workers is not None and io_workers < 1:
@@ -940,7 +963,23 @@ class Pyronova:
             )
         if extra_tls_ports is None:
             _ep = os.environ.get("PYRONOVA_TLS_PORTS")
-            extra_tls_ports = [int(p) for p in _ep.split(",") if p.strip()] if _ep else None
+            if _ep:
+                # Surface bad entries with the offending value, not a
+                # bare "invalid literal for int()" (arc app-7).
+                parsed = []
+                for p in _ep.split(","):
+                    p = p.strip()
+                    if not p:
+                        continue
+                    try:
+                        parsed.append(int(p))
+                    except ValueError:
+                        raise ValueError(
+                            f"PYRONOVA_TLS_PORTS contains non-integer port {p!r}"
+                        ) from None
+                extra_tls_ports = parsed
+            else:
+                extra_tls_ports = None
 
         # Hot reload: watch .py files, restart on change
         reload = reload or os.environ.get("PYRONOVA_RELOAD") == "1"
