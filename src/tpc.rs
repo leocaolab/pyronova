@@ -87,7 +87,19 @@ pub(crate) fn elevate_thread_qos_macos() {
         fn pthread_set_qos_class_self_np(qos_class: c_int, relative_priority: c_int) -> c_int;
     }
     unsafe {
-        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        let rc = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        // Silent failure here can park TPC threads on E-cores — fatal
+        // for throughput per the doc comment above ("no work-stealing
+        // across threads"). Log so the perf regression is visible
+        // before it shows up as a benchmark drop (arc finding tpc-1).
+        if rc != 0 {
+            tracing::warn!(
+                target: "pyronova::server",
+                rc,
+                "pthread_set_qos_class_self_np failed; TPC thread may be \
+                 scheduled on E-cores — expect throughput collapse"
+            );
+        }
     }
 }
 
@@ -859,7 +871,42 @@ fn fire_gc(worker: &std::rc::Rc<std::cell::RefCell<SubInterpreterWorker>>) {
         if !res.is_null() {
             ffi::Py_DECREF(res);
         } else {
-            ffi::PyErr_Clear();
+            // gc.collect() failing is a serious signal (OOM, heap
+            // corruption, interp state damage). Pre-fix the exception
+            // was cleared silently — issue cascades into mysterious
+            // later crashes (arc tpc-2). Log the exception value
+            // before clearing so the root cause is captured. Uses
+            // 3.12+ PyErr_GetRaisedException (the deprecated triple
+            // PyErr_Fetch was replaced).
+            if !ffi::PyErr_Occurred().is_null() {
+                let exc = ffi::PyErr_GetRaisedException();
+                let msg = if !exc.is_null() {
+                    let s = ffi::PyObject_Str(exc);
+                    let owned = if !s.is_null() {
+                        let cs = ffi::PyUnicode_AsUTF8(s);
+                        let m = if !cs.is_null() {
+                            std::ffi::CStr::from_ptr(cs).to_string_lossy().into_owned()
+                        } else {
+                            "<repr failed>".to_string()
+                        };
+                        ffi::Py_DECREF(s);
+                        m
+                    } else {
+                        "<str failed>".to_string()
+                    };
+                    ffi::Py_DECREF(exc);
+                    owned
+                } else {
+                    "<no value>".to_string()
+                };
+                tracing::error!(
+                    target: "pyronova::app",
+                    error = %msg,
+                    "gc.collect() raised — clearing exception to keep worker \
+                     alive, but this signals OOM / heap corruption / interp \
+                     damage and will likely cascade"
+                );
+            }
         }
     }
     w.tstate = tstate_cell.get();
