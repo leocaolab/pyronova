@@ -39,8 +39,14 @@ def test_async_engine_graceful_shutdown_present():
     )
     # The shutdown has to be in a `finally:` branch so it runs even when
     # the fetcher thread joins normally (not just on exception).
-    # Sanity: find `finally:` after `await asyncio.to_thread`.
-    idx_join = src.find("await asyncio.to_thread(t.join)")
+    # Sanity: find `finally:` after the thread-join call. Match the
+    # `asyncio.to_thread(t.join)` substring without requiring a leading
+    # `await ` — the actual await may be on `asyncio.wait_for(...)` that
+    # wraps the to_thread call (arc finding async-engine-4 added a
+    # 30s shutdown timeout). The behavioral invariant — that we join
+    # the fetcher thread and then run the finally cleanup — is what
+    # this guard cares about, not the exact wrapping expression.
+    idx_join = src.find("asyncio.to_thread(t.join)")
     assert idx_join != -1
     finally_idx = src.find("finally:", idx_join)
     assert finally_idx != -1, "shutdown must be in a finally: block"
