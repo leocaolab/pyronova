@@ -89,6 +89,11 @@ def set_cookie(
     """
     from pyronova.engine import Response
 
+    # RFC 6265 §4.1.1 cookie-name = token = 1*<CHAR>. Empty name would
+    # produce `Set-Cookie: =value; ...` which browsers may reject or
+    # parse ambiguously (arc finding cookies-1).
+    if not name:
+        raise ValueError("cookie name must not be empty (RFC 6265 §4.1.1)")
     _reject_control_chars("name", name)
     _reject_control_chars("value", value)
     if domain is not None:
