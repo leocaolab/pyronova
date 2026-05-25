@@ -51,7 +51,10 @@ impl PyronovaWebSocket {
     /// Python server in disguise.
     fn recv(&self, py: Python<'_>) -> Option<String> {
         py.detach(|| {
-            let mut rx = self.incoming_rx.lock().unwrap();
+            // Recover from poisoning (a previous holder panicked) — channel
+// data is intact, only the poison flag is set. Panicking across
+// FFI into Python is UB per PyO3 (arc websocket-1).
+let mut rx = self.incoming_rx.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 match rx.blocking_recv()? {
                     WsMsg::Text(s) => return Some(s),
@@ -65,7 +68,10 @@ impl PyronovaWebSocket {
     /// Releases the GIL while waiting — see `recv` for rationale.
     fn recv_bytes(&self, py: Python<'_>) -> Option<Vec<u8>> {
         py.detach(|| {
-            let mut rx = self.incoming_rx.lock().unwrap();
+            // Recover from poisoning (a previous holder panicked) — channel
+// data is intact, only the poison flag is set. Panicking across
+// FFI into Python is UB per PyO3 (arc websocket-1).
+let mut rx = self.incoming_rx.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 match rx.blocking_recv()? {
                     WsMsg::Binary(b) => return Some(b),
@@ -81,7 +87,10 @@ impl PyronovaWebSocket {
         // Release the GIL across the blocking recv; re-acquire to build the
         // Python-typed return value.
         let msg = py.detach(|| {
-            let mut rx = self.incoming_rx.lock().unwrap();
+            // Recover from poisoning (a previous holder panicked) — channel
+// data is intact, only the poison flag is set. Panicking across
+// FFI into Python is UB per PyO3 (arc websocket-1).
+let mut rx = self.incoming_rx.lock().unwrap_or_else(|e| e.into_inner());
             rx.blocking_recv()
         })?;
         match msg {
@@ -113,7 +122,8 @@ impl PyronovaWebSocket {
 
     /// Close the PyronovaWebSocket connection.
     fn close(&self) {
-        let mut tx = self.outgoing_tx.lock().unwrap();
+        // Recover from poisoning — see recv() rationale (arc websocket-1).
+        let mut tx = self.outgoing_tx.lock().unwrap_or_else(|e| e.into_inner());
         *tx = None;
     }
 }
@@ -121,7 +131,14 @@ impl PyronovaWebSocket {
 impl PyronovaWebSocket {
     fn try_send_outgoing(&self, msg: WsMsg) -> PyResult<()> {
         use tokio::sync::mpsc::error::TrySendError;
-        let guard = self.outgoing_tx.lock().unwrap();
+        // Convert poisoning to PyConnectionError — this method already
+        // returns PyResult, so failure can flow back to Python normally
+        // (arc websocket-1). Panicking across FFI is UB per PyO3.
+        let guard = self.outgoing_tx.lock().map_err(|e| {
+            pyo3::exceptions::PyConnectionError::new_err(format!(
+                "PyronovaWebSocket outgoing mutex poisoned: {e}"
+            ))
+        })?;
         let tx = guard.as_ref().ok_or_else(|| {
             pyo3::exceptions::PyConnectionError::new_err("PyronovaWebSocket closed")
         })?;
@@ -273,12 +290,31 @@ where
                     // coroutine that must be driven. Detect via
                     // `asyncio.iscoroutine`; if so, run it on a fresh
                     // event loop. Otherwise drop the result.
-                    let is_coro = py
+                    // If the iscoroutine check fails (asyncio import,
+                    // attribute lookup, or call), pre-fix this silently
+                    // returned `false` and the coroutine was dropped
+                    // un-awaited — handler appears to succeed but does
+                    // nothing (arc finding websocket-3). Log so the
+                    // silent no-op is observable.
+                    let is_coro = match py
                         .import("asyncio")
                         .and_then(|m| m.getattr("iscoroutine"))
                         .and_then(|f| f.call1((&result,)))
                         .and_then(|r| r.extract::<bool>())
-                        .unwrap_or(false);
+                    {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "pyronova::app",
+                                error = %e,
+                                "websocket handler: asyncio.iscoroutine check \
+                                 failed; treating result as non-coroutine — \
+                                 if the handler is async def its body will \
+                                 not have run"
+                            );
+                            false
+                        }
+                    };
                     if is_coro {
                         if let Err(e) = py
                             .import("asyncio")
