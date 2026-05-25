@@ -151,6 +151,14 @@ class TestClient:
                 app.run(host=host, port=port, mode="default")
             except Exception as e:
                 self._server_error = e
+                # Pre-fix the exception was stored but never logged.
+                # Tests then saw only generic 'connection refused' with
+                # no clue why (arc finding testing-3).
+                import logging as _log
+                _log.getLogger("pyronova.testing").exception(
+                    "TestClient inner server crashed; clients will see "
+                    "connection refused"
+                )
 
         self._thread = threading.Thread(target=_run_server, daemon=True)
         self._thread.start()
