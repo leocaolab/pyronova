@@ -300,6 +300,26 @@ pub(crate) unsafe fn register_db_bridge(globals: *mut ffi::PyObject) {
         if !func.is_null() {
             ffi::PyDict_SetItemString(globals, name.as_ptr(), func);
             ffi::Py_DECREF(func);
+        } else {
+            // PyCFunction_NewEx returning null = alloc failure or
+            // invalid PyMethodDef. Pre-fix this was silent → sub-interp
+            // missing the DB bridge function → NameError at request
+            // time, root cause hidden (arc finding bridge-db-bridge-2).
+            // Clear any pending error so subsequent registrations don't
+            // inherit it; log so the missing-function failure is
+            // diagnosable.
+            if !ffi::PyErr_Occurred().is_null() {
+                ffi::PyErr_Clear();
+            }
+            let name_str = std::ffi::CStr::from_ptr(name.as_ptr())
+                .to_string_lossy();
+            tracing::error!(
+                target: "pyronova::app",
+                function = %name_str,
+                "PyCFunction_NewEx returned null while registering DB \
+                 bridge function — sub-interp will see NameError at \
+                 runtime when handlers try to call it"
+            );
         }
     }
 
