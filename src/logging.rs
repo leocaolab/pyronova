@@ -93,8 +93,20 @@ pub fn init_logger(level: String, access_log: bool, format: String) -> PyResult<
             format = %format,
             "Pyronova tracing engine initialized"
         );
+    } else if let Err(e) = result {
+        // Pre-fix this branch was entirely silent — caller got Ok(())
+        // believing logging was operational, but every log call then
+        // silently no-op'd because a foreign subscriber held the slot
+        // (arc finding logging-1). Print directly to stderr (we can't
+        // use tracing — that's what failed) so the failure is at least
+        // observable in startup output. Still return Ok because hot
+        // reload + tests legitimately hit this path.
+        eprintln!(
+            "[pyronova] init_logger: tracing subscriber already set ({e}); \
+             pyronova logging is INACTIVE — log calls from this process \
+             will route to whatever subscriber installed first."
+        );
     }
-    // Silently ignore if already initialized (hot reload, tests)
 
     Ok(())
 }
