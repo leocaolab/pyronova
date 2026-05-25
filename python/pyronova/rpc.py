@@ -132,9 +132,24 @@ def rpc_decorator(app, path: str, proto_model=None):
             else:
                 return envelope  # Framework auto-serializes dict as JSON
 
-        # Check if handler takes 2 args (req, data) or 1 (data)
+        # Check if handler takes 2 args (req, data) or 1 (data).
+        # arc finding rpc-1: pre-fix the `>= 2` check failed for
+        # 0-param handlers (would call fn(data) → TypeError) and
+        # **kwargs-only handlers. Validate at registration so misuse
+        # surfaces at decorator time, not at first request.
         sig = inspect.signature(fn)
-        takes_data = len(sig.parameters) >= 2
+        positional_or_keyword = [
+            p for p in sig.parameters.values()
+            if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                          inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        n_pos = len(positional_or_keyword)
+        if n_pos < 1:
+            raise TypeError(
+                f"RPC handler {fn.__name__!r} must accept at least 1 "
+                "positional argument (data) or 2 (req, data); got 0"
+            )
+        takes_data = n_pos >= 2
 
         # Any uncaught exception in an RPC handler becomes a structured
         # {ok: false, error: ...} envelope so clients don't see a raw 500.
