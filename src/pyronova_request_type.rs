@@ -310,9 +310,18 @@ unsafe fn build_str_dict_from_hashmap(m: &HashMap<String, String>) -> *mut ffi::
             return std::ptr::null_mut();
         }
         // PyDict_SetItem INCREFs both — we DECREF our owned refs.
-        ffi::PyDict_SetItem(dict, kobj, vobj);
+        // Check return: -1 on failure leaves a Python exception set
+        // and the dict in an inconsistent (partial) state. Pre-fix
+        // the loop continued and returned a partial dict to the caller
+        // who only NULL-checks — exception state leaks into the next
+        // operation (arc request-type-1/-2).
+        let rc = ffi::PyDict_SetItem(dict, kobj, vobj);
         ffi::Py_DECREF(kobj);
         ffi::Py_DECREF(vobj);
+        if rc != 0 {
+            ffi::Py_DECREF(dict);
+            return std::ptr::null_mut();
+        }
     }
     dict
 }
