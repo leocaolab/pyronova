@@ -402,7 +402,26 @@ pub(crate) fn call_handler_with_hooks(
                 }
             }
         } else {
-            &routes.handlers[handler_idx]
+            // Bound-check rather than panic on out-of-range index.
+            // Caller is expected to pass a valid index, but router bugs
+            // or future refactors could feed garbage; pre-fix that would
+            // panic the worker thread mid-request (arc handlers-3).
+            // Treat as a 500 instead.
+            match routes.handlers.get(handler_idx) {
+                Some(h) => h,
+                None => {
+                    tracing::error!(
+                        target: "pyronova::app",
+                        handler_idx,
+                        n_handlers = routes.handlers.len(),
+                        "handler_idx out of range — returning 500 \
+                         instead of panicking; check caller validation"
+                    );
+                    return HandlerResult::PyronovaResponse(Err(
+                        "internal: handler index out of range".to_string(),
+                    ));
+                }
+            }
         };
 
         // before_request hooks
