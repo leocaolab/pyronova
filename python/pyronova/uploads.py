@@ -32,7 +32,13 @@ class UploadFile:
 
     @property
     def text(self) -> str:
-        return self.data.decode("utf-8")
+        # Uploaded bytes are arbitrary user content — may not be valid
+        # UTF-8 (binary files, mojibake, partial buffers). Use `replace`
+        # so calling .text on a binary upload yields a lossy string
+        # instead of crashing the request with UnicodeDecodeError
+        # (arc finding uploads-1). Callers who need strict decoding
+        # should work with .data directly.
+        return self.data.decode("utf-8", errors="replace")
 
     @property
     def size(self) -> int:
@@ -50,12 +56,18 @@ def parse_multipart(req) -> "dict[str, UploadFile | list[UploadFile]]":
     if "multipart/form-data" not in ct:
         raise ValueError(f"Expected multipart/form-data, got: {ct}")
 
-    # Extract boundary
+    # Extract boundary. RFC 2045: Content-Type parameter names are
+    # case-insensitive — `BOUNDARY=` and `boundary=` are equivalent.
+    # Matching only lowercase rejects valid uppercase clients (arc
+    # finding uploads-3). Compare against the lowercased token.
     boundary = None
     for part in ct.split(";"):
         part = part.strip()
-        if part.startswith("boundary="):
-            boundary = part[9:].strip().strip('"')
+        lowered = part.lower()
+        if lowered.startswith("boundary="):
+            # Slice from the original `part` so casing in the value
+            # itself (boundaries are case-sensitive) is preserved.
+            boundary = part[len("boundary="):].strip().strip('"')
             break
 
     if not boundary:
@@ -65,9 +77,32 @@ def parse_multipart(req) -> "dict[str, UploadFile | list[UploadFile]]":
     if raw is None:
         raise ValueError("parse_multipart: request body is empty")
     body = raw if isinstance(raw, bytes) else raw.encode()
-    boundary_bytes = f"--{boundary}".encode()
 
-    parts = body.split(boundary_bytes)
+    # RFC 2046: boundary markers MUST be line-anchored (preceded by
+    # CRLF). Splitting on the raw `--{boundary}` token false-splits
+    # when file content contains those bytes mid-stream — a
+    # data-corruption bug for any upload whose content happens to
+    # include the boundary sequence (CRITICAL, arc finding
+    # python-pyronova-uploads-2).
+    #
+    # Fix: prepend \r\n to the body so the very first boundary
+    # (which has no leading CRLF when the body starts directly
+    # with `--boundary`) is uniformly anchored, then split on
+    # \r\n--{boundary}. LF-only framing falls back to \n--{boundary}
+    # — matches the \n\n header-separator fallback below for
+    # clients/proxies that strip CRLF.
+    crlf_anchor = ("\r\n--" + boundary).encode()
+    lf_anchor = ("\n--" + boundary).encode()
+    if crlf_anchor in body:
+        parts = (b"\r\n" + body).split(crlf_anchor)
+    elif lf_anchor in body:
+        parts = (b"\n" + body).split(lf_anchor)
+    else:
+        # No line-anchored boundary marker found — body is malformed
+        # or degenerate. Return empty parts rather than the pre-fix
+        # behavior of splitting on raw `--{boundary}` (which produced
+        # subtly-wrong data instead of an empty result).
+        parts = []
     result = {}
 
     for part in parts:
