@@ -114,9 +114,14 @@ def main() -> int:
         rc = proc.wait()
         if rc != 0:
             _log.warning("launcher: process exited with code %d", rc)
+        # Propagate child rc so CI/CD pipelines see real failures
+        # (arc finding launcher-3). Pre-fix this always returned 0 even
+        # when the underlying pyronova process exited non-zero — masking
+        # benchmark failures.
+        return rc
     except Exception:
         _log.warning("launcher: wait() failed", exc_info=True)
-    return 0
+        return 1
 
 
 if __name__ == "__main__":
