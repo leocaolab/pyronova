@@ -34,6 +34,9 @@ except ImportError:
 
 # Injected by Rust: WORKER_ID = {worker_idx}
 # Injected by Rust: HANDLER_NAMES = [{handlers_array}]
+# Injected by Rust: _pyronova_pool_id (sub-interp pool identifier; passed to
+#   every _pyronova_send/_pyronova_recv call — see src/python/interp.rs:2480
+#   for the injection site).
 
 
 # Timeout for async handlers — 2s before Rust's 30s gateway timeout,
@@ -144,7 +147,20 @@ async def _pyronova_engine():
         _log.exception("worker=%s fetcher thread failed to start", WORKER_ID)
         return
     try:
-        await asyncio.to_thread(t.join)
+        # Bound shutdown duration. Without a timeout, a stuck fetcher
+        # thread (e.g. _pyronova_recv FFI hanging, zombie-worker guard
+        # failing, channel deadlock) would block shutdown indefinitely
+        # (arc finding async-engine-4). 30s aligns with Rust's gateway
+        # timeout — if the fetcher hasn't exited by then, it never will.
+        try:
+            await asyncio.wait_for(asyncio.to_thread(t.join), timeout=30.0)
+        except asyncio.TimeoutError:
+            _log.error(
+                "worker=%s fetcher thread did not exit within 30s — "
+                "proceeding with shutdown; thread will be killed by "
+                "Py_EndInterpreter",
+                WORKER_ID,
+            )
     finally:
         # Graceful asyncio shutdown. Without this, Py_EndInterpreter
         # would tear the VM down while pending tasks (background
