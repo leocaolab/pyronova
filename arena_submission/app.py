@@ -43,6 +43,15 @@ try:
     with open(DATASET_PATH) as f:
         DATASET_ITEMS = json.load(f)
 except Exception:
+    # The file's documented contract (~line 40) is: every broad-except
+    # logs with exc_info=True so init failures aren't silent. Apply
+    # consistently here (arc finding arena-app-1).
+    import logging as _arena_log
+    _arena_log.getLogger(__name__).warning(
+        "arena_submission: failed to load DATASET_PATH=%r; "
+        "/json endpoints will return empty results",
+        DATASET_PATH, exc_info=True,
+    )
     DATASET_ITEMS = []
 
 
@@ -59,6 +68,15 @@ if DATABASE_URL:
         max_conn = int(os.environ.get("DATABASE_MAX_CONN", "256"))
         PG_POOL = PgPool.connect(DATABASE_URL, max_connections=max_conn)
     except Exception:
+        # Same contract as arena-app-1: surface init failures so
+        # benchmark profiles that need PG don't silently regress to
+        # empty responses (arc finding arena-app-2).
+        import logging as _arena_log
+        _arena_log.getLogger(__name__).warning(
+            "arena_submission: PgPool.connect failed; /async-db and "
+            "/crud/* will return empty/500 responses",
+            exc_info=True,
+        )
         PG_POOL = None
 
 
