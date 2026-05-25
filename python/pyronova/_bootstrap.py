@@ -132,7 +132,16 @@ try:
     import gc as _gc
     _gc.disable()
 except Exception:
-    pass
+    # NEVER silently swallow. If gc.disable() fails, automatic GC stays
+    # on — at 400k RPS that means hundreds of generation-0 collections
+    # per second, each adding 10-50ms to P99 tail latency. Without this
+    # log the regression is invisible until production monitoring catches
+    # the tail spike. Emit at ERROR so it shows up in default log filters.
+    _logging.getLogger("pyronova.bootstrap").error(
+        "gc.disable() failed — CPython auto-GC remains active; "
+        "expect P99 tail spikes at high RPS",
+        exc_info=True,
+    )
 
 _mock_engine = types.ModuleType("pyronova.engine")
 _mock_engine.PyronovaApp = type("PyronovaApp", (), {
@@ -348,6 +357,18 @@ def _set_cookie(resp, name, value, **kw):
     # the sub-interp mock would silently emit attacker-controlled bytes
     # into the Set-Cookie header, defeating the v1.4.5 fix.
     _reject_cookie_crlf("name", name)
+    # RFC 6265 §4.1.1: cookie-name is a token; '=' is the name/value
+    # separator and MUST NOT appear in the name itself. Without this
+    # check, name="foo=bar" produces `Set-Cookie: foo=bar=value` which
+    # browsers parse as name="foo" value="bar=value" — a session-id
+    # bypass surface if the name is attacker-influenced (arc finding
+    # bootstrap-2). '=' is not added to _COOKIE_FORBIDDEN because it
+    # IS valid in values (base64 padding, etc.) — name-specific check.
+    if name is not None and "=" in name:
+        raise ValueError(
+            f"cookie name {name!r} contains '=' which is forbidden by "
+            "RFC 6265 §4.1.1 (would corrupt browser parsing)"
+        )
     _reject_cookie_crlf("value", value)
     _reject_cookie_crlf("path", kw.get("path"))
     _reject_cookie_crlf("domain", kw.get("domain"))
