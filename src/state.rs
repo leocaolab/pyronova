@@ -97,8 +97,16 @@ impl SharedState {
     }
 
     /// Check if key exists.
+    ///
+    /// Mirrors `__getitem__`: a key only counts as "in" the state if its
+    /// value is valid UTF-8, since `__getitem__` raises KeyError otherwise.
+    /// This preserves the dict invariant that `key in state` implies
+    /// `state[key]` succeeds. Use `get_bytes` for raw non-UTF-8 access.
     fn __contains__(&self, key: &str) -> bool {
-        self.inner.contains_key(key)
+        self.inner
+            .get(key)
+            .map(|v| std::str::from_utf8(v.value()).is_ok())
+            .unwrap_or(false)
     }
 
     /// dict-like: state["key"] = "value"
