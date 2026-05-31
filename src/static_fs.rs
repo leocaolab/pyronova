@@ -199,13 +199,22 @@ pub(crate) async fn try_static_file(
             .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed)
             + bytes.len() as u64;
         if new_total <= STATIC_CACHE_MAX_BYTES {
-            cache().insert(
+            // `insert` returns the entry it replaced. If a concurrent thread
+            // (or an earlier request) already cached this key, our `fetch_add`
+            // double-counted: both reservations are in the counter but the map
+            // only holds one entry. Subtract the replaced entry's bytes so the
+            // counter tracks live map contents. This sub is balanced — `prev`
+            // was added by whoever inserted it — so it cannot underflow.
+            if let Some(prev) = cache().insert(
                 file_canonical.clone(),
                 CachedFile {
                     bytes: bytes.clone(),
                     content_type: ct,
                 },
-            );
+            ) {
+                cache_bytes()
+                    .fetch_sub(prev.bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
         } else {
             cache_bytes().fetch_sub(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
