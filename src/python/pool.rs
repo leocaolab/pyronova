@@ -544,47 +544,8 @@ fn worker_thread_loop_async(
             ml_doc: std::ptr::null(),
         }));
 
-        let recv_func =
-            ffi::PyCFunction_NewEx(recv_def, std::ptr::null_mut(), std::ptr::null_mut());
-        let send_func =
-            ffi::PyCFunction_NewEx(send_def, std::ptr::null_mut(), std::ptr::null_mut());
-
-        // Null-guard like pool_id_obj / emit_log_func below: PyCFunction_NewEx
-        // can return null (OOM, corrupted interp state), and PyDict_SetItemString
-        // does not accept null values per the CPython contract — passing one
-        // would segfault.
-        // On success PyCFunction_NewEx borrows the PyMethodDef for the
-        // function object's lifetime, so we intentionally leak the Box.
-        // On the null path no function object took ownership, so reclaim
-        // the Box to avoid leaking ~80 bytes per failed registration
-        // (mirrors db_bridge.rs).
-        if !recv_func.is_null() {
-            ffi::PyDict_SetItemString(worker.globals, c"_pyronova_recv".as_ptr(), recv_func);
-            ffi::Py_DECREF(recv_func);
-        } else {
-            let _ = Box::from_raw(recv_def);
-        }
-        if !send_func.is_null() {
-            ffi::PyDict_SetItemString(worker.globals, c"_pyronova_send".as_ptr(), send_func);
-            ffi::Py_DECREF(send_func);
-        } else {
-            let _ = Box::from_raw(send_def);
-        }
-
-        // Zombie-guard: each sub-interpreter stamps its pool_id as a
-        // module-level constant. The async engine reads it once and
-        // passes it as the second arg to every _pyronova_recv / _pyronova_send
-        // call. If a later pool's WorkerState has replaced our slot,
-        // the C-FFI bridge detects the id mismatch and returns None
-        // (sentinel for "your pool is gone, clean up and exit") so
-        // this worker can't receive requests meant for the live pool.
-        let pool_id_obj = ffi::PyLong_FromUnsignedLongLong(worker.pool_id);
-        if !pool_id_obj.is_null() {
-            ffi::PyDict_SetItemString(worker.globals, c"_pyronova_pool_id".as_ptr(), pool_id_obj);
-            ffi::Py_DECREF(pool_id_obj);
-        }
-
-        // Register _pyronova_emit_log for async worker logging bridge
+        // Build the logging-bridge PyMethodDef up front so the registration
+        // closure below can reclaim its Box on any early-failure path.
         #[allow(clippy::missing_transmute_annotations)]
         let emit_log_def = Box::into_raw(Box::new(ffi::PyMethodDef {
             ml_name: c"_pyronova_emit_log".as_ptr(),
@@ -594,15 +555,94 @@ fn worker_thread_loop_async(
             ml_flags: ffi::METH_VARARGS,
             ml_doc: std::ptr::null(),
         }));
-        let emit_log_func =
-            ffi::PyCFunction_NewEx(emit_log_def, std::ptr::null_mut(), std::ptr::null_mut());
-        if !emit_log_func.is_null() {
-            ffi::PyDict_SetItemString(
-                worker.globals,
-                c"_pyronova_emit_log".as_ptr(),
-                emit_log_func,
-            );
+
+        // Register the C-FFI async bridge (_pyronova_recv/_pyronova_send), the
+        // zombie-guard pool_id, and the logging bridge (_pyronova_emit_log) into
+        // the sub-interpreter globals. Every one of these is on the async
+        // engine's hot path: the fetcher thread calls _pyronova_recv /
+        // _pyronova_send on each request, reads _pyronova_pool_id to detect a
+        // replaced slot, and routes logs through _pyronova_emit_log. So a null
+        // from PyCFunction_NewEx / PyLong_FromUnsignedLongLong (OOM or corrupted
+        // interpreter state) is FATAL — continuing would spawn a worker that
+        // crashes with AttributeError on its very first request. We must not let
+        // that worker run; we abort it instead (see the bail-out below).
+        //
+        // (PyDict_SetItemString also rejects null values per the CPython
+        // contract — passing one would segfault — so the null check is required
+        // for safety as well as correctness.)
+        //
+        // Ownership: on success PyCFunction_NewEx borrows the PyMethodDef for the
+        // function object's lifetime, so we intentionally leak the Box; on a null
+        // path no object took ownership, so we reclaim every not-yet-consumed Box
+        // to avoid leaking ~80 bytes each (mirrors db_bridge.rs).
+        let globals = worker.globals;
+        let pool_id = worker.pool_id;
+        // Already inside the function's outer `unsafe` block (above), so the
+        // closure body inherits that context — no inner `unsafe` needed.
+        let register_bridge = || -> bool {
+            let recv_func =
+                ffi::PyCFunction_NewEx(recv_def, std::ptr::null_mut(), std::ptr::null_mut());
+            if recv_func.is_null() {
+                let _ = Box::from_raw(recv_def);
+                let _ = Box::from_raw(send_def);
+                let _ = Box::from_raw(emit_log_def);
+                return false;
+            }
+            ffi::PyDict_SetItemString(globals, c"_pyronova_recv".as_ptr(), recv_func);
+            ffi::Py_DECREF(recv_func);
+
+            let send_func =
+                ffi::PyCFunction_NewEx(send_def, std::ptr::null_mut(), std::ptr::null_mut());
+            if send_func.is_null() {
+                let _ = Box::from_raw(send_def);
+                let _ = Box::from_raw(emit_log_def);
+                return false;
+            }
+            ffi::PyDict_SetItemString(globals, c"_pyronova_send".as_ptr(), send_func);
+            ffi::Py_DECREF(send_func);
+
+            // Zombie-guard: each sub-interpreter stamps its pool_id as a
+            // module-level constant. The async engine reads it once and
+            // passes it as the second arg to every _pyronova_recv /
+            // _pyronova_send call. If a later pool's WorkerState has replaced
+            // our slot, the C-FFI bridge detects the id mismatch and returns
+            // None (sentinel for "your pool is gone, clean up and exit") so
+            // this worker can't receive requests meant for the live pool.
+            let pool_id_obj = ffi::PyLong_FromUnsignedLongLong(pool_id);
+            if pool_id_obj.is_null() {
+                let _ = Box::from_raw(emit_log_def);
+                return false;
+            }
+            ffi::PyDict_SetItemString(globals, c"_pyronova_pool_id".as_ptr(), pool_id_obj);
+            ffi::Py_DECREF(pool_id_obj);
+
+            let emit_log_func =
+                ffi::PyCFunction_NewEx(emit_log_def, std::ptr::null_mut(), std::ptr::null_mut());
+            if emit_log_func.is_null() {
+                let _ = Box::from_raw(emit_log_def);
+                return false;
+            }
+            ffi::PyDict_SetItemString(globals, c"_pyronova_emit_log".as_ptr(), emit_log_func);
             ffi::Py_DECREF(emit_log_func);
+
+            true
+        };
+
+        if !register_bridge() {
+            tracing::error!(
+                target: "pyronova::server",
+                worker = worker_idx,
+                "failed to register C-FFI bridge in sub-interpreter (OOM or \
+                 corrupted interpreter state); aborting async worker instead of \
+                 running an engine that would crash on first request"
+            );
+            // Clean up the half-initialized sub-interpreter and exit the worker.
+            // Same zombie-safety guard as the normal cleanup path below.
+            if pyo3::ffi::Py_IsInitialized() != 0 {
+                ffi::Py_EndInterpreter(ffi::PyThreadState_Get());
+            }
+            worker.tstate = std::ptr::null_mut();
+            return;
         }
 
         // Sub-interp DB bridge — see sync worker path + src/db_bridge.rs
