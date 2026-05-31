@@ -549,10 +549,27 @@ fn worker_thread_loop_async(
         let send_func =
             ffi::PyCFunction_NewEx(send_def, std::ptr::null_mut(), std::ptr::null_mut());
 
-        ffi::PyDict_SetItemString(worker.globals, c"_pyronova_recv".as_ptr(), recv_func);
-        ffi::PyDict_SetItemString(worker.globals, c"_pyronova_send".as_ptr(), send_func);
-        ffi::Py_DECREF(recv_func);
-        ffi::Py_DECREF(send_func);
+        // Null-guard like pool_id_obj / emit_log_func below: PyCFunction_NewEx
+        // can return null (OOM, corrupted interp state), and PyDict_SetItemString
+        // does not accept null values per the CPython contract — passing one
+        // would segfault.
+        // On success PyCFunction_NewEx borrows the PyMethodDef for the
+        // function object's lifetime, so we intentionally leak the Box.
+        // On the null path no function object took ownership, so reclaim
+        // the Box to avoid leaking ~80 bytes per failed registration
+        // (mirrors db_bridge.rs).
+        if !recv_func.is_null() {
+            ffi::PyDict_SetItemString(worker.globals, c"_pyronova_recv".as_ptr(), recv_func);
+            ffi::Py_DECREF(recv_func);
+        } else {
+            let _ = Box::from_raw(recv_def);
+        }
+        if !send_func.is_null() {
+            ffi::PyDict_SetItemString(worker.globals, c"_pyronova_send".as_ptr(), send_func);
+            ffi::Py_DECREF(send_func);
+        } else {
+            let _ = Box::from_raw(send_def);
+        }
 
         // Zombie-guard: each sub-interpreter stamps its pool_id as a
         // module-level constant. The async engine reads it once and

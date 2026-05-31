@@ -302,12 +302,17 @@ pub(crate) unsafe fn register_db_bridge(globals: *mut ffi::PyObject) {
             ffi::Py_DECREF(func);
         } else {
             // PyCFunction_NewEx returning null = alloc failure or
-            // invalid PyMethodDef. Pre-fix this was silent → sub-interp
-            // missing the DB bridge function → NameError at request
-            // time, root cause hidden (arc finding bridge-db-bridge-2).
-            // Clear any pending error so subsequent registrations don't
-            // inherit it; log so the missing-function failure is
-            // diagnosable.
+            // invalid PyMethodDef. The success path intentionally leaks
+            // `def` (CPython requires the PyMethodDef to outlive the
+            // function object), but here no function object took
+            // ownership, so reclaim the box to avoid leaking ~80 bytes
+            // per failed registration.
+            let _ = Box::from_raw(def);
+            // Pre-fix this was silent → sub-interp missing the DB bridge
+            // function → NameError at request time, root cause hidden
+            // (arc finding bridge-db-bridge-2). Clear any pending error
+            // so subsequent registrations don't inherit it; log so the
+            // missing-function failure is diagnosable.
             if !ffi::PyErr_Occurred().is_null() {
                 ffi::PyErr_Clear();
             }

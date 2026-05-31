@@ -16,11 +16,20 @@ use super::ffi::*;
 // ---------------------------------------------------------------------------
 
 /// Create a new Python unicode string. Returns an owned `PyObjRef`.
+///
+/// On failure (allocation error), clears the pending Python exception
+/// before returning None, per the module-level contract.
 pub(crate) unsafe fn py_str(s: &str) -> Option<PyObjRef> {
-    PyObjRef::from_owned(ffi::PyUnicode_FromStringAndSize(
+    match PyObjRef::from_owned(ffi::PyUnicode_FromStringAndSize(
         s.as_ptr() as *const _,
         s.len() as isize,
-    ))
+    )) {
+        Some(p) => Some(p),
+        None => {
+            ffi::PyErr_Clear();
+            None
+        }
+    }
 }
 
 /// Create a new Python dict from a HashMap<String, String>. Returns owned `PyObjRef`.
@@ -57,6 +66,9 @@ pub(crate) unsafe fn log_and_clear_py_exception(context: &str) {
         let mut size: ffi::Py_ssize_t = 0;
         let data = ffi::PyUnicode_AsUTF8AndSize(repr, &mut size);
         let s = if data.is_null() {
+            // PyUnicode_AsUTF8AndSize set a new exception on failure;
+            // drop it so we honor the "always clears" contract.
+            ffi::PyErr_Clear();
             "<non-utf8 exception repr>".to_string()
         } else {
             String::from_utf8_lossy(std::slice::from_raw_parts(data as *const u8, size as usize))
@@ -65,6 +77,10 @@ pub(crate) unsafe fn log_and_clear_py_exception(context: &str) {
         ffi::Py_DECREF(repr);
         s
     } else {
+        // PyObject_Str failed and left its own exception set; clear it so
+        // the subsequent Py_DECREF and any downstream C-API calls run with
+        // a clean error indicator.
+        ffi::PyErr_Clear();
         "<PyObject_Str failed>".to_string()
     };
 

@@ -260,10 +260,28 @@ unsafe fn pyronova_recv_inner(args: *mut ffi::PyObject) -> *mut ffi::PyObject {
             // All Python objects built successfully — NOW insert response_tx.
             // Any earlier bail keeps the sender alive; caller's oneshot will
             // close, returning a 503 instead of an orphaned response_map entry.
+            // Recover from a poisoned Mutex instead of panicking. A panic in
+            // any worker while holding this lock would poison it; a plain
+            // .unwrap() here would then panic the next worker → ffi_catch_unwind
+            // → PyRuntimeError → worker exit, cascading to zero workers under
+            // load. Continuing is strictly less bad than dying, but it is NOT
+            // a guarantee the map is consistent: Rust's HashMap is only
+            // unwind-safe for alloc-triggered panics — a panic mid-resize or
+            // in a custom hasher could leave it half-written. We can't detect
+            // that, so we log on recovery to make the (rare) poison observable
+            // in telemetry rather than swallowing it silently.
             state
                 .response_map
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| {
+                    tracing::error!(
+                        target: "pyronova::server",
+                        "response_map mutex poisoned (a worker panicked while \
+                         holding the lock); recovering inner guard — map state \
+                         may be inconsistent"
+                    );
+                    e.into_inner()
+                })
                 .insert(req_id, req.response_tx);
 
             ffi::PyTuple_SetItem(tuple, 0, id_obj);
@@ -350,7 +368,8 @@ unsafe fn pyronova_send_inner(args: *mut ffi::PyObject) -> *mut ffi::PyObject {
     // than just skipping means the tokio side times out naturally (504)
     // instead of getting a response from the wrong pool.
     if let Some(state) = get_worker_state(worker_id as usize).filter(|s| s.pool_id == pool_id) {
-        let mut map = state.response_map.lock().unwrap();
+        // Recover from poison rather than panicking — see pyronova_recv_inner.
+        let mut map = state.response_map.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(tx) = map.remove(&req_id) {
             // Check if the receiver is still alive (client may have timed out).
             // If closed, skip the send — the response would be discarded anyway.
