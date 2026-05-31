@@ -133,6 +133,17 @@ static RSS_SAMPLER_HANDLE: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>
 ///
 /// This thread never touches Python or the GIL — it only reads /proc/self/statm.
 pub fn spawn_rss_sampler() {
+    // Hold the handle lock across the whole check-and-spawn so two callers
+    // can't race, and bail out if a sampler is already installed. Spawning a
+    // second would overwrite (and thus detach) the first's JoinHandle, leaving
+    // stop_rss_sampler able to join only the newest — the detached thread would
+    // then outlive Py_Finalize and segfault on freed code pages (ISSUE-72).
+    let mut slot = RSS_SAMPLER_HANDLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if slot.is_some() {
+        return;
+    }
     RSS_SAMPLER_RUNNING.store(true, Ordering::Release);
     let handle = match std::thread::Builder::new()
         .name("pyronova-rss-sampler".to_string())
@@ -161,16 +172,8 @@ pub fn spawn_rss_sampler() {
             return;
         }
     };
-    // Recover from poisoning rather than silently drop the handle.
-    // Pre-fix a poisoned mutex made the handle un-stored → stop_rss_sampler
-    // couldn't join → the sampler thread outlived Py_Finalize and
-    // could segfault on freed code pages — the exact race the module
-    // comment warns against (arc finding monitor-1).
-    let mut slot = RSS_SAMPLER_HANDLE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    // Drop any previous handle (shouldn't happen — spawn is guarded
-    // by METRICS_INIT call_once — but belt + suspenders).
+    // slot was locked at the top and confirmed empty above, so this never
+    // overwrites (and thus detaches) a live handle.
     *slot = Some(handle);
 }
 
