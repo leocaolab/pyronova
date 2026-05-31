@@ -108,13 +108,29 @@ pub(crate) use dispatch_python_log;
 #[pyfunction]
 #[pyo3(signature = (level, access_log, format))]
 pub fn init_logger(level: String, access_log: bool, format: String) -> PyResult<()> {
-    let mut filter = EnvFilter::new(&level);
+    // Validate the level string. `EnvFilter::new` uses `parse_lossy`, which
+    // silently discards invalid directives — a malformed level can yield an
+    // empty filter that lets everything through, with no error to the caller.
+    // `try_new` surfaces the parse error so we can fall back to a sane "info"
+    // default and emit a visible warning instead of filtering unpredictably.
+    let mut filter = EnvFilter::try_new(&level).unwrap_or_else(|err| {
+        eprintln!(
+            "[pyronova] init_logger: invalid log level filter {level:?} ({err}); \
+             falling back to \"info\""
+        );
+        EnvFilter::new("info")
+    });
 
     // Suppress access log target when disabled
     if !access_log {
-        if let Ok(directive) = "pyronova::access=off".parse() {
-            filter = filter.add_directive(directive);
-        }
+        // This is a compile-time constant directive — a parse failure here is a
+        // programming error, not a runtime condition. Panic loudly rather than
+        // silently leaving access logs enabled and breaking the access_log=false
+        // contract.
+        let directive = "pyronova::access=off"
+            .parse()
+            .expect("hardcoded log directive 'pyronova::access=off' must be a valid EnvFilter directive");
+        filter = filter.add_directive(directive);
     }
 
     // Non-blocking writer: all log I/O happens on a dedicated background thread.
