@@ -8,8 +8,19 @@
 //! PyO3 contact at all. Physically grouping the unsafe-heavy files
 //! makes the FFI boundary easy to audit and isolate.
 //!
-//! - `interp`: sub-interpreter worker / GIL / tstate rebinding.
-//!   Most of the `unsafe` in the codebase lives here.
+//! Sub-interpreter management was historically one ~2.7k-LOC `interp`
+//! god module. It is now split into cohesive siblings (all still
+//! unsafe-heavy, so the audit-isolation rationale above still holds):
+//!
+//! - `ffi`: raw FFI primitives — `PyObjRef` RAII, `SubInterpGilGuard`,
+//!   tstate rebinding, the worker-state registry, and the C-FFI bridge
+//!   (`pyronova_recv`/`pyronova_send`/`pyronova_emit_log`).
+//! - `convert`: Python `str`/`dict` conversion helpers.
+//! - `worker`: `SubInterpreterWorker` — owns one sub-interpreter.
+//! - `pool`: `InterpreterPool`, `WorkRequest`, `SubInterpResponse`, and
+//!   the per-OS-thread worker loops.
+//! - `interp`: thin facade re-exporting the four above so existing
+//!   `crate::python::interp::X` call sites keep compiling unchanged.
 //! - `body_stream`: hyper Request body → Python channel. Used by
 //!   `stream=True` routes to feed upload data incrementally into
 //!   a Python async generator.
@@ -21,5 +32,9 @@
 //! sites keep compiling with `crate::python::interp::X`.
 
 pub(crate) mod body_stream;
+pub(crate) mod convert;
+pub(crate) mod ffi;
 pub(crate) mod interp;
+pub(crate) mod pool;
 pub(crate) mod stream;
+pub(crate) mod worker;

@@ -252,7 +252,65 @@ pub(crate) fn apply_cors(resp: &mut Response<BoxBody>, cors: Option<&crate::rout
 
 #[inline]
 pub(crate) fn full_body(resp: Response<Full<Bytes>>) -> Response<BoxBody> {
-    resp.map(|b| b.map_err(|_| unreachable!()).boxed())
+    // `Full<Bytes>::Error` is `std::convert::Infallible` (uninhabited) — this
+    // body can never yield an error. `match e {}` is the compiler-proven total
+    // conversion to the boxed body's `hyper::Error`, with no runtime panic path.
+    resp.map(|b| b.map_err(|e| match e {}).boxed())
+}
+
+/// Turn a sub-interpreter/TPC handler result into a hyper response.
+///
+/// Shared by the sub-interp-pool (`subinterp.rs`) and TPC-inline (`tpc.rs`)
+/// handlers — both take a `Result<SubInterpResponse, String>` and apply the
+/// *same* content-type detection, compression, status mapping, and header
+/// assembly. Keeping it in one place removes the change-one-forget-the-other
+/// hazard between the two hot paths. Callers still own CORS + access logging,
+/// which differ per mode. `handler_name` only enriches the error log on the
+/// (near-impossible) invalid-header path.
+pub(crate) fn build_subinterp_http_response(
+    result: Result<crate::python::interp::SubInterpResponse, String>,
+    accept_encoding: &str,
+    handler_name: Option<&str>,
+) -> Response<BoxBody> {
+    match result {
+        Ok(mut resp) => {
+            let ct_owned: String = resp.content_type.clone().unwrap_or_else(|| {
+                if resp.is_json || resp.body.starts_with(b"{") || resp.body.starts_with(b"[") {
+                    "application/json".to_string()
+                } else {
+                    "text/plain; charset=utf-8".to_string()
+                }
+            });
+            let body_bytes = crate::compression::maybe_compress_subinterp(
+                std::mem::take(&mut resp.body),
+                &ct_owned,
+                &mut resp.headers,
+                accept_encoding,
+            );
+            let status =
+                StatusCode::from_u16(resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let mut builder = Response::builder()
+                .status(status)
+                .header("content-type", &ct_owned)
+                .header("server", crate::response::SERVER_HEADER);
+            for (k, v) in &resp.headers {
+                builder = builder.header(k.as_str(), v.as_str());
+            }
+            match builder.body(Full::new(body_bytes)) {
+                Ok(r) => full_body(r),
+                Err(e) => {
+                    tracing::error!(
+                        target: "pyronova::handler",
+                        error = %e,
+                        handler = handler_name.unwrap_or("?"),
+                        "handler returned invalid response headers"
+                    );
+                    full_body(error_response("invalid response headers"))
+                }
+            }
+        }
+        Err(e) => full_body(error_response(&e)),
+    }
 }
 
 /// Build a hyper response from a `FastResponse` — used for the fast-path
@@ -568,7 +626,11 @@ pub(crate) fn build_stream_response(info: StreamInfo) -> Response<BoxBody> {
         tokio_stream::wrappers::ReceiverStream::new(info.rx).map(|result| result.map(Frame::data));
 
     let body = StreamBody::new(stream);
-    let boxed: BoxBody = BoxBody::new(body.map_err(|_| unreachable!()));
+    // The SSE channel item type is `Result<Bytes, std::convert::Infallible>`
+    // (see `StreamInfo.rx`), so this body's error is uninhabited and can never
+    // be produced. `match e {}` is the total, panic-free conversion to the
+    // boxed body's `hyper::Error`.
+    let boxed: BoxBody = BoxBody::new(body.map_err(|e| match e {}));
 
     let status = StatusCode::from_u16(info.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut builder = Response::builder()
@@ -588,4 +650,133 @@ pub(crate) fn build_stream_response(info: StreamInfo) -> Response<BoxBody> {
             .body(BoxBody::default())
             .expect("static 500 response is always valid")
     })
+}
+
+// ─────────────────────── shared request preprocessing ───────────────────
+
+/// Outcome of [`preprocess_request`].
+pub(crate) enum Preprocessed {
+    /// A short-circuit response was produced (gRPC reply, fast-path hit,
+    /// static-file hit, or 404). Return it to the client directly.
+    Respond(Response<BoxBody>),
+    /// The request matched a route (or the fallback handler). Carries the
+    /// prepared request state for the caller's mode-specific dispatch.
+    Dispatch(Prepared),
+}
+
+/// Request state common to every dispatch mode, produced once by
+/// [`preprocess_request`] and consumed by each handler's dispatch logic.
+pub(crate) struct Prepared {
+    pub method: Arc<str>,
+    pub path: Arc<str>,
+    pub query: String,
+    pub raw_headers: hyper::HeaderMap,
+    pub accept_encoding: String,
+    pub body: Incoming,
+    pub handler_idx: usize,
+    pub params: Vec<(String, String)>,
+    pub start: std::time::Instant,
+}
+
+/// Run the request-preprocessing pipeline shared by every dispatch mode:
+/// gRPC short-circuit, request counting, fast-path lookup, method/path/
+/// query + header extraction, body hand-off, route lookup, and the
+/// static-file / 404 fallback.
+///
+/// The pieces that differ between modes are passed in: `cors` and
+/// `static_dirs` come from the active source (`FrozenRoutes` for GIL/TPC,
+/// the `InterpreterPool` for sub-interp), and `lookup` performs the
+/// source-specific route match. `routes` always supplies the fast-path
+/// table and the fallback flag (identical across modes).
+///
+/// Returns [`Preprocessed::Respond`] for any short-circuit, otherwise
+/// [`Preprocessed::Dispatch`] with the prepared request state. This is
+/// the single source of truth for preprocessing — previously the gRPC /
+/// fast-path / static-file / 404 / CORS logic was copy-pasted across the
+/// GIL and sub-interp handlers (the "Same CORS fix as handle_request"
+/// comments being a live example of change-one-forget-the-other drift).
+pub(crate) async fn preprocess_request(
+    req: hyper::Request<Incoming>,
+    routes: &FrozenRoutes,
+    cors: Option<&crate::router::CorsConfig>,
+    static_dirs: &[(String, String)],
+    lookup: impl FnOnce(&str, &str) -> Option<(usize, Vec<(String, String)>)>,
+) -> Result<Preprocessed, hyper::Error> {
+    // gRPC short-circuit: gRPC needs HTTP/2 trailers (`grpc-status`) the
+    // normal Response<Full<Bytes>> path can't model, so it goes to the
+    // hand-rolled unary dispatcher.
+    if crate::grpc::is_grpc_request(&req) {
+        return Ok(Preprocessed::Respond(crate::grpc::handle_grpc(req).await?));
+    }
+    crate::monitor::count_request();
+    let start = std::time::Instant::now();
+
+    // Fast-path: zero-alloc lookup, borrowing method/path from hyper.
+    // The fast-path table and its CORS source are always `routes`.
+    if !routes.fast_responses.is_empty() {
+        if let Some(fr) = routes
+            .fast_responses
+            .get(req.method().as_str())
+            .and_then(|m| m.get(req.uri().path()))
+        {
+            return Ok(Preprocessed::Respond(full_body(build_fast_response(
+                fr,
+                routes.cors_config.as_ref(),
+            ))));
+        }
+    }
+
+    let method: Arc<str> = Arc::from(req.method().as_str());
+    let uri = req.uri().clone();
+    let path: Arc<str> = Arc::from(uri.path());
+    let query = uri.query().unwrap_or("").to_string();
+
+    // Lazy headers: keep the raw HeaderMap, convert only on access.
+    let raw_headers = req.headers().clone();
+    // Capture Accept-Encoding before raw_headers is moved downstream.
+    let accept_encoding = raw_headers
+        .get(hyper::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    // Take ownership of the body before routing; the caller decides
+    // whether to collect it (buffered) or hand it to a feeder (streaming).
+    let body = req.into_body();
+
+    let lookup_result = lookup(&method, &path);
+
+    if lookup_result.is_none() && (method.as_ref() == "GET" || method.as_ref() == "HEAD") {
+        if let Some(resp) = crate::static_fs::try_static_file(&path, static_dirs).await {
+            // Static-file hit must still carry CORS — otherwise CORS-
+            // configured apps serve assets without allow-origin headers.
+            let mut r = full_body(resp);
+            apply_cors(&mut r, cors);
+            return Ok(Preprocessed::Respond(r));
+        }
+    }
+
+    let (handler_idx, params) = match lookup_result {
+        Some(v) => v,
+        None if routes.fallback_handler.is_some() => (usize::MAX, Vec::new()),
+        // 404 must still carry CORS so a browser OPTIONS preflight against
+        // an unknown path doesn't surface as an opaque CORS failure.
+        None => {
+            let mut r = full_body(crate::response::not_found_response());
+            apply_cors(&mut r, cors);
+            return Ok(Preprocessed::Respond(r));
+        }
+    };
+
+    Ok(Preprocessed::Dispatch(Prepared {
+        method,
+        path,
+        query,
+        raw_headers,
+        accept_encoding,
+        body,
+        handler_idx,
+        params,
+        start,
+    }))
 }

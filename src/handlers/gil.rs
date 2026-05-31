@@ -18,14 +18,13 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 
-use crate::response::{build_response, not_found_response, payload_too_large_response};
+use crate::response::{build_response, payload_too_large_response};
 use crate::router::FrozenRoutes;
-use crate::static_fs::try_static_file;
 use crate::types::PyronovaRequest;
 
 use super::{
-    apply_cors, build_fast_response, build_stream_response, call_handler_with_hooks, full_body,
-    max_body_size, stream_body_feeder, BoxBody, HandlerResult,
+    apply_cors, build_stream_response, call_handler_with_hooks, full_body, max_body_size,
+    preprocess_request, stream_body_feeder, BoxBody, HandlerResult, Prepared, Preprocessed,
 };
 
 pub(crate) async fn handle_request(
@@ -33,79 +32,31 @@ pub(crate) async fn handle_request(
     routes: FrozenRoutes,
     client_ip_addr: std::net::IpAddr,
 ) -> Result<Response<BoxBody>, hyper::Error> {
-    // gRPC short-circuit: if the request looks like gRPC
-    // (`application/grpc*` content-type on POST), it goes to the
-    // hand-rolled unary dispatcher instead of the normal routing
-    // pipeline. gRPC responses need HTTP/2 trailers with `grpc-status`,
-    // which the regular Response<Full<Bytes>> path doesn't model.
-    if crate::grpc::is_grpc_request(&req) {
-        return crate::grpc::handle_grpc(req).await;
-    }
-    crate::monitor::count_request();
-    let start = std::time::Instant::now();
-
-    // Fast-path: zero-alloc lookup. Borrows method/path from hyper
-    // directly; the nested map accepts `&str` via `String: Borrow<str>`.
-    if !routes.fast_responses.is_empty() {
-        if let Some(fr) = routes
-            .fast_responses
-            .get(req.method().as_str())
-            .and_then(|m| m.get(req.uri().path()))
-        {
-            return Ok(full_body(build_fast_response(
-                fr,
-                routes.cors_config.as_ref(),
-            )));
-        }
-    }
-
-    let method: Arc<str> = Arc::from(req.method().as_str());
-    let uri = req.uri().clone();
-    let path: Arc<str> = Arc::from(uri.path());
-    let query = uri.query().unwrap_or("").to_string();
-
-    // Lazy headers: store raw HeaderMap, convert only if Python accesses req.headers.
-    let raw_headers = req.headers().clone();
-    // Capture Accept-Encoding before raw_headers is moved into the PyronovaRequest.
-    let accept_encoding = raw_headers
-        .get(hyper::header::ACCEPT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    // Take ownership of the body before the route lookup — we may either
-    // collect it synchronously (buffered path) or spawn a feeder task
-    // (streaming path) based on the matched route's `stream` flag.
-    let body_obj = req.into_body();
-
-    let lookup = routes.lookup(&method, &path);
-    let has_fallback = routes.fallback_handler.is_some();
-
-    if lookup.is_none() && (method.as_ref() == "GET" || method.as_ref() == "HEAD") {
-        if let Some(resp) = try_static_file(&path, &routes.static_dirs).await {
-            // Static file hit: apply CORS before returning. Previously
-            // this early-return path skipped `apply_cors` at the function
-            // bottom, so CORS-configured apps served static assets
-            // without the allow-origin / allow-methods headers.
-            let mut r = full_body(resp);
-            apply_cors(&mut r, routes.cors_config.as_ref());
-            return Ok(r);
-        }
-    }
-
-    let (handler_idx, params) = match lookup {
-        Some(v) => v,
-        None if has_fallback => (usize::MAX, Vec::new()),
-        // 404 must still carry CORS headers — browsers running an
-        // OPTIONS preflight against an unknown path would otherwise
-        // block the real cross-origin request with a generic "CORS
-        // policy" error that's painful to debug. The normal dispatch
-        // path applies CORS at function-exit; we replicate that here.
-        None => {
-            let mut r = full_body(not_found_response());
-            apply_cors(&mut r, routes.cors_config.as_ref());
-            return Ok(r);
-        }
+    // Shared preprocessing: gRPC short-circuit, fast-path, header/body
+    // extraction, route lookup, and the static-file / 404 fallback. Any
+    // short-circuit returns an early response; otherwise we get the
+    // prepared request state and continue with GIL-specific dispatch.
+    let Prepared {
+        method,
+        path,
+        query,
+        raw_headers,
+        accept_encoding,
+        body: body_obj,
+        handler_idx,
+        params,
+        start,
+    } = match preprocess_request(
+        req,
+        &routes,
+        routes.cors_config.as_ref(),
+        &routes.static_dirs,
+        |m, p| routes.lookup(m, p),
+    )
+    .await?
+    {
+        Preprocessed::Respond(r) => return Ok(r),
+        Preprocessed::Dispatch(p) => p,
     };
 
     let is_stream_route =

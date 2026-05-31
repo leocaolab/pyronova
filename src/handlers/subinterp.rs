@@ -11,22 +11,22 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
-use hyper::{Request, Response, StatusCode};
+use hyper::{Request, Response};
 
 use crate::python::interp;
 use crate::response::{
-    build_response, error_response, gateway_timeout_response, not_found_response,
-    overloaded_response, payload_too_large_response,
+    build_response, error_response, gateway_timeout_response, overloaded_response,
+    payload_too_large_response,
 };
 use crate::router::FrozenRoutes;
-use crate::static_fs::try_static_file;
 use crate::types::PyronovaRequest;
 
 use super::{
-    apply_cors, build_fast_response, build_stream_response, call_handler_with_hooks, full_body,
-    max_body_size, stream_body_feeder, BoxBody, HandlerResult, SharedPool,
+    apply_cors, build_stream_response, call_handler_with_hooks, full_body, max_body_size,
+    preprocess_request, stream_body_feeder, BoxBody, HandlerResult, Prepared, Preprocessed,
+    SharedPool,
 };
 
 pub(crate) async fn handle_request_subinterp(
@@ -35,66 +35,30 @@ pub(crate) async fn handle_request_subinterp(
     routes: FrozenRoutes,
     client_ip_addr: std::net::IpAddr,
 ) -> Result<Response<BoxBody>, hyper::Error> {
-    // gRPC short-circuit — see handle_request above.
-    if crate::grpc::is_grpc_request(&req) {
-        return crate::grpc::handle_grpc(req).await;
-    }
-    crate::monitor::count_request();
-    let start = std::time::Instant::now();
-
-    // Fast-path: zero-alloc lookup (see handle_request).
-    if !routes.fast_responses.is_empty() {
-        if let Some(fr) = routes
-            .fast_responses
-            .get(req.method().as_str())
-            .and_then(|m| m.get(req.uri().path()))
-        {
-            return Ok(full_body(build_fast_response(
-                fr,
-                routes.cors_config.as_ref(),
-            )));
-        }
-    }
-
-    let method: Arc<str> = Arc::from(req.method().as_str());
-    let uri = req.uri().clone();
-    let path: Arc<str> = Arc::from(uri.path());
-    let query = uri.query().unwrap_or("").to_string();
-
-    // Defer header extraction — only convert if needed (sub-interp path).
-    let raw_headers = req.headers().clone();
-    let accept_encoding = raw_headers
-        .get(hyper::header::ACCEPT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    // Take ownership of the body before routing so we can decide whether
-    // to collect (buffered path) or hand it to a feeder task (streaming
-    // path). Mirrors the restructure done in handle_request().
-    let body_obj = req.into_body();
-
-    let lookup = pool.lookup(&method, &path);
-    let has_fallback = routes.fallback_handler.is_some();
-
-    if lookup.is_none() && (method.as_ref() == "GET" || method.as_ref() == "HEAD") {
-        if let Some(resp) = try_static_file(&path, &pool.static_dirs).await {
-            // Same CORS fix as handle_request — don't short-circuit
-            // past apply_cors on static-file hits.
-            let mut r = full_body(resp);
-            apply_cors(&mut r, pool.cors_config.as_ref());
-            return Ok(r);
-        }
-    }
-
-    let (handler_idx, params) = match lookup {
-        Some(v) => v,
-        None if has_fallback => (usize::MAX, Vec::new()),
-        None => {
-            let mut r = full_body(not_found_response());
-            apply_cors(&mut r, pool.cors_config.as_ref());
-            return Ok(r);
-        }
+    // Shared preprocessing (see `handle_request`). Route lookup, static
+    // dirs, and CORS for the static-file / 404 fallback come from the
+    // pool; the fast-path table and fallback flag come from `routes`.
+    let Prepared {
+        method,
+        path,
+        query,
+        raw_headers,
+        accept_encoding,
+        body: body_obj,
+        handler_idx,
+        params,
+        start,
+    } = match preprocess_request(
+        req,
+        &routes,
+        pool.cors_config.as_ref(),
+        &pool.static_dirs,
+        |m, p| pool.lookup(m, p),
+    )
+    .await?
+    {
+        Preprocessed::Respond(r) => return Ok(r),
+        Preprocessed::Dispatch(p) => p,
     };
 
     // ── Hybrid dispatch: GIL routes use main interpreter ──
@@ -327,44 +291,7 @@ pub(crate) async fn handle_request_subinterp(
         }
     };
 
-    let mut http_resp = match result {
-        Ok(mut resp) => {
-            let ct_owned: String = resp.content_type.clone().unwrap_or_else(|| {
-                if resp.is_json || resp.body.starts_with(b"{") || resp.body.starts_with(b"[") {
-                    "application/json".to_string()
-                } else {
-                    "text/plain; charset=utf-8".to_string()
-                }
-            });
-            let body_bytes = crate::compression::maybe_compress_subinterp(
-                std::mem::take(&mut resp.body),
-                &ct_owned,
-                &mut resp.headers,
-                &accept_encoding,
-            );
-            let status =
-                StatusCode::from_u16(resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            let mut builder = Response::builder()
-                .status(status)
-                .header("content-type", &ct_owned)
-                .header("server", crate::response::SERVER_HEADER);
-            for (k, v) in &resp.headers {
-                builder = builder.header(k.as_str(), v.as_str());
-            }
-            match builder.body(Full::new(body_bytes)) {
-                Ok(r) => full_body(r),
-                Err(e) => {
-                    tracing::error!(
-                        target: "pyronova::handler",
-                        error = %e,
-                        "subinterp handler returned invalid response headers"
-                    );
-                    full_body(error_response("invalid response headers"))
-                }
-            }
-        }
-        Err(e) => full_body(error_response(&e)),
-    };
+    let mut http_resp = super::build_subinterp_http_response(result, &accept_encoding, None);
     // Apply CORS uniformly to both Ok and Err paths. Previously the Err
     // path returned a bare 500 with no CORS headers, so a browser would
     // surface the real error as an opaque CORS failure — a classic

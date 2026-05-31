@@ -15,9 +15,8 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::Full;
 use hyper::body::Incoming;
-use hyper::{Request, Response, StatusCode};
+use hyper::{Request, Response};
 
 use crate::python::interp;
 use crate::response::{
@@ -307,45 +306,11 @@ pub(crate) async fn handle_request_tpc_inline(
         }
     };
 
-    let mut http_resp = match result {
-        Ok(mut resp) => {
-            let ct_owned: String = resp.content_type.clone().unwrap_or_else(|| {
-                if resp.is_json || resp.body.starts_with(b"{") || resp.body.starts_with(b"[") {
-                    "application/json".to_string()
-                } else {
-                    "text/plain; charset=utf-8".to_string()
-                }
-            });
-            let body_bytes = crate::compression::maybe_compress_subinterp(
-                std::mem::take(&mut resp.body),
-                &ct_owned,
-                &mut resp.headers,
-                &accept_encoding,
-            );
-            let status =
-                StatusCode::from_u16(resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            let mut builder = Response::builder()
-                .status(status)
-                .header("content-type", &ct_owned)
-                .header("server", crate::response::SERVER_HEADER);
-            for (k, v) in &resp.headers {
-                builder = builder.header(k.as_str(), v.as_str());
-            }
-            match builder.body(Full::new(body_bytes)) {
-                Ok(r) => full_body(r),
-                Err(e) => {
-                    tracing::error!(
-                        target: "pyronova::handler",
-                        error = %e,
-                        handler = %routes.handler_names.get(handler_idx).map(|s| s.as_str()).unwrap_or("?"),
-                        "handler returned invalid response headers"
-                    );
-                    full_body(error_response("invalid response headers"))
-                }
-            }
-        }
-        Err(e) => full_body(error_response(&e)),
-    };
+    let mut http_resp = super::build_subinterp_http_response(
+        result,
+        &accept_encoding,
+        routes.handler_names.get(handler_idx).map(|s| s.as_str()),
+    );
     apply_cors(&mut http_resp, routes.cors_config.as_ref());
     let latency_us = start.elapsed().as_micros() as u64;
     let status = http_resp.status().as_u16();

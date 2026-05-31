@@ -587,6 +587,68 @@ impl PyronovaApp {
     }
 }
 
+/// Drive a single HTTP/1+2 connection to completion, then drain it on
+/// shutdown. Shared by `run_gil` and `run_subinterp`: the accept layer
+/// and the per-request service closure differ, but the AutoBuilder setup
+/// (Slowloris header-read timeout) and the graceful-shutdown lifecycle
+/// loop are byte-identical. `tpc.rs::drive_gil_conn` runs the same shape
+/// on a `current_thread` runtime with `LocalExec` rather than
+/// `TokioExecutor`, so it cannot reuse this `TokioExecutor`-specialized
+/// helper without an executor-generic bound.
+async fn serve_connection<S>(
+    io: TokioIo<crate::tls::MaybeTlsStream>,
+    svc: S,
+    conn_token: tokio_util::sync::CancellationToken,
+) where
+    S: hyper::service::Service<
+            Request<Incoming>,
+            Response = hyper::Response<crate::handlers::BoxBody>,
+            Error = hyper::Error,
+        > + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    let mut builder = AutoBuilder::new(hyper_util::rt::TokioExecutor::new());
+    // Slowloris defense: cap how long hyper waits for the client to finish
+    // sending request headers. Without this a client that opens a TCP
+    // connection and dribbles one header byte per minute holds a Tokio
+    // task + fd forever. TLS handshake is already bounded in
+    // src/tls.rs::wrap_tls; this closes the analogous hole on the
+    // plaintext HTTP path (and on HTTP-after-TLS). HTTP/2 has its own
+    // internal frame/settings timeouts via the h2 crate, so we only
+    // configure H/1 here. Requires a Timer — TokioTimer ties it to the runtime.
+    builder
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(std::time::Duration::from_secs(10));
+    let conn = builder.serve_connection_with_upgrades(io, svc);
+    tokio::pin!(conn);
+    let mut graceful_sent = false;
+    loop {
+        tokio::select! {
+            res = conn.as_mut() => {
+                if let Err(e) = res {
+                    let msg = e.to_string();
+                    if !msg.contains("connection closed")
+                        && !msg.contains("reset by peer")
+                        && !msg.contains("broken pipe")
+                    {
+                        tracing::warn!(target: "pyronova::server", error = %e, "Connection error");
+                    }
+                }
+                break;
+            }
+            _ = conn_token.cancelled(), if !graceful_sent => {
+                // Shutdown: tell hyper to stop accepting new requests on
+                // this connection and drain in-flight ones. Keep driving
+                // the connection future until it completes.
+                conn.as_mut().graceful_shutdown();
+                graceful_sent = true;
+            }
+        }
+    }
+}
+
 impl PyronovaApp {
     #[allow(clippy::too_many_arguments)]
     fn add_route(
@@ -748,48 +810,7 @@ impl PyronovaApp {
                                                 }
                                             }
                                         });
-                                        let mut builder = AutoBuilder::new(hyper_util::rt::TokioExecutor::new());
-                                        // Slowloris defense: cap how long hyper waits for the
-                                        // client to finish sending request headers. Without this
-                                        // a client that opens a TCP connection and dribbles
-                                        // one header byte per minute holds a Tokio task + fd
-                                        // forever. TLS handshake is already bounded in
-                                        // src/tls.rs::wrap_tls; this closes the analogous hole
-                                        // on the plaintext HTTP path (and on HTTP-after-TLS).
-                                        // HTTP/2 has its own internal frame/settings timeouts
-                                        // via the h2 crate, so we only configure H/1 here.
-                                        // Requires a Timer — TokioTimer ties it to the runtime.
-                                        builder
-                                            .http1()
-                                            .timer(hyper_util::rt::TokioTimer::new())
-                                            .header_read_timeout(std::time::Duration::from_secs(10));
-                                        let conn = builder.serve_connection_with_upgrades(io, svc);
-                                        tokio::pin!(conn);
-                                        let mut graceful_sent = false;
-                                        loop {
-                                            tokio::select! {
-                                                res = conn.as_mut() => {
-                                                    if let Err(e) = res {
-                                                        let msg = e.to_string();
-                                                        if !msg.contains("connection closed")
-                                                            && !msg.contains("reset by peer")
-                                                            && !msg.contains("broken pipe")
-                                                        {
-                                                            tracing::warn!(target: "pyronova::server", error = %e, "Connection error");
-                                                        }
-                                                    }
-                                                    break;
-                                                }
-                                                _ = conn_token.cancelled(), if !graceful_sent => {
-                                                    // Shutdown: tell hyper to stop accepting
-                                                    // new requests on this connection and drain
-                                                    // in-flight ones. Keep driving the
-                                                    // connection future until it completes.
-                                                    conn.as_mut().graceful_shutdown();
-                                                    graceful_sent = true;
-                                                }
-                                            }
-                                        }
+                                        serve_connection(io, svc, conn_token).await;
                                     });
                                 }
                                 _ = token.cancelled() => break,
@@ -1009,44 +1030,7 @@ impl PyronovaApp {
                                                 }
                                             }
                                         });
-                                        let mut builder = AutoBuilder::new(hyper_util::rt::TokioExecutor::new());
-                                        // Slowloris defense: cap how long hyper waits for the
-                                        // client to finish sending request headers. Without this
-                                        // a client that opens a TCP connection and dribbles
-                                        // one header byte per minute holds a Tokio task + fd
-                                        // forever. TLS handshake is already bounded in
-                                        // src/tls.rs::wrap_tls; this closes the analogous hole
-                                        // on the plaintext HTTP path (and on HTTP-after-TLS).
-                                        // HTTP/2 has its own internal frame/settings timeouts
-                                        // via the h2 crate, so we only configure H/1 here.
-                                        // Requires a Timer — TokioTimer ties it to the runtime.
-                                        builder
-                                            .http1()
-                                            .timer(hyper_util::rt::TokioTimer::new())
-                                            .header_read_timeout(std::time::Duration::from_secs(10));
-                                        let conn = builder.serve_connection_with_upgrades(io, svc);
-                                        tokio::pin!(conn);
-                                        let mut graceful_sent = false;
-                                        loop {
-                                            tokio::select! {
-                                                res = conn.as_mut() => {
-                                                    if let Err(e) = res {
-                                                        let msg = e.to_string();
-                                                        if !msg.contains("connection closed")
-                                                            && !msg.contains("reset by peer")
-                                                            && !msg.contains("broken pipe")
-                                                        {
-                                                            tracing::warn!(target: "pyronova::server", error = %e, "Connection error");
-                                                        }
-                                                    }
-                                                    break;
-                                                }
-                                                _ = conn_token.cancelled(), if !graceful_sent => {
-                                                    conn.as_mut().graceful_shutdown();
-                                                    graceful_sent = true;
-                                                }
-                                            }
-                                        }
+                                        serve_connection(io, svc, conn_token).await;
                                     });
                                 }
                                 _ = token.cancelled() => break,

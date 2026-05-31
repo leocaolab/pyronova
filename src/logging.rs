@@ -32,6 +32,74 @@ struct LoggerState {
 
 static LOGGER: OnceLock<LoggerState> = OnceLock::new();
 
+/// Dispatch a Python log record to the matching compile-time tracing macro.
+///
+/// This `macro_rules!` expands *inline* at every call site, so each `level`
+/// branch remains a distinct static tracing callsite — `EnvFilter` keeps its
+/// near-zero-cost skip. Extracted so the main-interpreter path
+/// (`emit_python_log`) and the sub-interpreter C-FFI bridge
+/// (`python::interp`) can never drift apart.
+///
+/// `$level` must be `&str`; `$name`/`$pathname`/`$message` are formatted via
+/// `Display`; `$wid`/`$lineno` are recorded as integer fields.
+macro_rules! dispatch_python_log {
+    ($level:expr, $wid:expr, $name:expr, $pathname:expr, $lineno:expr, $message:expr $(,)?) => {
+        match $level {
+            "DEBUG" => {
+                tracing::debug!(
+                    target: "pyronova::app",
+                    worker = $wid,
+                    logger = %$name,
+                    file = %$pathname,
+                    line = $lineno,
+                    "{}", $message
+                );
+            }
+            "INFO" => {
+                tracing::info!(
+                    target: "pyronova::app",
+                    worker = $wid,
+                    logger = %$name,
+                    file = %$pathname,
+                    line = $lineno,
+                    "{}", $message
+                );
+            }
+            "WARNING" => {
+                tracing::warn!(
+                    target: "pyronova::app",
+                    worker = $wid,
+                    logger = %$name,
+                    file = %$pathname,
+                    line = $lineno,
+                    "{}", $message
+                );
+            }
+            "ERROR" | "CRITICAL" => {
+                tracing::error!(
+                    target: "pyronova::app",
+                    worker = $wid,
+                    logger = %$name,
+                    file = %$pathname,
+                    line = $lineno,
+                    "{}", $message
+                );
+            }
+            _ => {
+                tracing::trace!(
+                    target: "pyronova::app",
+                    worker = $wid,
+                    logger = %$name,
+                    file = %$pathname,
+                    line = $lineno,
+                    "{}", $message
+                );
+            }
+        }
+    };
+}
+pub(crate) use dispatch_python_log;
+
 /// Initialize the Rust tracing engine. Called once at Pyronova startup.
 ///
 /// - `level`: filter string — "OFF", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"
@@ -128,60 +196,10 @@ pub fn emit_python_log(
 ) -> PyResult<()> {
     let wid = worker_id.unwrap_or(0);
 
-    // Dispatch to compile-time tracing macros via match.
-    // Each branch is a separate static callsite — EnvFilter can skip at near-zero cost.
-    match level.as_str() {
-        "DEBUG" => {
-            tracing::debug!(
-                target: "pyronova::app",
-                worker = wid,
-                logger = %name,
-                file = %pathname,
-                line = lineno,
-                "{}", message
-            );
-        }
-        "INFO" => {
-            tracing::info!(
-                target: "pyronova::app",
-                worker = wid,
-                logger = %name,
-                file = %pathname,
-                line = lineno,
-                "{}", message
-            );
-        }
-        "WARNING" => {
-            tracing::warn!(
-                target: "pyronova::app",
-                worker = wid,
-                logger = %name,
-                file = %pathname,
-                line = lineno,
-                "{}", message
-            );
-        }
-        "ERROR" | "CRITICAL" => {
-            tracing::error!(
-                target: "pyronova::app",
-                worker = wid,
-                logger = %name,
-                file = %pathname,
-                line = lineno,
-                "{}", message
-            );
-        }
-        _ => {
-            tracing::trace!(
-                target: "pyronova::app",
-                worker = wid,
-                logger = %name,
-                file = %pathname,
-                line = lineno,
-                "{}", message
-            );
-        }
-    }
+    // Dispatch to compile-time tracing macros via match. The macro expands
+    // inline, so each branch remains a separate static callsite — EnvFilter
+    // can skip at near-zero cost.
+    dispatch_python_log!(level.as_str(), wid, name, pathname, lineno, message);
 
     Ok(())
 }
