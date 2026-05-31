@@ -165,8 +165,16 @@ def register_crud(
     def list_rows(req):
         q = req.query_params
         try:
-            limit = max(1, min(int(q.get("limit", default_limit)), max_limit))
-            offset = max(int(q.get("offset", 0)), 0)
+            # Bound the raw string length before parsing so a hostile client
+            # can't make us allocate / parse an arbitrarily huge integer
+            # (e.g. ?limit=9999...repeated millions of times). Any legitimate
+            # limit/offset fits comfortably in a handful of digits.
+            raw_limit = q.get("limit", default_limit)
+            raw_offset = q.get("offset", 0)
+            if len(str(raw_limit)) > 18 or len(str(raw_offset)) > 18:
+                raise ValueError("limit/offset too long")
+            limit = max(1, min(int(raw_limit), max_limit))
+            offset = max(int(raw_offset), 0)
         except (TypeError, ValueError):
             return Response(
                 body={"error": "invalid limit/offset"},
