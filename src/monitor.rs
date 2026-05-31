@@ -134,7 +134,7 @@ static RSS_SAMPLER_HANDLE: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>
 /// This thread never touches Python or the GIL — it only reads /proc/self/statm.
 pub fn spawn_rss_sampler() {
     RSS_SAMPLER_RUNNING.store(true, Ordering::Release);
-    let handle = std::thread::Builder::new()
+    let handle = match std::thread::Builder::new()
         .name("pyronova-rss-sampler".to_string())
         .spawn(|| {
             while RSS_SAMPLER_RUNNING.load(Ordering::Relaxed) {
@@ -144,8 +144,23 @@ pub fn spawn_rss_sampler() {
                 std::thread::sleep(Duration::from_secs(1));
             }
             tracing::debug!(target: "pyronova::server", "RSS sampler stopped");
-        })
-        .expect("failed to spawn RSS sampler");
+        }) {
+        Ok(handle) => handle,
+        Err(e) => {
+            // RSS sampling is a passive observability feature. If the OS
+            // refuses the thread (resource exhaustion, ulimit), don't take
+            // the whole server down — degrade gracefully and serve requests
+            // without RSS metrics. Reset the run flag so stop_rss_sampler is
+            // a no-op and a later spawn attempt starts clean.
+            RSS_SAMPLER_RUNNING.store(false, Ordering::Release);
+            tracing::warn!(
+                target: "pyronova::server",
+                error = %e,
+                "failed to spawn RSS sampler; continuing without RSS metrics"
+            );
+            return;
+        }
+    };
     // Recover from poisoning rather than silently drop the handle.
     // Pre-fix a poisoned mutex made the handle un-stored → stop_rss_sampler
     // couldn't join → the sampler thread outlived Py_Finalize and
