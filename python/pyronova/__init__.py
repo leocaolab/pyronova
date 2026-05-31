@@ -47,9 +47,10 @@ __all__ = [
 try:
     from importlib.metadata import PackageNotFoundError, version as _get_version
     __version__ = _get_version("pyronova")
-except PackageNotFoundError:
-    # Only the genuinely-expected case (running from a source checkout that
-    # was never installed) falls back to "dev". A broad `except Exception`
-    # would mask real import/runtime bugs behind the same silent default
-    # (arc finding init-6).
+except (ImportError, PackageNotFoundError):
+    # ImportError: importlib.metadata unavailable (ancient Python).
+    # PackageNotFoundError: running from a source checkout that was never
+    # installed. Both are expected "no metadata" cases; any other error
+    # (corrupt metadata, FS permission) should surface, not be hidden
+    # behind a silent "dev" default (arc finding init-6).
     __version__ = "dev"

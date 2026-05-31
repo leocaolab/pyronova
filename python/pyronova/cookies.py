@@ -55,11 +55,23 @@ def get_cookies(req: Request) -> dict[str, str]:
         pair = pair.strip()
         if "=" in pair:
             name, _, value = pair.partition("=")
+            name = name.strip()
             value = value.strip()
-            # RFC 6265 allows DQUOTE-wrapped cookie values
-            if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+            # RFC 6265 allows DQUOTE-wrapped cookie values — unwrap a
+            # matched pair only. A bare/unbalanced DQUOTE (e.g. value
+            # `"`) is not a valid quoted-string; drop the stray quote so
+            # it can't survive into a later re-emitted Set-Cookie header
+            # (arc finding cookies-25).
+            if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
                 value = value[1:-1]
-            cookies[name.strip()] = value
+            elif value == '"':
+                value = ""
+            # First occurrence wins: if a Cookie header carries duplicate
+            # names (e.g. an attacker appended `session=evil` after the
+            # browser's legitimate `session=...`), keep the first and
+            # ignore the injected trailing copy (arc finding cookies-26).
+            if name not in cookies:
+                cookies[name] = value
     return cookies
 
 

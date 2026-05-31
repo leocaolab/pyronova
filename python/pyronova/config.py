@@ -29,6 +29,8 @@ users who don't opt in don't pay the cost.
 
 from __future__ import annotations
 
+import threading
+
 
 def _load_pydantic_settings():
     try:
@@ -41,8 +43,6 @@ def _load_pydantic_settings():
     return BaseSettings, SettingsConfigDict
 
 
-import threading as _threading
-
 _BaseSettings, _SettingsConfigDict = None, None
 # Cache the generated Settings class. PEP 562 module __getattr__ does NOT
 # memoize, so without this every `from pyronova.config import Settings`
@@ -51,33 +51,41 @@ _BaseSettings, _SettingsConfigDict = None, None
 # (arc finding config-11). The lock makes the build-once check-then-set
 # atomic so concurrent first imports don't each run _load_pydantic_settings
 # or mint competing classes (arc finding config-12).
-_Settings = None
-_lock = _threading.Lock()
+_Settings = None  # cached Settings class — built exactly once
+_lock = threading.Lock()
+
+
+def _build_settings():
+    """Build the Settings class once, under lock, and cache it.
+
+    Caching the class (rather than re-creating it on every attribute
+    access) preserves class identity so ``isinstance()`` checks and
+    class-level state behave correctly. The lock guards the
+    check-then-act on the module globals against concurrent callers.
+    """
+    global _BaseSettings, _SettingsConfigDict, _Settings
+    with _lock:
+        if _Settings is not None:
+            return _Settings
+        if _BaseSettings is None:
+            _BaseSettings, _SettingsConfigDict = _load_pydantic_settings()
+
+        class Settings(_BaseSettings):
+            model_config = _SettingsConfigDict(
+                env_file=".env",
+                env_file_encoding="utf-8",
+                extra="ignore",
+                case_sensitive=False,
+            )
+
+        _Settings = Settings
+        return _Settings
 
 
 def __getattr__(name: str):
     """Lazy-import pydantic_settings only when Settings is touched."""
-    global _BaseSettings, _SettingsConfigDict, _Settings
     if name == "Settings":
-        cached = _Settings
-        if cached is not None:
-            return cached
-        with _lock:
-            if _Settings is not None:
-                return _Settings
-            if _BaseSettings is None:
-                _BaseSettings, _SettingsConfigDict = _load_pydantic_settings()
-
-            class Settings(_BaseSettings):
-                model_config = _SettingsConfigDict(
-                    env_file=".env",
-                    env_file_encoding="utf-8",
-                    extra="ignore",
-                    case_sensitive=False,
-                )
-
-            _Settings = Settings
-            return Settings
+        return _build_settings()
     raise AttributeError(f"module 'pyronova.config' has no attribute {name!r}")
 
 

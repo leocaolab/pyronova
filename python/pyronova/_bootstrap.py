@@ -325,7 +325,14 @@ def _cached_json(ttl, key=None):
             elif isinstance(result, str):
                 body = result.encode("utf-8")
             else:
-                body = _json.dumps(result, separators=(",", ":")).encode("utf-8")
+                try:
+                    body = _json.dumps(result, separators=(",", ":")).encode("utf-8")
+                except (TypeError, ValueError):
+                    # Non-serializable handler result: don't cache, hand the
+                    # raw result back so the engine's normal response path
+                    # handles it (or raises a clear error) instead of a bare
+                    # 500 from inside the cache wrapper. arc finding bootstrap-16.
+                    return result
             with _lock:
                 _cache[k] = (body, now + ttl)
             return _Response(body=body, content_type="application/json")
