@@ -368,7 +368,7 @@ where
                     }
                     #[allow(clippy::collapsible_match)]
                     Some(Ok(Message::Binary(data))) => {
-                        if incoming_tx.send(WsMsg::Binary(data.to_vec())).await.is_err() {
+                        if incoming_tx.send(WsMsg::Binary(data.into())).await.is_err() {
                             break;
                         }
                     }
