@@ -330,8 +330,17 @@ def _cached_json(ttl, key=None):
                 except (TypeError, ValueError):
                     # Non-serializable handler result: don't cache, hand the
                     # raw result back so the engine's normal response path
-                    # handles it (or raises a clear error) instead of a bare
-                    # 500 from inside the cache wrapper. arc finding bootstrap-16.
+                    # (src/response.rs extract_response_data) handles it. That
+                    # path runs the same json.dumps and surfaces the original
+                    # exception as "handler returned non-serializable type: {e}"
+                    # — NOT a lenient swallow — so the diagnostic survives there.
+                    # We still log here so the failure isn't silently discarded,
+                    # mirroring the key-function branch above. arc finding bootstrap-16.
+                    import logging as _log_cache
+                    _log_cache.getLogger("pyronova.cache").exception(
+                        "cached_json: handler result is not JSON-serializable; "
+                        "bypassing cache and deferring to engine response path"
+                    )
                     return result
             with _lock:
                 _cache[k] = (body, now + ttl)
