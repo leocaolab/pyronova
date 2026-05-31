@@ -100,7 +100,12 @@ def main() -> int:
         env.pop("PYRONOVA_TLS_KEY", None)
         env.pop("PYRONOVA_TLS_PORTS", None)
 
-    proc = subprocess.Popen(["python3", "app.py"], env=env)
+    try:
+        proc = subprocess.Popen(["python3", "app.py"], env=env)
+    except FileNotFoundError:
+        raise SystemExit("launcher: 'python3' not found on PATH")
+    except OSError as exc:
+        raise SystemExit(f"launcher: failed to start 'python3 app.py': {exc}")
 
     # Guard so repeated SIGTERM/SIGINT don't each spawn a cleanup thread,
     # all racing on terminate()/kill() and os._exit (arc finding launcher-9).
