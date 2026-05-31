@@ -89,6 +89,27 @@ class WebSocket:
     def close(self) -> None: ...
 
 class SharedState:
+    """Concurrent key-value store shared across all workers / sub-interpreters.
+
+    Backed by a single lock-free concurrent map (Rust ``DashMap``) held behind
+    an ``Arc``, so every worker observes the same state in shared memory.
+
+    Concurrency contract:
+
+    - Each individual method call (``__getitem__``, ``__setitem__``,
+      ``__delitem__``, ``get``, ``__contains__``, ``incr``, ``decr``, ...) is
+      atomic with respect to other calls; there is no need for external
+      locking around a single operation.
+    - Compound *check-then-act* sequences across two or more calls are **not**
+      atomic. For example ``if key not in state: state[key] = v`` can race
+      another worker between the membership test and the assignment.
+    - For atomic counters use ``incr`` / ``decr`` instead of read-modify-write
+      via ``__getitem__`` + ``__setitem__``.
+    - Snapshot methods (``keys`` / ``values`` / ``items`` / ``__len__``)
+      return a point-in-time view; concurrent writers may change the map
+      immediately after the snapshot is taken.
+    """
+
     def __getitem__(self, key: str) -> str:
         """``state[key]`` — raises ``KeyError`` if the key is absent
         (standard mapping semantics). Use ``get`` for a default instead."""
@@ -99,6 +120,14 @@ class SharedState:
         ...
     def __contains__(self, key: str) -> bool: ...
     def get(self, key: str, default: str | None = None) -> str | None: ...
+    def incr(self, key: str, amount: int) -> int:
+        """Atomically add ``amount`` and return the new value. Missing keys
+        start at 0. Raises ``TypeError`` if the stored value is not an
+        integer (it is never silently reset)."""
+        ...
+    def decr(self, key: str, amount: int) -> int:
+        """Atomically subtract ``amount`` and return the new value."""
+        ...
     def keys(self) -> list[str]: ...
     def values(self) -> list[str]: ...
     def items(self) -> list[tuple[str, str]]: ...
