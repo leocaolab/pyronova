@@ -174,6 +174,12 @@ class Pyronova:
                 "format": user.get("format", "json"),
             }
         self._logger_initialized = False
+        # Guards the idempotency check-then-set in the enable_* helpers so
+        # concurrent startup hooks/threads can't both pass the "already
+        # enabled?" check and double-register routes/hooks (arc findings
+        # app-36/37/38).
+        import threading as _threading
+        self._enable_lock = _threading.Lock()
 
     @property
     def mcp(self) -> MCPServer:
@@ -416,11 +422,18 @@ class Pyronova:
                     )
                 return Response(body="Request body validation failed", status_code=422, content_type="text/plain")
 
+            # model_validate_json raises ValidationError for schema
+            # mismatches, but malformed JSON syntax (or a non-decodable
+            # body) surfaces as json.JSONDecodeError / ValueError / TypeError.
+            # All of these are client-side "bad body" → 422, never 500.
+            # _validation_error_response degrades to a generic 422 for the
+            # non-pydantic cases via its hasattr(e, "errors") guard.
+            _BODY_ERRORS = (_PydanticValidationError, ValueError, TypeError)
             if is_async:
                 async def wrapper(req):
                     try:
                         validated = mdl.model_validate_json(req.body)
-                    except _PydanticValidationError as e:
+                    except _BODY_ERRORS as e:
                         return _validation_error_response(e)
                     if len(params) >= 2:
                         return await fn(req, validated)
@@ -429,7 +442,7 @@ class Pyronova:
                 def wrapper(req):
                     try:
                         validated = mdl.model_validate_json(req.body)
-                    except _PydanticValidationError as e:
+                    except _BODY_ERRORS as e:
                         return _validation_error_response(e)
                     if len(params) >= 2:
                         return fn(req, validated)
@@ -659,11 +672,12 @@ class Pyronova:
         propagated from an upstream proxy survive). If not, a fresh UUID
         v4 hex is minted. Idempotent.
         """
-        if getattr(self, "_request_id_enabled", False):
-            return
-        from pyronova.observability import install_request_id
-        install_request_id(self, header)
-        self._request_id_enabled = True
+        with self._enable_lock:
+            if getattr(self, "_request_id_enabled", False):
+                return
+            from pyronova.observability import install_request_id
+            install_request_id(self, header)
+            self._request_id_enabled = True
 
     def enable_metrics(self, path: str = "/metrics") -> None:
         """Expose Prometheus metrics at ``path`` (default ``/metrics``).
@@ -672,11 +686,12 @@ class Pyronova:
         that maintain counters in ``app.state``. The scrape endpoint does
         not count itself. Idempotent.
         """
-        if getattr(self, "_metrics_enabled", False):
-            return
-        from pyronova.observability import install_metrics
-        install_metrics(self, path)
-        self._metrics_enabled = True
+        with self._enable_lock:
+            if getattr(self, "_metrics_enabled", False):
+                return
+            from pyronova.observability import install_metrics
+            install_metrics(self, path)
+            self._metrics_enabled = True
 
     # ------------------------------------------------------------------
     # Health probes — /livez + /readyz
@@ -706,18 +721,19 @@ class Pyronova:
                  because most readiness checks touch globals (DB pools,
                  cache clients) that live on the main interp.
         """
-        if self._health_probes_enabled:
-            return
-        from pyronova.health import _build_livez_handler, _build_readyz_handler
+        with self._enable_lock:
+            if self._health_probes_enabled:
+                return
+            from pyronova.health import _build_livez_handler, _build_readyz_handler
 
-        self._route("GET", livez_path, _build_livez_handler(), gil=gil)
-        self._route(
-            "GET",
-            readyz_path,
-            _build_readyz_handler(self._readiness_checks),
-            gil=gil,
-        )
-        self._health_probes_enabled = True
+            self._route("GET", livez_path, _build_livez_handler(), gil=gil)
+            self._route(
+                "GET",
+                readyz_path,
+                _build_readyz_handler(self._readiness_checks),
+                gil=gil,
+            )
+            self._health_probes_enabled = True
 
     def readiness_check(self, name: str) -> Callable:
         """Register a readiness check. Sync or async. Decorator form::
@@ -827,18 +843,27 @@ class Pyronova:
         """
         from datetime import datetime
 
+        import threading as _threading
+
         _timings: dict[int, float] = {}
         _MAX_TIMINGS = 10000  # Cap to prevent memory leak from SSE/stream requests
+        # before/after hooks run concurrently across requests on multiple
+        # worker threads. The len()-then-clear() check-then-act and the
+        # set/pop interleave can race; serialize all _timings access so we
+        # never hit "dict changed size during iteration"/KeyError (arc app-40).
+        _timings_lock = _threading.Lock()
         _min_level = {"debug": 0, "info": 1, "warn": 2, "error": 3}.get(level.lower(), 1)
 
         def _log_before(req):
-            if len(_timings) > _MAX_TIMINGS:
-                _timings.clear()  # Emergency cleanup — stream requests skip after_hook
-            _timings[id(req)] = time.monotonic()
+            with _timings_lock:
+                if len(_timings) > _MAX_TIMINGS:
+                    _timings.clear()  # Emergency cleanup — stream requests skip after_hook
+                _timings[id(req)] = time.monotonic()
             return None
 
         def _log_after(req, resp):
-            start = _timings.pop(id(req), None)
+            with _timings_lock:
+                start = _timings.pop(id(req), None)
             elapsed = (time.monotonic() - start) * 1000 if start else 0
             status = getattr(resp, "status_code", 200)
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -945,6 +970,12 @@ class Pyronova:
 
         if port is None:
             port = _env_int("PYRONOVA_PORT", "8000")
+        # Guarantee an int reaches the Rust FFI boundary. _env_int already
+        # has a "8000" default, but pin the invariant explicitly so a None
+        # can never flow into self._engine.run(port=...) and produce an
+        # opaque type error deep in Rust (arc finding app-39).
+        if port is None:
+            port = 8000
         if workers is None:
             workers = _env_int("PYRONOVA_WORKERS")
         if io_workers is None:
@@ -1055,7 +1086,14 @@ class Pyronova:
                 extra_tls_ports=extra_tls_ports,
             )
         finally:
-            # Run shutdown hooks (even if server exits abnormally)
+            # Run shutdown hooks (even if server exits abnormally).
+            # [arc:intentional-handle] reason: shutdown is a best-effort
+            # teardown barrier — one hook failing (e.g. a pool that's
+            # already closed) must not prevent the remaining hooks from
+            # running their own cleanup. We log each failure with the
+            # exception object (full traceback via .exception) so the
+            # cleanup error is observable, then continue; there is no
+            # caller left to propagate to at process exit.
             for hook in self._shutdown_hooks:
                 try:
                     hook()
@@ -1109,7 +1147,13 @@ class Pyronova:
                     break
             except KeyboardInterrupt:
                 proc.terminate()
-                proc.wait()
+                # Bound the wait so a child that ignores SIGTERM can't hang
+                # the reloader forever — escalate to SIGKILL like the
+                # file-change branch above (arc finding app-42).
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
                 break
 
     def _run_with_reload_poll(self, watch_dir: str, script: str):
@@ -1159,5 +1203,11 @@ class Pyronova:
                     break
             except KeyboardInterrupt:
                 proc.terminate()
-                proc.wait()
+                # Bound the wait so a child that ignores SIGTERM can't hang
+                # the reloader forever — escalate to SIGKILL like the
+                # file-change branch above (arc finding app-42).
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
                 break

@@ -49,6 +49,29 @@ _log = logging.getLogger(__name__)
 CheckFn = Union[Callable[[], Any], Callable[[], Awaitable[Any]]]
 
 
+def _drive(coro: Awaitable[Any]) -> Any:
+    """Run a coroutine to completion from sync code, even if this thread
+    already has a running event loop.
+
+    ``asyncio.run()`` raises ``RuntimeError`` when called from a thread
+    with a running loop (e.g. an async request worker). In that case we
+    offload to a dedicated thread that owns its own fresh loop, so the
+    readyz handler works in both sync and async deployments
+    (arc finding health-32).
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No loop running on this thread — create+close one properly.
+        return asyncio.run(coro)
+    # A loop is already running here; asyncio.run() would blow up. Drive
+    # the coroutine on a worker thread that has no running loop.
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(asyncio.run, coro).result()
+
+
 def _run_checks_sync(checks: list[tuple[str, CheckFn]]) -> tuple[bool, dict[str, Any]]:
     """Run every check, catching exceptions. Returns (all_ok, results)."""
     results: dict[str, Any] = {}
@@ -56,12 +79,16 @@ def _run_checks_sync(checks: list[tuple[str, CheckFn]]) -> tuple[bool, dict[str,
     for name, fn in checks:
         try:
             if inspect.iscoroutinefunction(fn):
-                # Drive the coroutine on a temporary loop — readyz is a
-                # cold-path call. Use asyncio.run() which creates and
-                # closes the loop properly (no fd leak).
-                res = asyncio.run(fn())
+                res = _drive(fn())
             else:
                 res = fn()
+                # A plain function that *returns* a coroutine/awaitable
+                # (e.g. `def c(): return redis.ping()`) would otherwise be
+                # recorded as passing with the un-awaited awaitable as its
+                # truthy result — the check never actually runs. Drive it
+                # (arc finding health-33).
+                if inspect.isawaitable(res):
+                    res = _drive(res)
             # Treat False OR any other falsy non-None value as failure,
             # matching the docstring contract.
             if res is not None and not res:

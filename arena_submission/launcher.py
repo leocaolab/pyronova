@@ -42,7 +42,13 @@ def main() -> int:
     per_proc = total
     io_per_proc = per_proc
 
-    base_port = int(os.environ.get("PORT", "8080"))
+    _port_raw = os.environ.get("PORT", "8080")
+    try:
+        base_port = int(_port_raw)
+    except ValueError:
+        import logging as _log
+        _log.error("launcher: PORT=%r is not an integer; aborting", _port_raw)
+        return 2
     tls_cert = os.environ.get("TLS_CERT", "/certs/server.crt")
     tls_key = os.environ.get("TLS_KEY", "/certs/server.key")
     have_tls = os.path.exists(tls_cert) and os.path.exists(tls_key)
@@ -84,8 +90,17 @@ def main() -> int:
 
     proc = subprocess.Popen(["python3", "app.py"], env=env)
 
+    # Guard so repeated SIGTERM/SIGINT don't each spawn a cleanup thread,
+    # all racing on terminate()/kill() and os._exit (arc finding launcher-9).
+    _shutting_down = threading.Event()
+
     def shutdown(_sig, _frame):
         # Signal handlers must not block — offload the wait+kill to a thread.
+        # First signal wins; later signals are no-ops until exit.
+        if _shutting_down.is_set():
+            return
+        _shutting_down.set()
+
         def _cleanup():
             import logging as _log
             try:
@@ -101,9 +116,14 @@ def main() -> int:
                     proc.kill()
                 except Exception:
                     _log.warning("launcher: kill failed for pid %s", proc.pid, exc_info=True)
+            # Propagate the child's real exit code rather than masking every
+            # shutdown as success. If the child already exited non-zero (e.g.
+            # a benchmark crash that itself raised the signal), os._exit(0)
+            # would hide that failure from CI (arc finding launcher-8).
+            rc = proc.poll()
             # os._exit terminates all threads (including this daemon thread);
             # sys.exit(0) from a daemon thread only kills the daemon thread.
-            os._exit(0)
+            os._exit(rc if rc is not None and rc > 0 else 0)
         threading.Thread(target=_cleanup, daemon=True).start()
 
     signal.signal(signal.SIGTERM, shutdown)

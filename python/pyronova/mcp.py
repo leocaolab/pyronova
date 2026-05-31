@@ -36,6 +36,37 @@ from typing import Any, Callable, Optional
 
 _log = logging.getLogger(__name__)
 
+# Upper bound on how long a single async tool/resource/prompt handler may
+# run before it is abandoned with a timeout error. Without this an
+# indefinitely-hanging coroutine blocks the dispatching thread forever
+# (arc finding mcp-61).
+_ASYNC_HANDLER_TIMEOUT_S = 30.0
+
+
+def _drive_coro(coro):
+    """Run a coroutine to completion from this blocking dispatch thread,
+    bounded by ``_ASYNC_HANDLER_TIMEOUT_S``.
+
+    A fresh loop is used because this always runs on a blocking Tokio
+    thread that never has its own running asyncio loop.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(
+            asyncio.wait_for(coro, timeout=_ASYNC_HANDLER_TIMEOUT_S)
+        )
+    finally:
+        loop.close()
+
+
+def _resolve(result):
+    """If a handler returned a coroutine/awaitable, drive it to a value;
+    otherwise return it unchanged. Shared by tool/resource/prompt handlers
+    so async support is uniform across all three (arc finding mcp-57)."""
+    if inspect.iscoroutine(result):
+        return _drive_coro(result)
+    return result
+
 
 def _extract_schema(fn: Callable) -> dict:
     """Auto-generate JSON schema from function signature."""
@@ -111,6 +142,11 @@ class MCPServer:
 
         def register(f: Callable) -> Callable:
             tool_name = name or f.__name__
+            if tool_name in self._tools:
+                _log.warning(
+                    "MCP tool %r is already registered; overwriting the "
+                    "previous handler", tool_name,
+                )
             self._tools[tool_name] = {
                 "name": tool_name,
                 "description": description or f.__doc__ or "",
@@ -134,6 +170,11 @@ class MCPServer:
         """Register a readable resource with URI template support."""
 
         def register(fn: Callable) -> Callable:
+            if uri in self._resources:
+                _log.warning(
+                    "MCP resource %r is already registered; overwriting the "
+                    "previous handler", uri,
+                )
             self._resources[uri] = {
                 "uri": uri,
                 "name": name or fn.__name__,
@@ -155,13 +196,25 @@ class MCPServer:
         """Register a prompt template."""
 
         def register(fn: Callable) -> Callable:
+            if name in self._prompts:
+                _log.warning(
+                    "MCP prompt %r is already registered; overwriting the "
+                    "previous handler", name,
+                )
             self._prompts[name] = {
                 "name": name,
                 "description": description or fn.__doc__ or "",
                 "arguments": arguments or [
                     {"name": p, "required": param.default is inspect.Parameter.empty}
                     for p, param in inspect.signature(fn).parameters.items()
+                    # Skip *args / **kwargs — they aren't named MCP arguments
+                    # and including them produces a bogus schema (arc mcp-58),
+                    # matching _extract_schema's variadic filter.
                     if p not in ("self", "cls")
+                    and param.kind not in (
+                        inspect.Parameter.VAR_POSITIONAL,
+                        inspect.Parameter.VAR_KEYWORD,
+                    )
                 ],
                 "handler": fn,
             }
@@ -188,6 +241,14 @@ class MCPServer:
         if not isinstance(req, dict):
             return self._error_response(None, -32600, "Invalid Request")
 
+        # JSON-RPC 2.0 §4.2: the "jsonrpc" member MUST be exactly "2.0".
+        # Reject anything else so we don't silently accept a v1 / malformed
+        # client and behave inconsistently (arc finding mcp-60).
+        if req.get("jsonrpc") != "2.0":
+            return self._error_response(
+                req.get("id"), -32600, "Invalid Request: jsonrpc must be '2.0'"
+            )
+
         # JSON-RPC 2.0 §4: absence of "id" means this is a notification —
         # the server MUST NOT reply.  We return "" which the HTTP layer
         # converts to a 204-like empty response.
@@ -202,6 +263,17 @@ class MCPServer:
         params = req.get("params", {})
         if not isinstance(params, (dict, list)):
             return self._error_response(req_id, -32600, "Invalid Request: params must be Object or Array")
+        # Array (positional) params are a structurally valid JSON-RPC
+        # request, but every method handler here consumes named arguments
+        # via params.get(...). Passing a list would AttributeError deep in a
+        # handler and surface as a generic -32000. Reject up front with the
+        # correct -32602 Invalid params instead (arc finding mcp-55).
+        if isinstance(params, list):
+            return self._error_response(
+                req_id, -32602,
+                "Invalid params: this server requires named parameters (Object), "
+                "positional Array params are not supported",
+            )
 
         handler_map = {
             "initialize": self._handle_initialize,
@@ -224,11 +296,16 @@ class MCPServer:
             if is_notification:
                 return ""
             return json.dumps({"jsonrpc": "2.0", "id": req_id, "result": result})
-        except Exception as e:
+        except Exception:
+            # The full exception (with traceback) goes to the operator log.
+            # Do NOT echo str(e) to the client — a handler error can embed
+            # file paths, DSNs, or stack fragments that leak internals to an
+            # untrusted MCP caller (arc finding mcp-54). Return a generic
+            # message; operators correlate via the logged exception.
             _log.exception("MCP handler %r raised", method)
             if is_notification:
                 return ""
-            return self._error_response(req_id, -32000, str(e))
+            return self._error_response(req_id, -32000, "Internal error")
 
     # ------------------------------------------------------------------
     # Method handlers
@@ -265,17 +342,19 @@ class MCPServer:
         arguments = params.get("arguments", {})
         if not isinstance(arguments, dict):
             raise ValueError(f"tool arguments must be an object, got {type(arguments).__name__}")
+        # Defense-in-depth: verify the declared required params are present
+        # before invoking, so a missing argument yields a clear validation
+        # error rather than an opaque TypeError from handler(**arguments)
+        # (arc finding mcp-56).
+        required = tool.get("inputSchema", {}).get("required", [])
+        missing = [r for r in required if r not in arguments]
+        if missing:
+            raise ValueError(f"missing required argument(s): {missing}")
         handler = tool["handler"]
-        result = handler(**arguments)
-        # Await async tools. asyncio.run() fails if called from a running
-        # event loop; use a fresh loop instead (safe because this handler
-        # always executes in a blocking Tokio thread, never inside asyncio).
-        if inspect.iscoroutine(result):
-            loop = asyncio.new_event_loop()
-            try:
-                result = loop.run_until_complete(result)
-            finally:
-                loop.close()
+        # _resolve awaits a coroutine result on a fresh loop with a timeout
+        # (safe — this handler runs on a blocking Tokio thread, never inside
+        # an asyncio loop).
+        result = _resolve(handler(**arguments))
 
         # Convert result to MCP content format
         if isinstance(result, str):
@@ -305,7 +384,7 @@ class MCPServer:
         if resource is None:
             raise ValueError(f"Unknown resource: {uri}")
 
-        result = resource["handler"]()
+        result = _resolve(resource["handler"]())
         if isinstance(result, str):
             text = result
         else:
@@ -335,7 +414,7 @@ class MCPServer:
             raise ValueError(f"Unknown prompt: {prompt_name}")
 
         arguments = params.get("arguments", {})
-        result = prompt["handler"](**arguments)
+        result = _resolve(prompt["handler"](**arguments))
 
         return {
             "description": prompt["description"],

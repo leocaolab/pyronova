@@ -59,7 +59,22 @@ class _PyronovaRustHandler(_logging.Handler):
 
 _root = _logging.getLogger()
 _root.handlers.clear()
-_root.addHandler(_PyronovaRustHandler())
+# Verify the Rust→Python FFI contract before installing the bridge handler.
+# The docstring promises `_pyronova_emit_log` is injected into globals by
+# Rust (interp.rs) before this script runs. If that injection failed or
+# timing changed, the handler's emit() would NameError on every record and
+# handleError() would silently eat all logs — invisible log loss. Fail
+# loud at install time instead, and fall back to stderr so logs survive.
+if "_pyronova_emit_log" not in globals():
+    import sys as _sys_boot
+    print(
+        "pyronova: _pyronova_emit_log FFI not injected before bootstrap; "
+        "logging bridge unavailable, falling back to stderr",
+        file=_sys_boot.stderr,
+    )
+    _root.addHandler(_logging.StreamHandler())
+else:
+    _root.addHandler(_PyronovaRustHandler())
 # Sync Python's level gate with Rust's EnvFilter — rejects calls below
 # threshold *before* getMessage() formatting or FFI crossing occurs.
 # e.g. level=ERROR → logger.debug() returns immediately, no FFI overhead.

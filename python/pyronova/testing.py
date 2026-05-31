@@ -86,7 +86,12 @@ class TestResponse:
         return self.status_code < 400
 
     def json(self, **loads_kwargs) -> Any:
-        """Decode the body as JSON. Passes kwargs to ``json.loads``."""
+        """Decode the body as JSON. Passes kwargs to ``json.loads``.
+
+        Raises ``json.JSONDecodeError`` (a ``ValueError`` subclass) when the
+        body is not valid JSON — same contract as ``requests``/``httpx``
+        ``.json()``. Catch ``ValueError`` if the endpoint may return non-JSON.
+        """
         return json.loads(self.body, **loads_kwargs)
 
     def raise_for_status(self) -> None:
@@ -126,10 +131,14 @@ class TestClient:
         follow_redirects: bool = True,
     ):
         if port is None:
+            # try/finally so a failing bind() (permission denied, address in
+            # use) can't leak the socket fd (arc finding testing-47).
             s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-            s.bind((host, 0))
-            port = s.getsockname()[1]
-            s.close()
+            try:
+                s.bind((host, 0))
+                port = s.getsockname()[1]
+            finally:
+                s.close()
         self.host = host
         self.port = port
         self.base_url = f"http://{host}:{port}"
@@ -175,10 +184,16 @@ class TestClient:
                     + (f": {type(err).__name__}: {err}" if err else "")
                 )
             try:
-                resp = self._opener.open(f"{self.base_url}/", timeout=1)
-                resp.close()
+                # Context manager guarantees the response is closed even if
+                # something raises after open() (arc finding testing-48).
+                with self._opener.open(f"{self.base_url}/", timeout=1):
+                    pass
                 return
-            except urllib.error.HTTPError:
+            except urllib.error.HTTPError as e:
+                # An HTTP error still proves the server is up. HTTPError is a
+                # file-like object holding an open socket — close it so the
+                # probe doesn't leak a connection (arc finding testing-49).
+                e.close()
                 return
             except urllib.error.URLError:
                 pass
@@ -238,9 +253,18 @@ class TestClient:
                     headers=_collapse_headers(resp.headers),
                 )
         except urllib.error.HTTPError as e:
+            # e.read() can itself raise (timeout / broken pipe while reading
+            # the error body). Degrade to an empty body rather than letting a
+            # different, undocumented exception escape (arc finding testing-50).
+            try:
+                err_body = e.read()
+            except Exception:
+                err_body = b""
+            finally:
+                e.close()
             return TestResponse(
                 status_code=e.code,
-                body=e.read(),
+                body=err_body,
                 headers=_collapse_headers(e.headers),
             )
         except urllib.error.URLError as e:

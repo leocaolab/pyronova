@@ -45,7 +45,11 @@ __all__ = [
     "cached_json",
 ]
 try:
-    from importlib.metadata import version as _get_version
+    from importlib.metadata import PackageNotFoundError, version as _get_version
     __version__ = _get_version("pyronova")
-except Exception:
+except PackageNotFoundError:
+    # Only the genuinely-expected case (running from a source checkout that
+    # was never installed) falls back to "dev". A broad `except Exception`
+    # would mask real import/runtime bugs behind the same silent default
+    # (arc finding init-6).
     __version__ = "dev"

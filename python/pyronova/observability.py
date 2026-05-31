@@ -71,7 +71,14 @@ def install_request_id(app: "Pyronova", header: str) -> None:
         rid = getattr(_tls, "request_id", None)
         if rid is None:
             return resp
-        merged = {**resp.headers, header.lower(): rid}
+        # HTTP header names are case-insensitive, but a Python dict is not.
+        # If resp.headers already carries any case-variant of this header
+        # (e.g. "X-Request-ID" vs our "x-request-id"), a naive {**, lower:
+        # rid} merge would emit BOTH as separate response headers. Drop any
+        # existing case-variant first, then set the canonical lower-case key
+        # (arc finding observability-45).
+        merged = {k: v for k, v in resp.headers.items() if k.lower() != header_lower}
+        merged[header_lower] = rid
         return Response(
             body=resp.body,
             status_code=resp.status_code,

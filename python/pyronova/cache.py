@@ -37,10 +37,10 @@ need query-aware caching, pre-compose the key yourself:
 
 from __future__ import annotations
 
-import asyncio
 import functools
 import inspect
 import json
+import logging
 import threading
 import time
 from typing import Callable
@@ -48,6 +48,16 @@ from typing import Callable
 from .app import Response
 
 __all__ = ["cached_json"]
+
+_log = logging.getLogger("pyronova.cache")
+
+# Hard cap on per-handler cache entries. The cache is keyed by request
+# path (or a user key_fn), so a high-cardinality endpoint (/item/1,
+# /item/2, ...) or a hostile client cycling unique paths would otherwise
+# grow the dict without bound until the worker OOMs (arc finding cache-17).
+# On overflow we drop the whole dict — simple, allocation-free, and the
+# TTL is short so the rebuild cost is bounded.
+_MAX_ENTRIES = 10_000
 
 
 def cached_json(ttl: float, key: Callable | None = None):
@@ -74,44 +84,81 @@ def cached_json(ttl: float, key: Callable | None = None):
                 return result.encode("utf-8")
             return json.dumps(result, separators=(",", ":")).encode("utf-8")
 
-        def _hit_or_miss(k: str, now: float):
-            entry = _cache.get(k)
+        def _hit(k: str, now: float):
+            # Read under the lock: the async path is explicitly multi-thread
+            # (threading.Lock guards writes), so an unlocked .get() can tear
+            # against a concurrent resize (arc finding cache-16).
+            with _lock:
+                entry = _cache.get(k)
             if entry is not None and entry[1] > now:
                 return Response(body=entry[0], content_type="application/json")
             return None
+
+        def _store(k: str, body: bytes) -> None:
+            # Expiry is measured from store time, not from request start —
+            # a handler slower than the TTL must not insert an
+            # already-stale entry that every later request re-computes
+            # (arc finding cache-15).
+            expires = time.monotonic() + ttl
+            with _lock:
+                if len(_cache) >= _MAX_ENTRIES and k not in _cache:
+                    _cache.clear()
+                _cache[k] = (body, expires)
+
+        def _safe_key(req):
+            # A raising key_fn must degrade to an uncached call, not 500
+            # the request (arc finding cache-13).
+            try:
+                return key_fn(req), True
+            except Exception:
+                _log.exception("cached_json key function raised; bypassing cache")
+                return None, False
 
         if _is_async:
             @functools.wraps(handler)
             async def async_wrapper(req):
                 now = time.monotonic()
-                k = key_fn(req)
-                cached = _hit_or_miss(k, now)
-                if cached is not None:
-                    return cached
+                k, ok = _safe_key(req)
+                if ok:
+                    cached = _hit(k, now)
+                    if cached is not None:
+                        return cached
                 result = await handler(req)
                 if isinstance(result, Response):
                     return result
-                body = _serialize(result)
-                with _lock:
-                    _cache[k] = (body, now + ttl)
+                # A non-serializable handler result must fall back to the
+                # framework's normal serialization path uncached, not raise
+                # out of the wrapper (arc finding cache-14).
+                try:
+                    body = _serialize(result)
+                except (TypeError, ValueError):
+                    _log.exception("cached_json could not serialize result; returning uncached")
+                    return result
+                if ok:
+                    _store(k, body)
                 return Response(body=body, content_type="application/json")
             return async_wrapper
 
         @functools.wraps(handler)
         def wrapper(req):
             now = time.monotonic()
-            k = key_fn(req)
-            cached = _hit_or_miss(k, now)
-            if cached is not None:
-                return cached
+            k, ok = _safe_key(req)
+            if ok:
+                cached = _hit(k, now)
+                if cached is not None:
+                    return cached
             result = handler(req)
             # Handler returned an explicit Response — user is signalling
             # a custom status / headers; don't cache, don't rewrap.
             if isinstance(result, Response):
                 return result
-            body = _serialize(result)
-            with _lock:
-                _cache[k] = (body, now + ttl)
+            try:
+                body = _serialize(result)
+            except (TypeError, ValueError):
+                _log.exception("cached_json could not serialize result; returning uncached")
+                return result
+            if ok:
+                _store(k, body)
             return Response(body=body, content_type="application/json")
 
         return wrapper

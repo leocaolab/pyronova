@@ -15,6 +15,60 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+def _split_header_params(value: str) -> list[str]:
+    """Split a header on top-level ``;`` separators, treating semicolons
+    inside a quoted-string as literal.
+
+    A naive ``value.split(";")`` corrupts any parameter whose quoted value
+    contains a semicolon, e.g. ``filename="report;2024.csv"`` (arc finding
+    uploads-71). RFC 2045 quoted-strings are honoured here.
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    in_quotes = False
+    escaped = False
+    for ch in value:
+        if escaped:
+            buf.append(ch)
+            escaped = False
+            continue
+        if in_quotes and ch == "\\":
+            buf.append(ch)
+            escaped = True
+            continue
+        if ch == '"':
+            in_quotes = not in_quotes
+            buf.append(ch)
+            continue
+        if ch == ";" and not in_quotes:
+            parts.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    parts.append("".join(buf))
+    return parts
+
+
+def _unquote_param(value: str) -> str:
+    """Strip surrounding DQUOTEs and unescape ``\\"`` / ``\\\\`` per RFC 2045
+    quoted-string rules (arc finding uploads-73)."""
+    value = value.strip()
+    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+        inner = value[1:-1]
+        out: list[str] = []
+        escaped = False
+        for ch in inner:
+            if escaped:
+                out.append(ch)
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            else:
+                out.append(ch)
+        return "".join(out)
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class UploadFile:
     """A single uploaded file or form field.
@@ -136,12 +190,17 @@ def parse_multipart(req) -> "dict[str, UploadFile | list[UploadFile]]":
         field_name = None
         filename = None
 
-        for param in disposition.split(";"):
+        # RFC 2045 §5.1: parameter names are case-insensitive (NAME=,
+        # FileName= are valid), and quoted values may contain semicolons
+        # and escaped quotes. Use the quote-aware splitter + case-insensitive
+        # name match (arc findings uploads-70/71/73).
+        for param in _split_header_params(disposition):
             param = param.strip()
-            if param.startswith("name="):
-                field_name = param[5:].strip('"')
-            elif param.startswith("filename="):
-                filename = param[9:].strip('"')
+            lowered = param.lower()
+            if lowered.startswith("name="):
+                field_name = _unquote_param(param[5:])
+            elif lowered.startswith("filename="):
+                filename = _unquote_param(param[9:])
 
         if field_name:
             content_type = headers.get("content-type", "application/octet-stream" if filename else "text/plain")

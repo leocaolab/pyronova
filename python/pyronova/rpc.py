@@ -150,6 +150,21 @@ def rpc_decorator(app, path: str, proto_model=None):
                 "positional argument (data) or 2 (req, data); got 0"
             )
         takes_data = n_pos >= 2
+        # The wrapper only ever supplies (req, data) or (data). Any
+        # *additional* positional-or-keyword param without a default would
+        # therefore TypeError at first request, not at registration —
+        # check the upper bound too so misuse fails fast (arc finding rpc-43).
+        _supplied = 2 if takes_data else 1
+        _extra_required = [
+            p.name for p in positional_or_keyword[_supplied:]
+            if p.default is inspect.Parameter.empty
+        ]
+        if _extra_required:
+            raise TypeError(
+                f"RPC handler {fn.__name__!r} declares required positional "
+                f"argument(s) {_extra_required} beyond the (req, data) the "
+                "RPC dispatcher supplies; give them defaults or remove them"
+            )
 
         # Any uncaught exception in an RPC handler becomes a structured
         # {ok: false, error: ...} envelope so clients don't see a raw 500.

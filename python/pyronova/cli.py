@@ -32,7 +32,18 @@ def _load_app(target: str) -> "Pyronova":
     """Resolve ``module[:attr]`` → Pyronova instance. Importing the module
     runs its top-level code, which registers routes on the app."""
     if ":" in target:
+        # A module:attr spec has exactly one colon. More than one (a:b:c)
+        # or a leading colon (:app) is a malformed target — fail with a
+        # clear message rather than a confusing ImportError downstream
+        # (arc findings cli-18, cli-21). Module names never contain colons.
+        if target.count(":") > 1:
+            sys.exit(
+                f"pyronova: invalid target {target!r}: expected module:attr "
+                "(exactly one ':')"
+            )
         module_name, attr = target.split(":", 1)
+        if not module_name:
+            sys.exit(f"pyronova: invalid target {target!r}: module name must not be empty")
         if not attr:
             sys.exit(f"pyronova: invalid target {target!r}: attribute name must not be empty")
     else:
@@ -119,6 +130,12 @@ def _cmd_routes(args: argparse.Namespace) -> None:
         print("(no routes registered)")
         return
 
+    # Coerce every cell to str up front: a route dict may carry non-string
+    # values (e.g. an int method/handler from a misbehaving registration),
+    # and both len() and the {:<w} format spec raise on non-str — turning a
+    # diagnostic command into a crash (arc finding cli-20).
+    rows = [tuple(str(c) for c in row) for row in rows]
+
     widths = [max(len(r[i]) for r in rows) for i in range(4)]
     header = ("METHOD", "PATH", "HANDLER", "FLAGS")
     widths = [max(widths[i], len(header[i])) for i in range(4)]
@@ -147,7 +164,10 @@ def main(argv: list[str] | None = None) -> None:
     )
     try:
         from pyronova import __version__ as _v
-    except Exception:
+    except (ImportError, AttributeError):
+        # Only swallow the genuinely-expected lookup failures (package not
+        # installed / __version__ absent). A broad `except Exception` here
+        # would mask real bugs behind a silent "dev" fallback (arc cli-19).
         _v = "dev"
     parser.add_argument("--version", action="version", version=f"pyronova {_v}")
     sub = parser.add_subparsers(dest="cmd", required=True)

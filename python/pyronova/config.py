@@ -41,25 +41,43 @@ def _load_pydantic_settings():
     return BaseSettings, SettingsConfigDict
 
 
+import threading as _threading
+
 _BaseSettings, _SettingsConfigDict = None, None
+# Cache the generated Settings class. PEP 562 module __getattr__ does NOT
+# memoize, so without this every `from pyronova.config import Settings`
+# minted a fresh class object — breaking `is` identity, isinstance/
+# issubclass, metaclass registration, and pickling across modules
+# (arc finding config-11). The lock makes the build-once check-then-set
+# atomic so concurrent first imports don't each run _load_pydantic_settings
+# or mint competing classes (arc finding config-12).
+_Settings = None
+_lock = _threading.Lock()
 
 
 def __getattr__(name: str):
     """Lazy-import pydantic_settings only when Settings is touched."""
-    global _BaseSettings, _SettingsConfigDict
+    global _BaseSettings, _SettingsConfigDict, _Settings
     if name == "Settings":
-        if _BaseSettings is None:
-            _BaseSettings, _SettingsConfigDict = _load_pydantic_settings()
+        cached = _Settings
+        if cached is not None:
+            return cached
+        with _lock:
+            if _Settings is not None:
+                return _Settings
+            if _BaseSettings is None:
+                _BaseSettings, _SettingsConfigDict = _load_pydantic_settings()
 
-        class Settings(_BaseSettings):
-            model_config = _SettingsConfigDict(
-                env_file=".env",
-                env_file_encoding="utf-8",
-                extra="ignore",
-                case_sensitive=False,
-            )
+            class Settings(_BaseSettings):
+                model_config = _SettingsConfigDict(
+                    env_file=".env",
+                    env_file_encoding="utf-8",
+                    extra="ignore",
+                    case_sensitive=False,
+                )
 
-        return Settings
+            _Settings = Settings
+            return Settings
     raise AttributeError(f"module 'pyronova.config' has no attribute {name!r}")
 
 

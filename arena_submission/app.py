@@ -186,8 +186,13 @@ def json_endpoint(req: "Request"):
     except ValueError:
         m = 1
     count = max(0, min(count, len(DATASET_ITEMS)))
+    # A schema-wrong dataset (missing price/quantity on an item) must not
+    # KeyError at request time — the load at line ~42 only validates JSON
+    # syntax, not shape. Default the multiplicands to 0 so a malformed
+    # item yields total=0 instead of crashing the /json profile (arc
+    # finding arena-5).
     items = [
-        {**dsitem, "total": dsitem["price"] * dsitem["quantity"] * m}
+        {**dsitem, "total": dsitem.get("price", 0) * dsitem.get("quantity", 0) * m}
         for dsitem in DATASET_ITEMS[:count]
     ]
     return {"items": items, "count": count}
@@ -244,6 +249,22 @@ def async_db_endpoint(req: "Request"):
     return _rows_to_payload(rows)
 
 
+def _parse_tags(raw):
+    # The `tags` column is jsonb; the driver usually hands back a
+    # dict/list already, but a string-typed column (or a row written
+    # outside the jsonb contract) can carry malformed JSON. A bare
+    # json.loads() there raises JSONDecodeError and 500s the request —
+    # match the file-wide contract: log with the trace, degrade to an
+    # empty tag list rather than crash the handler (arc finding arena-1/2).
+    if raw.__class__ is str:
+        try:
+            return json.loads(raw)
+        except (ValueError, TypeError):
+            log.warning("malformed tags JSON %r; using []", raw, exc_info=True)
+            return []
+    return raw
+
+
 def _rows_to_payload(rows):
     # Hot loop — shaves ~30% per-row Python overhead by reading each
     # column exactly once and skipping the `isinstance(tags, str)` check
@@ -251,9 +272,7 @@ def _rows_to_payload(rows):
     items = []
     append = items.append
     for row in rows:
-        tags = row["tags"]
-        if tags.__class__ is str:
-            tags = json.loads(tags)
+        tags = _parse_tags(row["tags"])
         append({
             "id": row["id"],
             "name": row["name"],
@@ -274,6 +293,7 @@ _EMPTY_DB_RESPONSE = {"items": [], "count": 0}
 _NOT_FOUND = Response("not found", status_code=404, content_type="text/plain")
 _BAD_REQUEST = Response("bad request", status_code=400, content_type="text/plain")
 _INTERNAL_ERROR = Response("internal server error", status_code=500, content_type="text/plain")
+_SERVICE_UNAVAILABLE = Response("service unavailable", status_code=503, content_type="text/plain")
 
 
 # ---------------------------------------------------------------------------
@@ -325,9 +345,7 @@ _CRUD_UPSERT_SQL = (
 
 
 def _row_to_full_item(row):
-    tags = row["tags"]
-    if tags.__class__ is str:
-        tags = json.loads(tags)
+    tags = _parse_tags(row["tags"])
     return {
         "id": row["id"],
         "name": row["name"],
@@ -408,7 +426,10 @@ def crud_list(req: "Request"):
 @app.put("/crud/items/{id}", gil=True)
 def crud_update(req: "Request"):
     if PG_POOL is None:
-        return _NOT_FOUND
+        # No DB connection is a server-side outage, not a missing item —
+        # 503 tells clients the failure is ours and retryable, not 404
+        # ("item not found") which misleads (arc finding arena-3).
+        return _SERVICE_UNAVAILABLE
     try:
         item_id = int(req.params["id"])
         body = json.loads(req.body) if req.body else {}
@@ -434,7 +455,9 @@ def crud_update(req: "Request"):
 @app.post("/crud/items", gil=True)
 def crud_upsert(req: "Request"):
     if PG_POOL is None:
-        return _BAD_REQUEST
+        # Server-side DB outage — 503, not 400 ("your request is
+        # malformed"). The client did nothing wrong (arc finding arena-4).
+        return _SERVICE_UNAVAILABLE
     try:
         body = json.loads(req.body) if req.body else {}
         item_id = int(body["id"])

@@ -120,6 +120,23 @@ def register_crud(
         # request handler with cryptic 'X object is not callable'
         # (arc findings crud-9, crud-2).
         raise TypeError(f"id_type must be callable, got {type(id_type).__name__}")
+    # default_limit / max_limit hints aren't runtime-enforced either. A
+    # non-int (e.g. max_limit="1000") makes min(int(...), "1000") raise in
+    # *every* request, which the limit/offset except block then mislabels as
+    # a client "invalid limit/offset" 400 — blaming the caller for a
+    # registration-time misconfig (arc finding crud-84).
+    if not isinstance(default_limit, int) or isinstance(default_limit, bool):
+        raise TypeError(f"default_limit must be int, got {type(default_limit).__name__}")
+    if not isinstance(max_limit, int) or isinstance(max_limit, bool):
+        raise TypeError(f"max_limit must be int, got {type(max_limit).__name__}")
+    if default_limit < 1:
+        raise ValueError(f"default_limit must be >= 1, got {default_limit}")
+    if max_limit < 1:
+        raise ValueError(f"max_limit must be >= 1, got {max_limit}")
+    if default_limit > max_limit:
+        raise ValueError(
+            f"default_limit ({default_limit}) must not exceed max_limit ({max_limit})"
+        )
 
     _validate_ident(table, "table")
     for c in columns:
@@ -172,7 +189,14 @@ def register_crud(
             return Response(body={"error": "missing id"}, status_code=400)
         try:
             id_val = id_type(raw_id)
-        except (TypeError, ValueError):
+        except Exception:
+            # id_type is user-supplied and coerces an attacker-controlled
+            # path segment. A custom converter may raise something other
+            # than TypeError/ValueError (RuntimeError, OSError, KeyError);
+            # any failure here means "this id string is unacceptable" → 400,
+            # never a 500 (arc finding crud-83). Log so a genuinely broken
+            # converter is still diagnosable.
+            _log.warning("id_type(%r) raised; treating as invalid id", raw_id, exc_info=True)
             return Response(body={"error": "invalid id"}, status_code=400)
         try:
             row = pool.fetch_one(get_sql, id_val)
@@ -225,7 +249,14 @@ def register_crud(
             return Response(body={"error": "missing id"}, status_code=400)
         try:
             id_val = id_type(raw_id)
-        except (TypeError, ValueError):
+        except Exception:
+            # id_type is user-supplied and coerces an attacker-controlled
+            # path segment. A custom converter may raise something other
+            # than TypeError/ValueError (RuntimeError, OSError, KeyError);
+            # any failure here means "this id string is unacceptable" → 400,
+            # never a 500 (arc finding crud-83). Log so a genuinely broken
+            # converter is still diagnosable.
+            _log.warning("id_type(%r) raised; treating as invalid id", raw_id, exc_info=True)
             return Response(body={"error": "invalid id"}, status_code=400)
         try:
             body = req.json()
@@ -268,7 +299,14 @@ def register_crud(
             return Response(body={"error": "missing id"}, status_code=400)
         try:
             id_val = id_type(raw_id)
-        except (TypeError, ValueError):
+        except Exception:
+            # id_type is user-supplied and coerces an attacker-controlled
+            # path segment. A custom converter may raise something other
+            # than TypeError/ValueError (RuntimeError, OSError, KeyError);
+            # any failure here means "this id string is unacceptable" → 400,
+            # never a 500 (arc finding crud-83). Log so a genuinely broken
+            # converter is still diagnosable.
+            _log.warning("id_type(%r) raised; treating as invalid id", raw_id, exc_info=True)
             return Response(body={"error": "invalid id"}, status_code=400)
         try:
             affected = pool.execute(delete_sql, id_val)

@@ -168,12 +168,19 @@ impl PyronovaApp {
             status: status_code,
             headers: headers.unwrap_or_default(),
         };
-        self.routes
-            .write()
-            .fast_responses
-            .entry(method_key)
-            .or_default()
-            .insert(path_key, resp);
+        let mut routes = self.routes.write();
+        let bucket = routes.fast_responses.entry(method_key.clone()).or_default();
+        // Reject duplicate (method, path) registrations instead of silently
+        // discarding the previous one. add_route already errors on duplicate
+        // routes; mirror that so a double-registration (hot reload, plugin)
+        // surfaces a clear error rather than losing the first one with no
+        // diagnostic (arc finding app-53).
+        if bucket.contains_key(&path_key) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "fast response already registered for {method_key} {path_key}"
+            )));
+        }
+        bucket.insert(path_key, resp);
         Ok(())
     }
 
@@ -828,9 +835,17 @@ impl PyronovaApp {
                     tracing::error!(
                         target: "pyronova::server",
                         error = %e,
-                        "ctrl_c signal handler registration failed; falling \
-                         through to immediate shutdown"
+                        "ctrl_c signal handler registration failed; cannot \
+                         receive SIGINT. Accept loops are live and serving — \
+                         parking instead of tearing down. Terminate via \
+                         SIGTERM/SIGKILL."
                     );
+                    // Do NOT fall through to shutdown: the accept loops were
+                    // already spawned above and are serving traffic. Falling
+                    // through here is what made the server "start then die
+                    // seconds later" (arc app-1/-2/-52). Park forever so the
+                    // server keeps running; the OS can still SIGKILL it.
+                    std::future::pending::<()>().await;
                 }
                 tracing::info!(target: "pyronova::server", "Shutting down gracefully...");
                 println!("\n  Shutting down gracefully...");
@@ -1048,9 +1063,17 @@ impl PyronovaApp {
                     tracing::error!(
                         target: "pyronova::server",
                         error = %e,
-                        "ctrl_c signal handler registration failed; falling \
-                         through to immediate shutdown"
+                        "ctrl_c signal handler registration failed; cannot \
+                         receive SIGINT. Accept loops are live and serving — \
+                         parking instead of tearing down. Terminate via \
+                         SIGTERM/SIGKILL."
                     );
+                    // Do NOT fall through to shutdown: the accept loops were
+                    // already spawned above and are serving traffic. Falling
+                    // through here is what made the server "start then die
+                    // seconds later" (arc app-1/-2/-52). Park forever so the
+                    // server keeps running; the OS can still SIGKILL it.
+                    std::future::pending::<()>().await;
                 }
                 tracing::info!(target: "pyronova::server", "Shutting down gracefully...");
                 println!("\n  Shutting down gracefully...");

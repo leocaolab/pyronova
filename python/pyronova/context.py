@@ -38,8 +38,16 @@ from typing import Any
 
 _REQUEST_ID_KEY = "__pyronova_request_id__"
 
-_DEFAULT: dict[str, Any] = {}
-_current: ContextVar[dict[str, Any]] = ContextVar("pyronova_ctx", default=_DEFAULT)
+# Sentinel marking "no per-request dict installed yet". Using a unique
+# object() rather than a shared empty `{}` as the ContextVar default means
+# the copy-on-write guard in set() keys on identity that nothing else can
+# forge: a caller cannot accidentally (or maliciously) store the sentinel,
+# so two requests can never end up sharing one mutable dict (arc finding
+# context-22). It also makes clear()/reset restore the true "unset" state
+# so the next set() allocates fresh instead of copying a stale `{}`
+# (arc finding context-23).
+_UNSET: Any = object()
+_current: ContextVar[Any] = ContextVar("pyronova_ctx", default=_UNSET)
 
 
 class _Ctx:
@@ -47,14 +55,15 @@ class _Ctx:
     instance users need."""
 
     def get(self, key: str, default: Any = None) -> Any:
-        return _current.get().get(key, default)
+        d = _current.get()
+        if d is _UNSET:
+            return default
+        return d.get(key, default)
 
     def set(self, key: str, value: Any) -> None:
-        # Copy-on-write: never mutate the dict stored in an outer scope
-        # (e.g., the default empty dict shared by every worker thread
-        # before any request has started).
+        # Copy-on-write: never mutate a dict stored in an outer scope.
         d = _current.get()
-        if d is _DEFAULT:
+        if d is _UNSET:
             d = {}
         else:
             d = dict(d)
@@ -62,7 +71,7 @@ class _Ctx:
         _current.set(d)
 
     def clear(self) -> None:
-        _current.set({})
+        _current.set(_UNSET)
 
     def request_id(self) -> str | None:
         return self.get(_REQUEST_ID_KEY)
@@ -71,8 +80,18 @@ class _Ctx:
         self.set(_REQUEST_ID_KEY, rid)
 
     def snapshot(self) -> dict[str, Any]:
-        """Return a shallow copy of the current context dict."""
-        return dict(_current.get())
+        """Return a **shallow** copy of the current context dict.
+
+        Top-level keys are copied, but nested mutable values (lists, dicts)
+        are shared by reference with the live context — mutating them after
+        snapshotting leaks across the boundary. If you need an isolated copy
+        to hand to a background task, deep-copy the result yourself
+        (``copy.deepcopy(ctx.snapshot())``).
+        """
+        d = _current.get()
+        if d is _UNSET:
+            return {}
+        return dict(d)
 
 
 ctx = _Ctx()
@@ -80,8 +99,8 @@ ctx = _Ctx()
 
 def _reset_for_new_request() -> None:
     """Called by Pyronova's internal before-request hook to start each
-    request with a fresh dict."""
-    _current.set({})
+    request with a fresh (unset) scope."""
+    _current.set(_UNSET)
 
 
 __all__ = ["ctx"]
