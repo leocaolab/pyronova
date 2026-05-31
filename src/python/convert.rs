@@ -70,6 +70,11 @@ pub(crate) unsafe fn log_and_clear_py_exception(context: &str) {
             // drop it so we honor the "always clears" contract.
             ffi::PyErr_Clear();
             "<non-utf8 exception repr>".to_string()
+        } else if size < 0 {
+            // Defensive: PyUnicode_AsUTF8AndSize must not report a negative
+            // length on success, but a corrupt/garbage value cast to usize
+            // wraps to an enormous slice → UB in from_raw_parts (arc interp-2).
+            "<invalid exception repr length>".to_string()
         } else {
             String::from_utf8_lossy(std::slice::from_raw_parts(data as *const u8, size as usize))
                 .into_owned()
@@ -145,7 +150,10 @@ pub(crate) unsafe fn py_str_dict_from_vec(pairs: &[(String, String)]) -> Option<
 pub(crate) unsafe fn pyobj_to_string(obj: *mut ffi::PyObject) -> Result<String, String> {
     let mut size: isize = 0;
     let ptr = ffi::PyUnicode_AsUTF8AndSize(obj, &mut size);
-    if ptr.is_null() {
+    if ptr.is_null() || size < 0 {
+        // size < 0 can't happen on a successful PyUnicode_AsUTF8AndSize, but a
+        // garbage value cast to usize wraps to an enormous slice → UB in
+        // from_raw_parts (arc interp-2). Treat it as failure.
         ffi::PyErr_Clear(); // Must clear exception before any further C-API calls
         return Err("failed to extract string".to_string());
     }
