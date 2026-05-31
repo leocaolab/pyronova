@@ -215,7 +215,12 @@ pub fn emit_python_log(
     // Dispatch to compile-time tracing macros via match. The macro expands
     // inline, so each branch remains a separate static callsite — EnvFilter
     // can skip at near-zero cost.
-    dispatch_python_log!(level.as_str(), wid, name, pathname, lineno, message);
+    // Normalize to uppercase so the dispatch match (which only has uppercase
+    // arms) categorizes lowercase/mixed-case levels correctly. Python's
+    // logging.addLevelName() can register lowercase custom levels; without
+    // this, those fall through to the TRACE arm and are silently dropped by
+    // a typical EnvFilter (e.g. RUST_LOG=debug excludes TRACE).
+    dispatch_python_log!(level.to_uppercase().as_str(), wid, name, pathname, lineno, message);
 
     Ok(())
 }
