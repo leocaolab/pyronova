@@ -262,7 +262,7 @@ pub(crate) unsafe extern "C" fn pyronova_db_execute_cfunc(
             })
             .map_err(|e| PyRuntimeError::new_err(format!("db execute runtime: {e}")))?
             .map_err(|e| PyRuntimeError::new_err(format!("db execute: {e}")))?;
-        let affected = result.rows_affected() as i64;
+        let affected: u64 = result.rows_affected();
         Ok(affected
             .into_pyobject(py)
             .map_err(|e| PyRuntimeError::new_err(format!("int conv: {e}")))?
@@ -291,14 +291,33 @@ pub(crate) unsafe fn register_db_bridge(globals: *mut ffi::PyObject) {
         let def = Box::into_raw(Box::new(ffi::PyMethodDef {
             ml_name: name.as_ptr(),
             ml_meth: ffi::PyMethodDefPointer {
-                PyCFunctionWithKeywords: std::mem::transmute(cfunc as *const ()),
+                PyCFunction: std::mem::transmute(cfunc as *const ()),
             },
             ml_flags: ffi::METH_VARARGS,
             ml_doc: std::ptr::null(),
         }));
         let func = ffi::PyCFunction_NewEx(def, std::ptr::null_mut(), std::ptr::null_mut());
         if !func.is_null() {
-            ffi::PyDict_SetItemString(globals, name.as_ptr(), func);
+            // PyDict_SetItemString returns -1 on failure (e.g. allocation
+            // failure growing the dict). Unchecked, the bridge function would
+            // be silently missing from globals → NameError at request time
+            // with the root cause hidden — the same failure mode the
+            // PyCFunction_NewEx null branch below guards against. Clear the
+            // pending error and log so it stays diagnosable.
+            if ffi::PyDict_SetItemString(globals, name.as_ptr(), func) == -1 {
+                if !ffi::PyErr_Occurred().is_null() {
+                    ffi::PyErr_Clear();
+                }
+                let name_str = std::ffi::CStr::from_ptr(name.as_ptr())
+                    .to_string_lossy();
+                tracing::error!(
+                    target: "pyronova::app",
+                    function = %name_str,
+                    "PyDict_SetItemString failed while registering DB \
+                     bridge function — sub-interp will see NameError at \
+                     runtime when handlers try to call it"
+                );
+            }
             ffi::Py_DECREF(func);
         } else {
             // PyCFunction_NewEx returning null = alloc failure or
