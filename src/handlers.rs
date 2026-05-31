@@ -136,6 +136,11 @@ fn resolve_coroutine(py: Python<'_>, obj: Py<PyAny>) -> Result<Py<PyAny>, String
     /// (leak the loop object) rather than segfault on invalid thread state.
     struct LoopGuard(Option<Py<PyAny>>);
     impl Drop for LoopGuard {
+        /// [arc:intentional-handle] reason: we are in Drop with no error
+        /// channel to propagate to and no caller to defer to. A failed
+        /// close() can still leak FDs/tasks, so rather than silently dropping
+        /// the error we log it (with the error object) so the leak is
+        /// diagnosable.
         fn drop(&mut self) {
             if let Some(loop_obj) = self.0.take() {
                 // Check that the Python interpreter is still alive.
@@ -144,7 +149,14 @@ fn resolve_coroutine(py: Python<'_>, obj: Py<PyAny>) -> Result<Py<PyAny>, String
                 // Python::attach() UB (use-after-free on global interpreter).
                 if unsafe { pyo3::ffi::Py_IsInitialized() } != 0 {
                     Python::attach(|py| {
-                        let _ = loop_obj.call_method0(py, "close");
+                        if let Err(e) = loop_obj.call_method0(py, "close") {
+                            tracing::warn!(
+                                target: "pyronova::server",
+                                error = %e,
+                                "event loop close() failed during LoopGuard \
+                                 drop; loop FDs/tasks may have leaked"
+                            );
+                        }
                     });
                     // loop_obj's Py<PyAny>::Drop fires here under a live
                     // interp → benign refcount decrement.
