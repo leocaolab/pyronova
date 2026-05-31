@@ -155,7 +155,17 @@ def upload(req: "Request"):
     # (~1600 iterations for a 25 MB upload). Worth ~50% throughput on
     # the /upload profile; zero impact on streaming use cases that
     # actually want the per-chunk bytes.
-    size = req.stream.drain_count()
+    try:
+        size = req.stream.drain_count()
+    except Exception:
+        # drain_count() is a Rust FFI call over the live request stream;
+        # a mid-upload client disconnect or a corrupt hyper frame raises
+        # here. Match the file-wide contract (line ~30): log with the
+        # trace instead of 500'ing silently, and hand back 400 — the
+        # body was never fully received, so the request is malformed from
+        # the server's view (arc finding ISSUE-65).
+        log.warning("/upload: stream.drain_count failed", exc_info=True)
+        return _BAD_REQUEST
     return Response(str(size), content_type="text/plain")
 
 
