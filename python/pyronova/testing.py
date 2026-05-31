@@ -31,7 +31,9 @@ WebSocket::
 
 from __future__ import annotations
 
+import errno as _errno
 import json
+import logging as _logging
 import socket as _socket
 import threading
 import time
@@ -42,6 +44,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from http.cookiejar import CookieJar
 from typing import Any, Iterator
+
+_logger = _logging.getLogger("pyronova.testing")
 
 
 def _collapse_headers(msg) -> "dict[str, str | list[str]]":
@@ -130,15 +134,21 @@ class TestClient:
         timeout: float = 10.0,
         follow_redirects: bool = True,
     ):
-        if port is None:
-            # try/finally so a failing bind() (permission denied, address in
-            # use) can't leak the socket fd (arc finding testing-47).
+        auto_port = port is None
+
+        def _free_port() -> int:
+            # Ask the kernel for an unused port. try/finally so a failing
+            # bind() (permission denied, address in use) can't leak the
+            # socket fd (arc finding testing-47).
             s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
             try:
                 s.bind((host, 0))
-                port = s.getsockname()[1]
+                return s.getsockname()[1]
             finally:
                 s.close()
+
+        if port is None:
+            port = _free_port()
         self.host = host
         self.port = port
         self.base_url = f"http://{host}:{port}"
@@ -155,18 +165,83 @@ class TestClient:
 
         self._server_error: Exception | None = None
 
+        def _addr_in_use(exc: Exception) -> bool:
+            # Detect "port already taken" across the ways app.run can surface
+            # it: a plain OSError with errno set, or a PyO3-wrapped error whose
+            # message carries the OS text. Conservative — only these retry.
+            # errno is imported at module level so a hostile import can't
+            # silently disable detection (arc finding testing-25).
+            if isinstance(exc, OSError) and exc.errno in (
+                _errno.EADDRINUSE,
+                _errno.EADDRNOTAVAIL,
+            ):
+                return True
+            msg = str(exc).lower()
+            return "address already in use" in msg or "addrinuse" in msg
+
         def _run_server():
-            try:
-                app.run(host=host, port=port, mode="default")
-            except Exception as e:
-                self._server_error = e
+            # Picking a free port (bind→getsockname→close) then letting the
+            # server rebind it is inherently racy: between close() and the
+            # server's bind() another process can steal the port (TOCTOU,
+            # arc finding testing-24). app.run binds by host/port only — the
+            # Rust side has no fd-passing path — so the window can't be closed
+            # outright. When we auto-picked the port, repick a fresh one and
+            # retry on "address in use" so parallel test runs don't flake.
+            # A user-supplied port is honored exactly, no retry.
+            #
+            # Each repick calls _free_port() again, which carries the same
+            # TOCTOU window (arc finding testing-27). Under heavy contention
+            # (pytest-xdist, constrained ephemeral range) back-to-back losses
+            # are possible, so we back off between attempts to let the racing
+            # processes settle rather than burning all attempts instantly.
+            attempts = 8 if auto_port else 1
+            last_exc: Exception | None = None
+            for _attempt in range(attempts):
+                try:
+                    app.run(host=self.host, port=self.port, mode="default")
+                    return  # server ran and shut down cleanly
+                except Exception as e:  # noqa: BLE001 — stored & logged below
+                    last_exc = e
+                    if auto_port and _addr_in_use(e) and _attempt < attempts - 1:
+                        # Lost the port between probe and bind — pick another.
+                        # The readiness probe re-reads base_url each pass and
+                        # treats a refused connection as "still starting", so
+                        # updating it here is safe (arc finding testing-26:
+                        # leave a breadcrumb so port churn isn't invisible).
+                        old_port = self.port
+                        # Exponential backoff (10ms, 20ms, 40ms, ... capped at
+                        # ~1.3s) shrinks the odds of racing the same way twice
+                        # when many test processes contend (arc finding
+                        # testing-27).
+                        time.sleep(min(0.01 * (2 ** _attempt), 1.28))
+                        self.port = _free_port()
+                        self.base_url = f"http://{self.host}:{self.port}"
+                        _logger.info(
+                            "TestClient port %d was taken, repicking %d "
+                            "(attempt %d/%d)",
+                            old_port, self.port, _attempt + 1, attempts,
+                        )
+                        continue
+                    break
+            self._server_error = last_exc
+            # Distinguish exhausted port-collision retries from a genuine
+            # server crash so the test author isn't left guessing why they
+            # only see 'connection refused' (arc findings testing-3, -26).
+            if auto_port and last_exc is not None and _addr_in_use(last_exc):
+                _logger.warning(
+                    "TestClient port collision persisted after %d attempts "
+                    "(last port=%d); clients will see connection refused. "
+                    "Likely ephemeral-port exhaustion under heavy parallelism.",
+                    attempts, self.port, exc_info=last_exc,
+                )
+            else:
                 # Pre-fix the exception was stored but never logged.
                 # Tests then saw only generic 'connection refused' with
                 # no clue why (arc finding testing-3).
-                import logging as _log
-                _log.getLogger("pyronova.testing").exception(
+                _logger.error(
                     "TestClient inner server crashed; clients will see "
-                    "connection refused"
+                    "connection refused",
+                    exc_info=last_exc,
                 )
 
         self._thread = threading.Thread(target=_run_server, daemon=True)
