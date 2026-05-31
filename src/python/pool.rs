@@ -588,8 +588,20 @@ fn worker_thread_loop_async(
                 let _ = Box::from_raw(emit_log_def);
                 return false;
             }
-            ffi::PyDict_SetItemString(globals, c"_pyronova_recv".as_ptr(), recv_func);
+            // PyDict_SetItemString returns -1 on failure (e.g. allocation
+            // failure growing the dict). Unchecked, the bridge function would
+            // be silently missing from globals → AttributeError on the first
+            // async request, with the root cause hidden. DECREF the function
+            // we still own (SetItemString does not steal the ref), reclaim the
+            // not-yet-consumed defs, and bail so the caller's
+            // log_and_clear_pyerr surfaces it. Mirrors the null branches above.
+            let rc = ffi::PyDict_SetItemString(globals, c"_pyronova_recv".as_ptr(), recv_func);
             ffi::Py_DECREF(recv_func);
+            if rc != 0 {
+                let _ = Box::from_raw(send_def);
+                let _ = Box::from_raw(emit_log_def);
+                return false;
+            }
 
             let send_func =
                 ffi::PyCFunction_NewEx(send_def, std::ptr::null_mut(), std::ptr::null_mut());
@@ -598,8 +610,12 @@ fn worker_thread_loop_async(
                 let _ = Box::from_raw(emit_log_def);
                 return false;
             }
-            ffi::PyDict_SetItemString(globals, c"_pyronova_send".as_ptr(), send_func);
+            let rc = ffi::PyDict_SetItemString(globals, c"_pyronova_send".as_ptr(), send_func);
             ffi::Py_DECREF(send_func);
+            if rc != 0 {
+                let _ = Box::from_raw(emit_log_def);
+                return false;
+            }
 
             // Zombie-guard: each sub-interpreter stamps its pool_id as a
             // module-level constant. The async engine reads it once and
@@ -613,8 +629,12 @@ fn worker_thread_loop_async(
                 let _ = Box::from_raw(emit_log_def);
                 return false;
             }
-            ffi::PyDict_SetItemString(globals, c"_pyronova_pool_id".as_ptr(), pool_id_obj);
+            let rc = ffi::PyDict_SetItemString(globals, c"_pyronova_pool_id".as_ptr(), pool_id_obj);
             ffi::Py_DECREF(pool_id_obj);
+            if rc != 0 {
+                let _ = Box::from_raw(emit_log_def);
+                return false;
+            }
 
             let emit_log_func =
                 ffi::PyCFunction_NewEx(emit_log_def, std::ptr::null_mut(), std::ptr::null_mut());
@@ -622,8 +642,11 @@ fn worker_thread_loop_async(
                 let _ = Box::from_raw(emit_log_def);
                 return false;
             }
-            ffi::PyDict_SetItemString(globals, c"_pyronova_emit_log".as_ptr(), emit_log_func);
+            let rc = ffi::PyDict_SetItemString(globals, c"_pyronova_emit_log".as_ptr(), emit_log_func);
             ffi::Py_DECREF(emit_log_func);
+            if rc != 0 {
+                return false;
+            }
 
             true
         };
