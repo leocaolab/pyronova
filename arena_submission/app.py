@@ -482,6 +482,10 @@ def crud_update(req: "Request"):
         price = int(body.get("price", 0))
         quantity = int(body.get("quantity", 0))
     except (TypeError, ValueError):
+        # Non-numeric price/quantity is a 400, but log the exception so the
+        # bad field survives for debugging (file contract: even 400 handlers
+        # log with exc_info=True).
+        log.info("/crud/items update: bad price/quantity", exc_info=True)
         return _BAD_REQUEST
     try:
         affected = PG_POOL.execute(_CRUD_UPDATE_SQL, name, price, quantity, item_id)
@@ -515,6 +519,10 @@ def crud_upsert(req: "Request"):
         price = int(body.get("price", 0))
         quantity = int(body.get("quantity", 0))
     except (TypeError, ValueError):
+        # Non-numeric price/quantity is a 400, but log the exception so the
+        # bad field survives for debugging (file contract: even 400 handlers
+        # log with exc_info=True).
+        log.info("/crud/items upsert: bad price/quantity", exc_info=True)
         return _BAD_REQUEST
     try:
         new_id = PG_POOL.fetch_scalar(
