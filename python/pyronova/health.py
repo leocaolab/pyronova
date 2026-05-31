@@ -83,8 +83,20 @@ def _drive(coro: Awaitable[Any]) -> Any:
     # .result() timeout is a backstop in case the worker itself wedges.
     import concurrent.futures
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+    # NOTE: do NOT use ThreadPoolExecutor as a context manager here. Its
+    # __exit__ calls shutdown(wait=True), which blocks until the worker future
+    # finishes. If the check wedges (e.g. a coroutine that swallows the
+    # wait_for cancellation), .result() raises TimeoutError as intended — but
+    # shutdown(wait=True) would then block forever joining the still-running
+    # thread, defeating the timeout and re-exposing the exhausted-worker-pool
+    # scenario this bound exists to prevent. shutdown(wait=False) abandons a
+    # hung worker (it can't be killed in Python) so _drive returns promptly
+    # and the TimeoutError propagates to be recorded as a failed check.
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
         return ex.submit(asyncio.run, bounded).result(timeout=_CHECK_TIMEOUT_S + 1.0)
+    finally:
+        ex.shutdown(wait=False)
 
 
 def _run_checks_sync(checks: list[tuple[str, CheckFn]]) -> tuple[bool, dict[str, Any]]:
