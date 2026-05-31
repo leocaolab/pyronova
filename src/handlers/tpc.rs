@@ -124,6 +124,13 @@ pub(crate) async fn handle_request_tpc_inline(
     // TPC inline hot path (sync + non-gil + non-stream) never touches
     // `body_stream_rx` and pays no Arc::clone for a value it won't use.
     let is_stream_route = routes.is_stream[handler_idx];
+    // For streaming routes we spawn a feeder that drains the hyper body into the
+    // mpsc sender. Keep its JoinHandle so the dispatch-failure path below can
+    // abort it deterministically — otherwise dropping the work item only closes
+    // the receiver, which the feeder won't observe while parked on the next
+    // `body.frame().await`, leaving a detached task alive until the connection
+    // dies.
+    let mut feeder_handle = None;
     let (body_bytes, stream_rx): (
         Vec<u8>,
         Option<tokio::sync::mpsc::Receiver<crate::python::body_stream::ChunkMsg>>,
@@ -131,7 +138,11 @@ pub(crate) async fn handle_request_tpc_inline(
         let (tx, rx) = tokio::sync::mpsc::channel::<crate::python::body_stream::ChunkMsg>(
             crate::python::body_stream::CHANNEL_CAPACITY,
         );
-        tokio::task::spawn_local(stream_body_feeder(body_obj, tx, max_body_size()));
+        feeder_handle = Some(tokio::task::spawn_local(stream_body_feeder(
+            body_obj,
+            tx,
+            max_body_size(),
+        )));
         (Vec::new(), Some(rx))
     } else {
         match collect_body_bounded(body_obj).await {
@@ -195,7 +206,14 @@ pub(crate) async fn handle_request_tpc_inline(
             body_stream_rx,
             response_tx,
         };
-        if let Err((_dropped_item, err)) = bridge.try_dispatch(item) {
+        if let Err((dropped_item, err)) = bridge.try_dispatch(item) {
+            // Drop the rejected item (closing body_stream_rx) and abort the
+            // feeder so it can't linger detached if it's parked awaiting the
+            // next body frame from a stalled client.
+            drop(dropped_item);
+            if let Some(feeder) = feeder_handle.take() {
+                feeder.abort();
+            }
             crate::monitor::DROPPED_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let resp = match err {
                 crate::bridge::main_bridge::TryDispatchError::Full => {
