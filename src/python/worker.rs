@@ -750,16 +750,27 @@ def _attach_pyronova_request_helpers(t):\n    from urllib.parse import parse_qs\
                             if let Ok(k) = pyobj_to_string(sk.as_ptr()) {
                                 // Check if value is a Python list — e.g. multiple Set-Cookie values
                                 if ffi::PyList_Check(v_obj.as_ptr()) != 0 {
+                                    // Phase 1: snapshot the list items (no user code
+                                    // runs). PyList_GetItem returns borrowed refs, and
+                                    // PyObject_Str below may invoke user __str__ which
+                                    // could mutate the list → invalidating the borrow.
+                                    // INCREF each item to own it before converting.
                                     let n = ffi::PyList_Size(v_obj.as_ptr());
+                                    let mut items: Vec<PyObjRef> = Vec::new();
                                     for i in 0..n {
-                                        // PyList_GetItem returns a borrowed ref — do NOT wrap in from_owned.
                                         let item = ffi::PyList_GetItem(v_obj.as_ptr(), i);
                                         if item.is_null() {
                                             ffi::PyErr_Clear();
                                             continue;
                                         }
+                                        if let Some(owned) = PyObjRef::from_borrowed(item) {
+                                            items.push(owned);
+                                        }
+                                    }
+                                    // Phase 2: convert — safe to invoke __str__ now.
+                                    for item in items {
                                         if let Some(item_str) =
-                                            PyObjRef::from_owned(ffi::PyObject_Str(item))
+                                            PyObjRef::from_owned(ffi::PyObject_Str(item.as_ptr()))
                                         {
                                             if let Ok(v) = pyobj_to_string(item_str.as_ptr()) {
                                                 resp_headers.push((k.clone(), v));
