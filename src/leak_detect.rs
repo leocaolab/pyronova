@@ -57,33 +57,47 @@ use std::sync::OnceLock;
 use metrics_util::debugging::{DebuggingRecorder, Snapshotter};
 use pyo3::ffi;
 
-/// Global snapshotter. We install a DebuggingRecorder at first use and
-/// hold onto its snapshotter so the Python-callable dump can render
-/// totals on demand.
-static SNAPSHOTTER: OnceLock<Snapshotter> = OnceLock::new();
+/// Global snapshotter slot. We install a DebuggingRecorder at first use
+/// and, *only on success*, hold onto its snapshotter so the
+/// Python-callable dump can render totals on demand.
+///
+/// The slot is `Option<Snapshotter>` so the install outcome is modeled
+/// explicitly: `Some` means our recorder owns the process and samples
+/// flow to this snapshotter; `None` means install failed (another
+/// recorder was registered first) and no samples will ever arrive. We
+/// deliberately do NOT keep the snapshotter on failure — even though it
+/// would stay memory-safe (it is `Arc`-backed), it would be permanently
+/// dead, and reading from it would produce a misleading empty dump that
+/// hides the real cause. Storing `None` lets the dump report the actual
+/// failure instead of relying on "the dead snapshotter happens to read
+/// empty" (arc finding leak-detect-1).
+static SNAPSHOTTER: OnceLock<Option<Snapshotter>> = OnceLock::new();
 
-fn ensure_recorder_installed() -> &'static Snapshotter {
-    SNAPSHOTTER.get_or_init(|| {
-        let recorder = DebuggingRecorder::new();
-        let snap = recorder.snapshotter();
-        // `install()` consumes the recorder. On success the global
-        // recorder is registered (our recorder stays alive). On failure
-        // (another recorder was registered first) the recorder is
-        // dropped here — `snap` may still be usable if metrics_util's
-        // snapshotter holds an Arc to the internal storage, but the
-        // diagnostic will be empty either way (no records flow to it).
-        // Pre-fix this failure was silent (`let _ = ...`); now surface
-        // it so an empty leak diagnostic isn't mysterious (arc finding
-        // leak-detect-1).
-        if let Err(e) = recorder.install() {
-            eprintln!(
-                "[leak_detect] DebuggingRecorder::install() failed: {e}; \
-                 leak diagnostic will be empty (another metrics recorder \
-                 is already installed in this process)"
-            );
-        }
-        snap
-    })
+fn ensure_recorder_installed() -> Option<&'static Snapshotter> {
+    SNAPSHOTTER
+        .get_or_init(|| {
+            let recorder = DebuggingRecorder::new();
+            let snap = recorder.snapshotter();
+            // `install()` consumes the recorder. On success the global
+            // recorder is registered (our recorder stays alive) and the
+            // snapshotter is the live view of its storage. On failure the
+            // recorder is dropped here; the snapshotter would be dead, so
+            // we discard it and record `None`. Pre-fix this failure was
+            // silent (`let _ = ...`); now surface it so an empty leak
+            // diagnostic isn't mysterious.
+            match recorder.install() {
+                Ok(()) => Some(snap),
+                Err(e) => {
+                    eprintln!(
+                        "[leak_detect] DebuggingRecorder::install() failed: {e}; \
+                         leak diagnostic will be empty (another metrics recorder \
+                         is already installed in this process)"
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
 }
 
 /// Sample a PyObjRef drop. Called unconditionally from `PyObjRef::Drop`
@@ -140,9 +154,19 @@ pub unsafe fn record_drop(ptr: *mut ffi::PyObject) {
 /// from Python via `pyronova.engine.leak_detect_dump()` (the
 /// function is registered in `lib.rs` only when this feature is on).
 pub fn dump_to_stderr() {
-    let Some(snap) = SNAPSHOTTER.get() else {
-        eprintln!("[leak_detect] no recorder installed yet (no drops sampled)");
-        return;
+    let snap = match SNAPSHOTTER.get() {
+        None => {
+            eprintln!("[leak_detect] no recorder installed yet (no drops sampled)");
+            return;
+        }
+        Some(None) => {
+            eprintln!(
+                "[leak_detect] recorder install failed earlier — another metrics \
+                 recorder owns this process; no samples were captured"
+            );
+            return;
+        }
+        Some(Some(snap)) => snap,
     };
     let mut rows: Vec<(String, u64)> = snap
         .snapshot()
