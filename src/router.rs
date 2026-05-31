@@ -157,10 +157,14 @@ impl RouteTable {
             .params
             .iter()
             .map(|(k, v)| {
+                // Lossy decode: every value is percent-decoded uniformly, with
+                // invalid UTF-8 bytes mapped to U+FFFD. The previous code fell
+                // back to the raw `%XX` string on decode failure, which mixed
+                // decoded and still-encoded values — handlers then couldn't
+                // tell a literal `%` (from `%25`) apart from a decode failure.
                 let decoded = percent_encoding::percent_decode_str(v)
-                    .decode_utf8()
-                    .map(|c| c.into_owned())
-                    .unwrap_or_else(|_| v.to_string());
+                    .decode_utf8_lossy()
+                    .into_owned();
                 (k.to_string(), decoded)
             })
             .collect();
