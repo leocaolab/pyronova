@@ -61,11 +61,14 @@ pub(crate) struct PyronovaRequest {
 /// Cloned requests lazily recompute headers if accessed.
 impl Clone for PyronovaRequest {
     fn clone(&self) -> Self {
-        // body_stream_rx is a one-shot channel — it can't be cloned. Clones
-        // get an empty stream slot; the original passed to the handler keeps
-        // the receiver. Since the framework only streams on the main request
-        // copy (before_request / after_request hooks run under the same
-        // sky_req before the clone cascade), this is the correct semantics.
+        // body_stream_rx is `Arc<Mutex<Option<Receiver>>>`, so clones share the
+        // *same* receiver slot rather than getting an independent one. This is
+        // deliberate and required: the handler runs on a clone (handed down by
+        // `call_handler_with_hooks`), so it must be able to take the receiver
+        // out of the shared slot. `.stream` is take-once — the first access
+        // (whichever clone) wins and later accesses see None. If two clones
+        // race for `.stream` only one gets the receiver; that's a caller bug,
+        // not a framework one, since streaming is expected on a single copy.
         Self {
             method: self.method.clone(),
             path: self.path.clone(),
