@@ -137,7 +137,7 @@ pub fn spawn_rss_sampler() {
     let handle = match std::thread::Builder::new()
         .name("pyronova-rss-sampler".to_string())
         .spawn(|| {
-            while RSS_SAMPLER_RUNNING.load(Ordering::Relaxed) {
+            while RSS_SAMPLER_RUNNING.load(Ordering::Acquire) {
                 MEMORY_RSS_BYTES.store(get_rss_bytes(), Ordering::Relaxed);
                 // 1 second interval — RSS doesn't change fast enough to warrant
                 // more frequent sampling, and this thread does zero GIL work.
