@@ -66,6 +66,12 @@ def get_cookies(req: Request) -> dict[str, str]:
                 value = value[1:-1]
             elif value == '"':
                 value = ""
+            # Reject empty names: a crafted `Cookie: =value` partitions to
+            # an empty name and would otherwise pollute the dict with a junk
+            # `"" -> value` entry. RFC 6265 cookie-names are non-empty tokens,
+            # so drop it (arc finding cookies-21).
+            if not name:
+                continue
             # First occurrence wins: if a Cookie header carries duplicate
             # names (e.g. an attacker appended `session=evil` after the
             # browser's legitimate `session=...`), keep the first and
