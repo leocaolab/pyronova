@@ -213,7 +213,10 @@ pub(crate) async fn handle_request_tpc_inline(
             .await
         {
             Ok(Ok(r)) => r,
-            Ok(Err(_)) => Err("bridge dropped response".to_string()),
+            Ok(Err(_)) => {
+                crate::monitor::DROPPED_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err("gil=True bridge dropped response (worker panicked or shut down)".to_string())
+            }
             Err(_) => {
                 crate::monitor::DROPPED_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut r = full_body(gateway_timeout_response());
