@@ -120,10 +120,20 @@ impl MainInterpBridge {
         // context. Plain std::threads with crossbeam recv() keep us
         // outside of any runtime, so the downstream Python-side
         // blocking_recv works correctly.
+        // Spawn workers best-effort: a thread spawn can fail under OS
+        // resource exhaustion (ulimit -u, ENOMEM). Panicking here would
+        // abort the whole server process — turning a recoverable
+        // partial-capacity situation into a total outage. Instead we log
+        // and continue with however many workers did start. The channel
+        // back-pressure (try_dispatch → 503) and disconnect handling
+        // (→ 500) already degrade gracefully when capacity is reduced or
+        // zero, so the rest of the fleet (sub-interp routes) keeps
+        // serving regardless.
+        let mut spawned = 0usize;
         for i in 0..workers {
             let rx = rx.clone();
             let routes = Arc::clone(&routes);
-            std::thread::Builder::new()
+            let res = std::thread::Builder::new()
                 .name(format!("pyronova-main-bridge-{i}"))
                 .spawn(move || {
                     loop {
@@ -141,13 +151,41 @@ impl MainInterpBridge {
                         worker = i,
                         "main-interp bridge worker exiting (channel closed)"
                     );
-                })
-                .expect("spawn main bridge worker");
+                });
+            match res {
+                Ok(_handle) => spawned += 1,
+                Err(e) => {
+                    tracing::error!(
+                        target: "pyronova::server",
+                        worker = i,
+                        error = %e,
+                        "failed to spawn main-interp bridge worker; \
+                         continuing with fewer workers"
+                    );
+                }
+            }
+        }
+
+        if spawned == 0 {
+            tracing::error!(
+                target: "pyronova::server",
+                requested = workers,
+                "no main-interp bridge workers could be spawned; \
+                 gil=True routes will respond 500 until resources free up"
+            );
+        } else if spawned < workers {
+            tracing::warn!(
+                target: "pyronova::server",
+                spawned,
+                requested = workers,
+                "main-interp bridge started with reduced worker count"
+            );
         }
 
         tracing::info!(
             target: "pyronova::server",
-            workers,
+            spawned,
+            requested = workers,
             capacity,
             "main-interp bridge spawned"
         );
