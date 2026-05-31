@@ -64,7 +64,7 @@ def get_cookies(req: Request) -> dict[str, str]:
             # (arc finding cookies-25).
             if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
                 value = value[1:-1]
-            elif value == '"':
+            if value == '"':
                 value = ""
             # Reject empty names: a crafted `Cookie: =value` partitions to
             # an empty name and would otherwise pollute the dict with a junk
