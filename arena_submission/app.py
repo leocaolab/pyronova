@@ -423,16 +423,25 @@ def crud_list(req: "Request"):
         return _EMPTY_CRUD_LIST
     q = req.query_params
     category = q.get("category") or "electronics"
+    # Bad ?page= / ?limit= are client typos, not server faults — degrade to
+    # the documented defaults rather than 400. But honor the file-wide
+    # contract (~line 30): don't swallow the parse error silently. Log at
+    # WARNING with exc_info so a flood of garbage params is visible in the
+    # runner log (matches /async-db's bad-query-param handler).
     try:
         page = int(q.get("page", "1"))
         if page < 1:
             page = 1
     except ValueError:
+        log.warning("/crud/items list: bad page param %r; using 1",
+                    q.get("page"), exc_info=True)
         page = 1
         log.warning("/crud/items list: bad page param %r", q.get("page"), exc_info=True)
     try:
         limit = int(q.get("limit", "10"))
     except ValueError:
+        log.warning("/crud/items list: bad limit param %r; using 10",
+                    q.get("limit"), exc_info=True)
         limit = 10
         log.warning("/crud/items list: bad limit param %r", q.get("limit"), exc_info=True)
     if limit < 1 or limit > 50:
