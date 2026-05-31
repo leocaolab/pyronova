@@ -533,7 +533,15 @@ _EMPTY_CRUD_LIST = {"items": [], "total": 0, "page": 1, "limit": 10}
 if __name__ == "__main__":
     # launcher.py decides which port + TLS config to pass via env.
     host = os.environ.get("PYRONOVA_HOST", "0.0.0.0")
-    port = int(os.environ.get("PYRONOVA_PORT", "8080"))
+    # Guard the int() the same way PYRONOVA_TLS_PORTS is guarded below: a
+    # non-numeric PYRONOVA_PORT=abc must not crash startup with a bare
+    # ValueError traceback — log and fall back to the documented default.
+    _port_env = os.environ.get("PYRONOVA_PORT", "8080")
+    try:
+        port = int(_port_env)
+    except ValueError:
+        log.warning("PYRONOVA_PORT=%r is not numeric; falling back to 8080", _port_env)
+        port = 8080
     # Detect worker count from cgroup cpu.max (same pattern as actix's helper).
     # Pyronova's engine will fall back to num_cpus if PYRONOVA_WORKERS isn't set.
     _tls_ports_env = os.environ.get("PYRONOVA_TLS_PORTS")
