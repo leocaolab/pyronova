@@ -462,6 +462,25 @@ class _MockPgCursor:
     def __next__(self): raise StopIteration
     def to_list(self): return []
 
+def _db_ffi(name):
+    # Resolve a DB C-FFI entry point injected by Rust (src/interp.rs)
+    # before this bootstrap runs. Mirrors the logging bridge's
+    # `_pyronova_emit_log` presence check (above): if injection failed
+    # or timing changed, the function is absent from globals() and a
+    # bare call would raise a cryptic `NameError` from inside the pool
+    # proxy — indistinguishable from a pyronova bug. Raise a clear
+    # RuntimeError instead so callers know the DB bridge is unavailable.
+    fn = globals().get(name)
+    if fn is None:
+        raise RuntimeError(
+            f"pyronova.db is unavailable: the {name!r} C-FFI entry point was "
+            "not injected into this sub-interpreter. The Rust engine injects "
+            "the DB bridge at worker init; if you see this, DB access from "
+            "sub-interpreter workers is not configured. Route DB handlers "
+            "with gil=True to use the pool from the main interpreter."
+        )
+    return fn
+
 class _PgPool:
     """Sub-interp proxy for the Rust-side sqlx pool.
 
@@ -477,13 +496,13 @@ class _PgPool:
         # and every method call reads that global directly.
         return cls()
     def fetch_all(self, sql, *params):
-        return _pyronova_db_fetch_all(sql, params)  # type: ignore[name-defined]
+        return _db_ffi("_pyronova_db_fetch_all")(sql, params)
     def fetch_one(self, sql, *params):
-        return _pyronova_db_fetch_one(sql, params)  # type: ignore[name-defined]
+        return _db_ffi("_pyronova_db_fetch_one")(sql, params)
     def fetch_scalar(self, sql, *params):
-        return _pyronova_db_fetch_scalar(sql, params)  # type: ignore[name-defined]
+        return _db_ffi("_pyronova_db_fetch_scalar")(sql, params)
     def execute(self, sql, *params):
-        return _pyronova_db_execute(sql, params)  # type: ignore[name-defined]
+        return _db_ffi("_pyronova_db_execute")(sql, params)
     def fetch_iter(self, *a, **kw):
         return _MockPgCursor()
     # Async variants — not yet implemented. Silently returning falsy
