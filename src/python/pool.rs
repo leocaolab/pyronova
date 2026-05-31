@@ -155,7 +155,20 @@ impl Drop for InterpreterPool {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 if t.is_finished() {
-                    let _ = t.join();
+                    if let Err(panic) = t.join() {
+                        // A worker thread panicked (e.g. a bounds violation in
+                        // the handler dispatch). Surface the payload instead of
+                        // swallowing it — a silent Drop makes such bugs invisible.
+                        let msg = panic
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                        tracing::error!(
+                            target: "pyronova::server",
+                            "worker thread panicked during shutdown: {msg}",
+                        );
+                    }
                 } else {
                     tracing::warn!(
                         target: "pyronova::server",
