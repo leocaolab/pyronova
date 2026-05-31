@@ -65,6 +65,11 @@ def _unquote_param(value: str) -> str:
                 escaped = True
             else:
                 out.append(ch)
+        # A trailing backslash (malformed quoted-string per RFC 2045) leaves
+        # `escaped` set with nothing to escape — preserve it as a literal
+        # rather than silently dropping it.
+        if escaped:
+            out.append("\\")
         return "".join(out)
     return value
 
