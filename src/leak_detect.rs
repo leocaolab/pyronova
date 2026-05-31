@@ -118,16 +118,16 @@ pub unsafe fn record_drop(ptr: *mut ffi::PyObject) {
             if name_ptr.is_null() {
                 "<unnamed>"
             } else {
-                // SAFETY: tp_name is ASCII-NUL terminated by CPython
-                // contract. We never outlive the pointer; the labels
-                // we pass to `metrics::counter!` are interned against
-                // our own static table, so the borrow we hand out
-                // here is fine for the duration of the call.
-                let cstr = std::ffi::CStr::from_ptr(name_ptr);
-                match cstr.to_str() {
-                    Ok(s) => intern(s),
-                    Err(_) => "<non_utf8_type>",
-                }
+                // SAFETY: `name_ptr` is non-null. We read it with a hard
+                // length cap rather than `CStr::from_ptr` because this
+                // probe deliberately fires on corrupted objects too — the
+                // `"<0"` refcount bucket exists to surface double-free /
+                // use-after-free / FFI over-DECREF. A corrupted `tp_name`
+                // may be non-NUL-terminated, and `CStr::from_ptr`'s
+                // unbounded `strlen` scan would then run off the end of
+                // the allocation into unmapped pages (buffer over-read,
+                // UB). The interned label is `&'static`.
+                type_name_bounded(name_ptr)
             }
         }
     };
@@ -177,6 +177,42 @@ pub fn dump_to_stderr() {
 }
 
 // ── Small helpers ──────────────────────────────────────────────────
+
+/// Read a `tp_name` C string with a hard length cap and intern it.
+///
+/// Unlike `CStr::from_ptr`, which does an *unbounded* `strlen` scan, this
+/// reads one byte at a time and stops at the terminating NUL **or** after
+/// `MAX` bytes, whichever comes first. That matters because `record_drop`
+/// runs on corrupted objects by design (the `"<0"` refcount bucket): a
+/// corrupted `tp_name` may be non-NUL-terminated, and an unbounded scan
+/// would walk off the allocation into unmapped pages (UB). Reading
+/// byte-by-byte also means we never touch memory past the NUL — for a
+/// healthy name the cost is identical to `strlen`.
+///
+/// # Safety
+/// `ptr` must be non-null and point at readable memory for at least its
+/// NUL-terminated length (or `MAX` bytes if not terminated within `MAX`).
+unsafe fn type_name_bounded(ptr: *const std::os::raw::c_char) -> &'static str {
+    const MAX: usize = 256;
+    let mut len = 0usize;
+    while len < MAX {
+        if *ptr.add(len) == 0 {
+            break;
+        }
+        len += 1;
+    }
+    if len == MAX {
+        // No NUL within MAX bytes — treat as corrupt rather than interning
+        // arbitrarily long garbage.
+        return "<corrupt_type_name>";
+    }
+    // Every byte in 0..len was just read above, so the slice is valid.
+    let bytes = std::slice::from_raw_parts(ptr as *const u8, len);
+    match std::str::from_utf8(bytes) {
+        Ok(s) => intern(s),
+        Err(_) => "<non_utf8_type>",
+    }
+}
 
 /// Intern a type name into a static string table so the `metrics`
 /// labels can be `&'static str`. Sub-interpreter type names are
