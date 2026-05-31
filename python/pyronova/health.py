@@ -48,6 +48,14 @@ _log = logging.getLogger(__name__)
 
 CheckFn = Union[Callable[[], Any], Callable[[], Awaitable[Any]]]
 
+# A readiness check must fail fast. A hung check (DB deadlock, network
+# partition without a connection timeout, infinite loop) would otherwise
+# block the readyz handler thread forever — and k8s probes timing out
+# keep spawning fresh hung threads until the worker pool is exhausted.
+# Bound every check so the endpoint returns an explicit 503 instead
+# (arc finding health-33).
+_CHECK_TIMEOUT_S = 10.0
+
 
 def _drive(coro: Awaitable[Any]) -> Any:
     """Run a coroutine to completion from sync code, even if this thread
@@ -58,18 +66,25 @@ def _drive(coro: Awaitable[Any]) -> Any:
     offload to a dedicated thread that owns its own fresh loop, so the
     readyz handler works in both sync and async deployments
     (arc finding health-32).
+
+    Every check is bounded by ``_CHECK_TIMEOUT_S`` so a hung coroutine
+    surfaces as ``TimeoutError`` (recorded as a failed check) rather than
+    blocking the handler thread indefinitely.
     """
+    bounded = asyncio.wait_for(coro, _CHECK_TIMEOUT_S)
     try:
         asyncio.get_running_loop()
     except RuntimeError:
         # No loop running on this thread — create+close one properly.
-        return asyncio.run(coro)
+        return asyncio.run(bounded)
     # A loop is already running here; asyncio.run() would blow up. Drive
-    # the coroutine on a worker thread that has no running loop.
+    # the coroutine on a worker thread that has no running loop. The inner
+    # wait_for cancels the coroutine on timeout; the slightly-longer
+    # .result() timeout is a backstop in case the worker itself wedges.
     import concurrent.futures
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        return ex.submit(asyncio.run, coro).result()
+        return ex.submit(asyncio.run, bounded).result(timeout=_CHECK_TIMEOUT_S + 1.0)
 
 
 def _run_checks_sync(checks: list[tuple[str, CheckFn]]) -> tuple[bool, dict[str, Any]]:
