@@ -52,6 +52,11 @@ pub(crate) async fn collect_body_bounded(body: Incoming) -> Result<Vec<u8>, Resp
             {
                 Err(full_body(payload_too_large_response()))
             } else {
+                tracing::warn!(
+                    target: "pyronova::server",
+                    error = %e,
+                    "request body read failed"
+                );
                 Err(full_body(error_response("body read failed")))
             }
         }
