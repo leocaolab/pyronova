@@ -75,21 +75,22 @@ pub(crate) fn run_inmem_bench(
     let total = Arc::new(AtomicU64::new(0));
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
 
-    // Leak each per-worker Arc into a &'static RouteTable up-front.
-    // Each worker gets its own leaked pointer so the read-only route
-    // data lives on its own cacheline but is referenced without any
-    // refcount ops per request.
-    let per_worker_static: Vec<&'static RouteTable> = per_worker_routes
-        .drain(..)
-        .map(|arc| unsafe { &*Arc::into_raw(arc) } as &'static RouteTable)
-        .collect();
+    // Turn each per-worker Arc into a raw pointer up-front. Each worker
+    // reads its route table through a &'static derived from the pointer
+    // so the read-only route data lives on its own cacheline and is
+    // referenced without any refcount ops per request. The matching
+    // Arc::from_raw runs after every worker thread is joined (see the
+    // reclaim loop before the Ok return) so the allocations are freed
+    // rather than leaked — at which point no live &'static remains.
+    let per_worker_ptrs: Vec<*const RouteTable> =
+        per_worker_routes.drain(..).map(Arc::into_raw).collect();
 
     let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(n_threads);
     #[allow(clippy::needless_range_loop)] // i indexes 3 parallel slices
     for i in 0..n_threads {
         let core_id = core_ids.get(i).copied();
         let worker = workers.remove(0);
-        let routes: &'static RouteTable = per_worker_static[i];
+        let routes: &'static RouteTable = unsafe { &*per_worker_ptrs[i] };
         // Extra clone for spawn-failure cleanup path (arc bench-2).
         // Closure consumes its own `shutdown` clone; this one stays in
         // the outer scope so map_err can cancel before joining handles.
@@ -178,6 +179,14 @@ pub(crate) fn run_inmem_bench(
                 "bench worker thread panicked"
             );
         }
+    }
+
+    // Reclaim the per-worker route tables now that every worker thread
+    // has been joined — no live &'static references remain, so the
+    // Arc::from_raw here balances the Arc::into_raw above and frees the
+    // allocations instead of leaking them.
+    for ptr in per_worker_ptrs {
+        drop(unsafe { Arc::from_raw(ptr) });
     }
     Ok((end - start, elapsed))
 }
@@ -314,8 +323,10 @@ pub(crate) fn run_loopback_bench(
     let total = Arc::new(AtomicU64::new(0));
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
 
-    // Shared leaked &'static route table across all server workers.
-    let routes_static: &'static RouteTable = unsafe { &*Arc::into_raw(Arc::clone(&routes)) };
+    // Shared &'static route table across all server workers, reclaimed
+    // after the workers are joined (see the Arc::from_raw before Ok).
+    let routes_ptr: *const RouteTable = Arc::into_raw(Arc::clone(&routes));
+    let routes_static: &'static RouteTable = unsafe { &*routes_ptr };
 
     // --- Server threads (mirrors run_tpc_subinterp_per_thread_listener) ---
     let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(n_threads + 1);
@@ -430,6 +441,10 @@ pub(crate) fn run_loopback_bench(
             );
         }
     }
+
+    // Reclaim the shared route table now that all server + client
+    // threads are joined — balances the Arc::into_raw above.
+    drop(unsafe { Arc::from_raw(routes_ptr) });
     Ok((end - start, elapsed, port))
 }
 
