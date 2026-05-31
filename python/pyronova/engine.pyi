@@ -1,6 +1,6 @@
 """Type stubs for pyronova.engine (Rust extension module)."""
 
-from typing import Optional
+from typing import Any, Optional
 
 def init_logger(level: str, access_log: bool, format: str) -> None:
     """Initialize the Rust tracing engine. Call once at startup.
@@ -48,11 +48,12 @@ class Request:
         Raises ``ValueError`` if the body is not valid UTF-8.
         """
         ...
-    def json(self) -> dict:
+    def json(self) -> Any:
         """Parse the request body as JSON.
 
         Raises ``ValueError`` if the body is not well-formed JSON. The
-        return is typed ``dict`` for the common object payload, but a JSON
+        return is typed ``Any`` because the deserialized value depends on
+        the payload: a JSON object becomes a ``dict``, while a JSON
         array/scalar body deserializes to the corresponding Python type
         (``list``/``str``/``int``/...). Guard with try/except ``ValueError``.
         """
