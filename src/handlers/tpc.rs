@@ -265,7 +265,29 @@ pub(crate) async fn handle_request_tpc_inline(
         return Ok(http_resp);
     }
 
-    // &routes.handler_names[idx] lives long enough — call_handler is sync.
+    // Resolve the handler name up front via a checked lookup. handler_idx
+    // comes from the router, which registers names/flags in lockstep, so
+    // this should always succeed — but if the route table is ever
+    // inconsistent we surface it as an explicit 500 here rather than
+    // letting an out-of-range index panic *inside* the catch_unwind below,
+    // where it would be misreported as a handler panic at line ~304.
+    // call_handler is sync, so the &'static-derived borrow lives long enough.
+    let handler_name = match routes.handler_names.get(handler_idx) {
+        Some(name) => name,
+        None => {
+            tracing::error!(
+                target: "pyronova::handler",
+                handler_idx,
+                handler_count = routes.handler_names.len(),
+                "route table inconsistency: handler_idx out of range"
+            );
+            let mut r = full_body(error_response(
+                "internal error: route table inconsistency",
+            ));
+            apply_cors(&mut r, routes.cors_config.as_ref());
+            return Ok(r);
+        }
+    };
 
     // The inline dispatch: acquire the TPC thread's sub-interp GIL,
     // run the handler, release. Blocks the thread (which is the point —
@@ -277,7 +299,7 @@ pub(crate) async fn handle_request_tpc_inline(
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let _guard = interp::SubInterpGilGuard::acquire(tstate_cell.get(), &tstate_cell);
             worker_ref.call_handler(
-                &routes.handler_names[handler_idx],
+                handler_name,
                 &routes.before_hook_names,
                 &routes.after_hook_names,
                 method_str,
@@ -301,7 +323,7 @@ pub(crate) async fn handle_request_tpc_inline(
                 tracing::error!(
                     target: "pyronova::handler",
                     panic = msg,
-                    handler = %routes.handler_names.get(handler_idx).map(|s| s.as_str()).unwrap_or("?"),
+                    handler = %handler_name,
                     "TPC handler panicked"
                 );
                 Err(format!("internal error: TPC handler panic: {msg}"))
@@ -312,7 +334,7 @@ pub(crate) async fn handle_request_tpc_inline(
     let mut http_resp = super::build_subinterp_http_response(
         result,
         &accept_encoding,
-        routes.handler_names.get(handler_idx).map(|s| s.as_str()),
+        Some(handler_name.as_str()),
     );
     apply_cors(&mut http_resp, routes.cors_config.as_ref());
     let latency_us = start.elapsed().as_micros() as u64;
