@@ -290,19 +290,17 @@ fn set_compression_headers_vec(headers: &mut Vec<(String, String)>, encoding: &'
     headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
     let existing_vary = headers
         .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("vary"))
-        .map(|(k, v)| (k.clone(), v.clone()));
+        .position(|(k, _)| k.eq_ignore_ascii_case("vary"));
     match existing_vary {
-        Some((k, v)) => {
+        Some(idx) => {
+            let v = &headers[idx].1;
             if !v
                 .split(',')
                 .any(|tok| tok.trim().eq_ignore_ascii_case("accept-encoding"))
             {
                 let v_clean = v.trim_end().trim_end_matches(',').trim_end();
                 let new_val = format!("{v_clean}, Accept-Encoding");
-                if let Some(entry) = headers.iter_mut().find(|(ek, _)| ek == &k) {
-                    entry.1 = new_val;
-                }
+                headers[idx].1 = new_val;
             }
         }
         None => {
