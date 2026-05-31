@@ -213,13 +213,20 @@ pub(crate) fn column_to_py(py: Python<'_>, value: PgValueRef<'_>) -> PyResult<Py
             // Snapshot the raw wire bytes first — `sqlx::Decode::decode`
             // consumes the PgValueRef by value, so we can't retry on
             // fallback. Grab the bytes before any decode attempt.
-            let raw = value.as_bytes().ok().map(|b| b.to_vec());
+            // Keep the Err from `as_bytes` instead of discarding it with
+            // `.ok()` — if both the String decode and the raw-byte snapshot
+            // fail, the final error should report *why* the bytes were
+            // unavailable rather than a generic placeholder.
+            let raw: Result<Vec<u8>, String> = value
+                .as_bytes()
+                .map(|b| b.to_vec())
+                .map_err(|e| e.to_string());
             match <String as sqlx::Decode<sqlx::Postgres>>::decode(value) {
                 Ok(s) => Ok(PyString::new(py, &s).into_any().unbind()),
                 Err(_) => match raw {
-                    Some(b) => Ok(PyBytes::new(py, &b).into_any().unbind()),
-                    None => Err(PyRuntimeError::new_err(format!(
-                        "unsupported column type {type_name}: no raw bytes available"
+                    Ok(b) => Ok(PyBytes::new(py, &b).into_any().unbind()),
+                    Err(raw_err) => Err(PyRuntimeError::new_err(format!(
+                        "unsupported column type {type_name}: failed to read raw bytes: {raw_err}"
                     ))),
                 },
             }
