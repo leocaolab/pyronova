@@ -188,11 +188,11 @@ def json_endpoint(req: "Request"):
     count = max(0, min(count, len(DATASET_ITEMS)))
     # A schema-wrong dataset (missing price/quantity on an item) must not
     # KeyError at request time — the load at line ~42 only validates JSON
-    # syntax, not shape. Default the multiplicands to 0 so a malformed
-    # item yields total=0 instead of crashing the /json profile (arc
-    # finding arena-5).
+    # syntax, not shape. Default the multiplicands to 0 (and coerce a null
+    # price/quantity to 0 via `or 0`) so a malformed item yields total=0
+    # instead of crashing the /json profile (arc finding arena-5/arena-app).
     items = [
-        {**dsitem, "total": dsitem.get("price", 0) * dsitem.get("quantity", 0) * m}
+        {**dsitem, "total": (dsitem.get("price", 0) or 0) * (dsitem.get("quantity", 0) or 0) * m}
         for dsitem in DATASET_ITEMS[:count]
     ]
     return {"items": items, "count": count}
@@ -413,6 +413,11 @@ def crud_list(req: "Request"):
         limit = 10
     if limit < 1 or limit > 50:
         limit = 10
+    # Cap page so a pathological `?page=99999999999999999` can't build a
+    # gigantic OFFSET that PG rejects (or that overflows a bind param).
+    # 1M pages × 50/page is far past any real dataset.
+    if page > 1_000_000:
+        page = 1_000_000
     offset = (page - 1) * limit
     try:
         rows = PG_POOL.fetch_all(_CRUD_LIST_SQL, category, limit, offset)
@@ -502,5 +507,18 @@ if __name__ == "__main__":
     # Detect worker count from cgroup cpu.max (same pattern as actix's helper).
     # Pyronova's engine will fall back to num_cpus if PYRONOVA_WORKERS isn't set.
     _tls_ports_env = os.environ.get("PYRONOVA_TLS_PORTS")
-    extra_tls_ports = [int(p) for p in _tls_ports_env.split(",") if p.strip()] if _tls_ports_env else None
+    extra_tls_ports = None
+    if _tls_ports_env:
+        extra_tls_ports = []
+        for _p in _tls_ports_env.split(","):
+            _p = _p.strip()
+            if not _p:
+                continue
+            try:
+                extra_tls_ports.append(int(_p))
+            except ValueError:
+                # Skip junk tokens rather than crashing startup on a
+                # single bad entry in PYRONOVA_TLS_PORTS.
+                log.warning("PYRONOVA_TLS_PORTS: ignoring non-numeric port %r", _p)
+        extra_tls_ports = extra_tls_ports or None
     app.run(host=host, port=port, extra_tls_ports=extra_tls_ports)

@@ -37,18 +37,24 @@ def _numa_nodes() -> int:
         return 1
 
 
+def _parse_port(raw: str) -> int:
+    """Parse the PORT env var, failing with a clear message instead of a
+    raw ValueError traceback from int()."""
+    try:
+        port = int(raw)
+    except (TypeError, ValueError):
+        raise SystemExit(f"invalid PORT: {raw!r} is not an integer")
+    if not (1 <= port <= 65535):
+        raise SystemExit(f"invalid PORT: {port} out of range 1-65535")
+    return port
+
+
 def main() -> int:
     total = _cpu_count()
     per_proc = total
     io_per_proc = per_proc
 
-    _port_raw = os.environ.get("PORT", "8080")
-    try:
-        base_port = int(_port_raw)
-    except ValueError:
-        import logging as _log
-        _log.error("launcher: PORT=%r is not an integer; aborting", _port_raw)
-        return 2
+    base_port = _parse_port(os.environ.get("PORT", "8080"))
     tls_cert = os.environ.get("TLS_CERT", "/certs/server.crt")
     tls_key = os.environ.get("TLS_KEY", "/certs/server.key")
     have_tls = os.path.exists(tls_cert) and os.path.exists(tls_key)
