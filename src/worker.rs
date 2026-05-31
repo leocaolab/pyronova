@@ -50,6 +50,46 @@ where
     }
 }
 
+/// Classify a connection-driver error as a benign client disconnect:
+/// the peer closed/reset/aborted the socket, or hyper saw a partial
+/// message because the peer went away. These are normal under load
+/// and shouldn't be logged as server errors.
+///
+/// Walks the error source chain and matches on the typed
+/// `hyper::Error` predicates and `io::ErrorKind` rather than
+/// substring-matching the `Display` text. Substring matching is
+/// fragile across hyper/dependency versions and, worse, suppresses
+/// unrelated compound errors that merely contain one of the magic
+/// phrases (e.g. `"TLS handshake failed: connection reset by peer"`).
+fn is_benign_disconnect(err: &(dyn std::error::Error + 'static)) -> bool {
+    use std::io::ErrorKind;
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = source {
+        if let Some(hyper_err) = e.downcast_ref::<hyper::Error>() {
+            if hyper_err.is_incomplete_message()
+                || hyper_err.is_closed()
+                || hyper_err.is_canceled()
+                || hyper_err.is_body_write_aborted()
+            {
+                return true;
+            }
+        }
+        if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io_err.kind(),
+                ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof
+            ) {
+                return true;
+            }
+        }
+        source = e.source();
+    }
+    false
+}
+
 /// Generic connection driver.
 ///
 /// - `io`: any `AsyncRead + AsyncWrite + Unpin + 'static + Send`
@@ -90,11 +130,7 @@ pub(crate) async fn drive_conn<IO>(
                 tokio::select! {
                     res = $conn.as_mut() => {
                         if let Err(e) = res {
-                            let msg = e.to_string();
-                            if !msg.contains("connection closed")
-                                && !msg.contains("reset by peer")
-                                && !msg.contains("broken pipe")
-                            {
+                            if !is_benign_disconnect(e.as_ref()) {
                                 tracing::warn!(target: "pyronova::server", error = %e, "Connection error");
                             }
                         }
