@@ -73,7 +73,11 @@ def _load_app(target: str) -> "Pyronova":
 
 
 def _cmd_run(args: argparse.Namespace) -> None:
-    if bool(args.tls_cert) != bool(args.tls_key):
+    # Normalize empty strings to None so `--tls-cert ""` is rejected, not
+    # silently forwarded to app.run() as a bogus file path.
+    tls_cert = args.tls_cert or None
+    tls_key = args.tls_key or None
+    if (tls_cert is None) != (tls_key is None):
         sys.exit("pyronova: --tls-cert and --tls-key must be specified together")
     app = _load_app(args.target)
     app.run(
@@ -82,8 +86,8 @@ def _cmd_run(args: argparse.Namespace) -> None:
         workers=args.workers,
         io_workers=args.io_workers,
         reload=False,
-        tls_cert=args.tls_cert,
-        tls_key=args.tls_key,
+        tls_cert=tls_cert,
+        tls_key=tls_key,
     )
 
 
