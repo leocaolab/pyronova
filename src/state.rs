@@ -55,7 +55,8 @@ impl SharedState {
         self.inner.insert(key, Bytes::from(value));
     }
 
-    /// Get raw bytes value (zero-copy clone via Bytes refcount).
+    /// Get raw bytes value. Copies the stored bytes into a new ``Vec<u8>``
+    /// (required since the value is handed to Python as a ``bytes`` object).
     fn get_bytes(&self, key: &str) -> Option<Vec<u8>> {
         self.inner.get(key).map(|v| v.value().to_vec())
     }
