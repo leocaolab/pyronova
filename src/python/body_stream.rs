@@ -121,7 +121,13 @@ impl PyronovaBodyStream {
         // GIL: released across blocking_recv() so unrelated Python
         // threads (different stream objects, ordinary app code)
         // continue to run.
-        let mut guard = self.rx.lock().unwrap();
+        //
+        // Recover from a poisoned lock rather than `unwrap()`-panicking:
+        // an unwinding panic across the PyO3 FFI boundary can abort the
+        // whole Python process. The guarded value is just
+        // `Option<Receiver>`, which stays structurally valid even if a
+        // prior holder panicked, so `into_inner()` is safe.
+        let mut guard = self.rx.lock().unwrap_or_else(|p| p.into_inner());
         let Some(rx) = guard.as_mut() else {
             return Err(PyStopIteration::new_err("stream exhausted"));
         };
@@ -189,7 +195,10 @@ impl PyronovaBodyStream {
         // __next__ or drain_count racing drain_count) block on the
         // lock and then observe `None` — returning 0 — because the
         // first caller marked the stream exhausted.
-        let mut guard = self.rx.lock().unwrap();
+        //
+        // Recover from poison instead of panicking across the FFI
+        // boundary (see __next__ for rationale).
+        let mut guard = self.rx.lock().unwrap_or_else(|p| p.into_inner());
         let Some(rx) = guard.as_mut() else {
             return Ok(0);
         };
