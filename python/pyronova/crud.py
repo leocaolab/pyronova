@@ -182,7 +182,12 @@ def register_crud(
             )
         try:
             rows = pool.fetch_all(list_sql, limit, offset)
-        except RuntimeError:
+        except Exception:
+            # PgPool raises RuntimeError for DB errors per its contract, but a
+            # contract violation (pool closed, internal bug, a future driver
+            # raising a different type) must still surface as a clean logged
+            # 500 here rather than escaping to the framework's top-level
+            # handler, which may leak a full traceback to the client.
             _log.exception("list_rows: fetch_all failed")
             return Response(body={"error": "database error"}, status_code=500)
         return rows
@@ -208,7 +213,7 @@ def register_crud(
             return Response(body={"error": "invalid id"}, status_code=400)
         try:
             row = pool.fetch_one(get_sql, id_val)
-        except RuntimeError:
+        except Exception:
             _log.exception("get_row: fetch_one failed")
             return Response(body={"error": "database error"}, status_code=500)
         if row is None:
@@ -244,7 +249,7 @@ def register_crud(
         args = [body[c] for c in present]
         try:
             row = pool.fetch_one(insert_sql, *args)
-        except RuntimeError:
+        except Exception:
             _log.exception("create_row: DB error on INSERT into %s", table)
             return Response(body={"error": "database error"}, status_code=500)
         return Response(body=row, status_code=201)
@@ -290,7 +295,7 @@ def register_crud(
         args = [body[c] for c in present] + [id_val]
         try:
             row = pool.fetch_one(update_sql, *args)
-        except RuntimeError:
+        except Exception:
             _log.exception("update_row: DB error on UPDATE in %s", table)
             return Response(body={"error": "database error"}, status_code=500)
         if row is None:
@@ -318,7 +323,7 @@ def register_crud(
             return Response(body={"error": "invalid id"}, status_code=400)
         try:
             affected = pool.execute(delete_sql, id_val)
-        except RuntimeError:
+        except Exception:
             _log.exception("delete_row: DB error on DELETE from %s", table)
             return Response(body={"error": "database error"}, status_code=500)
         if affected == 0:
