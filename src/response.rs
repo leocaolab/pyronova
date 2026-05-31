@@ -32,8 +32,12 @@ fn get_or_init_json_dumps(py: Python<'_>) -> pyo3::PyResult<pyo3::Bound<'_, pyo3
         c"pyronova_json",
     )?;
     let f = module.getattr("dumps")?;
-    let _ = ORJSON_HELPER.set(f.clone().unbind());
-    Ok(f)
+    // Resolve the race: if another thread won the `set`, discard our local `f`
+    // and return the cached winner so every caller sees the same singleton.
+    match ORJSON_HELPER.set(f.clone().unbind()) {
+        Ok(()) => Ok(f),
+        Err(_) => Ok(ORJSON_HELPER.get().unwrap().bind(py).clone()),
+    }
 }
 
 fn orjson_dumps(py: Python<'_>, obj: &pyo3::Bound<'_, pyo3::PyAny>) -> Result<Bytes, String> {
