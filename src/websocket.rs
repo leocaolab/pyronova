@@ -198,7 +198,12 @@ pub(crate) async fn handle_websocket(
                 Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .body(Full::new(Bytes::from_static(b"no websocket handler")))
-                    .unwrap(),
+                    .unwrap_or_else(|_| {
+                        // builder() only fails on invalid status/headers, which
+                        // cannot happen with these literal inputs — fall back to a
+                        // plain response instead of panicking on the impossible case.
+                        Response::new(Full::new(Bytes::from_static(b"no websocket handler")))
+                    }),
             ));
         }
     };
