@@ -86,9 +86,15 @@ def main() -> int:
     env["PYRONOVA_LOG_LEVEL"] = "OFF"
 
     if have_tls:
+        tls_port = base_port + 1
+        if tls_port > 65535:
+            raise SystemExit(
+                f"invalid TLS port: PORT={base_port} leaves no room for the "
+                f"TLS companion port {tls_port} (max 65535); use PORT<=65534"
+            )
         env["PYRONOVA_TLS_CERT"] = tls_cert
         env["PYRONOVA_TLS_KEY"] = tls_key
-        env["PYRONOVA_TLS_PORTS"] = f"{base_port + 1},8443"
+        env["PYRONOVA_TLS_PORTS"] = f"{tls_port},8443"
     else:
         env.pop("PYRONOVA_TLS_CERT", None)
         env.pop("PYRONOVA_TLS_KEY", None)
