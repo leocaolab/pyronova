@@ -461,6 +461,10 @@ def crud_update(req: "Request"):
         item_id = int(req.params["id"])
         body = json.loads(req.body) if req.body else {}
     except (KeyError, ValueError, TypeError):
+        # Parse error (bad JSON / non-int id) and schema error (missing key)
+        # both map to 400, but log the actual exception so the distinction
+        # survives for debugging.
+        log.info("/crud/items update: bad request", exc_info=True)
         return _BAD_REQUEST
     name = body.get("name") or "Updated"
     try:
@@ -489,6 +493,10 @@ def crud_upsert(req: "Request"):
         body = json.loads(req.body) if req.body else {}
         item_id = int(body["id"])
     except (KeyError, ValueError, TypeError):
+        # Parse error (bad JSON / non-int id) and schema error (missing key)
+        # both map to 400, but log the actual exception so the distinction
+        # survives for debugging.
+        log.info("/crud/items upsert: bad request", exc_info=True)
         return _BAD_REQUEST
     name = body.get("name") or "New Product"
     category = body.get("category") or "test"
