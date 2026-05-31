@@ -445,20 +445,26 @@ impl PyronovaApp {
             if let Some(ref acc) = tls_acceptor {
                 extra_tls_ports
                     .iter()
-                    .filter_map(|&p| {
-                        let parsed = format!("{host}:{p}").parse::<SocketAddr>().ok();
-                        if parsed.is_none() {
-                            // arc src-app-3: previously silently dropped.
-                            tracing::warn!(
-                                target: "pyronova::server",
-                                port = p,
-                                "extra TLS port could not be parsed into SocketAddr; \
-                                 dropped — operator may believe this port is TLS-protected"
-                            );
-                        }
-                        parsed.map(|sa| (sa, Arc::clone(acc)))
+                    .map(|&p| -> PyResult<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)> {
+                        // arc src-app-3: a TLS port that fails to parse must NOT
+                        // be silently dropped. A warn-and-drop leaves the operator
+                        // believing the port is TLS-protected when it was never
+                        // opened at all — a security-UX trap. Fail fast at startup
+                        // (mirrors the cert/key validation above) so the
+                        // misconfiguration is impossible to miss.
+                        let sa = format!("{host}:{p}")
+                            .parse::<SocketAddr>()
+                            .map_err(|e: std::net::AddrParseError| {
+                                pyo3::exceptions::PyValueError::new_err(format!(
+                                    "extra TLS port {p} could not be parsed into a socket \
+                                     address (\"{host}:{p}\"): {e}. Refusing to start: an \
+                                     unparseable TLS port must never be silently dropped, \
+                                     since the operator expects this port to be TLS-protected."
+                                ))
+                            })?;
+                        Ok((sa, Arc::clone(acc)))
                     })
-                    .collect()
+                    .collect::<PyResult<Vec<_>>>()?
             } else {
                 if !extra_tls_ports.is_empty() {
                     // arc src-app-4: TLS ports configured but no cert =
