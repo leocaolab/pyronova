@@ -123,6 +123,15 @@ def set_cookie(
 
     parts = [f"{name}={value}"]
     if max_age is not None:
+        # Max-Age must be an integer number of seconds (RFC 6265 §5.2.2).
+        # The type hint is not enforced at runtime, so a non-int (e.g. a
+        # str like "0\r\nSet-Cookie: admin=1") would otherwise be
+        # interpolated verbatim and could inject headers. bool is an int
+        # subclass but never a meaningful Max-Age, so reject it too.
+        if isinstance(max_age, bool) or not isinstance(max_age, int):
+            raise ValueError(
+                f"cookie max_age must be an int (got {type(max_age).__name__})"
+            )
         parts.append(f"Max-Age={max_age}")
     if expires:
         parts.append(f"Expires={expires}")
