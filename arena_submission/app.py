@@ -429,10 +429,12 @@ def crud_list(req: "Request"):
             page = 1
     except ValueError:
         page = 1
+        log.warning("/crud/items list: bad page param %r", q.get("page"), exc_info=True)
     try:
         limit = int(q.get("limit", "10"))
     except ValueError:
         limit = 10
+        log.warning("/crud/items list: bad limit param %r", q.get("limit"), exc_info=True)
     if limit < 1 or limit > 50:
         limit = 10
     # Cap page so a pathological `?page=99999999999999999` can't build a
