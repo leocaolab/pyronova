@@ -225,4 +225,31 @@ async def _pyronova_engine():
             _log.exception("asyncio shutdown error")
 
 
+# Fail-fast contract check. Every name below is injected into this module's
+# namespace by the Rust host at sub-interpreter creation — C-FFI bridge
+# functions (_pyronova_recv/_pyronova_send), the _Request/_Response pyclasses,
+# and template-substituted constants (WORKER_ID, HANDLER_NAMES,
+# _pyronova_pool_id). None of them can be defined in Python. If injection ever
+# fails, surface it here with a clear diagnostic on the main thread BEFORE the
+# engine starts — otherwise the first missing reference (e.g. _pyronova_recv)
+# raises NameError inside the fetcher thread, which its except-Exception
+# back-off loop catches and retries forever, pinning a core and flooding logs.
+_REQUIRED_INJECTED = (
+    "WORKER_ID",
+    "HANDLER_NAMES",
+    "_pyronova_pool_id",
+    "_pyronova_recv",
+    "_pyronova_send",
+    "_Request",
+    "_Response",
+)
+_missing = [_name for _name in _REQUIRED_INJECTED if _name not in globals()]
+if _missing:
+    raise RuntimeError(
+        "pyronova async engine: required Rust-injected globals missing: "
+        + ", ".join(_missing)
+        + " — the sub-interpreter namespace was not populated by the host; "
+        "refusing to start the fetcher thread"
+    )
+
 asyncio.run(_pyronova_engine())
