@@ -52,7 +52,7 @@ class RPCClient:
         encoded_name = urllib.parse.quote(method_name, safe="")
 
         def remote_call(**kwargs):
-            if self.use_msgpack:
+            if self.use_msgpack and HAS_MSGPACK:
                 payload = msgpack.packb(kwargs, use_bin_type=True)
                 content_type = "application/msgpack"
             else:
