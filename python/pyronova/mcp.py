@@ -414,6 +414,19 @@ class MCPServer:
             raise ValueError(f"Unknown prompt: {prompt_name}")
 
         arguments = params.get("arguments", {})
+        if not isinstance(arguments, dict):
+            raise ValueError(f"prompt arguments must be an object, got {type(arguments).__name__}")
+        # Defense-in-depth: mirror _handle_tools_call — verify declared
+        # required arguments are present before invoking, so a missing
+        # argument yields a clear validation error rather than an opaque
+        # TypeError from handler(**arguments) (arc finding mcp-56).
+        missing = [
+            a["name"]
+            for a in prompt["arguments"]
+            if a.get("required") and a["name"] not in arguments
+        ]
+        if missing:
+            raise ValueError(f"missing required argument(s): {missing}")
         result = _resolve(prompt["handler"](**arguments))
 
         return {

@@ -200,6 +200,16 @@ class TestClient:
             except OSError:
                 pass
 
+        # The thread may have died during the final probe iteration (after the
+        # top-of-loop is_alive check, while open() raised URLError/OSError).
+        # Prefer the informative crash diagnostic over the generic timeout.
+        if not self._thread.is_alive():
+            err = self._server_error
+            raise RuntimeError(
+                f"TestClient: server thread exited before accepting connections"
+                + (f": {type(err).__name__}: {err}" if err else "")
+            )
+
         raise RuntimeError("TestClient: server failed to start within 5s")
 
     def close(self):

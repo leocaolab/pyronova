@@ -21,6 +21,14 @@ def redirect(url: str, status_code: int = 302) -> Response:
         def moved(req):
             return redirect("/new-home", status_code=301)
     """
+    # A redirect that isn't a 3xx is a contract violation: the browser
+    # won't follow the Location header. Reject non-redirect codes up front
+    # rather than emitting a response that silently does nothing.
+    if status_code not in (301, 302, 303, 307, 308):
+        raise ValueError(
+            f"invalid redirect status code {status_code}; "
+            f"must be one of 301, 302, 303, 307, 308"
+        )
     # Reject CR/LF/NUL — the same HTTP Response Splitting class of attack
     # the cookie helpers defend against. Open-redirect (scheme/host
     # allow-list) is left to the caller; we only block header injection.

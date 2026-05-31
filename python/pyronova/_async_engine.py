@@ -12,6 +12,7 @@ Template variables (replaced by Rust before exec):
 import asyncio
 import logging
 import threading
+import time
 
 _log = logging.getLogger("pyronova.async")
 
@@ -121,6 +122,7 @@ async def _process_request(req_id, handler_idx, method, path, params, query, bod
 
 
 def _fetcher_thread(loop):
+    consecutive_errors = 0
     while True:
         try:
             # The pool_id argument is the zombie-worker guard (see
@@ -134,8 +136,38 @@ def _fetcher_thread(loop):
                 _process_request(req_id, handler_idx, method, path, params, query, body_bytes, headers, client_ip),
                 loop,
             )
-        except Exception:
+            consecutive_errors = 0
+        except RuntimeError:
+            # run_coroutine_threadsafe raises RuntimeError once the event loop
+            # is closed (interpreter teardown / shutdown race). This is fatal
+            # and non-recoverable — retrying only spins the CPU and spams logs.
+            if loop.is_closed():
+                _log.info(
+                    "worker=%s fetcher: event loop closed — exiting", WORKER_ID
+                )
+                break
+            # A RuntimeError while the loop is still alive is unexpected but
+            # potentially transient; fall through to the retriable path.
+            consecutive_errors += 1
             _log.exception("worker=%s fetcher error — continuing", WORKER_ID)
+            time.sleep(min(0.05 * consecutive_errors, 1.0))
+        except Exception:
+            # Retriable error (e.g. recv unpacking failure, transient
+            # scheduling failure). Back off proportionally so a persistent
+            # error does not pin a core or flood the log.
+            #
+            # A closed loop is fatal here too: if the loop is torn down while
+            # this path keeps firing (e.g. OOM during shutdown), the back-off
+            # would never exit and the worker would burn CPU until killed.
+            # Mirror the RuntimeError branch and exit on a closed loop.
+            if loop.is_closed():
+                _log.info(
+                    "worker=%s fetcher: event loop closed — exiting", WORKER_ID
+                )
+                break
+            consecutive_errors += 1
+            _log.exception("worker=%s fetcher error — continuing", WORKER_ID)
+            time.sleep(min(0.05 * consecutive_errors, 1.0))
 
 
 async def _pyronova_engine():
@@ -177,7 +209,15 @@ async def _pyronova_engine():
             for task in pending:
                 task.cancel()
             if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
+                # Bound the drain so a task that ignores cancellation cannot
+                # block Py_EndInterpreter forever; matches the 30s zombie guard.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending, return_exceptions=True),
+                        timeout=30.0,
+                    )
+                except asyncio.TimeoutError:
+                    pass
             await loop.shutdown_asyncgens()
         except Exception:
             # Shutdown is best-effort; any exception here is better

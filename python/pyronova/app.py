@@ -6,6 +6,7 @@ import time
 import sys
 from typing import Callable, TypedDict
 import inspect
+import json as _json_module
 
 import os
 
@@ -513,14 +514,34 @@ class Pyronova:
                 allow_credentials=True,
             )
         """
-        if isinstance(allow_origins, list):
-            allow_origins = ", ".join(allow_origins)
-        if isinstance(allow_methods, list):
-            allow_methods = ", ".join(allow_methods)
-        if isinstance(allow_headers, list):
-            allow_headers = ", ".join(allow_headers)
-        if isinstance(expose_headers, list):
-            expose_headers = ", ".join(expose_headers)
+        def _normalize_cors_value(name: str, value: object) -> str:
+            # Contract is `str | list[str]`, but accept any non-str
+            # sequence (e.g. tuple) too. Reject everything else loudly
+            # so a bad value can never reach `.split(",")` below as a
+            # non-str and blow up with an opaque AttributeError.
+            if isinstance(value, str):
+                return value
+            if isinstance(value, (list, tuple)):
+                # str(o) would silently coerce ints/None/objects into
+                # syntactically-valid-but-wrong header tokens (e.g.
+                # [None, 8080] -> "None, 8080"). Reject mixed types loudly
+                # so a typo fails at config time, not as a broken header.
+                if not all(isinstance(o, str) for o in value):
+                    bad = next(o for o in value if not isinstance(o, str))
+                    raise TypeError(
+                        f"CORS: {name} list/tuple must contain only str, "
+                        f"got {type(bad).__name__}"
+                    )
+                return ", ".join(value)
+            raise TypeError(
+                f"CORS: {name} must be a str or list/tuple of str, "
+                f"got {type(value).__name__}"
+            )
+
+        allow_origins = _normalize_cors_value("allow_origins", allow_origins)
+        allow_methods = _normalize_cors_value("allow_methods", allow_methods)
+        allow_headers = _normalize_cors_value("allow_headers", allow_headers)
+        expose_headers = _normalize_cors_value("expose_headers", expose_headers)
 
         # W3C CORS spec forbids `Access-Control-Allow-Origin: *` together
         # with `Access-Control-Allow-Credentials: true` — browsers silently
@@ -840,7 +861,19 @@ class Pyronova:
 
             2026-03-24 17:30:01 [INFO]  GET /api/trade → 200 (2.3ms)
             2026-03-24 17:30:01 [ERROR] POST /rpc/add → 500 (0.4ms) TypeError: ...
+
+        Idempotent and thread-safe (matches the other ``enable_*`` helpers):
+        the before/after hooks below are *appended* to the engine, not
+        deduped, so a second call — e.g. a manual ``enable_logging()`` racing
+        the ``run()`` auto-enable, or two startup threads — would log every
+        request twice. Claim the right to initialize under ``_enable_lock``;
+        any subsequent call returns a no-op.
         """
+        with self._enable_lock:
+            if getattr(self, "_logging_enabled", False):
+                return
+            self._logging_enabled = True
+
         from datetime import datetime
 
         import threading as _threading
@@ -1009,8 +1042,6 @@ class Pyronova:
                             f"PYRONOVA_TLS_PORTS contains non-integer port {p!r}"
                         ) from None
                 extra_tls_ports = parsed
-            else:
-                extra_tls_ports = None
 
         # Hot reload: watch .py files, restart on change
         reload = reload or os.environ.get("PYRONOVA_RELOAD") == "1"
@@ -1018,10 +1049,11 @@ class Pyronova:
             self._run_with_reload()
             return
 
-        # Auto-enable logging if PYRONOVA_LOG=1 or debug=True
-        if (os.environ.get("PYRONOVA_LOG") == "1" or self.debug) and not hasattr(self, "_logging_enabled"):
+        # Auto-enable logging if PYRONOVA_LOG=1 or debug=True.
+        # enable_logging() is itself idempotent + lock-guarded, so no
+        # external lock or flag bookkeeping is needed here.
+        if os.environ.get("PYRONOVA_LOG") == "1" or self.debug:
             self.enable_logging()
-            self._logging_enabled = True
 
         # Initialize Rust tracing engine (deferred from __init__ so
         # enable_logging() can adjust the config first)
@@ -1040,13 +1072,12 @@ class Pyronova:
             mcp = self._mcp
 
             def _mcp_handler(req):
-                import json as _json
                 try:
                     body = req.text()
                     result = mcp.handle_request(body)
                 except Exception:
                     _logging.getLogger("pyronova.mcp").exception("MCP handler error")
-                    result = _json.dumps({
+                    result = _json_module.dumps({
                         "jsonrpc": "2.0",
                         "id": None,
                         "error": {"code": -32603, "message": "Internal error"},
