@@ -147,7 +147,7 @@ def main() -> int:
                 rc = proc.poll()
             # os._exit terminates all threads (including this daemon thread);
             # sys.exit(0) from a daemon thread only kills the daemon thread.
-            os._exit(rc if rc is not None and rc > 0 else 0)
+            os._exit(1 if rc is None else (128 + abs(rc) if rc < 0 else rc))
         threading.Thread(target=_cleanup, daemon=True).start()
 
     signal.signal(signal.SIGTERM, shutdown)
