@@ -11,7 +11,6 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 
@@ -83,7 +82,13 @@ pub(crate) async fn handle_request_subinterp(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
-    let _submit_permit = if !is_gil_route && content_length > ADMISSION_SKIP_BYTES {
+    // Fast path: an *honestly* declared large body takes its permit
+    // upfront so we can reject before reading a byte. A client that
+    // under-declares (or omits Content-Length via chunked / HTTP-2
+    // framing, which parses to 0) slips past here — the buffered collect
+    // below re-checks against bytes actually received and acquires the
+    // permit lazily, so the memory bound holds regardless of the header.
+    let mut submit_permit = if !is_gil_route && content_length > ADMISSION_SKIP_BYTES {
         match pool.submit_semaphore.clone().try_acquire_owned() {
             Ok(p) => Some(p),
             Err(_) => {
@@ -135,24 +140,39 @@ pub(crate) async fn handle_request_subinterp(
             Some(Arc::new(std::sync::Mutex::new(Some(rx)))),
         )
     } else {
-        use http_body_util::Limited;
-        let limited = Limited::new(body_obj, max_body_size());
-        match tokio::time::timeout(std::time::Duration::from_secs(30), limited.collect()).await {
-            Ok(Ok(c)) => (c.to_bytes(), None),
-            Ok(Err(e)) => {
-                let mut r = if e
-                    .downcast_ref::<http_body_util::LengthLimitError>()
-                    .is_some()
-                {
-                    full_body(payload_too_large_response())
-                } else {
-                    tracing::warn!(target: "pyronova::handler", error = %e, "body read error");
-                    full_body(crate::response::error_response("body read failed"))
-                };
+        // Buffered collect with lazy admission: the permit is acquired
+        // here if the body's *actual* size crosses the threshold, even
+        // when Content-Length claimed otherwise. GIL routes never gate.
+        use super::AdmissionCollect;
+        let outcome = super::collect_body_with_admission(
+            body_obj,
+            max_body_size(),
+            !is_gil_route,
+            ADMISSION_SKIP_BYTES,
+            &pool.submit_semaphore,
+            &mut submit_permit,
+        )
+        .await;
+        match outcome {
+            AdmissionCollect::Body(b) => (b, None),
+            AdmissionCollect::Overloaded => {
+                crate::monitor::DROPPED_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut r = full_body(overloaded_response("server overloaded"));
                 apply_cors(&mut r, pool.cors_config.as_ref());
                 return Ok(r);
             }
-            Err(_) => {
+            AdmissionCollect::TooLarge => {
+                let mut r = full_body(payload_too_large_response());
+                apply_cors(&mut r, pool.cors_config.as_ref());
+                return Ok(r);
+            }
+            AdmissionCollect::ReadError(e) => {
+                tracing::warn!(target: "pyronova::handler", error = %e, "body read error");
+                let mut r = full_body(crate::response::error_response("body read failed"));
+                apply_cors(&mut r, pool.cors_config.as_ref());
+                return Ok(r);
+            }
+            AdmissionCollect::Timeout => {
                 let mut r = full_body(crate::response::gateway_timeout_response());
                 apply_cors(&mut r, pool.cors_config.as_ref());
                 return Ok(r);

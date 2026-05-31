@@ -63,6 +63,74 @@ pub(crate) async fn collect_body_bounded(body: Incoming) -> Result<Vec<u8>, Resp
     }
 }
 
+/// Outcome of an admission-aware body collect.
+pub(crate) enum AdmissionCollect {
+    /// Body collected in full (permit acquired iff it crossed the gate).
+    Body(Bytes),
+    /// Body exceeded `max` — caller should 413.
+    TooLarge,
+    /// Body crossed the admission threshold but no permit was free — 503.
+    Overloaded,
+    /// Transport-level read error.
+    ReadError(hyper::Error),
+    /// Collection exceeded the 30s budget — caller should 504.
+    Timeout,
+}
+
+/// Collect a request body up to `max`, acquiring the admission permit
+/// *lazily* once the bytes that have actually landed in our buffer cross
+/// `skip_bytes`.
+///
+/// The caller's upfront permit decision keys off the `Content-Length`
+/// header, which is client-controlled: a body sent with chunked transfer
+/// encoding or HTTP/2 framing carries no length (parses to 0), and a
+/// malicious client can simply under-declare it. Either way the upfront
+/// gate is skipped and a large body would stream straight past the
+/// admission control the semaphore is meant to enforce. Re-checking
+/// against bytes we have genuinely buffered closes that gap: the header
+/// is only ever a fast-path hint, never a way to bypass the memory bound.
+///
+/// `gate == false` (GIL routes) collects with the size cap and timeout
+/// but never touches the semaphore.
+pub(crate) async fn collect_body_with_admission(
+    body: Incoming,
+    max: usize,
+    gate: bool,
+    skip_bytes: u64,
+    semaphore: &Arc<tokio::sync::Semaphore>,
+    permit: &mut Option<tokio::sync::OwnedSemaphorePermit>,
+) -> AdmissionCollect {
+    let mut body = body;
+    let mut collected: Vec<u8> = Vec::new();
+    let fut = async {
+        loop {
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    // Trailer/non-data frames carry no body bytes — ignore.
+                    if let Ok(data) = frame.into_data() {
+                        if collected.len().saturating_add(data.len()) > max {
+                            return AdmissionCollect::TooLarge;
+                        }
+                        collected.extend_from_slice(&data);
+                        if gate && permit.is_none() && collected.len() as u64 > skip_bytes {
+                            match semaphore.clone().try_acquire_owned() {
+                                Ok(p) => *permit = Some(p),
+                                Err(_) => return AdmissionCollect::Overloaded,
+                            }
+                        }
+                    }
+                }
+                Some(Err(e)) => return AdmissionCollect::ReadError(e),
+                None => return AdmissionCollect::Body(Bytes::from(collected)),
+            }
+        }
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(30), fut).await {
+        Ok(outcome) => outcome,
+        Err(_) => AdmissionCollect::Timeout,
+    }
+}
+
 /// Default max request body size (10 MB). Configurable via `app.max_body_size`.
 const DEFAULT_MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 
