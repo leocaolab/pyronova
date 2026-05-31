@@ -80,7 +80,17 @@ pub(crate) async fn handle_request(
             match tokio::time::timeout(std::time::Duration::from_secs(30), limited.collect()).await
             {
                 Ok(Ok(c)) => c.to_bytes(),
-                Ok(Err(_)) => {
+                Ok(Err(e)) => {
+                    // `Limited::collect` fails either because the size cap was
+                    // exceeded or because the underlying body produced an IO /
+                    // protocol error. We respond 413 in both cases (the body is
+                    // unusable regardless), but log the cause so a non-size
+                    // failure isn't silently misreported as "too large".
+                    tracing::warn!(
+                        target: "pyronova::server",
+                        error = %e,
+                        "request body collection failed; responding 413"
+                    );
                     let mut r = full_body(payload_too_large_response());
                     apply_cors(&mut r, routes.cors_config.as_ref());
                     return Ok(r);
