@@ -351,7 +351,10 @@ pub(crate) fn build_fast_response(
     }
     builder
         .body(Full::new(fr.body.clone()))
-        .unwrap_or_else(|_| error_response("invalid fast response"))
+        .unwrap_or_else(|e| {
+            tracing::error!(target: "pyronova::server", error = %e, "failed to build fast response body");
+            error_response("invalid fast response")
+        })
 }
 
 /// Feeder task for `stream=True` routes. Reads one hyper body frame at a
