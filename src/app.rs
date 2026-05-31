@@ -462,15 +462,16 @@ impl PyronovaApp {
             } else {
                 if !extra_tls_ports.is_empty() {
                     // arc src-app-4: TLS ports configured but no cert =
-                    // ports are never opened. Operators expect TLS on
-                    // these; silent no-op is dangerous (security UX).
-                    tracing::warn!(
-                        target: "pyronova::server",
-                        ports = ?extra_tls_ports,
-                        "extra_tls_ports configured but tls_cert/tls_key not set; \
-                         these ports will NOT be opened as TLS — provide cert+key \
-                         or remove the port list to silence this warning"
-                    );
+                    // ports would never be opened. Operators expect TLS on
+                    // these; a silent (or merely warned) no-op leaves them
+                    // believing the ports are protected when they are not.
+                    // This is a security misconfiguration — fail fast at
+                    // startup rather than serve in a misleading state.
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "extra_tls_ports {extra_tls_ports:?} configured but tls_cert/tls_key \
+                         not set; these ports cannot be opened as TLS. Provide tls_cert+tls_key \
+                         or remove the port list."
+                    )));
                 }
                 vec![]
             };
