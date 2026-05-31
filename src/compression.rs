@@ -122,6 +122,10 @@ fn negotiate(accept_encoding: &str, mask: usize) -> Option<Algo> {
                     if p.len() >= 2 && p[..2].eq_ignore_ascii_case("q=") {
                         // Malformed q-value → 0.0 (disabled), not 1.0 (max preference).
                         q = p[2..].trim().parse().unwrap_or(0.0);
+                        // First q= wins; duplicate params (e.g. `br;q=1.0;q=0.0`)
+                        // have undefined semantics, so don't let a later write
+                        // silently flip the preference. Take the first, stop.
+                        break;
                     }
                 }
                 (n.trim(), q)

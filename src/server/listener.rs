@@ -19,13 +19,26 @@ pub(crate) fn setup_tcp_quickack(stream: &tokio::net::TcpStream) {
         use std::os::unix::io::AsRawFd;
         let fd = stream.as_raw_fd();
         let val: libc::c_int = 1;
-        unsafe {
+        let rc = unsafe {
             libc::setsockopt(
                 fd,
                 libc::SOL_TCP,
                 libc::TCP_QUICKACK,
                 &val as *const _ as *const libc::c_void,
                 std::mem::size_of_val(&val) as libc::socklen_t,
+            )
+        };
+        // Mirror the TCP_DEFER_ACCEPT handling in create_reuseport_listener:
+        // a silent failure here disables the latency optimization (delayed
+        // ACKs creep back in) with no trace, making it look mysteriously
+        // absent under load. Log so the missing knob is observable.
+        if rc != 0 {
+            let errno = std::io::Error::last_os_error();
+            tracing::warn!(
+                target: "pyronova::server",
+                ?errno,
+                "setsockopt(TCP_QUICKACK) failed; delayed-ACK latency \
+                 optimization is disabled on this socket"
             );
         }
     }
