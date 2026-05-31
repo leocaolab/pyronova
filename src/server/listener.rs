@@ -130,19 +130,50 @@ pub(crate) fn create_reuseport_listener(addr: SocketAddr) -> Result<std::net::Tc
 /// Transient per-connection errors (ECONNABORTED etc.) get a tiny yield to
 /// avoid degenerate tight loops without meaningfully delaying legitimate traffic.
 pub(crate) async fn handle_accept_error(e: &std::io::Error) {
-    let backoff_ms = match e.raw_os_error() {
-        Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOBUFS) | Some(libc::ENOMEM) => {
-            tracing::error!(
-                target: "pyronova::server",
-                error = %e,
-                "accept() resource exhaustion — backing off 250ms",
-            );
-            250
-        }
-        _ => {
-            tracing::warn!(target: "pyronova::server", error = %e, "accept() error");
-            10
-        }
+    let backoff_ms = if is_resource_exhaustion(e) {
+        tracing::error!(
+            target: "pyronova::server",
+            error = %e,
+            "accept() resource exhaustion — backing off 250ms",
+        );
+        250
+    } else {
+        tracing::warn!(target: "pyronova::server", error = %e, "accept() error");
+        10
     };
     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+}
+
+/// Whether an accept() error signals resource exhaustion (out of file
+/// descriptors / socket handles / kernel buffers) versus a transient
+/// per-connection error. `raw_os_error()` returns platform-native codes,
+/// so the constants must be matched per-platform: Unix errnos here, the
+/// `WSAE*` WinSock codes on Windows (e.g. WSAEMFILE=10024, *not* the CRT
+/// EMFILE=24 returned for non-socket errors).
+fn is_resource_exhaustion(e: &std::io::Error) -> bool {
+    match e.raw_os_error() {
+        Some(code) => {
+            #[cfg(unix)]
+            {
+                matches!(
+                    code,
+                    libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM
+                )
+            }
+            #[cfg(windows)]
+            {
+                // WSAEMFILE (no more socket handles), WSAENOBUFS (no buffer
+                // space). Windows has no socket-level ENFILE/ENOMEM analogue.
+                const WSAEMFILE: i32 = 10024;
+                const WSAENOBUFS: i32 = 10055;
+                matches!(code, WSAEMFILE | WSAENOBUFS)
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                let _ = code;
+                false
+            }
+        }
+        None => false,
+    }
 }
