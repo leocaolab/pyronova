@@ -32,7 +32,7 @@ use futures_util::stream;
 use http_body_util::{BodyExt, LengthLimitError, Limited, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::header::HeaderValue;
-use hyper::{HeaderMap, Request, Response, StatusCode};
+use hyper::{HeaderMap, Request, Response};
 
 use crate::handlers::BoxBody;
 
@@ -197,11 +197,14 @@ fn grpc_reply_trailers(
     ));
     let boxed: BoxBody = body.boxed();
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/grpc")
-        .body(boxed)
-        .unwrap()
+    // Build infallibly: Response::new defaults to 200 OK, and inserting a
+    // 'static header value never errors — no unwrap / panic path.
+    let mut response = Response::new(boxed);
+    response.headers_mut().insert(
+        "content-type",
+        HeaderValue::from_static("application/grpc"),
+    );
+    response
 }
 
 fn read_varint(input: &[u8]) -> Option<(u64, &[u8])> {
