@@ -28,12 +28,14 @@ pub(crate) fn setup_tcp_quickack(stream: &tokio::net::TcpStream) {
                 std::mem::size_of_val(&val) as libc::socklen_t,
             )
         };
+        // Capture errno immediately after the syscall, before the branch test
+        // or anything else can clobber the thread-local errno.
+        let errno = std::io::Error::last_os_error();
         // Mirror the TCP_DEFER_ACCEPT handling in create_reuseport_listener:
         // a silent failure here disables the latency optimization (delayed
         // ACKs creep back in) with no trace, making it look mysteriously
         // absent under load. Log so the missing knob is observable.
         if rc != 0 {
-            let errno = std::io::Error::last_os_error();
             tracing::warn!(
                 target: "pyronova::server",
                 ?errno,
@@ -100,12 +102,14 @@ pub(crate) fn create_reuseport_listener(addr: SocketAddr) -> Result<std::net::Tc
                 std::mem::size_of_val(&secs) as libc::socklen_t,
             )
         };
+        // Capture errno immediately after the syscall, before the branch test
+        // or anything else can clobber the thread-local errno.
+        let errno = std::io::Error::last_os_error();
         // Silent failure here disables the DoS mitigation the doc
         // comment above describes (cold-connect floods burning FDs).
         // Log so the missing optimization is observable instead of
         // mysteriously absent at scale (arc finding listener-2).
         if rc != 0 {
-            let errno = std::io::Error::last_os_error();
             tracing::warn!(
                 target: "pyronova::server",
                 ?errno,
