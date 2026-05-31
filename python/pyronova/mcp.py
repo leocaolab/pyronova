@@ -367,6 +367,57 @@ class MCPServer:
         if missing:
             raise ValueError(f"missing required argument(s): {missing}")
         handler = tool["handler"]
+        # Validate that the handler can actually consume this argument set
+        # before splatting, so a signature mismatch (unexpected keys,
+        # positional-only params, or missing non-schema params) yields a clear
+        # validation error rather than an opaque TypeError (arc finding ISSUE-37).
+        try:
+            sig = inspect.signature(handler)
+        except (ValueError, TypeError):
+            sig = None
+        if sig is not None:
+            sig_params = list(sig.parameters.values())
+            accepts_var_kw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params
+            )
+            positional_only = [
+                p.name
+                for p in sig_params
+                if p.kind == inspect.Parameter.POSITIONAL_ONLY
+            ]
+            if positional_only:
+                raise ValueError(
+                    f"tool handler has positional-only parameter(s) that "
+                    f"cannot be supplied by name: {positional_only}"
+                )
+            by_name = {
+                p.name
+                for p in sig_params
+                if p.kind
+                in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                )
+            }
+            if not accepts_var_kw:
+                unexpected = sorted(set(arguments) - by_name)
+                if unexpected:
+                    raise ValueError(f"unexpected argument(s): {unexpected}")
+            missing_params = [
+                p.name
+                for p in sig_params
+                if p.kind
+                in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                )
+                and p.default is inspect.Parameter.empty
+                and p.name not in arguments
+            ]
+            if missing_params:
+                raise ValueError(
+                    f"missing required argument(s): {missing_params}"
+                )
         # _resolve awaits a coroutine result on a fresh loop with a timeout
         # (safe — this handler runs on a blocking Tokio thread, never inside
         # an asyncio loop).
