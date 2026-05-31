@@ -126,7 +126,14 @@ def main() -> int:
             # shutdown as success. If the child already exited non-zero (e.g.
             # a benchmark crash that itself raised the signal), os._exit(0)
             # would hide that failure from CI (arc finding launcher-8).
-            rc = proc.poll()
+            # SIGKILL is delivered asynchronously, so poll() can still return
+            # None right after kill() — wait() blocks until the process is
+            # actually reaped and yields the true exit code (arc finding
+            # launcher-140). Bounded so a wedged child can't hang shutdown.
+            try:
+                rc = proc.wait(timeout=10)
+            except Exception:
+                rc = proc.poll()
             # os._exit terminates all threads (including this daemon thread);
             # sys.exit(0) from a daemon thread only kills the daemon thread.
             os._exit(rc if rc is not None and rc > 0 else 0)
