@@ -149,6 +149,15 @@ def register_crud(
 
     col_list = ", ".join(columns)
     non_id_cols = [c for c in columns if c != id_column]
+    # The PUT handler can only update non-PK columns. If columns is just the
+    # PK, every PUT would hit the "include at least one of []" 422 with no way
+    # for a client to satisfy it — the route is permanently broken. Reject at
+    # registration so the misconfig surfaces at startup, not per-request.
+    if not non_id_cols:
+        raise ValueError(
+            f"columns={columns!r} must include at least one non-PK column "
+            f"besides id_column {id_column!r} (PUT can only update non-PK columns)"
+        )
 
     # --- GET /prefix --------------------------------------------------------
     # All routes pinned to gil=True. The sub-interp DB bridge
