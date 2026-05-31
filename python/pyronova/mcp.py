@@ -56,7 +56,23 @@ def _drive_coro(coro):
             asyncio.wait_for(coro, timeout=_ASYNC_HANDLER_TIMEOUT_S)
         )
     finally:
-        loop.close()
+        # On normal return, timeout, or error the coroutine may have spawned
+        # child tasks (or wait_for's own cancellation may not have fully
+        # propagated). Cancel and await any stragglers, then shut down async
+        # generators, before closing — otherwise `loop.close()` discards them
+        # in a half-cancelled state and emits "Task was destroyed but it is
+        # pending" / "coroutine ignored GeneratorExit" warnings.
+        try:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        finally:
+            loop.close()
 
 
 def _resolve(result):
