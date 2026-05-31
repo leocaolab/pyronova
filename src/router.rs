@@ -112,14 +112,19 @@ impl RouteTable {
         is_async: bool,
         is_stream: bool,
     ) -> Result<(), String> {
+        // Perform the fallible router insert FIRST, before touching the
+        // parallel vectors. `idx` is the slot the handler *will* occupy once we
+        // commit. If `router.insert` fails (e.g. duplicate path), we return
+        // early without having mutated any vector, so RouteTable stays
+        // consistent — no orphaned handler, no length skew, no leaked Py ref.
         let idx = self.handlers.len();
+        let router = self.routers.entry(method.to_uppercase()).or_default();
+        router.insert(path, idx).map_err(|e| e.to_string())?;
         self.handlers.push(handler);
         self.handler_names.push(handler_name);
         self.requires_gil.push(gil);
         self.is_async.push(is_async);
         self.is_stream.push(is_stream);
-        let router = self.routers.entry(method.to_uppercase()).or_default();
-        router.insert(path, idx).map_err(|e| e.to_string())?;
         Ok(())
     }
 
