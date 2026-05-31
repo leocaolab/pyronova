@@ -205,7 +205,9 @@ fn resolve_coroutine(py: Python<'_>, obj: Py<PyAny>) -> Result<Py<PyAny>, String
             let new_loop = asyncio
                 .call_method0("new_event_loop")
                 .map_err(|e| format!("new_event_loop: {e}"))?;
-            let _ = asyncio.call_method1("set_event_loop", (&new_loop,));
+            asyncio
+                .call_method1("set_event_loop", (&new_loop,))
+                .map_err(|e| format!("set_event_loop: {e}"))?;
             guard.0 = Some(new_loop.unbind());
         }
 
