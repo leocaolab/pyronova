@@ -293,7 +293,16 @@ _EMPTY_DB_RESPONSE = {"items": [], "count": 0}
 _NOT_FOUND = Response("not found", status_code=404, content_type="text/plain")
 _BAD_REQUEST = Response("bad request", status_code=400, content_type="text/plain")
 _INTERNAL_ERROR = Response("internal server error", status_code=500, content_type="text/plain")
-_SERVICE_UNAVAILABLE = Response("service unavailable", status_code=503, content_type="text/plain")
+_SERVICE_UNAVAILABLE = Response(
+    "service unavailable",
+    status_code=503,
+    content_type="text/plain",
+    # Retry-After hints clients to back off ~30s instead of hammering a
+    # server that can't recover quickly (e.g. DB creds misconfigured at
+    # startup). 503 already signals "ours and retryable"; this adds the
+    # backpressure so a tight client retry loop doesn't pile on.
+    headers={"retry-after": "30"},
+)
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +375,10 @@ def crud_get_one(req: "Request"):
     # Postgres. Header is computed once per code path and wrapped in a
     # Response() because a bare dict return would skip custom headers.
     if PG_POOL is None:
-        return _NOT_FOUND
+        # No DB connection is a server-side outage, not a missing item —
+        # 503 tells clients the failure is ours and retryable, not 404
+        # ("item not found") which misleads (matches PUT/POST handlers).
+        return _SERVICE_UNAVAILABLE
     try:
         item_id = int(req.params["id"])
     except (KeyError, ValueError):
