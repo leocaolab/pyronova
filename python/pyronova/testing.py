@@ -240,7 +240,10 @@ class TestClient:
         url = f"{self.base_url}{path}"
         if params:
             # Append (don't replace) — path may already carry a query.
-            sep = "&" if "?" in path else "?"
+            if path.endswith(("?", "&")):
+                sep = ""
+            else:
+                sep = "&" if "?" in path else "?"
             url = f"{url}{sep}{urllib.parse.urlencode(params, doseq=True)}"
 
         req_headers = dict(headers or {})
