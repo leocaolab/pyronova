@@ -449,7 +449,10 @@ unsafe extern "C" fn request_getbuffer(
             ffi::PyExc_BufferError,
             c"pyronova _Request buffer is readonly".as_ptr(),
         );
-        (*view).obj = std::ptr::null_mut();
+        // Leave the whole Py_buffer in a consistent zeroed state (not just
+        // obj=NULL): a caller that ignores the -1 return and reads buf/len
+        // then sees a null sentinel, never uninitialized stack data.
+        std::ptr::write_bytes(view, 0, 1);
         return -1;
     }
 

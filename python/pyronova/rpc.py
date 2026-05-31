@@ -168,10 +168,12 @@ def rpc_decorator(app, path: str, proto_model=None):
 
         # Any uncaught exception in an RPC handler becomes a structured
         # {ok: false, error: ...} envelope so clients don't see a raw 500.
-        # The envelope alone is opaque server-side — the stack trace is
-        # discarded — so we ALSO log.exception here to preserve the
-        # traceback in operator logs. Without that, recurring handler
-        # crashes would be invisible on the server.
+        # The envelope carries ONLY the exception class name — never the
+        # exception message — because messages routinely embed filesystem
+        # paths, SQL fragments, connection strings, or config values that
+        # must not cross the wire to RPC clients. The full message and stack
+        # trace are preserved for operators via log.exception below; without
+        # that, recurring handler crashes would be invisible on the server.
 
         def sync_wrapper(req):
             try:
@@ -180,7 +182,7 @@ def rpc_decorator(app, path: str, proto_model=None):
                 return _encode_response(result, req)
             except Exception as e:
                 _log.exception("RPC handler %s raised", fn.__qualname__)
-                return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+                return {"ok": False, "error": type(e).__name__}
 
         async def async_wrapper(req):
             try:
@@ -189,7 +191,7 @@ def rpc_decorator(app, path: str, proto_model=None):
                 return _encode_response(result, req)
             except Exception as e:
                 _log.exception("RPC handler %s raised", fn.__qualname__)
-                return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+                return {"ok": False, "error": type(e).__name__}
 
         handler = functools.wraps(fn)(async_wrapper if is_async else sync_wrapper)
 
