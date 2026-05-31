@@ -458,9 +458,11 @@ fn run_tpc_subinterp_per_thread_listener(
     // memory cost is one RouteTable worth, held for the server's life
     // — acceptable for a long-running server. `Arc::into_raw` + deref
     // is the stable-since-1.0 way to get this; the pointer is never
-    // reclaimed, which is the whole point.
-    let routes_static: &'static crate::router::RouteTable =
-        unsafe { &*Arc::into_raw(Arc::clone(&routes)) };
+    // reclaimed on the success path, which is the whole point. We keep
+    // the raw pointer so the error path below can reclaim it instead of
+    // leaking on every failed start.
+    let routes_raw: *const crate::router::RouteTable = Arc::into_raw(Arc::clone(&routes));
+    let routes_static: &'static crate::router::RouteTable = unsafe { &*routes_raw };
 
     let mut handles = Vec::with_capacity(n_threads);
     for i in 0..n_threads {
@@ -508,7 +510,15 @@ fn run_tpc_subinterp_per_thread_listener(
         match handle {
             Ok(h) => handles.push(h),
             Err(e) => {
+                // Tell the threads that did spawn to exit, join them so
+                // none still reference routes_static, then reclaim the
+                // leaked Arc before returning — otherwise repeated failed
+                // starts (restart, tests) accumulate leaked RouteTables.
                 shutdown.cancel();
+                for h in handles {
+                    let _ = h.join();
+                }
+                unsafe { drop(Arc::from_raw(routes_raw)) };
                 return Err(format!("spawn tpc-{i}: {e}"));
             }
         }
@@ -586,8 +596,10 @@ fn run_tpc_subinterp_fanout(
 
     // Leak once for a shared &'static, same rationale as the per-thread
     // listener path. All workers read from the same static, no Arc ops.
-    let routes_static: &'static crate::router::RouteTable =
-        unsafe { &*Arc::into_raw(Arc::clone(&routes)) };
+    // Keep the raw pointer so the error path can reclaim it on a failed
+    // start instead of leaking.
+    let routes_raw: *const crate::router::RouteTable = Arc::into_raw(Arc::clone(&routes));
+    let routes_static: &'static crate::router::RouteTable = unsafe { &*routes_raw };
 
     let mut handles = Vec::with_capacity(n_threads + 1);
 
@@ -633,7 +645,14 @@ fn run_tpc_subinterp_fanout(
         match handle {
             Ok(h) => handles.push(h),
             Err(e) => {
+                // Reclaim the leaked Arc on a failed start: cancel so the
+                // already-spawned threads exit, join them so none still
+                // reference routes_static, then drop the reclaimed Arc.
                 shutdown.cancel();
+                for h in handles {
+                    let _ = h.join();
+                }
+                unsafe { drop(Arc::from_raw(routes_raw)) };
                 return Err(format!("spawn tpc-{i}: {e}"));
             }
         }
