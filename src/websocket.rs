@@ -376,7 +376,9 @@ where
                         break;
                     }
                     Some(Ok(Message::Ping(data))) => {
-                        let _ = ws_sink.send(Message::Pong(data)).await;
+                        if ws_sink.send(Message::Pong(data)).await.is_err() {
+                            break;
+                        }
                     }
                     Some(Err(e)) => {
                         tracing::warn!(target: "pyronova::server", error = %e, "PyronovaWebSocket read error");
