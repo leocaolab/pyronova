@@ -143,7 +143,14 @@ def main() -> int:
             # launcher-140). Bounded so a wedged child can't hang shutdown.
             try:
                 rc = proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                # Child still wedged after SIGKILL + 10s — give up waiting and
+                # fall back to a non-blocking poll (likely still None).
+                rc = proc.poll()
             except Exception:
+                # OSError or other unexpected failures from wait() — log so the
+                # cause is visible rather than silently masked.
+                _log.warning("launcher: wait() failed during shutdown", exc_info=True)
                 rc = proc.poll()
             # os._exit terminates all threads (including this daemon thread);
             # sys.exit(0) from a daemon thread only kills the daemon thread.
