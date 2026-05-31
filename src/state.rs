@@ -106,9 +106,23 @@ impl SharedState {
     }
 
     /// dict-like: state["key"]
+    ///
+    /// Raises `KeyError` only when the key is genuinely absent. When the key
+    /// exists but holds non-UTF-8 bytes (e.g. via `set_bytes`) this raises
+    /// `TypeError` instead — masking it as `KeyError` would contradict
+    /// `__contains__` (which returns True) and hide the fact that the value
+    /// is present but not decodable as a string. Use `get_bytes` for raw access.
     fn __getitem__(&self, key: &str) -> PyResult<String> {
-        self.get(key, None)
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_string()))
+        match self.inner.get(key) {
+            None => Err(pyo3::exceptions::PyKeyError::new_err(key.to_string())),
+            Some(v) => std::str::from_utf8(v.value())
+                .map(|s| s.to_string())
+                .map_err(|_| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "state[{key:?}]: value is not valid UTF-8; use get_bytes() for raw access"
+                    ))
+                }),
+        }
     }
 
     /// dict-like: del state["key"]
