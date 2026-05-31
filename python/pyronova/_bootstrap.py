@@ -575,7 +575,13 @@ class _UploadFile:
         self.content_type = content_type
         self.data = data
     @property
-    def text(self): return self.data.decode('utf-8')
+    def text(self):
+        # Uploaded bytes are arbitrary user content — may not be valid UTF-8
+        # (binary files, mojibake, partial buffers). Use errors='replace' so
+        # calling .text on a binary upload yields a lossy string instead of
+        # crashing the request with UnicodeDecodeError. Callers needing strict
+        # decoding should work with .data directly. Matches uploads.py.
+        return self.data.decode('utf-8', errors='replace')
     @property
     def size(self): return len(self.data)
 def _parse_multipart(req):
