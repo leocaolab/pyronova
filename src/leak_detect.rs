@@ -205,9 +205,18 @@ fn intern(s: &str) -> &'static str {
 /// Bucket refcounts into labels. Label strings must be &'static so we
 /// precompute 0..=8 and a catch-all. 99% of samples land in the small
 /// range in practice.
+///
+/// A negative refcount is impossible in a healthy CPython heap — it means
+/// the object's `ob_refcnt` field has been corrupted (double-free,
+/// use-after-free, or an FFI over-DECREF). That is the single most
+/// valuable signal this probe can surface, so it gets its own `"<0"`
+/// bucket instead of being folded into `"9+"` where it would be
+/// indistinguishable from a benign high refcount.
 fn rc_label(rc: ffi::Py_ssize_t) -> &'static str {
     const PRECOMPUTED: &[&str] = &["0", "1", "2", "3", "4", "5", "6", "7", "8"];
-    if (0..PRECOMPUTED.len() as ffi::Py_ssize_t).contains(&rc) {
+    if rc < 0 {
+        "<0"
+    } else if (0..PRECOMPUTED.len() as ffi::Py_ssize_t).contains(&rc) {
         PRECOMPUTED[rc as usize]
     } else {
         "9+"
