@@ -147,14 +147,18 @@ impl PyronovaBodyStream {
     fn read(&self, py: Python<'_>, n: Option<usize>) -> PyResult<Py<PyBytes>> {
         let mut buf = Vec::<u8>::new();
         loop {
+            // Check the limit before pulling another chunk so that
+            // read(0) returns b"" without consuming any data (matching
+            // Python's file.read(0) contract), and so we never fetch a
+            // chunk we've already satisfied the request for.
+            if let Some(limit) = n {
+                if buf.len() >= limit {
+                    break;
+                }
+            }
             match self.__next__(py) {
                 Ok(chunk) => {
                     buf.extend_from_slice(chunk.bind(py).as_bytes());
-                    if let Some(limit) = n {
-                        if buf.len() >= limit {
-                            break;
-                        }
-                    }
                 }
                 Err(e) if e.is_instance_of::<PyStopIteration>(py) => break,
                 Err(e) => return Err(e),
