@@ -126,7 +126,11 @@ def parse_multipart(req) -> "dict[str, UploadFile | list[UploadFile]]":
         if lowered.startswith("boundary="):
             # Slice from the original `part` so casing in the value
             # itself (boundaries are case-sensitive) is preserved.
-            boundary = part[len("boundary="):].strip().strip('"')
+            # Use the RFC 2045 quoted-string unquoter (not a naive
+            # `.strip('"')`, which corrupts values that begin or end
+            # with a quote char) for consistency with the
+            # Content-Disposition param parsing below.
+            boundary = _unquote_param(part[len("boundary="):])
             break
 
     if not boundary:
