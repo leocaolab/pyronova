@@ -400,6 +400,10 @@ fn worker_thread_loop(
         // Skip requests whose caller already timed out (504) — avoid wasting
         // CPU on "dead" requests during queue backlog (prevents snowball effect).
         if req.response_tx.is_closed() {
+            // Account for the skipped request so the leak_detect invariant
+            // (inc_created == inc_completed at steady state) holds. A dropped
+            // dead request is still a fully-accounted WorkRequest, not a leak.
+            WorkRequest::inc_completed();
             continue;
         }
 
