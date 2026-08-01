@@ -9,8 +9,42 @@ the multi-interp override at sub-interp init, so user handlers just `import nump
 copies/paths/counters never touch user code (`examples/isolate_numpy.py`, `tests/test_isolate.py`).
 Soak-proven (zero leak/double-free/deadlock, ~75 MB/worker; see `docs/subinterp-c-extension-status.md`).
 
-Follow-ups: Linux `dlmopen` namespaces as a lower-memory alternative;
-`_Request` → PyO3 0.29 `#[pyclass]` to drop the hand-written FFI.
+Follow-up: Linux `dlmopen` namespaces as a lower-memory alternative for copy-isolation.
+
+## Next — `_Request` → PyO3 0.29 `#[pyclass]` (drop the hand-written FFI) — DE-RISKED, ready ⭐
+
+pyre hand-writes `_Request`/`_Response` as raw C-API heap types
+(`src/pyronova_request_type.rs`, ~334 lines: `PyType_FromSpec` + `PyMemberDef` +
+a custom `tp_dealloc`, one type object built per sub-interpreter in
+`src/python/worker.rs` around line 207 via `register_type()`). The reason was
+purely that **PyO3 0.28 hard-panicked on `#[pyclass]` inside a sub-interpreter**
+(`pyo3#576`). PyO3 0.29 (shipped in v2.6) fixes that, so this can become a normal
+`#[pyclass]` — deleting the hand-written FFI.
+
+**De-risked (measured, 2026-08):**
+- **No leak.** A `#[pyclass]` with reference fields (`Py<PyBytes>` + `String`),
+  500k create/destroy in a sub-interpreter, grew **2 MB** — PyO3's Rust `Drop` /
+  `tp_dealloc` releases ref fields correctly. So the PEP 684 `__slots__`-dealloc
+  leak (~500 MB/s) that the hand-written `tp_dealloc` exists to fix does **NOT**
+  recur under `#[pyclass]`.
+- **type object is process-global** (`GILOnceCell`), shared across sub-interpreters —
+  NOT per-interp like the hand-written type. Instance data is independent and it
+  works in practice (iso_ext 8/8 sub-interps, stress soak zero-crash). The one
+  remaining risk is that shared type object's lifetime when a sub-interpreter is
+  torn down.
+
+**Plan:**
+1. Rewrite `src/pyronova_request_type.rs` as `#[pyclass] Request` — fields
+   body/method/path/query/params/headers/client_ip; methods text/json/query_params
+   (currently Python-monkey-patched in `worker.rs`).
+2. Replace `worker.rs::register_type()` (raw C-API `PyType_FromSpec`) with PyO3
+   type-object injection into each sub-interpreter's globals as `_Request`.
+3. **Regression gate:** `tests/test_subinterp_memory_regression.py` must stay green
+   on BOTH macOS and Linux (it's the leak baseline — Linux runs it, reads /proc);
+   add a churn+teardown soak to catch the shared-type-object lifetime risk.
+
+Do this in a focused session — it's a multi-file refactor of the hottest,
+most `unsafe`-heavy path, with a real (if de-risked) lifetime risk.
 
 ## Phase 1 — Skeleton (DONE ✓) — 2026-03-23
 
