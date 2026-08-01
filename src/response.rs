@@ -42,7 +42,9 @@ fn get_or_init_json_dumps(py: Python<'_>) -> pyo3::PyResult<pyo3::Bound<'_, pyo3
 
 fn orjson_dumps(py: Python<'_>, obj: &pyo3::Bound<'_, pyo3::PyAny>) -> Result<Bytes, String> {
     let dumps = get_or_init_json_dumps(py).map_err(|e| format!("json init: {e}"))?;
-    let result = dumps.call1((obj,)).map_err(|e| format!("json error: {e}"))?;
+    let result = dumps
+        .call1((obj,))
+        .map_err(|e| format!("json error: {e}"))?;
     let bytes = result
         .cast::<PyBytes>()
         .map_err(|e| format!("json error: {e}"))?;
