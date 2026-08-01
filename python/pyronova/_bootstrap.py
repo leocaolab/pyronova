@@ -93,29 +93,26 @@ if _log_level_str not in _PYRONOVA_LEVEL_MAP:
     )
 _root.setLevel(_PYRONOVA_LEVEL_MAP.get(_log_level_str, _logging.DEBUG))
 
-# -- Request / Response stubs ------------------------------------------------
+# -- Request / Response types ------------------------------------------------
 #
-# `_Request` is defined later by Rust (src/pyronova_request_type.rs) via
-# PyType_FromSpec — it's a raw C heap type with __slots__-equivalent C
-# members, a custom tp_dealloc, and helper methods (.text/.json/.body/
-# .query_params) monkey-patched on at sub-interp init. The Python class
-# that used to live here has been removed; see commit `d4bce1c` for the
-# Route B migration and commit `fc45a7f` for the tstate fix that made
-# it safe to rely solely on the Rust type.
-
-class _Response:
-    # Strict __slots__: no __dict__, no dynamic attributes. Paired with
-    # Rust's SlotClearer, this makes the per-request cleanup exhaustive —
-    # user code cannot stash an object on the response and leak it past
-    # the sub-interpreter dealloc bug. If someone writes
-    # `response.my_thing = x`, Python raises AttributeError at runtime
-    # rather than silently hiding the ref from the Rust-side cleaner.
-    __slots__ = ("body", "status_code", "content_type", "headers")
-    def __init__(self, body="", status_code=200, content_type=None, headers=None):
-        self.body = body
-        self.status_code = status_code
-        self.content_type = content_type
-        self.headers = headers or {}
+# `_Request` and `_Response` are injected later by Rust (src/python/worker.rs)
+# into this sub-interp's globals: they are `crate::types::PyronovaRequest` /
+# `PyronovaResponse`, PyO3 `#[pyclass(frozen)]` types. Their real `#[pymethods]`
+# provide the request helpers (.text()/.json()/.body/.query_params …) and the
+# response fields — no monkey-patching. PyO3's generated tp_dealloc Rust-drops
+# every field (so nothing leaks despite PEP 684's dead Python finalizers), they
+# have no __dict__ (stray attributes are rejected), and they are not GC-tracked
+# (no __traverse__ ⇒ no Py_TPFLAGS_HAVE_GC). The pure-Python `_Response` mock
+# and the raw C-API `_Request` type that used to live here are both gone now
+# that PyO3 0.29 supports #[pyclass] inside sub-interpreters (pyo3#576); see
+# commits `d4bce1c` (Route B) and `fc45a7f` (tstate fix).
+#
+# NOTE: only the *types* became real pyclasses — the rest of this file still
+# mocks the `pyronova` module surface because the Rust *extension module*
+# itself cannot be imported into a sub-interpreter (PEP 684 multi-interpreter
+# loading is unsupported). The bootstrap helpers below that build `_Response(...)`
+# (redirect / cached_json / set_cookie) resolve `_Response` from globals at
+# call time, i.e. the injected pyclass.
 
 # -- Mock pyronova modules ----------------------------------------------------
 
@@ -173,13 +170,11 @@ _mock_engine.PyronovaApp = type("PyronovaApp", (), {
     "static_dir": lambda self, *a: None,
     "run": lambda self, **kw: None,
 })
-# Request is bound to the raw-C Rust type by interp.rs after this
-# bootstrap script finishes running — the Rust injection overwrites
-# both `globals()["_Request"]` and these module-level references.
-# Until then it's None; user code should not import Request at
-# module-load time anyway (the type is only meaningful inside a
-# running sub-interp handler).
-_mock_engine.Request = None
+# Request and Response are the real Rust pyclasses (`PyronovaRequest` /
+# `PyronovaResponse`), injected into `globals()` by worker.rs BEFORE this
+# bootstrap runs. Wiring them into the mock modules here means user code's
+# top-level `from pyronova import Response` captures the real type.
+_mock_engine.Request = _Request
 _mock_engine.Response = _Response
 _mock_engine.WebSocket = type("WebSocket", (), {})
 _mock_engine.SharedState = type("SharedState", (), {})
@@ -189,7 +184,7 @@ _mock_engine.get_gil_metrics = lambda: (0,0,0,0,0,0,0,0,0)
 _mock_pyron = types.ModuleType("pyronova")
 _mock_pyron.engine = _mock_engine
 _mock_pyron.PyronovaApp = _mock_engine.PyronovaApp
-_mock_pyron.Request = None  # overwritten by interp.rs post-bootstrap
+_mock_pyron.Request = _Request
 _mock_pyron.Response = _Response
 _mock_pyron.WebSocket = _mock_engine.WebSocket
 _mock_pyron.SharedState = _mock_engine.SharedState
@@ -276,7 +271,8 @@ _mock_pyron.Pyronova = _MockPyron
 _mock_app = types.ModuleType("pyronova.app")
 _mock_app.Pyronova = _MockPyron
 # pyronova.cache imports `from .app import Response`, so the mock
-# `pyronova.app` must expose a Response symbol too.
+# `pyronova.app` must expose a Response symbol too — the real Response
+# pyclass, injected into globals by worker.rs before this bootstrap runs.
 _mock_app.Response = _Response
 
 sys.modules["pyronova"] = _mock_pyron

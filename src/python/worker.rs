@@ -6,6 +6,8 @@ use std::collections::HashMap;
 
 use pyo3::ffi;
 
+use pyo3::Python;
+
 use super::convert::*;
 use super::ffi::*;
 use super::pool::*;
@@ -23,12 +25,6 @@ pub(crate) struct SubInterpreterWorker {
     pub(crate) globals: *mut ffi::PyObject,
     /// Cached: json.dumps function pointer (avoids per-request import)
     json_dumps_func: *mut ffi::PyObject,
-    /// Cached: `_Request` **type object** (raw C-API heap type,
-    /// defined in `pyronova_request_type.rs`). Built per sub-interp via
-    /// `PyType_FromSpec` so its custom `tp_dealloc` can synchronously
-    /// DECREF all slot fields — workaround for PEP 684's broken
-    /// per-instance dealloc path on `__slots__` Python classes.
-    sky_request_cls: *mut ffi::PyObject,
     /// Cached: _Response class pointer
     sky_response_cls: *mut ffi::PyObject,
     /// Cached: persistent asyncio event loop for this sub-interpreter
@@ -162,6 +158,47 @@ impl SubInterpreterWorker {
             ffi::PyDict_SetItemString(globals.as_ptr(), c"__file__".as_ptr(), py_file.as_ptr());
         }
 
+        // Inject the `_Request` / `_Response` types into `globals` BEFORE the
+        // bootstrap + user script run. They are `crate::types::PyronovaRequest`
+        // / `PyronovaResponse`, PyO3 `#[pyclass(frozen)]` types whose type
+        // objects are process-global (one `GILOnceCell`) and shared across
+        // sub-interpreters — `py.get_type` returns that shared object.
+        //
+        // Ordering matters: `_bootstrap.py` wires these into the mock
+        // `pyronova` modules (`_mock_*.Request/Response = _Request/_Response`)
+        // and the user script's top-level `from pyronova import Response`
+        // captures the value at import time. Both run inside the single
+        // `PyRun_String` below, so the real types must already be in `globals`
+        // — injecting after the script would leave user code holding a stale
+        // placeholder and every `Response(...)` call would fail.
+        //
+        // Why pyclasses are safe in a sub-interp now: PyO3 0.29 supports
+        // `#[pyclass]` there (pyo3#576), and PyO3's generated `tp_dealloc`
+        // Rust-drops every field, so per-request data is reclaimed despite
+        // PEP 684's dead Python finalizers — no custom C `tp_dealloc`. No
+        // `__traverse__` ⇒ no `Py_TPFLAGS_HAVE_GC` (which had reintroduced the
+        // leak), and no `__dict__` ⇒ stray attributes are still rejected.
+        for (name, ty_ptr) in [
+            (
+                c"_Request".as_ptr(),
+                Python::attach(|py| py.get_type::<crate::types::PyronovaRequest>().into_ptr()),
+            ),
+            (
+                c"_Response".as_ptr(),
+                Python::attach(|py| py.get_type::<crate::types::PyronovaResponse>().into_ptr()),
+            ),
+        ] {
+            let rc = ffi::PyDict_SetItemString(globals.as_ptr(), name, ty_ptr);
+            // The globals dict takes its own ref on success; PyO3's process-
+            // global type cache keeps the type object alive regardless. Drop
+            // our `into_ptr` ref either way.
+            ffi::Py_DECREF(ty_ptr);
+            if rc != 0 {
+                ffi::PyErr_Print();
+                return Err("failed to inject _Request/_Response into sub-interp globals".to_string());
+            }
+        }
+
         let code_cstr = std::ffi::CString::new(bootstrap.as_bytes())
             .map_err(|e| format!("CString error: {e}"))?;
         let _filename_cstr =
@@ -194,50 +231,11 @@ impl SubInterpreterWorker {
             }
         }
 
-        // Build the raw C-API `_Request` type for THIS sub-interp
-        // (custom tp_dealloc that synchronously DECREFs every slot —
-        // workaround for PEP 684's broken heap-type finalizer). One
-        // type per sub-interp: PyTypeObject state is per-interp.
-        //
-        // We then install helper methods (`.text()`, `.json()`, `.body`,
-        // `.query_params`) DIRECTLY on the heap type — NOT via a
-        // Python subclass. A subclass triggers CPython's subtype_dealloc
-        // fallback and bypasses our custom tp_dealloc, restoring the
-        // full-instance leak we're trying to fix.
-        let rust_ty = crate::pyronova_request_type::register_type()?;
-        let req_cls_name = std::ffi::CString::new("_Request").unwrap();
-        if ffi::PyDict_SetItemString(globals.as_ptr(), req_cls_name.as_ptr(), rust_ty) != 0 {
-            ffi::PyErr_Print();
-            return Err("failed to inject _Request into sub-interp globals".to_string());
-        }
-
-        // Attach helper methods directly on the type (mutable by
-        // virtue of Py_TPFLAGS_HEAPTYPE). Users can do
-        // `req.text()` / `req.json()` / `req.body` / `req.query_params`.
-        //
-        // Also rebind the mock module attributes (`pyronova.PyronovaRequest`
-        // and `pyronova.engine.PyronovaRequest`) to this Rust type —
-        // `_bootstrap.py` sets them to None as placeholders because it
-        // runs BEFORE this injection. User code doing
-        // `from pyronova import PyronovaRequest` or
-        // `isinstance(req, PyronovaRequest)` then gets the real type.
-        let helpers_src = c"\
-def _attach_pyronova_request_helpers(t):\n    from urllib.parse import parse_qs\n    import json as _json\n    t.body = property(lambda self: self.body_bytes)\n    t.query_params = property(lambda self: {k: v[0] for k, v in parse_qs(self.query, keep_blank_values=True).items()})\n    t.query_params_all = property(lambda self: parse_qs(self.query, keep_blank_values=True))\n    t.text = lambda self: self.body_bytes.decode('utf-8') if isinstance(self.body_bytes, (bytes, bytearray)) else str(self.body_bytes)\n    t.json = lambda self: _json.loads(self.text())\n_attach_pyronova_request_helpers(_Request)\nimport sys as _sys\n_m = _sys.modules.get('pyronova.engine')\nif _m is not None:\n    _m.PyronovaRequest = _Request\n_p = _sys.modules.get('pyronova')\nif _p is not None:\n    _p.PyronovaRequest = _Request\n";
-        let helpers_result = ffi::PyRun_String(
-            helpers_src.as_ptr(),
-            ffi::Py_file_input,
-            globals.as_ptr(),
-            globals.as_ptr(),
-        );
-        if helpers_result.is_null() {
-            ffi::PyErr_Print();
-            return Err("failed to attach _Request helper methods".to_string());
-        }
-        ffi::Py_DECREF(helpers_result);
-
-        let sky_request_cls = rust_ty;
-        ffi::Py_INCREF(sky_request_cls);
-
+        // The `_Request` / `_Response` type objects were injected into
+        // `globals` before the bootstrap + user script ran (see the injection
+        // just above the `PyRun_String` call). Cache the `_Response` type
+        // object here for `parse_result`'s response-type check; it lives for
+        // the worker's (process) lifetime.
         let resp_cls_name = std::ffi::CString::new("_Response").unwrap();
         let sky_response_cls = ffi::PyDict_GetItemString(globals.as_ptr(), resp_cls_name.as_ptr());
         if !sky_response_cls.is_null() {
@@ -349,7 +347,6 @@ def _attach_pyronova_request_helpers(t):\n    from urllib.parse import parse_qs\
             handlers,
             globals: globals_ptr,
             json_dumps_func,
-            sky_request_cls,
             sky_response_cls,
             _asyncio_loop: asyncio_loop,
             loop_run_func,
@@ -362,12 +359,15 @@ def _attach_pyronova_request_helpers(t):\n    from urllib.parse import parse_qs\
 
     /// Build a fresh `_Request` instance for this request.
     ///
-    /// Returns a NEW owned reference (caller must DECREF). The
-    /// instance's `tp_dealloc` synchronously DECREFs all slot fields,
-    /// so no `SlotClearer` / instance recycling is needed.
+    /// Returns a NEW owned reference (caller must DECREF). Constructs a
+    /// `PyronovaRequest` pyclass via `Py::new`; PyO3's generated
+    /// `tp_dealloc` Rust-drops every field when the returned object's
+    /// refcount reaches zero, so no `SlotClearer` / instance recycling is
+    /// needed and there is nothing to leak under PEP 684 sub-interpreters.
     ///
     /// # Safety
-    /// Must be called with this sub-interpreter's GIL held.
+    /// Must be called with this sub-interpreter's GIL held (the current
+    /// thread state must be this sub-interpreter's).
     #[allow(clippy::too_many_arguments)]
     unsafe fn build_request(
         &self,
@@ -377,87 +377,35 @@ def _attach_pyronova_request_helpers(t):\n    from urllib.parse import parse_qs\
         query: &str,
         body: &[u8],
         headers: &HashMap<String, String>,
-        client_ip: &str,
+        client_ip: std::net::IpAddr,
     ) -> Result<*mut ffi::PyObject, String> {
-        // ── Leak-hunt bisection of slot constructors (leak_detect only) ──
-        // PYRONOVA_BISECT_SLOT=<name> replaces that slot's value with Py_None:
-        //   method | path | params | query | body | headers | client_ip
-        //   all    — every slot becomes None (alloc shell only)
-        //   none   — normal (default)
-        #[cfg(feature = "leak_detect")]
-        let slot_mode = std::env::var("PYRONOVA_BISECT_SLOT").ok();
-        #[cfg(not(feature = "leak_detect"))]
-        let slot_mode: Option<String> = None;
-        let skip = |name: &str| -> bool {
-            match slot_mode.as_deref() {
-                Some("all") => true,
-                Some(s) => s == name,
-                None => false,
-            }
-        };
-        let none_ref = || unsafe { PyObjRef::from_borrowed(ffi::Py_None()).unwrap() };
+        use crate::types::{LazyHeaders, PyronovaRequest};
 
-        let py_method = if skip("method") {
-            none_ref()
-        } else {
-            py_str(method).ok_or("failed to create py_method")?
+        // `headers` is already converted to a HashMap (the Tokio side
+        // extracted the hyper HeaderMap off the worker thread), so use the
+        // pre-converted variant. params → dict and body → bytes are still
+        // materialized lazily by the pyclass getters, so a handler that
+        // never touches `.params` / `.headers` / `.body` pays nothing for
+        // them — same laziness the old raw type had, minus the hand-written
+        // FFI.
+        let req = PyronovaRequest {
+            method: std::sync::Arc::from(method),
+            path: std::sync::Arc::from(path),
+            params: params.to_vec(),
+            query: query.to_string(),
+            headers_source: LazyHeaders::Converted(headers.clone()),
+            headers_cache: std::sync::OnceLock::new(),
+            client_ip_addr: client_ip,
+            body_bytes: bytes::Bytes::copy_from_slice(body),
+            body_stream_rx: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            query_cache: std::sync::OnceLock::new(),
+            query_all_cache: std::sync::OnceLock::new(),
         };
-        let py_path = if skip("path") {
-            none_ref()
-        } else {
-            py_str(path).ok_or("failed to create py_path")?
-        };
-        let py_query = if skip("query") {
-            none_ref()
-        } else {
-            py_str(query).ok_or("failed to create py_query")?
-        };
-        let py_client_ip = if skip("client_ip") {
-            none_ref()
-        } else {
-            py_str(client_ip).ok_or("failed to create py_client_ip")?
-        };
-
-        if self.sky_request_cls.is_null() {
-            return Err("_Request type not registered".to_string());
-        }
-
-        // Lazy maps: move raw Rust data into a Box. The getset getters
-        // on `_Request` will build the actual PyDict on first access
-        // to `.params` / `.headers` — handlers that never touch those
-        // slots (common on plaintext benchmarks) pay zero Python
-        // allocation for them.
-        //
-        // The skip_* bisection flags for params/headers are honored by
-        // supplying empty placeholders; the getters still return a
-        // (now empty) dict, preserving the old observation surface.
-        let skip_params = skip("params");
-        let skip_headers = skip("headers");
-        let skip_body = skip("body");
-        let maps = Box::new(crate::pyronova_request_type::LazyMaps {
-            params: if skip_params {
-                Vec::new()
-            } else {
-                params.to_vec()
-            },
-            headers: if skip_headers {
-                HashMap::new()
-            } else {
-                headers.clone()
-            },
-            body: if skip_body { Vec::new() } else { body.to_vec() },
-        });
-
-        // Transfer ownership of each new ref into the instance.
-        // `alloc_and_init_lazy` DECREFs them + drops `maps` on failure.
-        crate::pyronova_request_type::alloc_and_init_lazy(
-            self.sky_request_cls,
-            py_method.into_raw(),
-            py_path.into_raw(),
-            py_query.into_raw(),
-            py_client_ip.into_raw(),
-            maps,
-        )
+        Python::attach(|py| {
+            pyo3::Py::new(py, req)
+                .map(|obj| obj.into_ptr())
+                .map_err(|e| format!("Py::new(_Request) failed: {e}"))
+        })
     }
 
     /// Parse a handler return value into SubInterpResponse.
@@ -890,7 +838,7 @@ def _attach_pyronova_request_helpers(t):\n    from urllib.parse import parse_qs\
         query: &str,
         body: &[u8],
         headers: &HashMap<String, String>,
-        client_ip: &str,
+        client_ip: std::net::IpAddr,
     ) -> Result<SubInterpResponse, String> {
         let func = *self
             .handlers

@@ -428,7 +428,6 @@ fn worker_thread_loop(
         // SubInterpGilGuard ensures GIL is released even if call_handler panics.
         // Deferred conversions: moved off Tokio thread.
         let headers_map = crate::types::extract_headers(&req.headers);
-        let ip_str = req.client_ip.to_string();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let _guard = SubInterpGilGuard::acquire(tstate_cell.get(), &tstate_cell);
@@ -444,7 +443,7 @@ fn worker_thread_loop(
                 &req.query,
                 &req.body,
                 &headers_map,
-                &ip_str,
+                req.client_ip,
             )
             // _guard drops here → PyEval_SaveThread() → tstate_cell updated
         }));

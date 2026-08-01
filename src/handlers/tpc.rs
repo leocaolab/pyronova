@@ -326,7 +326,7 @@ pub(crate) async fn handle_request_tpc_inline(
                 query,
                 &body_bytes,
                 &headers,
-                &client_ip_addr.to_string(),
+                client_ip_addr,
             )
         }));
         worker_ref.tstate = tstate_cell.get();

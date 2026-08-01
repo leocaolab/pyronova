@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
+use pyo3::ffi;
 use pyo3::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -107,6 +108,46 @@ impl PyronovaRequest {
 
 #[pymethods]
 impl PyronovaRequest {
+    /// Python-side constructor for the sub-interpreter async engine bridge
+    /// (`_async_engine.py`: `_Request(method, path, params, query,
+    /// body_bytes, headers, client_ip)`). The sync sub-interp worker path
+    /// (`worker.rs::build_request`) and the GIL route path
+    /// (`handlers/subinterp.rs`) construct this type directly from Rust and
+    /// never go through here.
+    ///
+    /// `params` / `headers` arrive as already-built `dict[str, str]` (the
+    /// FFI recv side builds them — see `python/ffi.rs`), `body_bytes` as
+    /// `bytes`, and `client_ip` as a string. On this path the peer address
+    /// is always a well-formed IP; a parse failure falls back to the
+    /// unspecified address rather than erroring, so a malformed address can
+    /// never sink an otherwise-valid request.
+    #[new]
+    fn py_new(
+        method: &str,
+        path: &str,
+        params: HashMap<String, String>,
+        query: &str,
+        body_bytes: Vec<u8>,
+        headers: HashMap<String, String>,
+        client_ip: &str,
+    ) -> Self {
+        PyronovaRequest {
+            method: Arc::from(method),
+            path: Arc::from(path),
+            params: params.into_iter().collect(),
+            query: query.to_string(),
+            headers_source: LazyHeaders::Converted(headers),
+            headers_cache: OnceLock::new(),
+            client_ip_addr: client_ip
+                .parse()
+                .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            body_bytes: Bytes::from(body_bytes),
+            body_stream_rx: Arc::new(std::sync::Mutex::new(None)),
+            query_cache: OnceLock::new(),
+            query_all_cache: OnceLock::new(),
+        }
+    }
+
     #[getter]
     fn method(&self) -> &str {
         &self.method
@@ -238,6 +279,74 @@ impl PyronovaRequest {
                 map
             })
             .clone()
+    }
+
+    // ── Buffer protocol: zero-copy `memoryview(req)` into the body ──────
+    //
+    // Lets big-body handlers view the Rust-owned body `Bytes` with no copy:
+    // `memoryview(req)` / `np.frombuffer(req, dtype=...)` point straight at
+    // our buffer, unlike `req.body` which materializes a `PyBytes` (a
+    // memcpy). Read-only, 1-D, itemsize 1, format "B". The view takes a
+    // strong ref to `req` (`view.obj`), so the body outlives the view — our
+    // instance (and its `Bytes`) can only drop after the memoryview
+    // releases that ref. This is the on-ramp for large / columnar payloads
+    // (file uploads, AI-agent bodies, and a future Arrow zero-copy body).
+    unsafe fn __getbuffer__(
+        slf: Bound<'_, Self>,
+        view: *mut ffi::Py_buffer,
+        flags: std::ffi::c_int,
+    ) -> PyResult<()> {
+        if view.is_null() {
+            return Err(pyo3::exceptions::PyBufferError::new_err("NULL view"));
+        }
+        if (flags & ffi::PyBUF_WRITABLE) == ffi::PyBUF_WRITABLE {
+            // Zero the view so a caller that ignores the error and reads
+            // buf/len sees nulls, not uninitialized stack data.
+            std::ptr::write_bytes(view, 0, 1);
+            return Err(pyo3::exceptions::PyBufferError::new_err(
+                "pyronova Request body is readonly",
+            ));
+        }
+
+        // `frozen` ⇒ `Bound::get` yields `&Self` without a borrow guard.
+        // `body_bytes` is heap-owned by this instance at a stable address,
+        // kept alive by the strong ref we stash in `view.obj` below, so the
+        // raw pointer stays valid for the view's whole lifetime.
+        let data: &[u8] = &slf.get().body_bytes;
+        (*view).buf = data.as_ptr() as *mut std::ffi::c_void;
+        (*view).len = data.len() as ffi::Py_ssize_t;
+        (*view).itemsize = 1;
+        (*view).readonly = 1;
+        (*view).ndim = 1;
+        (*view).format = if (flags & ffi::PyBUF_FORMAT) == ffi::PyBUF_FORMAT {
+            c"B".as_ptr() as *mut std::ffi::c_char
+        } else {
+            std::ptr::null_mut()
+        };
+        // For a 1-D contiguous buffer, shape/strides (when requested) point
+        // at the view's own `len`/`itemsize` fields — the CPython
+        // "stored by value in the Py_buffer" convention.
+        (*view).shape = if (flags & ffi::PyBUF_ND) == ffi::PyBUF_ND {
+            &mut (*view).len
+        } else {
+            std::ptr::null_mut()
+        };
+        (*view).strides = if (flags & ffi::PyBUF_STRIDES) == ffi::PyBUF_STRIDES {
+            &mut (*view).itemsize
+        } else {
+            std::ptr::null_mut()
+        };
+        (*view).suboffsets = std::ptr::null_mut();
+        (*view).internal = std::ptr::null_mut();
+        // Hand the view a strong ref to keep `req` (and its body) alive.
+        (*view).obj = slf.into_ptr();
+        Ok(())
+    }
+
+    unsafe fn __releasebuffer__(&self, _view: *mut ffi::Py_buffer) {
+        // Nothing to free: the buffer points into `self.body_bytes`, owned
+        // by this instance. CPython's PyBuffer_Release DECREFs `view.obj`
+        // (the ref we handed out) on its own; we must not double-free it.
     }
 }
 
