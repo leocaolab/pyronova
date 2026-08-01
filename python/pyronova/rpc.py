@@ -182,7 +182,7 @@ def rpc_decorator(app, path: str, proto_model=None):
                 return _encode_response(result, req)
             except Exception as e:
                 _log.exception("RPC handler %s raised", fn.__qualname__)
-                return {"ok": False, "error": type(e).__name__}
+                return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
         async def async_wrapper(req):
             try:
@@ -191,7 +191,7 @@ def rpc_decorator(app, path: str, proto_model=None):
                 return _encode_response(result, req)
             except Exception as e:
                 _log.exception("RPC handler %s raised", fn.__qualname__)
-                return {"ok": False, "error": type(e).__name__}
+                return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
         handler = functools.wraps(fn)(async_wrapper if is_async else sync_wrapper)
 

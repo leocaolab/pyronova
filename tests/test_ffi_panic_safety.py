@@ -20,7 +20,7 @@ import pathlib
 
 
 def test_ffi_catch_unwind_helper_defined():
-    src = pathlib.Path("src/python/interp.rs").read_text()
+    src = "\n".join(p.read_text() for p in pathlib.Path("src/python").glob("*.rs"))
     assert "unsafe fn ffi_catch_unwind" in src
     assert "std::panic::catch_unwind" in src
     # On caught panic, must log + set PyRuntimeError + return NULL.
@@ -37,7 +37,7 @@ def test_ffi_catch_unwind_helper_defined():
 
 
 def test_all_three_ffi_entry_points_guarded():
-    src = pathlib.Path("src/python/interp.rs").read_text()
+    src = "\n".join(p.read_text() for p in pathlib.Path("src/python").glob("*.rs"))
     # The 3 functions registered into sub-interpreter globals as
     # _pyronova_recv / _pyronova_send / _pyronova_emit_log.
     ffi_fns = ["pyronova_recv_cfunc", "pyronova_send_cfunc", "pyronova_emit_log_cfunc"]

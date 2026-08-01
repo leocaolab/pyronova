@@ -34,6 +34,14 @@ import signal
 import subprocess
 import sys
 import time
+
+import pytest
+
+# These tests read /proc/self/status (VmRSS) — Linux-only.
+_linux_only = pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="reads /proc/self/status (Linux-only)",
+)
 import urllib.request
 from pathlib import Path
 
@@ -397,6 +405,7 @@ def test_headers_dicts_do_not_accumulate(server):
 # ─────────────────────────────────────────────────────────────────
 
 
+@_linux_only
 def test_rss_growth_per_request_is_bounded(server):
     """End-to-end regression: RSS should not grow by more than ~0.5 KB per
     request.
@@ -443,6 +452,7 @@ def test_rss_growth_per_request_is_bounded(server):
     )
 
 
+@_linux_only
 def test_sustained_concurrent_load_no_leak(server):
     """Regression guard for `rebind_tstate_to_current_thread` (commit fc45a7f).
 

@@ -110,8 +110,9 @@ def compute(req):
 ```
 
 **Load test** (`wrk -t8 -c256 -d10s /compute`, native kernel per request in a sub-interp):
-**6,647 req/s, 66,740 requests, zero errors, 38 ms latency, stable** — each sub-interpreter
-has its own kernel instance and does not crash under load.
+**Linux (bluewhale, 16-core): 29,260 req/s** · macOS (M5 Pro): 6,647 req/s — 66k+ requests,
+zero errors, each sub-interpreter has its own kernel instance and does not crash under load
+(Linux epoll + 16 workers ~4.4× faster than macOS).
 
 ## 6. Recommendations
 

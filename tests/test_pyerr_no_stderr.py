@@ -24,7 +24,7 @@ import textwrap
 
 
 def test_log_helper_present_and_wired():
-    src = pathlib.Path("src/python/interp.rs").read_text()
+    src = "\n".join(p.read_text() for p in pathlib.Path("src/python").glob("*.rs"))
     assert "fn log_and_clear_py_exception" in src
     # Hot-path call sites: handler errors, hook errors, json.dumps,
     # run_until_complete, _Response construction, async engine exec.

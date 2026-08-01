@@ -68,7 +68,7 @@ def test_semaphore_reject_returns_503():
 def test_pool_exposes_submit_semaphore():
     """The InterpreterPool struct carries the Arc<Semaphore> so it can be
     reached from handle_request_subinterp."""
-    src = (_REPO / "src/python/interp.rs").read_text()
+    src = "\n".join(p.read_text() for p in (_REPO / "src/python").glob("*.rs"))
     assert "submit_semaphore: Arc<tokio::sync::Semaphore>" in src, (
         "InterpreterPool must hold Arc<tokio::sync::Semaphore> as submit_semaphore"
     )

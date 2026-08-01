@@ -97,7 +97,7 @@ def compute(req):
 ```
 
 **Load test**（`wrk -t8 -c256 -d10s /compute`，每请求跑 native kernel in sub-interp）：
-**6,647 req/s，66,740 请求零错误，latency 38ms 稳定** —— 每个子解释器独立 kernel 实例，负载下不崩。
+**Linux(bluewhale, 16-core):29,260 req/s** · macOS(M5 Pro):6,647 req/s —— 66k+ 请求零错误，每个子解释器独立 kernel 实例，负载下不崩(Linux epoll + 16 worker 比 macOS 快 ~4.4×)。
 
 ## 六、建议
 
