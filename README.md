@@ -12,6 +12,22 @@ Built on Per-Interpreter GIL (PEP 684) and a Rust async core, Pyronova runs Pyth
 - Sustained **400k QPS**: RSS grew **4 MB over 73.8M requests** in 180s
   (≈0 B/req). Zero errors, zero leaks.
 
+### What's new in v2.6 (2026-08-01)
+
+- **C extensions under sub-interpreters — PyO3 0.29.** Upgraded PyO3 0.28→0.29,
+  which finally registers `#[pyclass]` types inside sub-interpreters (0.28
+  hard-panicked, `pyo3#576`). A native Rust/PyO3 kernel now runs in every own-GIL
+  sub-interpreter, zero-copy over Arrow-shaped f64 buffers: **29,260 req/s** on
+  Linux (16 cores), 6,647 on macOS. See `examples/c_extension_subinterp.py`.
+- **Copy-isolation for numpy / orjson / scikit-learn.** C extensions with
+  process-global state (numpy, orjson, lxml) can't share one instance across
+  sub-interpreters. A per-worker *physical copy* gives each its own state —
+  shared-nothing, no data races, no dependence on upstream thread-safety, and
+  (in principle) safer than free-threading. A 16-worker soak
+  (`examples/stress_grill.py`, ~680k requests, broad numpy/orjson/sklearn API
+  coverage): **zero leak / double-free / deadlock / crash**, ~75 MB/worker. Full
+  status + compatibility matrix: `docs/subinterp-c-extension-status.md`.
+
 ### What's new in v2.3 (2026-04-23)
 
 - **TPC GIL bridge: single thread → N workers.** I/O-bound `gil=True`
