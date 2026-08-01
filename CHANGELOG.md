@@ -1,5 +1,32 @@
 # Changelog
 
+## v2.6.0 (2026-08-01) — PyO3 0.29 + C extensions under sub-interpreters
+
+### Upgraded PyO3 0.28 → 0.29
+
+Clean upgrade: 522 `pyo3::ffi` call sites and 11 `#[pyclass]` types compile
+unchanged; all 52 Rust unit tests pass. Why it matters: PyO3 0.28 hard-panics
+(`pyo3#576`) when a `#[pyclass]` is registered inside a sub-interpreter — the
+reason Pyronova had to `bypass pyo3` and hand-build its `_Request` type via raw
+C-API. PyO3 0.29 loads `#[pyclass]` types under the multi-interp override, with a
+*distinct* module instance per sub-interpreter (8 sub-interps → 8 module
+addresses, true isolation). Numeric C extensions no longer need the raw-C-API
+treatment. `pyo3-async-runtimes` and `pythonize` bumped to 0.29 to match.
+
+### C extensions under sub-interpreters — documented and demonstrated
+
+- **New doc** `docs/subinterp-c-extension-status.md` (+ `.en.md`) — the *measured*
+  status (Python 3.14.6 / PyO3 0.29): the two walls (slot check vs. global-state
+  `cannot load module more than once`), the
+  `_imp._override_multi_interp_extensions_check` switch, a fresh compatibility
+  matrix (pydantic / msgpack / cryptography work under override; numpy / orjson /
+  lxml need a per-worker physical copy), PyO3 0.28-vs-0.29, and the kernel
+  throughput spectrum. Supersedes the stale `subinterp-c-extension-compat.md`.
+- **New example** `examples/c_extension_subinterp.py` — a Rust/PyO3 0.29 native
+  kernel running inside own-GIL sub-interpreter workers, zero-copy over an f64
+  buffer. Load test (`wrk -t8 -c256 -d10s /compute`): **6,647 req/s, 66,740
+  requests, zero errors, 38 ms latency**.
+
 ## v2.3.1 (2026-04-23) — Sub-interpreter DB bridge unlocked under TPC
 
 ### Sub-interpreter DB bridge now works under TPC
