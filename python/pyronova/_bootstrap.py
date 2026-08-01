@@ -700,6 +700,12 @@ def _pyronova_isolate_libs():
     worker_dir = os.path.join(base, "w%d" % idx)
     os.makedirs(worker_dir, exist_ok=True)
     clone = ["cp", "-c", "-R"] if platform.system() == "Darwin" else ["cp", "--reflink=auto", "-R"]
+
+    def _clone(s, d):
+        if not os.path.exists(d):
+            subprocess.run(clone + [s, d], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
     for lib in libs:
         spec = importlib.util.find_spec(lib)
         if spec is None:
@@ -710,10 +716,13 @@ def _pyronova_isolate_libs():
             src = spec.origin
         else:
             continue
-        dst = os.path.join(worker_dir, os.path.basename(src))
-        if not os.path.exists(dst):
-            subprocess.run(clone + [src, dst], check=False,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _clone(src, os.path.join(worker_dir, os.path.basename(src)))
+        # Also clone the wheel's vendored shared libs: on Linux these live in a
+        # sibling `<pkg>.libs/` dir (e.g. numpy.libs/ holds OpenBLAS, referenced by
+        # RPATH next to the package). macOS bundles them inside `<pkg>/.dylibs/`.
+        vendored = os.path.join(os.path.dirname(src), os.path.basename(src) + ".libs")
+        if os.path.isdir(vendored):
+            _clone(vendored, os.path.join(worker_dir, os.path.basename(vendored)))
     _sys.path.insert(0, worker_dir)
 
 
