@@ -106,6 +106,52 @@ def compute(req):
 - **numpy / orjson / lxml**：每 worker 一份物理副本（损失内存换隔离）；这对 free-threading 也是最优隔离手段（不用担心共享 bug）。
 - **override 的代价**：它是进程级开关，会顺带放行 numpy 等不安全扩展去*尝试*加载（numpy 仍会因自身全局态失败）。生产里配合 crash isolation（子解释器崩不带垮 supervisor）。
 
+## 七、16-worker soak test —— 实测稳定性 + 内存
+
+`examples/stress_grill.py`:16 个 own-GIL 子解释器,每个一份独立副本
+(numpy+scipy+sklearn+orjson,APFS clone),每请求随机走**不同** C 路径广覆盖
+(不是重复一个函数):numpy(svd / matmul-BLAS / fft / sort / inv-LAPACK /
+boolean-index / ufunc 链 / percentile / eigvalsh)、orjson(4 种)、sklearn
+(LogReg / KMeans / Scaler / PCA fit)。
+
+| 维度 | 结果(M5 Pro, ~7 分钟, ~68 万请求) |
+|------|------|
+| 吞吐 | 2,509 req/s,p99 69ms |
+| 内存泄漏 | RSS 476 → 476 MB,**Δ0** |
+| double-free | `MallocScribble`+`MallocPreScribble`+`MallocErrorAbort` 专项,**0** |
+| deadlock | **无**(吞吐持续 + 事后即时响应) |
+| 崩溃 / 非-2xx | **0**(主 grill 45 万请求 100% 成功) |
+
+**内存代价**(eager 全加载 numpy+scipy+sklearn+orjson):
+
+| worker 数 | RSS | 每 worker |
+|---|---|---|
+| 1 | 264 MB | — |
+| 16 | 1403 MB | **75 MB/份** |
+
+75MB/worker 中,大头是**可写运行时态**(Python 堆 + 各库可写全局单例 + 每请求数组),
+本就必须独立;只有 `.so` 只读 text 段理论可共享(未来优化方向,Linux `dlmopen`
+namespace)。**概念阶段坚决完全隔离,不过早优化** —— 把 text 共享掺进来会稀释"零共享"这个核心保证。
+
+诚实边界:guard malloc 只覆盖 90s / 8 worker(macOS guard malloc 让 sklearn 慢到起不来);
+更彻底的 double-free/UAF 检测应在 **Linux 上用 ASan/Valgrind** 补,dlopen/dlmopen 语义也需 Linux 复测。
+
+## 八、副本隔离 vs free-threading —— 为什么理论上更安全
+
+共享可变状态是共同的敌人:sub-interpreter 的"一进程一份"墙,和 free-threading 的
+"多线程共享一份库 → data race",是同一问题的两面。
+
+| | free-threading | 副本 sub-interpreter |
+|---|---|---|
+| 模型 | 一份库,多线程**共享**全局态 | 每 worker 一份独立库,**零共享** |
+| 线程安全 | 依赖库自己适配(numpy free-threading 仍 experimental,有 data race) | **不需要库改任何代码** |
+| 故障隔离 | 共享地址空间,一处 corrupt 全崩 | 独立全局态 + crash isolation |
+| 代价 | 省内存 | ~75 MB/worker |
+
+副本方案 = **shared-nothing**:用内存换「无 data race + 不依赖上游线程安全适配 + 强隔离」。
+上面的 soak test(零 double-free / 零 deadlock)正是"零共享"的直接结果。free-threading
+省这份内存,但要赌 numpy/sklearn 的 experimental 线程安全。**概念阶段选坚决隔离 = 用能承受的内存买最硬的安全保证。**
+
 ## 附：上游追踪（现状 2026-08）
 
 | 项目 | Issue | 现状 |

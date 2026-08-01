@@ -125,6 +125,60 @@ has its own kernel instance and does not crash under load.
   numpy *attempt* to load (numpy still fails on its own global state). Pair with crash
   isolation in production (a crashing sub-interpreter must not take the supervisor down).
 
+## 7. 16-worker soak test — measured stability + memory
+
+`examples/stress_grill.py`: 16 own-GIL sub-interpreters, each with its own copy
+(numpy+scipy+sklearn+orjson, APFS clone), each request randomly taking a
+**different** C path (not one repeated function): numpy (svd / matmul-BLAS / fft /
+sort / inv-LAPACK / boolean-index / ufunc chain / percentile / eigvalsh), orjson
+(4 variants), sklearn (LogReg / KMeans / Scaler / PCA fit).
+
+| Dimension | Result (M5 Pro, ~7 min, ~680k requests) |
+|-----------|------|
+| Throughput | 2,509 req/s, p99 69ms |
+| Memory leak | RSS 476 → 476 MB, **Δ0** |
+| double-free | `MallocScribble`+`MallocPreScribble`+`MallocErrorAbort` pass, **0** |
+| deadlock | **none** (throughput sustained + responsive afterward) |
+| crashes / non-2xx | **0** (main grill: 450k requests, 100% success) |
+
+**Memory cost** (eager-loading numpy+scipy+sklearn+orjson):
+
+| workers | RSS | per worker |
+|---|---|---|
+| 1 | 264 MB | — |
+| 16 | 1403 MB | **75 MB each** |
+
+Most of the 75 MB/worker is **writable runtime state** (Python heap + each lib's
+writable global singletons + per-request arrays) — which must be independent
+anyway; only the read-only `.so` text segment is theoretically shareable (a future
+optimization, e.g. Linux `dlmopen` namespaces). **In the concept phase we isolate
+fully and don't optimize early** — sharing text would dilute the core "shared-nothing"
+guarantee.
+
+Honest boundary: guard malloc only covered 90s / 8 workers (macOS guard malloc makes
+sklearn too slow to start at 16); a more thorough double-free/UAF check should be
+done on **Linux with ASan/Valgrind**, and dlopen/dlmopen semantics re-tested there.
+
+## 8. Copy isolation vs free-threading — why it's safer in principle
+
+Shared mutable state is the common enemy: the sub-interpreter "one-per-process" wall
+and free-threading's "N threads sharing one library → data race" are two faces of the
+same problem.
+
+| | free-threading | copy-per-worker sub-interpreter |
+|---|---|---|
+| Model | one library, N threads **share** global state | one library per worker, **zero sharing** |
+| Thread safety | depends on the library adapting (numpy free-threading still experimental, has data races) | **library needs no changes** |
+| Fault isolation | shared address space, one corruption crashes all | independent global state + crash isolation |
+| Cost | saves memory | ~75 MB/worker |
+
+The copy approach is **shared-nothing**: it trades memory for "no data races + no
+dependence on upstream thread-safety + strong isolation". The soak test above (zero
+double-free / zero deadlock) is a direct result of that zero-sharing. Free-threading
+saves the memory but bets on numpy/sklearn's experimental thread safety. **In the
+concept phase, choosing full isolation = buying the hardest safety guarantee with
+memory you can afford.**
+
 ## Appendix: upstream tracking (as of Aug 2026)
 
 | Project | Issue | Status |
