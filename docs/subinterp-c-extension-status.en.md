@@ -180,13 +180,11 @@ saves the memory but bets on numpy/sklearn's experimental thread safety. **In th
 concept phase, choosing full isolation = buying the hardest safety guarantee with
 memory you can afford.**
 
-## 9. How users use it — today (manual) vs planned (`app.isolate()` built-in) ⭐
+## 9. How users use it — `app.isolate()` (shipped in v2.6) ⭐
 
-> **Important**: copy-isolation is currently manual — the user script claims a copy
-> index + `cp -c` + `sys.path` + `override` (see `examples/stress_grill.py`).
-> **This should NOT be the user's job** — it belongs in the engine as a first-class feature.
-
-**Planned user API** (fold the hand-written logic into the engine):
+One line declares the libraries; the engine clones a private copy per worker — users
+**never touch** copies/paths/counters (see `examples/isolate_numpy.py` +
+`tests/test_isolate.py`):
 
 ```python
 app = Pyronova()

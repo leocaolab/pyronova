@@ -297,6 +297,37 @@ class Pyronova:
         return self._engine.state
 
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # C-extension isolation (per-worker library copies)
+    # ------------------------------------------------------------------
+
+    def isolate(self, *libraries: str) -> None:
+        """Give each own-GIL sub-interpreter worker its OWN private copy of these
+        C-extension libraries (e.g. ``numpy``, ``scipy``, ``scikit-learn``,
+        ``orjson``), so extensions holding process-global state can run isolated
+        across workers instead of colliding on "cannot load module more than once".
+
+        Call it at module top-level — it runs inside every sub-interpreter at
+        worker init (and is a no-op in the main interpreter). Declare a library's
+        C dependencies too, e.g. ``app.isolate("numpy", "scipy", "scikit-learn")``,
+        since each copy resolves imports from its own path first.
+
+        Copies are cloned copy-on-write (APFS ``cp -c`` / Linux ``cp --reflink=auto``),
+        so disk is near-free; memory is ~one full lib set per worker
+        (see docs/subinterp-c-extension-status.md).
+        """
+        # This just RECORDS the libraries (via an env var). The actual per-worker
+        # cloning happens in _bootstrap.py at sub-interpreter init — because in
+        # worker mode `Pyronova` is a mock whose methods are no-op'd, so this
+        # method only runs meaningfully in the main interpreter.
+        import os
+        current = [x for x in os.environ.get("PYRONOVA_ISOLATE_LIBS", "").split(",") if x]
+        for lib in libraries:
+            if lib not in current:
+                current.append(lib)
+        os.environ["PYRONOVA_ISOLATE_LIBS"] = ",".join(current)
+
+    # ------------------------------------------------------------------
     # Route registration (decorator + direct call)
     # ------------------------------------------------------------------
 

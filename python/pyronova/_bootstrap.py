@@ -659,3 +659,62 @@ def _parse_multipart(req):
 _uploads_mod.parse_multipart = _parse_multipart
 _uploads_mod.UploadFile = _UploadFile
 sys.modules["pyronova.uploads"] = _uploads_mod
+
+
+# ---------------------------------------------------------------------------
+# Per-worker C-extension isolation (app.isolate() -> PYRONOVA_ISOLATE_LIBS).
+# Clone each declared library into THIS sub-interpreter's own path so
+# process-global-state extensions (numpy, orjson, ...) run isolated instead of
+# colliding across sub-interpreters ("cannot load module more than once").
+# Runs at sub-interp init, before the user script — so handlers just `import numpy`.
+# ---------------------------------------------------------------------------
+def _pyronova_isolate_libs():
+    import os
+    libs = [x.strip() for x in os.environ.get("PYRONOVA_ISOLATE_LIBS", "").split(",") if x.strip()]
+    if not libs:
+        return
+    import _imp
+    try:
+        _imp._override_multi_interp_extensions_check(-1)
+    except RuntimeError:
+        return  # main interpreter — no per-worker copy needed
+    import sys as _sys
+    import fcntl
+    import subprocess
+    import platform
+    import importlib.util
+    base = os.path.join(os.environ.get("PYRONOVA_ISOLATE_DIR", "/tmp/pyronova-isolate"), str(os.getpid()))
+    os.makedirs(base, exist_ok=True)
+    counter = os.path.join(base, ".counter")
+    fd = os.open(counter, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        idx = int((os.read(fd, 16).decode().strip() or "0"))
+        os.lseek(fd, 0, 0)
+        b = str(idx + 1).encode()
+        os.write(fd, b)
+        os.ftruncate(fd, len(b))
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    worker_dir = os.path.join(base, "w%d" % idx)
+    os.makedirs(worker_dir, exist_ok=True)
+    clone = ["cp", "-c", "-R"] if platform.system() == "Darwin" else ["cp", "--reflink=auto", "-R"]
+    for lib in libs:
+        spec = importlib.util.find_spec(lib)
+        if spec is None:
+            continue
+        if spec.submodule_search_locations:
+            src = list(spec.submodule_search_locations)[0]
+        elif spec.origin and spec.origin not in ("built-in", "frozen"):
+            src = spec.origin
+        else:
+            continue
+        dst = os.path.join(worker_dir, os.path.basename(src))
+        if not os.path.exists(dst):
+            subprocess.run(clone + [src, dst], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _sys.path.insert(0, worker_dir)
+
+
+_pyronova_isolate_libs()

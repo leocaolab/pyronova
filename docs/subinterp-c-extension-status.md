@@ -152,12 +152,10 @@ namespace)。**概念阶段坚决完全隔离,不过早优化** —— 把 text 
 上面的 soak test(零 double-free / 零 deadlock)正是"零共享"的直接结果。free-threading
 省这份内存,但要赌 numpy/sklearn 的 experimental 线程安全。**概念阶段选坚决隔离 = 用能承受的内存买最硬的安全保证。**
 
-## 九、用户怎么用 —— 现状(手动)vs 规划(`app.isolate()` 内建)⭐
+## 九、用户怎么用 —— `app.isolate()`(已实现,v2.6)⭐
 
-> **重要**:副本隔离目前要用户在 script 里手动做(领副本 index + `cp -c` + `sys.path` +
-> `override`,见 `examples/stress_grill.py`)。**这不该甩给用户** —— 应该是引擎的一等公民功能。
-
-**规划的用户 API**(把手写逻辑收进引擎):
+一行声明要隔离的库,引擎自动为每个 worker clone 独立副本 —— 用户**完全不碰**副本/路径/counter
+(见 `examples/isolate_numpy.py` + `tests/test_isolate.py`):
 
 ```python
 app = Pyronova()
