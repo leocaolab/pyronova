@@ -1,5 +1,18 @@
 # Pyronova Roadmap
 
+## Next — Built-in library copy-isolation `app.isolate()` (planned) ⭐
+
+C extensions with process-global state (numpy, orjson, lxml, scipy, scikit-learn)
+can't share one instance across sub-interpreters. The workaround — a per-worker
+physical copy — works and is soak-proven (zero leak/double-free/deadlock, ~75 MB/worker;
+see `docs/subinterp-c-extension-status.md`), but today it's **manual** (`examples/stress_grill.py`).
+
+Make it a first-class API: `app.isolate("numpy", "orjson", ...)`. The engine clones each
+lib per worker (COW: `cp --reflink` / APFS `cp -c`) and wires `sys.path` + the multi-interp
+override at sub-interp init, so user handlers just `import numpy`. Copies/paths/counters
+never touch user code. (Also revisit Linux `dlmopen` namespaces as a lower-memory alternative,
+and `_Request` → PyO3 0.29 `#[pyclass]` to drop the hand-written FFI.)
+
 ## Phase 1 — Skeleton (DONE ✓) — 2026-03-23
 
 - Tokio + Hyper HTTP server

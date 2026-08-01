@@ -180,6 +180,34 @@ saves the memory but bets on numpy/sklearn's experimental thread safety. **In th
 concept phase, choosing full isolation = buying the hardest safety guarantee with
 memory you can afford.**
 
+## 9. How users use it — today (manual) vs planned (`app.isolate()` built-in) ⭐
+
+> **Important**: copy-isolation is currently manual — the user script claims a copy
+> index + `cp -c` + `sys.path` + `override` (see `examples/stress_grill.py`).
+> **This should NOT be the user's job** — it belongs in the engine as a first-class feature.
+
+**Planned user API** (fold the hand-written logic into the engine):
+
+```python
+app = Pyronova()
+app.isolate("numpy", "orjson", "scikit-learn")   # declare libs needing per-worker isolation
+
+@app.get("/compute")
+def compute(req):
+    import numpy as np      # engine already prepared this worker's own copy; just import
+    return {"r": float(np.linalg.svd(...).sum())}
+```
+
+When building the sub-interpreter pool, the engine automatically:
+1. clones each declared lib per worker via `cp --reflink` (Linux btrfs/xfs) / APFS `cp -c`
+   (macOS) — copy-on-write, near-zero disk;
+2. per sub-interp init: `_override_multi_interp_extensions_check(-1)` + `sys.path` to its own copy;
+3. user handlers just `import numpy` and get an isolated copy — **never touching
+   copies / paths / counters**.
+
+Memory cost is unchanged (~75 MB/worker, §7) but transparent to the user. Until this
+lands, `examples/stress_grill.py` is the reproducible manual reference.
+
 ## Appendix: upstream tracking (as of Aug 2026)
 
 | Project | Issue | Status |

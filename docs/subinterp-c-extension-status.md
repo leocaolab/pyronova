@@ -152,6 +152,30 @@ namespace)。**概念阶段坚决完全隔离,不过早优化** —— 把 text 
 上面的 soak test(零 double-free / 零 deadlock)正是"零共享"的直接结果。free-threading
 省这份内存,但要赌 numpy/sklearn 的 experimental 线程安全。**概念阶段选坚决隔离 = 用能承受的内存买最硬的安全保证。**
 
+## 九、用户怎么用 —— 现状(手动)vs 规划(`app.isolate()` 内建)⭐
+
+> **重要**:副本隔离目前要用户在 script 里手动做(领副本 index + `cp -c` + `sys.path` +
+> `override`,见 `examples/stress_grill.py`)。**这不该甩给用户** —— 应该是引擎的一等公民功能。
+
+**规划的用户 API**(把手写逻辑收进引擎):
+
+```python
+app = Pyronova()
+app.isolate("numpy", "orjson", "scikit-learn")   # 声明需 per-worker 隔离的库
+
+@app.get("/compute")
+def compute(req):
+    import numpy as np      # 引擎已为本 worker 备好独立副本,正常 import 即可
+    return {"r": float(np.linalg.svd(...).sum())}
+```
+
+引擎在 sub-interp pool 构建时自动:
+1. 为每个 worker `cp --reflink`(Linux btrfs/xfs)/ APFS `cp -c`(macOS)克隆声明的库 —— COW,近零磁盘;
+2. 每个 sub-interp init:`_override_multi_interp_extensions_check(-1)` + `sys.path` 指向自己那份;
+3. 用户 handler 里 `import numpy` 直接拿到隔离副本,**完全不碰副本/路径/counter**。
+
+内存代价照旧(~75 MB/worker,§7),但对用户透明。未做时,`examples/stress_grill.py` 是可复现的手动参考。
+
 ## 附：上游追踪（现状 2026-08）
 
 | 项目 | Issue | 现状 |
