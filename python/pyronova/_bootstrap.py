@@ -747,14 +747,28 @@ def _pyronova_isolate_libs():
         except OSError:
             shutil.rmtree(tmp, ignore_errors=True)  # lost the race — use theirs
 
+    import importlib.metadata as _md
+    try:
+        _pkg2dist = _md.packages_distributions()
+    except Exception:
+        _pkg2dist = {}
     for src in srcs:
         _clone(src, os.path.join(worker_dir, os.path.basename(src)))
         # Also clone the wheel's vendored shared libs: on Linux these live in a
-        # sibling `<pkg>.libs/` dir (e.g. numpy.libs/ holds OpenBLAS, referenced by
-        # RPATH next to the package). macOS bundles them inside `<pkg>/.dylibs/`.
-        vendored = os.path.join(os.path.dirname(src), os.path.basename(src) + ".libs")
-        if os.path.isdir(vendored):
-            _clone(vendored, os.path.join(worker_dir, os.path.basename(vendored)))
+        # sibling `<name>.libs/` dir (e.g. numpy.libs/ holds OpenBLAS, referenced
+        # by RPATH next to the package); macOS bundles them inside `<pkg>/.dylibs/`.
+        # `<name>` is the DISTRIBUTION name, which can differ from the import name
+        # — e.g. `sklearn` (import) ships its libgomp in `scikit_learn.libs/`, so
+        # guessing `<import_name>.libs` alone misses it. Clone every spelling.
+        base_name = os.path.basename(src)
+        parent = os.path.dirname(src)
+        libs_names = {base_name}
+        for dist in _pkg2dist.get(base_name, []):
+            libs_names.add(dist.replace("-", "_"))
+        for ln in libs_names:
+            vendored = os.path.join(parent, ln + ".libs")
+            if os.path.isdir(vendored):
+                _clone(vendored, os.path.join(worker_dir, os.path.basename(vendored)))
     _sys.path.insert(0, worker_dir)
 
 
