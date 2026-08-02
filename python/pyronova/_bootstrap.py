@@ -676,32 +676,23 @@ def _pyronova_isolate_libs():
         return  # main interpreter — no per-worker copy needed
     import sys as _sys
     import fcntl
+    import hashlib
+    import shutil
     import subprocess
     import platform
     import importlib.util
-    base = os.path.join(os.environ.get("PYRONOVA_ISOLATE_DIR", "/tmp/pyronova-isolate"), str(os.getpid()))
-    os.makedirs(base, exist_ok=True)
-    counter = os.path.join(base, ".counter")
-    fd = os.open(counter, os.O_RDWR | os.O_CREAT, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        idx = int((os.read(fd, 16).decode().strip() or "0"))
-        os.lseek(fd, 0, 0)
-        b = str(idx + 1).encode()
-        os.write(fd, b)
-        os.ftruncate(fd, len(b))
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
-    worker_dir = os.path.join(base, "w%d" % idx)
-    os.makedirs(worker_dir, exist_ok=True)
-    clone = ["cp", "-c", "-R"] if platform.system() == "Darwin" else ["cp", "--reflink=auto", "-R"]
 
-    def _clone(s, d):
-        if not os.path.exists(d):
-            subprocess.run(clone + [s, d], check=False,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
+    # Resolve each lib's source dir and build a version signature
+    # (path + mtime + size). The signature keys the clone directory, so the
+    # SAME clones (same inodes) are reused across process restarts as long as
+    # the libraries are unchanged — a lib upgrade changes the signature and
+    # gets a fresh tree. That reuse is the whole point: on macOS the kernel
+    # verifies a `.dylib`'s code signature on first dlopen from each new inode
+    # (a numpy+scipy+sklearn set is ~hundreds of libs → several seconds per
+    # worker); a reused inode is verified once ever, so a restart is instant
+    # instead of re-paying it on every boot.
+    srcs = []
+    sig = hashlib.sha1()
     for lib in libs:
         spec = importlib.util.find_spec(lib)
         if spec is None:
@@ -712,6 +703,51 @@ def _pyronova_isolate_libs():
             src = spec.origin
         else:
             continue
+        st = os.stat(src)
+        sig.update(("%s\0%d\0%d\0" % (src, st.st_mtime_ns, st.st_size)).encode())
+        srcs.append(src)
+    if not srcs:
+        return
+    root = os.environ.get("PYRONOVA_ISOLATE_DIR", "/tmp/pyronova-isolate")
+    base = os.path.join(root, sig.hexdigest()[:16])
+    os.makedirs(base, exist_ok=True)
+
+    # Claim a worker slot: grab the first free `w{i}.lock` (non-blocking) and
+    # hold it for the process lifetime (the fd is deliberately left open —
+    # closing it would release the slot). Concurrent servers therefore get
+    # distinct slots, while a fresh run of a single server reuses the low
+    # indices, i.e. the previous run's clone dirs (same, already-verified
+    # inodes). Held per open-file-description, so sibling workers in this same
+    # process also each get a distinct slot.
+    idx = 0
+    while True:
+        lk = os.open(os.path.join(base, "w%d.lock" % idx), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            os.close(lk)
+            idx += 1
+
+    worker_dir = os.path.join(base, "w%d" % idx)
+    os.makedirs(worker_dir, exist_ok=True)
+    clone = ["cp", "-c", "-R"] if platform.system() == "Darwin" else ["cp", "--reflink=auto", "-R"]
+
+    def _clone(s, d):
+        # Reuse an existing clone (its inodes are already signature-verified).
+        # Otherwise clone into a temp dir and atomically rename it into place,
+        # so a first-ever concurrent boot never observes a half-written copy.
+        if os.path.exists(d):
+            return
+        tmp = "%s.tmp-%d" % (d, os.getpid())
+        subprocess.run(clone + [s, tmp], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            os.replace(tmp, d)
+        except OSError:
+            shutil.rmtree(tmp, ignore_errors=True)  # lost the race — use theirs
+
+    for src in srcs:
         _clone(src, os.path.join(worker_dir, os.path.basename(src)))
         # Also clone the wheel's vendored shared libs: on Linux these live in a
         # sibling `<pkg>.libs/` dir (e.g. numpy.libs/ holds OpenBLAS, referenced by

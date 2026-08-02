@@ -4,13 +4,14 @@ repeated function). Exercises the "per-worker physical copy" isolation strategy
 for C extensions that hold process-global state (see
 docs/subinterp-c-extension-status.md).
 
-Why copies: numpy/orjson/lxml can't load into a 2nd sub-interpreter (global state).
-A physically distinct copy per worker gives each its own global state → true
-shared-nothing isolation (no data races, no dependence on upstream thread-safety).
-
-Self-contained: on first run it clones the copies (APFS `cp -c` on macOS — instant,
-copy-on-write) into /tmp/libcopies. Requires: numpy, scipy, scikit-learn, orjson
-installed in the active venv.
+Why copies: numpy/scipy/sklearn/orjson can't load into a 2nd sub-interpreter
+(they hold process-global C state → "cannot load module more than once"). A
+physically distinct copy per worker gives each its own global state → true
+shared-nothing isolation. `app.isolate(...)` records the libraries; the engine
+clones one copy-on-write copy per worker at sub-interp init (APFS `cp -c` /
+Linux `cp --reflink=auto`), so disk is near-free and this works on both
+platforms. Declare a lib's C dependencies too — each copy resolves imports from
+its own path first.
 
 Run:   PYRONOVA_WORKERS=16 python examples/stress_grill.py
 Grill: wrk -t8 -c128 -d180s http://127.0.0.1:8000/grill
@@ -19,60 +20,19 @@ Measured (M5 Pro, Python 3.14.6, PyO3 0.29, ~7 min / ~680k requests):
   throughput 2,509 req/s · RSS flat 476→476 MB (zero leak) · 75 MB/worker
   zero double-free (MallocScribble+MallocErrorAbort) · zero deadlock · zero crash
 """
-import os
-import fcntl
-import subprocess
-import sysconfig
+from pyronova import Pyronova
 
-_BASE = "/tmp/libcopies"
-_LIBS = ("numpy", "scipy", "sklearn", "orjson")
+app = Pyronova()
+# Give each own-GIL worker its own isolated copy of these C extensions. Must be
+# declared before app.run() so the setting reaches the workers; the actual
+# per-worker cloning happens in the engine at sub-interp init.
+app.isolate("numpy", "scipy", "sklearn", "orjson")
 
-
-def _setup_copies():
-    """Clone one private copy of each lib per (worker + spare). Idempotent."""
-    if os.path.exists(os.path.join(_BASE, "counter")):
-        return
-    n = int(os.environ.get("PYRONOVA_WORKERS", "16")) + 2
-    sp = sysconfig.get_paths()["purelib"]
-    os.makedirs(_BASE, exist_ok=True)
-    for i in range(n):
-        d = os.path.join(_BASE, f"w{i}")
-        os.makedirs(d, exist_ok=True)
-        for lib in _LIBS:
-            src = os.path.join(sp, lib)
-            if os.path.isdir(src) and not os.path.exists(os.path.join(d, lib)):
-                # cp -c = APFS clone on macOS (instant, COW); plain copy elsewhere
-                subprocess.run(["cp", "-c", "-R", src, os.path.join(d, lib)], check=False)
-    with open(os.path.join(_BASE, "counter"), "w") as f:
-        f.write("0")
-
-
-# --- allow C extensions to load in this sub-interpreter (main interp: no-op) ---
-import _imp
-try:
-    _imp._override_multi_interp_extensions_check(-1)
-except RuntimeError:
-    pass
-
-_setup_copies()
-
-
-def _claim_copy():
-    fd = os.open(os.path.join(_BASE, "counter"), os.O_RDWR)
-    fcntl.flock(fd, fcntl.LOCK_EX)
-    idx = int((os.read(fd, 16).decode().strip() or "0"))
-    os.lseek(fd, 0, 0); b = str(idx + 1).encode(); os.write(fd, b); os.ftruncate(fd, len(b))
-    fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
-    return idx
-
-
-IDX = _claim_copy()
-import sys
-sys.path.insert(0, os.path.join(_BASE, f"w{IDX}"))   # this worker's OWN copies
-
+# These resolve to THIS worker's private copies (the engine put the worker's
+# clone dir first on sys.path before the script runs). Eager-load scipy +
+# sklearn in every worker so the soak/memory numbers are honest.
 import numpy as np
 import orjson
-# eager-load scipy + sklearn in every worker (so the soak/memory numbers are honest)
 import scipy.linalg, scipy.fft  # noqa: E401
 import sklearn.linear_model, sklearn.cluster, sklearn.preprocessing, sklearn.decomposition  # noqa: E401
 
@@ -119,24 +79,21 @@ def _ml(rng):
     return float(PCA(3).fit_transform(X).sum())
 
 
-from pyronova import Pyronova
-app = Pyronova()
-
-
 @app.get("/grill")
 def grill(req):
     rng = np.random.default_rng()
     p = int(rng.integers(0, 10))
     if p < 6:
-        return {"lib": "np", "r": _np(rng), "w": IDX}   # 60% numpy
+        return {"lib": "np", "r": _np(rng)}   # 60% numpy
     if p < 9:
-        return {"lib": "oj", "r": _oj(rng), "w": IDX}   # 30% orjson
-    return {"lib": "ml", "r": _ml(rng), "w": IDX}        # 10% sklearn (heavy)
+        return {"lib": "oj", "r": _oj(rng)}   # 30% orjson
+    return {"lib": "ml", "r": _ml(rng)}        # 10% sklearn (heavy)
 
 
 @app.get("/")
 def index(req):
-    return {"ok": True, "worker": IDX}
+    # Reports which physical numpy copy this worker resolved (isolation proof).
+    return {"ok": True, "numpy": np.__file__}
 
 
 if __name__ == "__main__":
