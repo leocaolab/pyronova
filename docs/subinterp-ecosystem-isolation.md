@@ -71,6 +71,84 @@ Single-request full ecosystem: works with (1)+(2). Concurrent: works with (1)+(2
   OpenMP(libgomp: sklearn/xgboost/lightgbm/faiss), TBB, torch/TF/ONNX, Polars(rayon),
   numexpr, opencv. Mitigation is the uniform `*_NUM_THREADS=1` env set.
 
+### PyO3-extension load: #576 guard (C-class, isolate does NOT fix)
+- Symptom: under concurrency, intermittent handler errors (NOT segfault; server
+  survives). Raw panic:
+  `panicked at crates/polars-python/src/c_api/mod.rs:133:19: failed to wrap
+  pymodule: ImportError('PyO3 modules do not yet support subinterpreters, see
+  https://github.com/PyO3/pyo3/issues/576')`
+- Measured (bluewhale, W=4, polars, isolate + PYTHONMALLOC=malloc + POLARS_MAX_THREADS=1):
+  **single request WORKS** (`/pl => {"s":10,"m":25.0}`); **concurrent = 13.6%
+  failures** (39080 / 286152 Non-2xx). Unstable, not usable.
+- Cause: polars is a **PyO3 extension**; its PyO3 build still carries the hard
+  #576 guard that refuses `#[pymodule]` init in a non-main interpreter. Distinct
+  from the single-phase-C classes above: **`app.isolate` gives each worker its own
+  polars `.so` but does NOT defeat PyO3's interpreter-identity guard** — this is a
+  PyO3-upstream issue, unfixable engine-side (you can't rebuild the user's polars).
+- Why pyre's OWN PyO3 works but polars' doesn't: pyre's engine bootstraps in the
+  **main** interp, its pyclasses (PyronovaRequest) use a process-global shared type
+  object, and it's built with PyO3 0.29 (pyclass-in-subinterp fix). polars re-imports
+  its whole pymodule fresh in each sub-interp → trips the guard.
+- **polars — CORRECTED: runs zero-mod in sub-interps with PROPER isolation; NO binary
+    hack needed.** Earlier "13.6% #576 flake, upstream-blocked, use polars-rs only" was
+    an INVALID test: polars 1.43 splits its Rust core into a SEPARATE top-level package
+    `_polars_runtime_32` (the pure-python `polars/` dir has NO .so; `_plr.py` loads
+    `_polars_runtime_32/_polars_runtime.abi3.so`, 215 MB). `app.isolate("polars")` alone
+    cloned only the python dir → all workers SHARED one .so → the guard let the first
+    interpreter in and rejected the rest = the 13.6%.
+  - **The guard, reverse-engineered (polars built with PyO3 0.29.0):** the "#576" string
+    has exactly ONE xref (`lea rcx,[rip-0x7e8c06a]` @ VA 0x8cab3cf); exactly ONE branch
+    reaches the error block (`jne 0x8cab37a` @ VA 0x8cab1fd). The check:
+    `id = InterpreterState_GetID(); lock cmpxchg [module_state+0x78], id; ok = (slot was
+    -1 i.e. first load) OR (slot == this id i.e. same interp); if !ok -> #576`. So it is
+    **per-module-instance "first interpreter wins," NOT "main-only."** Therefore a
+    per-worker PHYSICAL COPY (distinct module state slot) satisfies it legitimately —
+    isolation is the correct fix, not patching the binary.
+  - **Measured (bluewhale, W=4, `app.isolate("polars")` + `app.isolate("_polars_runtime_32")`
+    + POLARS_MAX_THREADS=1):** `/pl => {"s":10,"m":25.0}`; **1.29M req / 25s @ 51k req/s,
+    ZERO Non-2xx, zero #576, RSS 259 MB.** The AI-proposed "binary hack to bypass the
+    guard" is UNNECESSARY (and would be UB): the RE showed the guard is per-instance, so
+    satisfying it via isolation is both correct and hack-free. Papercut: user must isolate
+    BOTH `polars` and `_polars_runtime_32` — the auto-isolate TODO (catch #576 → add the
+    offending module) should cover it. Note: POLARS_MAX_THREADS=1 (its rayon pool would
+    else be N_workers × N_cores threads); for heavy dataframe work, polars-rs at the Rust
+    ENGINE layer (real host-level multithreading) is still the better architecture — but
+    polars-in-UDF now WORKS for zero-mod user code.
+  - **Old PyO3 (pre-0.29) → hard #576 panic that override cannot bypass may still exist
+    for other libs; test each.**
+  - **Newer PyO3 → declares the CPython single-phase `Py_MOD_MULTIPLE_INTERPRETERS_
+    NOT_SUPPORTED` slot, exactly like numpy. Override-bypassable → behaves as a
+    single-phase C-ext: needs isolate (per-worker copy) + override, SAME recipe as
+    numpy. Engine-fixable.** Proven pristine (bare CPython sub-interp, no pyre):
+    - **pydantic_core 2.46.3**: WITHOUT override → `module pydantic_core._pydantic_core
+      does not support loading in subinterpreters` (numpy's exact error); **WITH
+      `_override_multi_interp_extensions_check(-1)` → LOADED OK, SchemaValidator present.**
+      So pydantic (web-server hot path) is SAVABLE, not #576-blocked.
+    - **tokenizers 0.23.1**: works in pyre WITH isolate — 6.35M concurrent req / 25s @
+      252k req/s, ZERO Non-2xx (W=4, isolate + PYTHONMALLOC=malloc).
+  - **Rule: test each lib.** "It's PyO3 ⇒ broken" is WRONG (tokenizers/pydantic_core are
+    fine, numpy-class). "It's PyO3 ⇒ needs no isolate" is also WRONG (they're single-
+    phase, need the copy). cryptography/orjson/rpds-py UNTESTED — verify, don't infer.
+- **pyre isolate BUG (surfaced by pydantic_core) — FIXED & verified.** pydantic_core is
+  a package (`pydantic_core/__init__.py`) whose real ext is an INTERNAL submodule .so
+  (`pydantic_core/_pydantic_core...so`). Two bugs in `_pyronova_isolate_libs`:
+  (1) `importlib.util.find_spec(lib)` **raises `ValueError: <lib>.__spec__ is None`** when
+  the lib is already in sys.modules as a single-phase re-init stub → killed isolate at
+  sub-interp 0 init. (2) even after cloning, `import` returned the cached empty stub
+  (`__file__=None`, no attrs) → `cannot import name '_pydantic_core' ... (unknown location)`.
+  **FIX (`python/pyronova/_bootstrap.py`):** resolve the source with
+  `importlib.machinery.PathFinder().find_spec` (searches sys.path, never consults
+  sys.modules → no ValueError), with `find_spec` as fallback; and after prepending
+  worker_dir, **evict the lib + its submodules from sys.modules** so the fresh per-worker
+  clone loads. **Verified (bluewhale, W=4, isolate pydantic+pydantic_core):** `/pyd =>
+  {"name":"leo","age":42,"bad_errors":1}` (full `from pydantic import BaseModel,
+  ValidationError`, coercion + ValidationError correct); **432k req / 25s @ 17k req/s,
+  zero Non-2xx, no #576, no crash.** So pydantic (FastAPI hot path) runs zero-mod in
+  sub-interps. (Lower throughput vs tokenizers = the test rebuilds the model per request;
+  a module-level model removes it.)
+- Guidance: use the lib's **Rust core at the engine layer** (polars-rs / DataFusion),
+  not its Python binding in a sub-interp UDF. UDF handles only what the Rust layer can't.
+
 ## mac vs Linux (why mac "just worked")
 - **BLAS backend:** mac ARM numpy uses **Apple Accelerate** (OS/GCD-managed threads)
   → no self-managed pthread pool → B-class doesn't bite. Linux uses **OpenBLAS**

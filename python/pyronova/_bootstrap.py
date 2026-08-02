@@ -691,10 +691,24 @@ def _pyronova_isolate_libs():
     # (a numpy+scipy+sklearn set is ~hundreds of libs → several seconds per
     # worker); a reused inode is verified once ever, so a restart is instant
     # instead of re-paying it on every boot.
+    import importlib.machinery
     srcs = []
     sig = hashlib.sha1()
     for lib in libs:
-        spec = importlib.util.find_spec(lib)
+        # Resolve the lib's on-disk location. Use PathFinder (searches sys.path
+        # directly, ignoring sys.modules) rather than importlib.util.find_spec:
+        # a single-phase extension re-init can leave the module in sys.modules
+        # with __spec__=None (seen with pydantic_core's internal _pydantic_core.so),
+        # and find_spec() raises ValueError on such an entry, killing isolate.
+        try:
+            spec = importlib.machinery.PathFinder().find_spec(lib)
+        except (ValueError, ImportError, AttributeError):
+            spec = None
+        if spec is None:
+            try:
+                spec = importlib.util.find_spec(lib)
+            except (ValueError, ImportError, AttributeError):
+                spec = None
         if spec is None:
             continue
         if spec.submodule_search_locations:
@@ -770,6 +784,16 @@ def _pyronova_isolate_libs():
             if os.path.isdir(vendored):
                 _clone(vendored, os.path.join(worker_dir, os.path.basename(vendored)))
     _sys.path.insert(0, worker_dir)
+    # Drop any already-loaded (possibly stub) copy of each isolated lib so the
+    # next `import` resolves to THIS worker's fresh clone under worker_dir, not a
+    # cached sys.modules entry. A single-phase extension can leave a __spec__=None
+    # stub for its internal .so (e.g. pydantic_core -> _pydantic_core), which would
+    # otherwise shadow the clone and surface as "cannot import name ... (unknown
+    # location)". Evicting the package and its submodules forces the clean reload.
+    for lib in libs:
+        for name in list(_sys.modules):
+            if name == lib or name.startswith(lib + "."):
+                del _sys.modules[name]
 
 
 _pyronova_isolate_libs()
