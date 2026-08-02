@@ -185,16 +185,33 @@ Single-request full ecosystem: works with (1)+(2). Concurrent: works with (1)+(2
   on the main interp / Rust layer with multi-threaded BLAS, NOT fanned out to sub-interps.
 
 ## Engine work to land (TODO — user changes nothing)
-1. `.libs` by distribution name — DONE in `_bootstrap.py` (uncommitted).
+1. `.libs` by distribution name — DONE in `_bootstrap.py` (committed 6f499de).
 2. PyMem → mimalloc/malloc via `PyMem_SetAllocator` at pymodule init (or re-exec with
    `PYTHONMALLOC=malloc`). NOT done. Note: measured mimalloc via LD_PRELOAD did NOT
    beat glibc malloc (both ≈ −6% vs pymalloc; pymalloc's small-object specialization
    is the lost win) — so this is a real ~6% cost when the ecosystem mode is on.
 3. Default the `*_NUM_THREADS=1` env set for isolated workers (before their first
    numpy import). NOT done.
-4. Auto-isolate: detect single-phase C exts (or catch the load failure) and add them
-   to the isolate set automatically, so the user doesn't even write `app.isolate(...)`.
-   NOT done. This closes the last user-visible line.
+4. isolate package + internal-.so layout (find_spec ValueError + sys.modules stub) —
+   DONE & verified (committed 7b7a0a1). Unblocked pydantic_core; no regression.
+5. **Auto-isolate — NOT done. Chosen design (next round): REACTIVE-CATCH.** The clean
+   fix is #4; auto-isolate closes the last user-visible line (no `app.isolate(...)`):
+   - **Detect by catching the failure, because the error names the exact module.** On a
+     sub-interp import raising `does not support loading in subinterpreters` (single-phase
+     slot) or PyO3 `#576` (per-instance guard), parse the offending module from the error
+     — it is already the REAL binary package (`pydantic_core._pydantic_core`,
+     `_polars_runtime_32`), not the outer shim → the polars papercut auto-resolves.
+   - **Then:** add that module (resolve to its top-level dist/package) to the isolate set,
+     evict it + submodules from sys.modules, re-run isolation for this worker, retry import.
+   - **Per-instance guards (polars) fail on the 2nd worker, not the 1st** — fine: each
+     worker catches its OWN first failure and isolates itself independently.
+   - **Cost guard (do NOT go silent):** auto-isolating a heavy .so (polars 215 MB) × N
+     workers is real memory — `log()` every auto-isolated module + its size; warn past a
+     threshold. Never silently clone hundreds of MB.
+   - Preferred over PROACTIVE-SCAN (probe each ext's multi-interp slot at startup): scan
+     is cleaner (no failed-import dance) but needs to know what the user will import;
+     reactive is simpler and the error already names the precise module. Revisit scan only
+     if the retry-after-failure cost is visible.
 
 ## OPEN / next design (其他的都是要解决的)
 - **Arrow Flight + HTTP server** dual-protocol node: HTTP (control/small, existing
