@@ -12,6 +12,22 @@ Built on Per-Interpreter GIL (PEP 684) and a Rust async core, Pyronova runs Pyth
 - Sustained **400k QPS**: RSS grew **4 MB over 73.8M requests** in 180s
   (≈0 B/req). Zero errors, zero leaks.
 
+### What's new in v2.7 (2026-08-02)
+
+- **Your unmodified scientific-Python code runs in parallel — with almost no
+  changes.** Just `import numpy` (or scipy, pandas, scikit-learn, orjson) and
+  write your handlers as usual. Pyronova runs them across every core in its
+  own-GIL sub-interpreter workers and gives each worker its own copy of the
+  extension **automatically** — no `app.isolate(...)` call, no locks, no
+  rewrite. The long-standing "numpy can't load in a second sub-interpreter" wall
+  is handled for you. Validated end-to-end by a 16-worker
+  numpy + scipy + scikit-learn + orjson soak on **macOS and Linux** (Linux:
+  1.01M requests, zero errors). The main scientific/ML C extensions are covered
+  — see `docs/subinterp-c-extension-status.md` for the exact per-library matrix.
+- **Rock-solid shutdown.** Ctrl-C on a server running isolated C extensions no
+  longer risks an abort during interpreter teardown, and your `on_shutdown`
+  hooks always run.
+
 ### What's new in v2.6 (2026-08-01)
 
 - **C extensions under sub-interpreters — PyO3 0.29.** Upgraded PyO3 0.28→0.29,
