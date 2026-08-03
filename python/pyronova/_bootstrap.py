@@ -658,74 +658,113 @@ sys.modules["pyronova.uploads"] = _uploads_mod
 
 
 # ---------------------------------------------------------------------------
-# Per-worker C-extension isolation (app.isolate() -> PYRONOVA_ISOLATE_LIBS).
-# Clone each declared library into THIS sub-interpreter's own path so
-# process-global-state extensions (numpy, orjson, ...) run isolated instead of
-# colliding across sub-interpreters ("cannot load module more than once").
-# Runs at sub-interp init, before the user script — so handlers just `import numpy`.
+# Per-worker C-extension isolation.
+# Clone a library into THIS sub-interpreter's own path so process-global-state
+# extensions (numpy, orjson, ...) run isolated instead of colliding across
+# sub-interpreters ("does not support loading in subinterpreters").
+#
+# Two ways in, one machinery:
+#   • PROACTIVE — `app.isolate("numpy")` records the lib in PYRONOVA_ISOLATE_LIBS;
+#     `_pyronova_isolate_libs()` clones it at worker init, before the user script.
+#   • REACTIVE  — `_iso_import` (installed as builtins.__import__ below) catches the
+#     "does not support loading in subinterpreters" / PyO3 #576 ImportError, reads
+#     the offending binary module straight out of the error, isolates it, and
+#     retries — so `import numpy` just works with no `app.isolate(...)` at all.
+# Both share the helpers below and one per-worker clone dir (`_ISO["worker_dir"]`).
 # ---------------------------------------------------------------------------
-def _pyronova_isolate_libs():
-    import os
-    libs = [x.strip() for x in os.environ.get("PYRONOVA_ISOLATE_LIBS", "").split(",") if x.strip()]
-    if not libs:
-        return
+
+# Per-sub-interpreter isolation state. `worker_dir` is the private clone dir
+# (claimed once, reused across proactive + reactive isolations); `isolated` is
+# the set of top-level package names already cloned into it.
+_ISO = {"worker_dir": None, "path_inserted": False, "isolated": set()}
+# Above this many cloned bytes, an auto-isolated lib is flagged (heavy per-worker
+# copy). Not an error — a visibility guard so a silent 215 MB × N-worker clone
+# never happens. Tune / silence-warn via env.
+_ISO_WARN_BYTES = int(_os.environ.get("PYRONOVA_ISOLATE_WARN_BYTES", str(100 * 1024 * 1024)))
+
+
+def _iso_transient_override():
+    """Force-allow single-phase extension loads in THIS interpreter, returning
+    (previous_value, ok). Pair with `_iso_restore_override` in a try/finally.
+
+    The override MUST be transient. `_override_multi_interp_extensions_check` is a
+    per-interpreter GLOBAL switch: leaving it on lets the NEXT un-isolated
+    single-phase extension load SHARED (un-isolated) instead of hard-failing —
+    and that hard failure is exactly the signal reactive auto-isolate relies on.
+    (Measured: after isolating orjson with a persistent override, numpy then
+    loaded shared and was never isolated.) So flip it on only around a clone's
+    import and restore it right after. ok=False on the main interpreter (the call
+    raises there — no per-worker copy is needed anyway)."""
     import _imp
     try:
-        _imp._override_multi_interp_extensions_check(-1)
+        return _imp._override_multi_interp_extensions_check(-1), True
     except RuntimeError:
-        return  # main interpreter — no per-worker copy needed
-    import sys as _sys
-    import fcntl
-    import hashlib
-    import shutil
-    import subprocess
-    import platform
-    import importlib.util
+        return None, False
 
-    # Resolve each lib's source dir and build a version signature
-    # (path + mtime + size). The signature keys the clone directory, so the
-    # SAME clones (same inodes) are reused across process restarts as long as
-    # the libraries are unchanged — a lib upgrade changes the signature and
-    # gets a fresh tree. That reuse is the whole point: on macOS the kernel
-    # verifies a `.dylib`'s code signature on first dlopen from each new inode
-    # (a numpy+scipy+sklearn set is ~hundreds of libs → several seconds per
-    # worker); a reused inode is verified once ever, so a restart is instant
-    # instead of re-paying it on every boot.
-    import importlib.machinery
-    srcs = []
-    sig = hashlib.sha1()
-    for lib in libs:
-        # Resolve the lib's on-disk location. Use PathFinder (searches sys.path
-        # directly, ignoring sys.modules) rather than importlib.util.find_spec:
-        # a single-phase extension re-init can leave the module in sys.modules
-        # with __spec__=None (seen with pydantic_core's internal _pydantic_core.so),
-        # and find_spec() raises ValueError on such an entry, killing isolate.
+
+def _iso_restore_override(prev):
+    if prev is not None:
+        import _imp
+        _imp._override_multi_interp_extensions_check(prev)
+
+
+def _iso_resolve_src(lib):
+    """On-disk source dir (package) or file (single-file ext) for `lib`, or None.
+
+    Uses PathFinder (searches sys.path directly, ignoring sys.modules) rather
+    than importlib.util.find_spec: a single-phase extension re-init can leave the
+    module in sys.modules with __spec__=None (seen with pydantic_core's internal
+    _pydantic_core.so), and find_spec() raises ValueError on such an entry."""
+    import importlib.util, importlib.machinery
+    try:
+        spec = importlib.machinery.PathFinder().find_spec(lib)
+    except (ValueError, ImportError, AttributeError):
+        spec = None
+    if spec is None:
         try:
-            spec = importlib.machinery.PathFinder().find_spec(lib)
+            spec = importlib.util.find_spec(lib)
         except (ValueError, ImportError, AttributeError):
             spec = None
-        if spec is None:
-            try:
-                spec = importlib.util.find_spec(lib)
-            except (ValueError, ImportError, AttributeError):
-                spec = None
-        if spec is None:
-            continue
-        if spec.submodule_search_locations:
-            src = list(spec.submodule_search_locations)[0]
-        elif spec.origin and spec.origin not in ("built-in", "frozen"):
-            src = spec.origin
-        else:
-            continue
-        st = os.stat(src)
-        sig.update(("%s\0%d\0%d\0" % (src, st.st_mtime_ns, st.st_size)).encode())
-        srcs.append(src)
-    if not srcs:
-        return
-    root = os.environ.get("PYRONOVA_ISOLATE_DIR", "/tmp/pyronova-isolate")
-    base = os.path.join(root, sig.hexdigest()[:16])
-    os.makedirs(base, exist_ok=True)
+    if spec is None:
+        return None
+    if spec.submodule_search_locations:
+        return list(spec.submodule_search_locations)[0]
+    if spec.origin and spec.origin not in ("built-in", "frozen"):
+        return spec.origin
+    return None
 
+
+def _iso_worker_dir(seed_libs):
+    """Claim (once) this worker's private clone dir and add it to sys.path.
+
+    Idempotent — later calls return the same dir regardless of `seed_libs`, so a
+    reactive isolation reuses the dir a proactive one already claimed.
+
+    Bucket layout: declared libs get a bucket keyed by their (path+mtime+size)
+    signature, so an unchanged set reuses the SAME clones (same inodes) across
+    restarts — on macOS the kernel verifies a `.dylib`'s code signature on first
+    dlopen per inode (a numpy+scipy+sklearn set is hundreds of libs → seconds
+    per worker), and a reused inode is verified once ever. A pure-reactive worker
+    (nothing declared) uses a stable shared `auto` bucket; per-worker isolation
+    still comes from the `w{idx}` slot below, and per-lib freshness from the
+    `.sig` manifest in `_iso_clone_lib`."""
+    if _ISO["worker_dir"] is not None:
+        return _ISO["worker_dir"]
+    import os, sys, fcntl, hashlib
+    root = os.environ.get("PYRONOVA_ISOLATE_DIR", "/tmp/pyronova-isolate")
+    if seed_libs:
+        sig = hashlib.sha1()
+        for lib in seed_libs:
+            src = _iso_resolve_src(lib)
+            if src is None:
+                continue
+            st = os.stat(src)
+            sig.update(("%s\0%d\0%d\0" % (src, st.st_mtime_ns, st.st_size)).encode())
+        bucket = sig.hexdigest()[:16]
+    else:
+        bucket = "auto"
+    base = os.path.join(root, bucket)
+    os.makedirs(base, exist_ok=True)
     # Claim a worker slot: grab the first free `w{i}.lock` (non-blocking) and
     # hold it for the process lifetime (the fd is deliberately left open —
     # closing it would release the slot). Concurrent servers therefore get
@@ -742,17 +781,58 @@ def _pyronova_isolate_libs():
         except OSError:
             os.close(lk)
             idx += 1
-
     worker_dir = os.path.join(base, "w%d" % idx)
     os.makedirs(worker_dir, exist_ok=True)
+    _ISO["worker_dir"] = worker_dir
+    # NOTE: do NOT put worker_dir on sys.path here. The clone SOURCE must always
+    # resolve to the ORIGINAL install (site-packages), never to a prior clone —
+    # if worker_dir were on the path before cloning, on a warm restart
+    # `_iso_resolve_src` would find the existing clone and treat it as the source,
+    # and the freshness check would rmtree-then-cp it onto itself, destroying it.
+    # Path insertion happens in `_iso_ensure_on_path`, AFTER cloning.
+    return worker_dir
+
+
+def _iso_ensure_on_path(worker_dir):
+    """Put this worker's clone dir at the front of sys.path (once), so imports of
+    isolated libs resolve to the private copy. Called AFTER cloning — see the
+    ordering note in `_iso_worker_dir`."""
+    import sys
+    if not _ISO["path_inserted"]:
+        sys.path.insert(0, worker_dir)
+        _ISO["path_inserted"] = True
+
+
+def _iso_clone_lib(lib, worker_dir, pkg2dist):
+    """Clone `lib` (and its vendored `.libs`) into `worker_dir`. Returns the
+    cloned destination path (dir or file), or None if the lib can't be resolved.
+
+    Freshness: a per-lib `<basename>.sig` manifest records the source signature.
+    An existing clone is reused only if the manifest still matches — a lib upgrade
+    (mtime/size change) forces a re-clone. This covers reactively-added libs the
+    bucket signature can't see, and makes declared-lib upgrades safe regardless of
+    the bucket keying."""
+    import os, subprocess, shutil, platform
+    src = _iso_resolve_src(lib)
+    if src is None:
+        return None
+    st = os.stat(src)
+    cur_sig = "%d\0%d" % (st.st_mtime_ns, st.st_size)
     clone = ["cp", "-c", "-R"] if platform.system() == "Darwin" else ["cp", "--reflink=auto", "-R"]
 
-    def _clone(s, d):
-        # Reuse an existing clone (its inodes are already signature-verified).
-        # Otherwise clone into a temp dir and atomically rename it into place,
-        # so a first-ever concurrent boot never observes a half-written copy.
+    def _clone(s, d, sig_path=None):
         if os.path.exists(d):
-            return
+            if sig_path is None:
+                return  # vendored .libs: no manifest, reuse as-is
+            try:
+                with open(sig_path) as f:
+                    if f.read() == cur_sig:
+                        return  # up-to-date clone, inodes already verified
+            except OSError:
+                pass
+            shutil.rmtree(d, ignore_errors=True)  # stale (lib upgraded) — re-clone
+        # Clone into a temp dir and atomically rename it into place, so a
+        # first-ever concurrent boot never observes a half-written copy.
         tmp = "%s.tmp-%d" % (d, os.getpid())
         subprocess.run(clone + [s, tmp], check=False,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -760,40 +840,259 @@ def _pyronova_isolate_libs():
             os.replace(tmp, d)
         except OSError:
             shutil.rmtree(tmp, ignore_errors=True)  # lost the race — use theirs
+        if sig_path is not None:
+            try:
+                with open(sig_path, "w") as f:
+                    f.write(cur_sig)
+            except OSError:
+                pass
 
+    base_name = os.path.basename(src)
+    dst = os.path.join(worker_dir, base_name)
+    _clone(src, dst, os.path.join(worker_dir, base_name + ".sig"))
+    # Also clone the wheel's vendored shared libs: on Linux these live in a
+    # sibling `<name>.libs/` dir (e.g. numpy.libs/ holds OpenBLAS, referenced
+    # by RPATH next to the package); macOS bundles them inside `<pkg>/.dylibs/`.
+    # `<name>` is the DISTRIBUTION name, which can differ from the import name
+    # — e.g. `sklearn` (import) ships its libgomp in `scikit_learn.libs/`, so
+    # guessing `<import_name>.libs` alone misses it. Clone every spelling.
+    parent = os.path.dirname(src)
+    libs_names = {base_name}
+    for dist in pkg2dist.get(base_name, []):
+        libs_names.add(dist.replace("-", "_"))
+    for ln in libs_names:
+        vendored = os.path.join(parent, ln + ".libs")
+        if os.path.isdir(vendored):
+            _clone(vendored, os.path.join(worker_dir, os.path.basename(vendored)))
+    return dst
+
+
+def _iso_evict(lib):
+    """Drop `lib` and its submodules from sys.modules so the next `import`
+    resolves to THIS worker's fresh clone, not a cached (possibly stub) entry.
+    A single-phase extension can leave a __spec__=None stub for its internal .so
+    (e.g. pydantic_core -> _pydantic_core), which would otherwise shadow the clone
+    and surface as "cannot import name ... (unknown location)"."""
+    import sys
+    for name in list(sys.modules):
+        if name == lib or name.startswith(lib + "."):
+            del sys.modules[name]
+
+
+def _iso_pkg2dist():
     import importlib.metadata as _md
     try:
-        _pkg2dist = _md.packages_distributions()
+        return _md.packages_distributions()
     except Exception:
-        _pkg2dist = {}
-    for src in srcs:
-        _clone(src, os.path.join(worker_dir, os.path.basename(src)))
-        # Also clone the wheel's vendored shared libs: on Linux these live in a
-        # sibling `<name>.libs/` dir (e.g. numpy.libs/ holds OpenBLAS, referenced
-        # by RPATH next to the package); macOS bundles them inside `<pkg>/.dylibs/`.
-        # `<name>` is the DISTRIBUTION name, which can differ from the import name
-        # — e.g. `sklearn` (import) ships its libgomp in `scikit_learn.libs/`, so
-        # guessing `<import_name>.libs` alone misses it. Clone every spelling.
-        base_name = os.path.basename(src)
-        parent = os.path.dirname(src)
-        libs_names = {base_name}
-        for dist in _pkg2dist.get(base_name, []):
-            libs_names.add(dist.replace("-", "_"))
-        for ln in libs_names:
-            vendored = os.path.join(parent, ln + ".libs")
-            if os.path.isdir(vendored):
-                _clone(vendored, os.path.join(worker_dir, os.path.basename(vendored)))
-    _sys.path.insert(0, worker_dir)
-    # Drop any already-loaded (possibly stub) copy of each isolated lib so the
-    # next `import` resolves to THIS worker's fresh clone under worker_dir, not a
-    # cached sys.modules entry. A single-phase extension can leave a __spec__=None
-    # stub for its internal .so (e.g. pydantic_core -> _pydantic_core), which would
-    # otherwise shadow the clone and surface as "cannot import name ... (unknown
-    # location)". Evicting the package and its submodules forces the clean reload.
-    for lib in libs:
-        for name in list(_sys.modules):
-            if name == lib or name.startswith(lib + "."):
-                del _sys.modules[name]
+        return {}
+
+
+def _iso_report(lib, dst):
+    """Never-silent cost guard: log the auto-isolated lib and its cloned size,
+    warning past `_ISO_WARN_BYTES`. Cloning a heavy .so (polars is 215 MB) into
+    every worker is real per-worker memory once it's dlopen'd — surface it."""
+    import os
+    total = 0
+    if os.path.isdir(dst):
+        for r, _d, files in os.walk(dst):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(r, f))
+                except OSError:
+                    pass
+    else:
+        try:
+            total = os.path.getsize(dst)
+        except OSError:
+            pass
+    mb = total / (1024 * 1024)
+    log = _logging.getLogger("pyronova.isolate")
+    if total >= _ISO_WARN_BYTES:
+        log.warning(
+            "auto-isolate: cloned %r (%.1f MB) into this worker — heavy per-worker "
+            "copy; declare it in app.isolate(%r) to make the cost explicit",
+            lib, mb, lib,
+        )
+    else:
+        log.info(
+            "auto-isolate: cloned %r (%.1f MB) into this worker "
+            "(import tripped sub-interpreter isolation)",
+            lib, mb,
+        )
+
+
+def _iso_isolate(mod_name):
+    """Clone the top-level package of `mod_name` into this worker and record it,
+    so the caller's retry (under a transient override) loads the private copy.
+    Returns True if the package is isolated (freshly cloned OR already staged),
+    False if its source can't be resolved. Cloning happens once per package per
+    worker; a freshly-cloned lib is reported (cost guard), an already-staged one
+    is not (proactive already logged the declaration)."""
+    lib = mod_name.split(".")[0]  # clone the top-level package, not the inner .so
+    if lib in _ISO["isolated"]:
+        return True  # already staged; caller still retries under transient override
+    worker_dir = _iso_worker_dir(seed_libs=())
+    dst = _iso_clone_lib(lib, worker_dir, _iso_pkg2dist())  # resolves source pre-path-insert
+    if dst is None:
+        return False
+    _iso_ensure_on_path(worker_dir)  # now the clone can shadow the original
+    _ISO["isolated"].add(lib)
+    _iso_evict(lib)
+    _iso_report(lib, dst)
+    return True
+
+
+def _pyronova_isolate_libs():
+    """PROACTIVE path: pre-stage a per-worker clone of every lib declared via
+    `app.isolate()` at worker init, before the user script runs, and put the
+    worker's clone dir on sys.path. The user's `import numpy` then resolves to
+    the private clone, whose C extension loads first-try under the meta_path
+    finder's transient override (below) — no failed attempt, warm-restart safe.
+    Proactive just does the cloning up front so the first request pays no `cp`.
+    (No persistent override: that would mask the collision signal an UNDECLARED
+    single-phase lib needs to trigger its own reactive clone.)"""
+    import os
+    libs = [x.strip() for x in os.environ.get("PYRONOVA_ISOLATE_LIBS", "").split(",") if x.strip()]
+    if not libs:
+        return
+    # Sub-interpreter probe: the override raises on the main interp, where no
+    # per-worker copy is needed. Probe and restore — real loads flip it later.
+    prev, ok = _iso_transient_override()
+    if not ok:
+        return
+    _iso_restore_override(prev)
+    resolvable = [lib for lib in libs if _iso_resolve_src(lib) is not None]
+    if not resolvable:
+        return
+    worker_dir = _iso_worker_dir(seed_libs=resolvable)
+    pkg2dist = _iso_pkg2dist()
+    cloned_any = False
+    for lib in resolvable:
+        # Clone while worker_dir is NOT yet on sys.path, so each source resolves
+        # to the original install, not a sibling clone (warm-restart safety).
+        if _iso_clone_lib(lib, worker_dir, pkg2dist) is not None:
+            _ISO["isolated"].add(lib)
+            cloned_any = True
+    if cloned_any:
+        _iso_ensure_on_path(worker_dir)
+        for lib in resolvable:
+            _iso_evict(lib)
+
+
+# -- Load-time override: a meta_path finder for C extensions -----------------
+#
+# A single-phase C extension refuses to load in a sub-interpreter unless the
+# per-interpreter override is set. We set it BEFORE the load (not after a failed
+# attempt): a meta_path finder swaps the real ExtensionFileLoader for one that
+# flips the transient override around exec_module. Because the load never fails-
+# then-retries, it can't leave a half-registered def in CPython's PROCESS-GLOBAL
+# extension table (`_PyRuntime.imports.extensions`) — the table `sys.modules`
+# eviction can't clear, whose pollution made a warm restart (reused clone) abort
+# with "cannot load module more than once per process". Declared libs (pre-staged
+# clones already on sys.path) therefore load isolated on the first try.
+
+import builtins as _builtins
+import importlib.machinery as _machinery
+_iso_real_import = _builtins.__import__
+_iso_in_hook = False  # re-entrancy guard: only the OUTERMOST import self-heals
+
+
+class _IsolatingExtensionLoader:
+    """Wraps an ExtensionFileLoader so its dlopen+PyInit runs under a transient
+    override. Delegates the rest of the loader protocol to the real loader."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def create_module(self, spec):
+        # For an extension the .so is dlopen'd + PyInit run HERE, and the
+        # single-phase "does not support loading in subinterpreters" check fires
+        # here (not in exec_module, which is a no-op for single-phase exts). So
+        # the override must wrap create_module.
+        prev, _ok = _iso_transient_override()
+        try:
+            return self._inner.create_module(spec)
+        finally:
+            _iso_restore_override(prev)
+
+    def exec_module(self, module):
+        prev, _ok = _iso_transient_override()
+        try:
+            self._inner.exec_module(module)
+        finally:
+            _iso_restore_override(prev)
+
+    def __getattr__(self, attr):
+        # get_filename / is_package / get_code / get_source / etc.
+        return getattr(self._inner, attr)
+
+
+class _IsolatingExtensionFinder:
+    """meta_path finder that, for C-extension imports ONLY, swaps in a loader
+    that sets the transient override around the load. Everything else returns
+    None so the default finders handle it. Uses PathFinder (which does not
+    consult meta_path) to resolve the real spec, so there's no recursion."""
+
+    def find_spec(self, fullname, path, target=None):
+        try:
+            spec = _machinery.PathFinder.find_spec(fullname, path, target)
+        except (ImportError, AttributeError, ValueError):
+            return None
+        if spec is None or not isinstance(spec.loader, _machinery.ExtensionFileLoader):
+            return None  # not a C extension — let the default finders handle it
+        spec.loader = _IsolatingExtensionLoader(spec.loader)
+        return spec
+
+
+# -- REACTIVE self-heal: clone an undeclared lib on the load that still collides
+#
+# With the override always set at load time (finder above), a single-phase ext
+# loads shared into the FIRST worker that touches it; a LATER worker loading the
+# same shared file gets "cannot load module more than once per process". That is
+# the signal that this undeclared lib needs a per-worker copy. We catch it at the
+# top-level import, clone the package, and restart the import — which now resolves
+# to the private clone (a DIFFERENT file → different registry key, so no double-
+# load). The failed attempt was on the original file; the retry is on the clone.
+
+def _iso_is_isolation_error(exc):
+    """True for the isolation-class ImportErrors a per-worker clone can fix."""
+    msg = str(exc)
+    return (
+        "does not support loading in subinterpreters" in msg  # single-phase, no override
+        or "cannot load module more than once per process" in msg  # shared 2nd load
+        or "do not yet support subinterpreters" in msg  # PyO3 #576
+    )
+
+
+def _iso_import(name, globals=None, locals=None, fromlist=(), level=0):
+    global _iso_in_hook
+    if _iso_in_hook:
+        # Nested import (e.g. numpy/__init__ importing its own .so): let it raise
+        # so the failure propagates to the outermost call, which owns the
+        # isolate-and-restart of the whole top-level statement.
+        return _iso_real_import(name, globals, locals, fromlist, level)
+    _iso_in_hook = True
+    try:
+        try:
+            return _iso_real_import(name, globals, locals, fromlist, level)
+        except ImportError as exc:
+            if not _iso_is_isolation_error(exc):
+                raise  # unrelated ImportError — surface the real error
+            # Isolate the top-level package (the outer import name is the
+            # top-level statement; fall back to the offending module's name).
+            top = (name or getattr(exc, "name", "") or "").split(".")[0]
+            if not top or not _iso_isolate(top):
+                raise  # can't identify/clone — original error stands, not masked
+            _iso_evict(top)  # drop the partial (shared) import so the clone loads
+            # Restart the import; worker_dir is now on sys.path so it resolves to
+            # the private clone, whose ext loads via the finder's override. A
+            # second failure propagates (never masked, never loops).
+            return _iso_real_import(name, globals, locals, fromlist, level)
+    finally:
+        _iso_in_hook = False
 
 
 _pyronova_isolate_libs()
+import sys as _sys_iso
+_sys_iso.meta_path.insert(0, _IsolatingExtensionFinder())
+_builtins.__import__ = _iso_import

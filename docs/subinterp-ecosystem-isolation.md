@@ -194,24 +194,57 @@ Single-request full ecosystem: works with (1)+(2). Concurrent: works with (1)+(2
    numpy import). NOT done.
 4. isolate package + internal-.so layout (find_spec ValueError + sys.modules stub) —
    DONE & verified (committed 7b7a0a1). Unblocked pydantic_core; no regression.
-5. **Auto-isolate — NOT done. Chosen design (next round): REACTIVE-CATCH.** The clean
-   fix is #4; auto-isolate closes the last user-visible line (no `app.isolate(...)`):
-   - **Detect by catching the failure, because the error names the exact module.** On a
-     sub-interp import raising `does not support loading in subinterpreters` (single-phase
-     slot) or PyO3 `#576` (per-instance guard), parse the offending module from the error
-     — it is already the REAL binary package (`pydantic_core._pydantic_core`,
-     `_polars_runtime_32`), not the outer shim → the polars papercut auto-resolves.
-   - **Then:** add that module (resolve to its top-level dist/package) to the isolate set,
-     evict it + submodules from sys.modules, re-run isolation for this worker, retry import.
-   - **Per-instance guards (polars) fail on the 2nd worker, not the 1st** — fine: each
-     worker catches its OWN first failure and isolates itself independently.
-   - **Cost guard (do NOT go silent):** auto-isolating a heavy .so (polars 215 MB) × N
-     workers is real memory — `log()` every auto-isolated module + its size; warn past a
-     threshold. Never silently clone hundreds of MB.
-   - Preferred over PROACTIVE-SCAN (probe each ext's multi-interp slot at startup): scan
-     is cleaner (no failed-import dance) but needs to know what the user will import;
-     reactive is simpler and the error already names the precise module. Revisit scan only
-     if the retry-after-failure cost is visible.
+5. **Auto-isolate — DONE & verified.** Closes the last user-visible line: an unmodified
+   `import numpy` works in own-GIL workers with NO `app.isolate(...)`. Implemented in
+   `_bootstrap.py`. Verified matrix (0 failures): cold + WARM restart × declared
+   (`app.isolate`) + undeclared (pure reactive) × workers 1/4/8, 3 restarts each.
+   - **Load-time override via a `sys.meta_path` finder — NOT catch-then-retry.** The naive
+     "let the import fail, then retry" design was abandoned: a single-phase ext's FAILED
+     first attempt can half-register its def in CPython's PROCESS-GLOBAL extension table
+     (`_PyRuntime.imports.extensions`), which `sys.modules` eviction cannot clear, so the
+     retry aborts with `cannot load module more than once per process` (flaky, warm-restart
+     only). Instead, `_IsolatingExtensionFinder` (at `sys.meta_path[0]`) wraps every
+     ExtensionFileLoader with `_IsolatingExtensionLoader`, which flips the transient override
+     around **`create_module`** (where the .so dlopen + PyInit + the single-phase check
+     actually happen — NOT `exec_module`, a no-op for single-phase exts). The load succeeds
+     on the FIRST try → no failed attempt → no registry pollution.
+   - **Transient override, never persistent.** `_override_multi_interp_extensions_check` is a
+     per-interpreter GLOBAL switch; leaving it on lets the NEXT un-isolated single-phase ext
+     load SHARED (un-isolated) instead of hard-failing (measured: after isolating orjson with
+     a persistent override, numpy then loaded shared and was never isolated). So it is flipped
+     on only around each clone's load and restored immediately.
+   - **Declared (`app.isolate`) vs undeclared.** Declared: pre-stage the clone + put worker_dir
+     on `sys.path` at bootstrap → `import numpy` resolves the clone, loads first-try under the
+     finder's override. Undeclared: the finder loads the ORIGINAL into the first worker that
+     touches it; a LATER worker loading the same shared file gets `cannot load module more than
+     once`, which `_iso_import` (a thin `__import__` wrapper) catches → clones the top-level
+     package → restarts the import → resolves the private clone (a DIFFERENT file → different
+     registry key → no collision). First worker uses the original, rest use clones — valid
+     per-interp isolation (same first-wins shape as the polars per-instance guard).
+   - **Clone SOURCE must resolve to the original install, never a sibling clone.** Bug found &
+     fixed: `_iso_worker_dir` originally inserted worker_dir on `sys.path` BEFORE the source
+     was resolved; on a WARM restart the existing clone shadowed the original, the freshness
+     check mismatched, and `_clone` rmtree'd-then-cp'd the clone onto itself → destroyed it
+     (`exists=False`) → warm restart aborted. Fix: path insertion moved to `_iso_ensure_on_path`,
+     called AFTER cloning.
+   - **Cost guard (never silent):** `_iso_report` logs every auto-isolated module + its cloned
+     MB via `logging.getLogger("pyronova.isolate")` (bridged to Rust tracing); WARNING past
+     `PYRONOVA_ISOLATE_WARN_BYTES` (default 100 MB) so a heavy 215 MB × N-worker clone is never
+     silent.
+6. **Teardown abort on graceful (SIGINT) shutdown — DONE & verified.** Finalizing a worker
+   that loaded an isolated single-phase ext aborts on a cross-arena free at `Py_Finalize →
+   Py_EndInterpreter → type_dealloc → _PyObject_Free` (~50% on macOS libmalloc; this is
+   A-class #2 surfacing at FINALIZATION, not import). NOT introduced by auto-isolate — it
+   reproduces on the base `app.isolate("numpy")` path too (4/8 on graceful SIGINT); the
+   existing tests never caught it because they stop the server with SIGTERM (proc.terminate),
+   which the Rust ctrl_c handler doesn't catch, so the process dies before finalization. Fix
+   (`app.py` `run()`): on a graceful stop in subinterp/auto mode, `os._exit(0)` AFTER shutdown
+   hooks, skipping CPython finalization (the OS reclaims everything). Because the same SIGINT
+   also raises `KeyboardInterrupt` on the Python main thread (often landing on the first
+   shutdown hook or right before the hard exit), SIGINT is set to `SIG_IGN` before the hooks
+   run. Verified: SIGABRT 0/6, shutdown hooks 6/6. Confirmed root cause independently:
+   `PYTHONMALLOC=malloc` also eliminates it (0/4) — that remains the proper fix for the
+   IMPORT-time A-class crash on Linux (#2), still not done.
 
 ## OPEN / next design (其他的都是要解决的)
 - **Arrow Flight + HTTP server** dual-protocol node: HTTP (control/small, existing

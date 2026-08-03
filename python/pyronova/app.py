@@ -1132,6 +1132,8 @@ class Pyronova:
 
         import threading
 
+        graceful = False
+        run_error = None
         try:
             # Run startup hooks inside the try so shutdown hooks still run on failure
             for hook in self._startup_hooks:
@@ -1147,22 +1149,62 @@ class Pyronova:
                 tls_key=tls_key,
                 extra_tls_ports=extra_tls_ports,
             )
-        finally:
-            # Run shutdown hooks (even if server exits abnormally).
-            # [arc:intentional-handle] reason: shutdown is a best-effort
-            # teardown barrier — one hook failing (e.g. a pool that's
-            # already closed) must not prevent the remaining hooks from
-            # running their own cleanup. We log each failure with the
-            # exception object (full traceback via .exception) so the
-            # cleanup error is observable, then continue; there is no
-            # caller left to propagate to at process exit.
-            for hook in self._shutdown_hooks:
+            graceful = True  # engine returned after its own SIGINT drain
+        except KeyboardInterrupt:
+            # SIGINT reaches BOTH Rust (which drains connections and returns) and
+            # Python's main thread (which raises KeyboardInterrupt — here, or a
+            # few bytecodes later). Either way it's a graceful stop.
+            graceful = True
+        except BaseException as e:  # noqa: BLE001 — real failure, re-raised below
+            run_error = e
+
+        # On a graceful stop, neutralize the triggering SIGINT before running
+        # shutdown hooks. The pending signal from ctrl-C often fires only once
+        # we're back in Python bytecode (i.e. on the FIRST shutdown hook,
+        # interrupting it) or between the hooks and the hard exit below (skipping
+        # it and dropping us into CPython finalization). Ignoring SIGINT here lets
+        # the hooks run to completion and guarantees the hard exit. Retry through a
+        # KeyboardInterrupt that fires while we're installing the handler.
+        if graceful:
+            while True:
                 try:
-                    hook()
-                except Exception:
-                    _logging.getLogger("pyronova.app").exception(
-                        "shutdown hook %s raised", getattr(hook, "__name__", repr(hook))
-                    )
+                    import signal as _signal
+                    _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
+                    break
+                except KeyboardInterrupt:
+                    continue
+                except (ValueError, OSError):
+                    break  # not the main thread / no handler slot — best effort
+
+        # Run shutdown hooks (best-effort teardown barrier): one hook failing
+        # (e.g. a pool already closed) must not stop the rest, so log each failure
+        # with its traceback and continue.
+        for hook in self._shutdown_hooks:
+            try:
+                hook()
+            except Exception:
+                _logging.getLogger("pyronova.app").exception(
+                    "shutdown hook %s raised", getattr(hook, "__name__", repr(hook))
+                )
+
+        # Sub-interpreter servers: on a graceful stop, skip CPython finalization.
+        # `Py_Finalize -> Py_EndInterpreter` finalizing a worker that loaded an
+        # ISOLATED single-phase C-extension (numpy, orjson, pydantic_core, ...)
+        # does a cross-arena free — own-GIL sub-interps each get their own pymalloc
+        # arena, and the ext's type teardown frees a pointer owned by another arena
+        # -> `_PyObject_Free` aborts (~50% on macOS libmalloc; the design's A-class
+        # allocator issue surfacing at finalization). Connections drained and the
+        # shutdown hooks ran, and the OS reclaims everything, so hard-exit instead.
+        # `default`/`gil` mode creates no sub-interpreters and finalizes cleanly.
+        # See docs/subinterp-ecosystem-isolation.md.
+        if graceful and mode in ("subinterp", "auto"):
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
+
+        # Not a graceful stop (real startup/run error): surface it normally.
+        if run_error is not None:
+            raise run_error
 
     def _run_with_reload(self):
         """Watch .py files and restart server on changes using OS-native events."""
