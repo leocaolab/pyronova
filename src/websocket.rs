@@ -380,6 +380,11 @@ where
                     Some(Ok(Message::Close(_))) | None => {
                         break;
                     }
+                    // clippy::collapsible_match wants this folded into a match
+                    // guard (`Ping(data) if ws_sink.send(Pong(data)).await.is_err()`),
+                    // but that moves `data` into the guard → E0507 (can't move a
+                    // pattern binding out in a guard). Keep the explicit `if`.
+                    #[allow(clippy::collapsible_match)]
                     Some(Ok(Message::Ping(data))) => {
                         if ws_sink.send(Message::Pong(data)).await.is_err() {
                             break;

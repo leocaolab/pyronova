@@ -372,16 +372,17 @@ impl InterpreterPool {
         // Route to async pool if handler is async and pool exists.
         // `async_work_tx.is_some()` is the single source of truth for
         // "async workers exist" — set iff `has_any_async` at construction.
-        let tx = if self.async_work_tx.is_some()
-            && self
-                .is_async_handler
-                .get(req.handler_idx)
-                .copied()
-                .unwrap_or(false)
-        {
-            self.async_work_tx.as_ref().unwrap()
-        } else {
-            &self.sync_work_tx
+        let tx = match self.async_work_tx.as_ref() {
+            Some(tx)
+                if self
+                    .is_async_handler
+                    .get(req.handler_idx)
+                    .copied()
+                    .unwrap_or(false) =>
+            {
+                tx
+            }
+            _ => &self.sync_work_tx,
         };
 
         tx.try_send(req).map_err(|e| match e {
