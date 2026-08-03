@@ -1,5 +1,41 @@
 # Changelog
 
+## v2.7.0 (2026-08-02) — Reactive auto-isolate + graceful-shutdown fix
+
+### Reactive auto-isolate — unmodified `import numpy` in own-GIL workers
+
+Single-phase C extensions (numpy, orjson, pydantic_core, ...) now run in
+sub-interpreter workers with **no `app.isolate(...)` call**. A `sys.meta_path`
+finder wraps each `ExtensionFileLoader` and flips the per-interpreter multi-interp
+override *transiently* around `create_module` (where the single-phase "does not
+support loading in subinterpreters" check fires), so the extension loads on the
+first try — no failed attempt to pollute CPython's process-global extension
+registry. Declared libs (`app.isolate(...)`) pre-stage a per-worker clone;
+undeclared libs self-heal on the load that collides; built-in single-phase exts
+that can't be cloned (e.g. `faulthandler`, pulled in by sklearn→joblib→loky) load
+shared under the override. Verified across cold + warm restart × declared +
+undeclared × workers 1/4/8, plus the 16-worker numpy/scipy/sklearn/orjson grill
+soak on both macOS and Linux.
+
+- **Transient, not persistent, override** — a persistent override masks the
+  hard-failure signal every later undeclared single-phase lib needs to isolate
+  itself.
+- **Warm-restart fix** — resolve a clone's *source* before putting the worker dir
+  on `sys.path`, so a prior clone can't shadow the original and be destroyed.
+- **Cost guard** — every auto-isolated module + its cloned size is logged;
+  WARNING past `PYRONOVA_ISOLATE_WARN_BYTES` (default 100 MB).
+
+### Graceful-shutdown teardown fix
+
+Finalizing a sub-interpreter worker that had loaded an isolated single-phase C
+extension aborted on a cross-arena free at `Py_EndInterpreter` (~50% on macOS
+libmalloc; pre-existing, reproduced on `app.isolate` too, hidden because the
+suite stops servers with SIGTERM). On a graceful (SIGINT) stop in subinterp mode,
+`app.run()` now `os._exit(0)`s after the shutdown hooks (skipping CPython
+finalization); SIGINT is `SIG_IGN`'d first so the same signal can't interrupt the
+hooks or skip the hard exit. New tests cover warm restart, graceful shutdown, and
+the built-in-ext fallback.
+
 ## v2.6.0 (2026-08-01) — PyO3 0.29 + C extensions under sub-interpreters
 
 ### Upgraded PyO3 0.28 → 0.29
