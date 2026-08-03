@@ -308,8 +308,7 @@ pub(crate) unsafe fn register_db_bridge(globals: *mut ffi::PyObject) {
                 if !ffi::PyErr_Occurred().is_null() {
                     ffi::PyErr_Clear();
                 }
-                let name_str = std::ffi::CStr::from_ptr(name.as_ptr())
-                    .to_string_lossy();
+                let name_str = std::ffi::CStr::from_ptr(name.as_ptr()).to_string_lossy();
                 tracing::error!(
                     target: "pyronova::app",
                     function = %name_str,
@@ -335,8 +334,7 @@ pub(crate) unsafe fn register_db_bridge(globals: *mut ffi::PyObject) {
             if !ffi::PyErr_Occurred().is_null() {
                 ffi::PyErr_Clear();
             }
-            let name_str = std::ffi::CStr::from_ptr(name.as_ptr())
-                .to_string_lossy();
+            let name_str = std::ffi::CStr::from_ptr(name.as_ptr()).to_string_lossy();
             tracing::error!(
                 target: "pyronova::app",
                 function = %name_str,

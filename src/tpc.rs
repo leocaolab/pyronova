@@ -610,9 +610,7 @@ fn run_tpc_subinterp_fanout(
         let shutdown_w = shutdown.clone();
         let tls = tls_acceptor.clone();
         let bridge = main_bridge.clone();
-        let rx = rx_slot
-            .take()
-            .expect("worker_rxs slot must be populated");
+        let rx = rx_slot.take().expect("worker_rxs slot must be populated");
 
         let handle = std::thread::Builder::new()
             .name(format!("pyronova-tpc-{i}"))

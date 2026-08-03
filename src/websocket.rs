@@ -52,9 +52,9 @@ impl PyronovaWebSocket {
     fn recv(&self, py: Python<'_>) -> Option<String> {
         py.detach(|| {
             // Recover from poisoning (a previous holder panicked) — channel
-// data is intact, only the poison flag is set. Panicking across
-// FFI into Python is UB per PyO3 (arc websocket-1).
-let mut rx = self.incoming_rx.lock().unwrap_or_else(|e| e.into_inner());
+            // data is intact, only the poison flag is set. Panicking across
+            // FFI into Python is UB per PyO3 (arc websocket-1).
+            let mut rx = self.incoming_rx.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 match rx.blocking_recv()? {
                     WsMsg::Text(s) => return Some(s),
@@ -69,9 +69,9 @@ let mut rx = self.incoming_rx.lock().unwrap_or_else(|e| e.into_inner());
     fn recv_bytes(&self, py: Python<'_>) -> Option<Vec<u8>> {
         py.detach(|| {
             // Recover from poisoning (a previous holder panicked) — channel
-// data is intact, only the poison flag is set. Panicking across
-// FFI into Python is UB per PyO3 (arc websocket-1).
-let mut rx = self.incoming_rx.lock().unwrap_or_else(|e| e.into_inner());
+            // data is intact, only the poison flag is set. Panicking across
+            // FFI into Python is UB per PyO3 (arc websocket-1).
+            let mut rx = self.incoming_rx.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 match rx.blocking_recv()? {
                     WsMsg::Binary(b) => return Some(b),
@@ -88,9 +88,9 @@ let mut rx = self.incoming_rx.lock().unwrap_or_else(|e| e.into_inner());
         // Python-typed return value.
         let msg = py.detach(|| {
             // Recover from poisoning (a previous holder panicked) — channel
-// data is intact, only the poison flag is set. Panicking across
-// FFI into Python is UB per PyO3 (arc websocket-1).
-let mut rx = self.incoming_rx.lock().unwrap_or_else(|e| e.into_inner());
+            // data is intact, only the poison flag is set. Panicking across
+            // FFI into Python is UB per PyO3 (arc websocket-1).
+            let mut rx = self.incoming_rx.lock().unwrap_or_else(|e| e.into_inner());
             rx.blocking_recv()
         })?;
         match msg {

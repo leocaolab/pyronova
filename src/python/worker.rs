@@ -195,7 +195,9 @@ impl SubInterpreterWorker {
             ffi::Py_DECREF(ty_ptr);
             if rc != 0 {
                 ffi::PyErr_Print();
-                return Err("failed to inject _Request/_Response into sub-interp globals".to_string());
+                return Err(
+                    "failed to inject _Request/_Response into sub-interp globals".to_string(),
+                );
             }
         }
 

@@ -299,9 +299,7 @@ pub(crate) async fn handle_request_tpc_inline(
                 handler_count = routes.handler_names.len(),
                 "route table inconsistency: handler_idx out of range"
             );
-            let mut r = full_body(error_response(
-                "internal error: route table inconsistency",
-            ));
+            let mut r = full_body(error_response("internal error: route table inconsistency"));
             apply_cors(&mut r, routes.cors_config.as_ref());
             return Ok(r);
         }
@@ -349,11 +347,8 @@ pub(crate) async fn handle_request_tpc_inline(
         }
     };
 
-    let mut http_resp = super::build_subinterp_http_response(
-        result,
-        &accept_encoding,
-        Some(handler_name.as_str()),
-    );
+    let mut http_resp =
+        super::build_subinterp_http_response(result, &accept_encoding, Some(handler_name.as_str()));
     apply_cors(&mut http_resp, routes.cors_config.as_ref());
     let latency_us = start.elapsed().as_micros() as u64;
     let status = http_resp.status().as_u16();

@@ -52,16 +52,18 @@ pub(crate) fn runtime() -> &'static Runtime {
     // explicit and avoids the unwind-into-FFI UB. In practice tokio
     // multi_thread Builder::build only fails on syscall exhaustion
     // (threads, fds) at process startup, which is unrecoverable.
-    PG_RUNTIME.get_or_init(|| match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_name("pyronova-db")
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("[pyronova-db] fatal: failed to build pg runtime: {e}");
-            std::process::abort();
+    PG_RUNTIME.get_or_init(|| {
+        match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("pyronova-db")
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("[pyronova-db] fatal: failed to build pg runtime: {e}");
+                std::process::abort();
+            }
         }
     })
 }
@@ -319,10 +321,9 @@ impl PgCursor {
         let msg = py.detach(|| rx.blocking_recv());
         match msg {
             Some(CursorMsg::Row(row)) => {
-                *self
-                    .rx
-                    .lock()
-                    .map_err(|e| PyRuntimeError::new_err(format!("cursor mutex poisoned: {e}")))? = Some(rx);
+                *self.rx.lock().map_err(|e| {
+                    PyRuntimeError::new_err(format!("cursor mutex poisoned: {e}"))
+                })? = Some(rx);
                 row_to_dict(py, &row)
             }
             Some(CursorMsg::Err(e)) => Err(PyRuntimeError::new_err(e)),

@@ -200,10 +200,9 @@ fn grpc_reply_trailers(
     // Build infallibly: Response::new defaults to 200 OK, and inserting a
     // 'static header value never errors — no unwrap / panic path.
     let mut response = Response::new(boxed);
-    response.headers_mut().insert(
-        "content-type",
-        HeaderValue::from_static("application/grpc"),
-    );
+    response
+        .headers_mut()
+        .insert("content-type", HeaderValue::from_static("application/grpc"));
     response
 }
 

@@ -658,7 +658,8 @@ fn worker_thread_loop_async(
                 let _ = Box::from_raw(emit_log_def);
                 return false;
             }
-            let rc = ffi::PyDict_SetItemString(globals, c"_pyronova_emit_log".as_ptr(), emit_log_func);
+            let rc =
+                ffi::PyDict_SetItemString(globals, c"_pyronova_emit_log".as_ptr(), emit_log_func);
             ffi::Py_DECREF(emit_log_func);
             if rc != 0 {
                 return false;

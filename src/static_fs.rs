@@ -212,8 +212,10 @@ pub(crate) async fn try_static_file(
                     content_type: ct,
                 },
             ) {
-                cache_bytes()
-                    .fetch_sub(prev.bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                cache_bytes().fetch_sub(
+                    prev.bytes.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
         } else {
             cache_bytes().fetch_sub(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);

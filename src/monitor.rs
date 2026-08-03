@@ -138,9 +138,7 @@ pub fn spawn_rss_sampler() {
     // second would overwrite (and thus detach) the first's JoinHandle, leaving
     // stop_rss_sampler able to join only the newest — the detached thread would
     // then outlive Py_Finalize and segfault on freed code pages (ISSUE-72).
-    let mut slot = RSS_SAMPLER_HANDLE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut slot = RSS_SAMPLER_HANDLE.lock().unwrap_or_else(|e| e.into_inner());
     if slot.is_some() {
         return;
     }

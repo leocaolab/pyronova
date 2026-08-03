@@ -127,9 +127,9 @@ pub fn init_logger(level: String, access_log: bool, format: String) -> PyResult<
         // programming error, not a runtime condition. Panic loudly rather than
         // silently leaving access logs enabled and breaking the access_log=false
         // contract.
-        let directive = "pyronova::access=off"
-            .parse()
-            .expect("hardcoded log directive 'pyronova::access=off' must be a valid EnvFilter directive");
+        let directive = "pyronova::access=off".parse().expect(
+            "hardcoded log directive 'pyronova::access=off' must be a valid EnvFilter directive",
+        );
         filter = filter.add_directive(directive);
     }
 
@@ -220,7 +220,14 @@ pub fn emit_python_log(
     // logging.addLevelName() can register lowercase custom levels; without
     // this, those fall through to the TRACE arm and are silently dropped by
     // a typical EnvFilter (e.g. RUST_LOG=debug excludes TRACE).
-    dispatch_python_log!(level.to_uppercase().as_str(), wid, name, pathname, lineno, message);
+    dispatch_python_log!(
+        level.to_uppercase().as_str(),
+        wid,
+        name,
+        pathname,
+        lineno,
+        message
+    );
 
     Ok(())
 }
