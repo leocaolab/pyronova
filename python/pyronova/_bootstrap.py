@@ -1078,16 +1078,28 @@ def _iso_import(name, globals=None, locals=None, fromlist=(), level=0):
         except ImportError as exc:
             if not _iso_is_isolation_error(exc):
                 raise  # unrelated ImportError — surface the real error
-            # Isolate the top-level package (the outer import name is the
+            # Try to isolate the top-level package (the outer import name is the
             # top-level statement; fall back to the offending module's name).
             top = (name or getattr(exc, "name", "") or "").split(".")[0]
-            if not top or not _iso_isolate(top):
-                raise  # can't identify/clone — original error stands, not masked
-            _iso_evict(top)  # drop the partial (shared) import so the clone loads
-            # Restart the import; worker_dir is now on sys.path so it resolves to
-            # the private clone, whose ext loads via the finder's override. A
-            # second failure propagates (never masked, never loops).
-            return _iso_real_import(name, globals, locals, fromlist, level)
+            if top and _iso_isolate(top):
+                _iso_evict(top)  # cloned → drop the partial so the retry loads it
+            # Retry under a TRANSIENT override — which covers BOTH cases:
+            #   • clonable file-ext (numpy/orjson/...): worker_dir is now on
+            #     sys.path, so it resolves to the private clone (loaded via the
+            #     override here or the finder's, both fine);
+            #   • UN-clonable single-phase ext (a built-in / stdlib .so like
+            #     `faulthandler`, pulled in transitively by sklearn→joblib→loky):
+            #     it has no clonable source, so `_iso_isolate` was a no-op — it
+            #     just needs the override to load SHARED, exactly as it did under
+            #     the old persistent override. The finder only wraps
+            #     ExtensionFileLoader, not BuiltinImporter, so this explicit
+            #     override is what makes built-ins load.
+            # A second failure propagates (never masked, never loops).
+            prev, _ok = _iso_transient_override()
+            try:
+                return _iso_real_import(name, globals, locals, fromlist, level)
+            finally:
+                _iso_restore_override(prev)
     finally:
         _iso_in_hook = False
 
