@@ -29,6 +29,40 @@ prerequisites, all engine-side (user changes nothing):**
 Single-request full ecosystem: works with (1)+(2). Concurrent: works with (1)+(2)+(3)
 — **345k concurrent heavy numpy/scipy/sklearn requests, zero crash.**
 
+## Capability matrix — 可以 / 不可以 (verified vs untested)
+
+**✅ works · ❌ doesn't · ❓ untested (verify, don't infer).** Where measured is noted;
+"bluewhale" = Linux, else mac (CPython 3.14) unless stated.
+
+### Libraries — zero-mod on own-GIL sub-interpreters
+| lib | verdict | prerequisites |
+|---|---|---|
+| numpy / scipy / sklearn | ✅ | isolate + override (+ on Linux: `PYTHONMALLOC=malloc` and `*_NUM_THREADS=1`); 345k concurrent, bluewhale |
+| orjson | ✅ | reactive auto-isolate (measured this repo) |
+| tokenizers | ✅ | isolate; 6.35M req, bluewhale |
+| pydantic / pydantic_core | ✅ | isolate + override; 432k req, bluewhale |
+| polars (in a UDF) | ✅ but | must isolate BOTH `polars` AND `_polars_runtime_32` (215 MB); for heavy work prefer polars-rs at the engine layer; 1.29M req, bluewhale |
+| cryptography / rpds-py / others | ❓ | not tested — verify each; "it's PyO3 ⇒ X" is wrong both ways |
+
+### Approaches
+| approach | verdict | why |
+|---|---|---|
+| per-worker physical clone + transient override | ✅ | the foundation |
+| meta_path finder: override around `create_module` | ✅ | load succeeds first-try, no failed attempt to pollute the process ext table |
+| `os._exit` on graceful shutdown (skip finalize) | ✅ | fixes the sub-interp teardown cross-arena abort; zero hot-path cost |
+| `PYTHONMALLOC=malloc` | ✅ | fixes A-class (Linux import-time abort AND teardown abort) |
+| catch-then-retry the failed import | ❌ | the failed 1st attempt half-registers the ext in `_PyRuntime.imports.extensions` (uncleanable by sys.modules eviction) → "cannot load module more than once" on warm restart |
+| persistent override | ❌ | masks the hard-failure signal every later undeclared single-phase ext needs to isolate itself |
+| `use_main_obmalloc=1` | ❌ | removes A-class but races under load (shared pymalloc, no lock) |
+| patchelf unique-SONAME per-worker | ❌ | isolates the instance but B-class still segfaults |
+| free-threading (PEP 703) as the general answer | ❌ | unmodified GIL-relying code data-races; sub-interps preserve per-worker GIL, that's the bet |
+
+### Platform
+- **mac:** import-time A-class tolerated (only a warning); **teardown aborted** (fixed via `os._exit`).
+- **Linux:** import-time A-class **hard-aborts** (glibc) → **without `PYTHONMALLOC=malloc` (#2), sklearn won't even import**; concurrent needs `*_NUM_THREADS=1` (#3).
+
+**One line:** declared `app.isolate` + the above = solid; reactive auto-isolate is the convenience layer; heavy work belongs in the Rust engine. Linux production still needs #2 and #3 (below).
+
 ## The three failure classes (independent)
 
 ### Load: single-phase C ext can't load in >1 interp
