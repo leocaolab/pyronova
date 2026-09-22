@@ -185,12 +185,15 @@ def delete_cookie(
     path: str = "/",
     domain: str | None = None,
     secure: bool = False,
+    httponly: bool = False,
     samesite: str | None = "Lax",
 ) -> Response:
     """Delete a cookie by setting it expired.
 
-    Forwards domain/secure/samesite so the browser's deletion matches the
-    original cookie's scope.
+    Forwards domain/secure/httponly/samesite so the browser's deletion
+    matches the original cookie's scope. Browsers refuse to overwrite an
+    HttpOnly cookie with a non-HttpOnly Set-Cookie, so deleting an HttpOnly
+    cookie requires ``httponly=True`` or the cookie silently survives.
     """
     return set_cookie(
         response, name, "",
@@ -198,5 +201,6 @@ def delete_cookie(
         path=path,
         domain=domain,
         secure=secure,
+        httponly=httponly,
         samesite=samesite,
     )

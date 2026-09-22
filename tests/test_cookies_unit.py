@@ -74,3 +74,18 @@ def test_delete_cookie():
     cookie_header = result.headers.get("set-cookie", "")
     assert "session=" in cookie_header
     assert "Max-Age=0" in cookie_header
+
+
+def test_delete_cookie_forwards_httponly():
+    resp = Response(body="ok")
+    result = delete_cookie(resp, "session", httponly=True, secure=True)
+    cookie_header = result.headers.get("set-cookie", "")
+    assert "Max-Age=0" in cookie_header
+    assert "HttpOnly" in cookie_header
+    assert "Secure" in cookie_header
+
+
+def test_delete_cookie_default_not_httponly():
+    resp = Response(body="ok")
+    result = delete_cookie(resp, "session")
+    assert "HttpOnly" not in result.headers.get("set-cookie", "")
