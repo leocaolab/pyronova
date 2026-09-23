@@ -174,6 +174,50 @@ def compute(req):
 
 内存代价照旧(~75 MB/worker,§7),但对用户透明。未做时,`examples/stress_grill.py` 是可复现的手动参考。
 
+## 十、已知问题与解决（Linux）
+
+16 worker 的 grill（`examples/stress_grill.py`）在 Linux 上（bluewhale，16 核，Python 3.14.4，
+numpy 2.5.1，scipy 1.18.0，OpenBLAS 0.3.33）暴露了三个问题，**都不是 PyO3 的问题**。第七节
+的 macOS 实测没遇到：arm64 的 numpy 用 Accelerate 不用 OpenBLAS，而第一个问题要冷 import 才触发。
+
+| # | 现象 | 原因 | 归属 | 解决 |
+|---|------|------|------|------|
+| 1 | 启动时 abort，`free(): invalid size`，在 `scipy/linalg/blas.py` `_get_funcs` | CPython ≥ 3.13 把单阶段扩展的 init 放到**主**解释器跑，子解释器拿到的是模块 dict 的浅拷贝 | CPython 的设计，经我们的 override 触发 | Pyronova 在 worker 自己里面跑私有副本的 init |
+| 2 | 负载下 SIGSEGV，在 OpenBLAS `dgetrf_parallel`（`np.linalg.inv`） | Pyronova 线程用 Rust 默认 2 MiB 栈；CPython 自己的线程是 8 MiB，OpenBLAS 需要超过 2 MiB | Pyronova | 所有跑 Python 的线程改为 8 MiB 栈 |
+| 3 | 负载下吞吐崩塌（4 worker 55 req/s） | 所有 worker 调同一个 BLAS，它的线程池按全部核数开 | OpenBLAS 部署问题（gunicorn/uvicorn 多 worker 一样） | 多 worker 默认每 worker 1 个 BLAS 线程 |
+
+**1. 单阶段 init 在主解释器里跑。** 3.13 起 `import.c` 的 `import_run_extension` 在调用单阶段
+模块的 `PyInit_*` 之前切到主解释器（`switch_to_main_interpreter`），在那里缓存模块 dict，子解释器
+拿到它的浅拷贝（`reload_singlephase_extension`）。CPython 自己的注释写明这对有独立 obmalloc 的
+解释器是个问题（gh-88216）。正常情况下子解释器会拒绝加载；开了 override 就能加载，而模块里所有对象
+（scipy 的 f2py fortran 对象）都在主解释器的堆上。第一次修改（`func.int_dtype = ...` 让对象的
+`__dict__` 扩容）就把主解释器的内存 free 进了 worker 的分配器。纯 CPython + `concurrent.interpreters`
+不带 Pyronova 即可复现，冷 import 100% 崩。每 worker 一份副本没用：副本只换了加载哪个文件，没换哪个
+解释器拥有对象。现在 Pyronova 的 loader 对私有副本自己在 worker 里调用 `PyInit_*`，并用
+`PyState_AddModule` 注册（即 3.12 的行为）。只有私有副本走这条路：别人不会加载那个文件，它的 C 静态
+状态只初始化一次。**仍未解决：** 从共享 site-packages 文件加载（未隔离）的单阶段扩展，对象仍归主解释器。
+
+**2. 线程栈大小。** `dgetrf_parallel` 递归，每层在栈上放一个大 job 数组。2 MiB 线程上溢出；
+`RUST_MIN_STACK=8M` 下同样负载干净。栈大小是 `src/python/mod.rs` 的 `PYTHON_THREAD_STACK`，
+占的是地址空间，不是常驻内存。
+
+**3. BLAS 线程。** `numpy` 和 `scipy` 各带一份 OpenBLAS，动态加载器每进程只映射一次，所以所有
+worker 共用。每个线程池按全部核数开，N 个 worker 同时调用就互相踩。纯 CPython、4 个子解释器
+× `np.linalg.inv` 25 秒：默认线程池 82 次，单线程 128,873 次。
+现在子解释器模式、worker 多于 1 时，`app.run()` 会：
+
+- 把 `OPENBLAS_NUM_THREADS`、`OMP_NUM_THREADS`、`MKL_NUM_THREADS`、`VECLIB_MAXIMUM_THREADS`
+  设为 `1`（管住之后才加载的 BLAS）；
+- 已经加载的 BLAS（应用顶部 import 了 numpy）若装了 `threadpoolctl` 就在运行时调成 1；
+  没装就打一条警告，说明怎么做；
+- 这几个变量你自己设过任何一个，就全部不动。想给 BLAS 更多线程，启动前设例如
+  `OPENBLAS_NUM_THREADS=4`。
+
+启动横幅会写明走了哪条（`BLAS: 1 thread per worker ...`）。
+
+三个修复之后的 grill，默认环境，每次 30 秒：4 worker 6,067 req/s，8 worker 10,666，16 worker
+11,058，无崩溃。16 worker、`wrk -c128` 跑 180 秒：271 万请求，15,063 req/s，无错误。
+
 ## 附：上游追踪（现状 2026-08）
 
 | 项目 | Issue | 现状 |

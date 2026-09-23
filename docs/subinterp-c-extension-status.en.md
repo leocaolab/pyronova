@@ -206,6 +206,60 @@ When building the sub-interpreter pool, the engine automatically:
 Memory cost is unchanged (~75 MB/worker, §7) but transparent to the user. Until this
 lands, `examples/stress_grill.py` is the reproducible manual reference.
 
+## 10. Known issues and fixes (Linux)
+
+Three problems showed up when the 16-worker grill (`examples/stress_grill.py`) ran on
+Linux (bluewhale, 16 cores, Python 3.14.4, numpy 2.5.1, scipy 1.18.0, OpenBLAS 0.3.33).
+None of them is a PyO3 problem. The macOS runs in §7 didn't hit them: arm64 numpy uses
+Accelerate instead of OpenBLAS, and the first one needs a cold import.
+
+| # | Symptom | Cause | Whose | Fix |
+|---|---------|-------|-------|-----|
+| 1 | Startup abort, `free(): invalid size`, in `scipy/linalg/blas.py` `_get_funcs` | CPython ≥ 3.13 runs a single-phase extension's init in the **main** interpreter and gives the sub-interpreter a shallow copy of the module dict | CPython design, reached through our override | Pyronova runs the init of a worker's private copy in the worker itself |
+| 2 | SIGSEGV under load in OpenBLAS `dgetrf_parallel` (`np.linalg.inv`) | Pyronova threads had Rust's 2 MiB default stack; CPython's own threads get 8 MiB, and OpenBLAS needs more than 2 MiB | Pyronova | Every thread that runs Python now has an 8 MiB stack |
+| 3 | Throughput collapses under load (55 req/s at 4 workers) | Every worker calls into one BLAS whose thread pool is sized to all cores | OpenBLAS deployment (same for gunicorn/uvicorn workers) | Multi-worker runs default to 1 BLAS thread per worker |
+
+**1. Single-phase init runs in the main interpreter.** Since 3.13, `import.c`
+`import_run_extension` switches to the main interpreter before calling a single-phase
+module's `PyInit_*` (`switch_to_main_interpreter`), caches the module dict there, and the
+sub-interpreter receives a shallow copy of it (`reload_singlephase_extension`). CPython's
+own comment on that cache says it is a problem for an interpreter with its own obmalloc
+(gh-88216). Normally the sub-interpreter would refuse the module. With the override on, it
+loads, and every object in the module (scipy's f2py fortran objects) lives on the main
+interpreter's heap. The first mutation (`func.int_dtype = ...` grows the object's
+`__dict__`) frees main's memory into the worker's allocator. Reproduced in plain CPython
+with `concurrent.interpreters`, no Pyronova involved: 100% on a cold import. The
+per-worker copy didn't help, because a copy only changes which file is loaded, not which
+interpreter owns the objects. Pyronova's loader now calls a private copy's `PyInit_*`
+itself, in the worker, and registers it with `PyState_AddModule` (what 3.12 did). Only
+private copies take this path: nothing else loads that file, so its C statics are
+initialized once. **Still open:** a single-phase extension loaded from the shared
+site-packages file (not isolated) still gets main-owned objects.
+
+**2. Thread stack size.** `dgetrf_parallel` recurses and keeps a large job array on the
+stack at each level. On a 2 MiB thread it overflowed; with `RUST_MIN_STACK=8M` the same
+load ran clean. The stack is `PYTHON_THREAD_STACK` in `src/python/mod.rs`. It is
+address space, not resident memory.
+
+**3. BLAS threads.** `numpy` and `scipy` each ship one OpenBLAS, and the dynamic loader
+maps each once per process, so every worker shares them. Each pool is sized to all cores;
+N workers calling at once thrash it. Plain CPython, 4 sub-interpreters × `np.linalg.inv`
+for 25 s: 82 inversions with the default pool, 128,873 with one thread.
+`app.run()` in sub-interpreter mode with more than one worker now:
+
+- sets `OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS`, `MKL_NUM_THREADS` and
+  `VECLIB_MAXIMUM_THREADS` to `1` (covers BLAS loaded later);
+- shrinks BLAS that is already loaded (numpy imported at the top of the app) through
+  `threadpoolctl`, if installed; without it, it logs a warning saying what to do;
+- leaves everything alone if you set any of those variables yourself. To give BLAS more
+  threads, set e.g. `OPENBLAS_NUM_THREADS=4` before starting.
+
+The startup banner says which one happened (`BLAS: 1 thread per worker ...`).
+
+Grill after the three fixes, default environment, 30 s runs: 6,067 req/s at 4 workers,
+10,666 at 8, 11,058 at 16, no crashes. 180 s at 16 workers, `wrk -c128`: 2.71M requests,
+15,063 req/s, no errors.
+
 ## Appendix: upstream tracking (as of Aug 2026)
 
 | Project | Issue | Status |

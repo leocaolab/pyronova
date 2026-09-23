@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **The Linux grill crash (pyronova#1).** Two separate bugs, neither in PyO3:
+  - **Startup abort, `free(): invalid size`, in scipy's `blas.py`.** CPython 3.13+ runs a
+    single-phase extension's init in the main interpreter and hands a sub-interpreter a
+    shallow copy of the module dict. So the objects of an isolated extension (scipy's f2py
+    modules) lived on the main interpreter's heap, and the worker's first change to one freed
+    main's memory into its own allocator. Reproduced in plain CPython, 100% on a cold import.
+    The loader now runs the init of a worker's private copy inside that worker.
+  - **SIGSEGV under load in OpenBLAS `dgetrf_parallel`.** Threads that run Python had Rust's
+    2 MiB default stack; CPython's own threads get 8 MiB, and OpenBLAS overflowed 2 MiB. They
+    now get 8 MiB (`PYTHON_THREAD_STACK`).
+
+### Changed
+
+- **Multi-worker runs default BLAS to 1 thread per worker.** Every worker shares one BLAS
+  whose thread pool is sized to all cores; the grill ran at 55 req/s with 4 workers, and at
+  6,067 with this default. Set `OPENBLAS_NUM_THREADS` (or `OMP_NUM_THREADS` /
+  `MKL_NUM_THREADS` / `VECLIB_MAXIMUM_THREADS`) to choose yourself; Pyronova then changes
+  nothing. BLAS already loaded before `app.run()` is changed through `threadpoolctl` when
+  installed, otherwise a warning says what to do. See
+  `docs/subinterp-c-extension-status.en.md` §10.
+
 ## v2.7.1 (2026-09-23) — Sub-interpreter crash fixes; PyO3 fork, isojson
 
 ### Fixed

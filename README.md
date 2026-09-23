@@ -426,6 +426,22 @@ Pyronova auto-detects which routes need GIL and dispatches accordingly. Fast rou
 
 > **When will this be fixed?** When PyO3 and numpy add PEP 684 multi-phase init support. Tracking: [PyO3#3451](https://github.com/PyO3/pyo3/issues/3451), [numpy#24003](https://github.com/numpy/numpy/issues/24003). When they do, these libraries will run at full speed in sub-interpreters — no `gil=True` needed.
 
+#### Known issues and solutions (C extensions on Linux)
+
+- **Multi-worker BLAS (numpy/scipy/sklearn).** Every worker shares one BLAS library whose
+  thread pool is sized to all cores, so N workers thrash it (measured: 55 req/s instead of
+  6,000). `app.run()` with more than one sub-interpreter worker therefore defaults BLAS to
+  **1 thread per worker**, the same advice as for gunicorn/uvicorn workers. Install
+  `threadpoolctl` so this also applies when numpy is imported before `app.run()`. To choose
+  yourself, set `OPENBLAS_NUM_THREADS` (or `OMP_NUM_THREADS` / `MKL_NUM_THREADS`) before
+  starting; Pyronova then changes nothing.
+- **Isolated single-phase extensions (scipy's f2py modules etc.) crashed on startup**
+  (`free(): invalid size`): CPython ≥ 3.13 runs their init in the main interpreter. Fixed (unreleased): Pyronova runs the init of each worker's private copy inside that worker.
+- **SIGSEGV in OpenBLAS under load**: worker threads had a 2 MiB stack. Fixed (unreleased;
+  8 MiB, same as CPython's threads).
+
+Details and measurements: [docs/subinterp-c-extension-status.en.md §10](docs/subinterp-c-extension-status.en.md#10-known-issues-and-fixes-linux).
+
 > **Why no OpenAPI?** Pyronova targets high-performance APIs and AI agents, not browser-based API explorers. For AI tool discovery, MCP is a more modern protocol. For human developers, Pydantic models + type stubs provide the same contract guarantees.
 >
 > **Why no dependency injection?** `before_request` hooks solve the same problem (auth, DB connections, shared logic) with less magic and better debuggability. DI adds framework coupling without performance benefit.
