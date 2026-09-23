@@ -1,5 +1,45 @@
 # Changelog
 
+## v2.7.1 (2026-09-23) — Sub-interpreter crash fixes; PyO3 fork, isojson
+
+### Fixed
+
+- **Mid-run segfault in sub-interpreter mode (affects 2.7.0).** Every sub-interpreter was
+  handed the main interpreter's `Request` / `Response` type objects. Each request
+  allocates and frees instances, so the one shared heap type's refcount was updated from
+  several threads under different GILs. Updates were lost until the refcount reached
+  zero, and `type_dealloc` segfaulted. PyO3 0.29.1, which the 2.7.0 wheels embed, exposed
+  this: it fixed instance dealloc to release the type reference, while 0.29.0 had leaked
+  it and so hid the race. Reproduced with the 2.7.0 wheel from PyPI: `bench_inmem`,
+  8 workers, 3/3 segfault. Each sub-interpreter now gets its own type objects.
+- **Crash when two or more sub-interpreters shut down.** pyre imported orjson in every
+  worker. orjson keeps its types and strings in process-global state, so every worker
+  shared the first worker's objects, and ending any sub-interpreter freed objects another
+  still used. With 1 worker the exit was clean; with 2, 4 or 8 workers it crashed every
+  time.
+- **Abort at exit when sub-interpreters were never ended.** TPC and bench workers now end
+  their own sub-interpreter on their own thread when they stop, as the channel pool
+  already did. With the raw `PyronovaApp` API, Ctrl-C aborted (exit 134).
+  `Pyronova.run` hard-exits and never hit this.
+
+### Changed
+
+- **PyO3 comes from [leocaolab/pyo3](https://github.com/leocaolab/pyo3)** (tag
+  `subinterp-2026-09-23`): per-interpreter type objects, caches and deferred-decref pools
+  for own-GIL sub-interpreters. `Cargo.lock` is now tracked and pins that commit; untracked,
+  fresh builds resolved whatever pyo3 0.29.x was newest.
+- **JSON: `isojson` replaces `orjson`** as the required dependency. It has the same API,
+  and output is byte-identical for the types Pyronova serializes. Unlike orjson, it is safe
+  in own-GIL sub-interpreters. The JSON helper is cached per interpreter.
+
+### Known issue
+
+- **The 16-worker grill soak (`examples/stress_grill.py`: numpy + scipy + sklearn + orjson,
+  isolated per worker) crashes at startup on Linux**, even at 1 worker (glibc `double free`
+  / `free(): invalid size`). This is not from this release: the released 2.7.0 wheel fails the
+  same way on the same host (numpy 2.5.3, scipy 1.18.1), and so does the pre-release code.
+  It passes on macOS. Tracked separately.
+
 ## v2.7.0 (2026-08-02) — Reactive auto-isolate + graceful-shutdown fix
 
 ### Reactive auto-isolate — unmodified `import numpy` in own-GIL workers
