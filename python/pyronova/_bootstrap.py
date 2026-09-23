@@ -885,6 +885,21 @@ def _iso_clone_lib(lib, worker_dir, pkg2dist):
     return dst
 
 
+# pyronova itself is never cloned, evicted or re-executed (Layer 2, FR-11): its engine
+# keeps process-wide state (the main-interpreter handle, the async worker registry, the
+# logger, the Postgres pool) that must exist once, and re-executing the package in a
+# worker would duplicate `pyronova.context.ctx` and its ContextVars.
+_ISO_PYRONOVA_REFUSED = (
+    "pyronova cannot be isolated: one shared copy of pyronova and its engine is "
+    "required (it keeps process-wide state), so it is never cloned, evicted or "
+    "re-executed in a worker. Remove it from app.isolate(...)."
+)
+
+
+def _iso_is_pyronova(name):
+    return name == "pyronova" or name.startswith("pyronova.")
+
+
 def _iso_evict(lib):
     """Drop `lib` and its submodules from sys.modules so the next `import`
     resolves to THIS worker's fresh clone, not a cached (possibly stub) entry.
@@ -892,6 +907,8 @@ def _iso_evict(lib):
     (e.g. pydantic_core -> _pydantic_core), which would otherwise shadow the clone
     and surface as "cannot import name ... (unknown location)"."""
     import sys
+    if _iso_is_pyronova(lib):
+        raise RuntimeError(_ISO_PYRONOVA_REFUSED)
     for name in list(sys.modules):
         if name == lib or name.startswith(lib + "."):
             del sys.modules[name]
@@ -947,6 +964,8 @@ def _iso_isolate(mod_name):
     worker; a freshly-cloned lib is reported (cost guard), an already-staged one
     is not (proactive already logged the declaration)."""
     lib = mod_name.split(".")[0]  # clone the top-level package, not the inner .so
+    if lib == "pyronova":
+        raise RuntimeError(_ISO_PYRONOVA_REFUSED)
     if lib in _ISO["isolated"]:
         return True  # already staged; caller still retries under transient override
     worker_dir = _iso_worker_dir(seed_libs=())
@@ -973,6 +992,8 @@ def _pyronova_isolate_libs():
     libs = [x.strip() for x in os.environ.get("PYRONOVA_ISOLATE_LIBS", "").split(",") if x.strip()]
     if not libs:
         return
+    if "pyronova" in libs:
+        raise RuntimeError(_ISO_PYRONOVA_REFUSED)
     # Sub-interpreter probe: the override raises on the main interp, where no
     # per-worker copy is needed. Probe and restore — real loads flip it later.
     prev, ok = _iso_transient_override()
@@ -1254,6 +1275,10 @@ class _IsolatingExtensionFinder:
     meta_path) to resolve the real spec, so there's no recursion."""
 
     def find_spec(self, fullname, path, target=None):
+        if _iso_is_pyronova(fullname):
+            # The engine declares per-interpreter support and loads through CPython's
+            # own check; the loaders here never touch it (FR-11).
+            return None
         if path is None:
             spec = _machinery.BuiltinImporter.find_spec(fullname)
             if spec is not None:
@@ -1344,12 +1369,15 @@ def _iso_import(name, globals=None, locals=None, fromlist=(), level=0):
                 top = (bad or outer).split(".")[0]
                 # One clone per package per statement: a package that still
                 # fails from its clone surfaces its real error, never loops.
-                if not top or top in cloned or not _iso_isolate(top):
+                # pyronova is never isolated (FR-11): its error surfaces as is.
+                if not top or top == "pyronova" or top in cloned or not _iso_isolate(top):
                     raise
                 cloned.add(top)
                 # Drop the statement's partial import too, so the retry
-                # re-resolves it with the clone dir on sys.path.
-                if outer:
+                # re-resolves it with the clone dir on sys.path. Never pyronova:
+                # the failed submodule is already out of sys.modules, and the
+                # package must stay the one this worker already executed (FR-11).
+                if outer and outer != "pyronova":
                     _iso_evict(outer)
     finally:
         _iso_in_hook = False

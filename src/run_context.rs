@@ -130,13 +130,26 @@ where
 ///
 /// # Panics
 ///
-/// If the thread is bound to a different interpreter.
+/// If the thread is bound to a different interpreter, or if a thread state other than the
+/// thread's own is current (Layer 2, FR-6).
 pub(crate) fn attach_to<F, R>(interp: Interp, f: F) -> R
 where
     F: for<'py> FnOnce(Python<'py>) -> R,
 {
     // SAFETY: always safe to call; null when this thread has no thread state.
     let bound = unsafe { ffi::PyGILState_GetThisThreadState() };
+    // SAFETY: always safe to call; null when no thread state is current on this thread.
+    let current = unsafe { ffi::PyThreadState_GetUnchecked() };
+    // Another thread state current on this thread (the main thread while a worker's init
+    // runs with the worker's thread state current): `PyGILState_Ensure` below would try to
+    // restore the bound one on top of it, a fatal error in CPython. Say what happened instead.
+    assert!(
+        current.is_null() || current == bound,
+        "attach_to(interpreter {}) while another thread state is current on this thread \
+         (a sub-interpreter's init or handler running on it); attach from a thread that has \
+         none",
+        interp.id(),
+    );
     if bound.is_null() {
         return interp.handle.attach(f);
     }

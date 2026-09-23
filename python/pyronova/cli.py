@@ -69,6 +69,11 @@ def _load_app(target: str) -> "Pyronova":
         sys.exit(
             f"pyronova: {target} is a {type(app).__name__}, expected pyronova.Pyronova"
         )
+    # Sub-interpreter workers execute the script that defines the app. Under the CLI,
+    # `__main__` is this file, so point them at the app's module instead.
+    module_file = getattr(module, "__file__", None)
+    if module_file:
+        app._engine.set_script_path(os.path.abspath(module_file))
     return app
 
 

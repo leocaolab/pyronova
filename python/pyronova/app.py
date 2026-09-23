@@ -358,9 +358,15 @@ class Pyronova:
         (see docs/subinterp-c-extension-status.md).
         """
         # This just RECORDS the libraries (via an env var). The actual per-worker
-        # cloning happens in _bootstrap.py at sub-interpreter init — because in
-        # worker mode `Pyronova` is a mock whose methods are no-op'd, so this
-        # method only runs meaningfully in the main interpreter.
+        # cloning happens in _bootstrap.py at sub-interpreter init, before the
+        # script runs; a worker executing this again only re-records the same list.
+        if "pyronova" in libraries:
+            # One shared copy of pyronova and its engine is required (FR-11).
+            raise ValueError(
+                "pyronova cannot be isolated: one shared copy of pyronova and its "
+                "engine is required (it keeps process-wide state). Remove it from "
+                "app.isolate(...)."
+            )
         import os
         current = [x for x in os.environ.get("PYRONOVA_ISOLATE_LIBS", "").split(",") if x]
         for lib in libraries:

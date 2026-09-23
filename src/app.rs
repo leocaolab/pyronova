@@ -271,15 +271,15 @@ impl PyronovaApp {
                 "_seal_registrations runs on the main interpreter only",
             ));
         }
-        let mut routes = self.routes.write();
-        if routes.sealed.is_none() {
-            routes.sealed = Some(Sealed {
-                routes: routes.handlers.len(),
-                before_hooks: routes.before_hooks.len(),
-                after_hooks: routes.after_hooks.len(),
-            });
-        }
+        self.seal_if_unsealed();
         Ok(())
+    }
+
+    /// The script workers execute, when it isn't `__main__.__file__`: `pyronova run
+    /// module:app` runs `cli.py` as `__main__`, and workers must execute the app's module
+    /// instead (Layer 2, N15).
+    fn set_script_path(&mut self, path: String) {
+        self.script_path = Some(path);
     }
 
     /// Records this app as the one the worker's script created, so the worker can take its
@@ -429,6 +429,17 @@ impl PyronovaApp {
         tpc: Option<bool>,
         extra_tls_ports: Option<Vec<u16>>,
     ) -> PyResult<()> {
+        // A worker executes the whole script, so an unguarded `app.run()` in a raw-engine
+        // script reaches here inside the worker's init. Serving from there would start a
+        // server inside a worker (Layer 2, N10); `Pyronova.run()` returns before this.
+        if !crate::run_context::on_main(py) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "PyronovaApp.run() was called inside a sub-interpreter worker. Workers execute \
+                 the whole script to register its routes; start the server only in the main \
+                 interpreter, e.g. under `if __name__ == \"__main__\":` or with \
+                 `if not pyronova.engine._in_worker():`",
+            ));
+        }
         // Refresh the metrics kill-switch from the current env every
         // run() — process-level state, but tests / hot-reload may flip
         // PYRONOVA_METRICS between runs and we want each new server to
@@ -466,6 +477,9 @@ impl PyronovaApp {
         // io_workers = Tokio async thread count + accept loop count (non-TPC mode).
         let io_workers = io_workers.unwrap_or(num_cpus);
 
+        // A raw-engine script never calls `_seal_registrations`; seal here so every served
+        // table has the script's boundary that workers compare against (Layer 2, FR-2).
+        self.seal_if_unsealed();
         // Freeze route table: extract from RwLock into read-only Arc.
         // After this point, no more route registration — zero-lock reads.
         let frozen: FrozenRoutes = Arc::new(self.snapshot(py));
@@ -724,6 +738,19 @@ async fn serve_connection<S>(
 }
 
 impl PyronovaApp {
+    /// Records the script's registration boundary unless one is already set; idempotent
+    /// (Layer 2, FR-2).
+    fn seal_if_unsealed(&self) {
+        let mut routes = self.routes.write();
+        if routes.sealed.is_none() {
+            routes.sealed = Some(Sealed {
+                routes: routes.handlers.len(),
+                before_hooks: routes.before_hooks.len(),
+                after_hooks: routes.after_hooks.len(),
+            });
+        }
+    }
+
     /// A copy of the route table for serving, with this app's CORS and logging settings.
     /// Each copy holds its own references to the handlers.
     fn snapshot(&self, py: Python<'_>) -> RouteTable {
@@ -1382,6 +1409,9 @@ impl PyronovaApp {
         // exclusive to the worker's P-core. Removes the cross-core
         // ping-pong from per-request Arc::clone(&routes) at the cost
         // of N × Py handler IncRefs at startup (one-time).
+        // Seal first, so the tables below carry the boundary workers compare against
+        // (Layer 2, FR-2).
+        self.seal_if_unsealed();
         let build_one = |py: Python<'_>| -> FrozenRoutes { Arc::new(self.snapshot(py)) };
 
         // Route-shape validation uses one sample.
@@ -1466,6 +1496,7 @@ impl PyronovaApp {
         workers: Option<usize>,
         client_conns: usize,
     ) -> PyResult<(u64, f64, u16)> {
+        self.seal_if_unsealed(); // see __bench_inmem_impl
         let routes: FrozenRoutes = Arc::new(self.snapshot(py));
 
         if routes.requires_gil.iter().any(|&g| g)

@@ -210,7 +210,9 @@ pub fn emit_python_log(
     lineno: u32,
     worker_id: Option<usize>,
 ) -> PyResult<()> {
-    let wid = worker_id.unwrap_or(0);
+    // `None` (the main interpreter) records no `worker` field at all, so a main-interpreter
+    // line can't pass for worker 0's (Layer 2, E2E-11).
+    let wid = worker_id;
 
     // Dispatch to compile-time tracing macros via match. The macro expands
     // inline, so each branch remains a separate static callsite — EnvFilter
