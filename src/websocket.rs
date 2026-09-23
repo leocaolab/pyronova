@@ -24,7 +24,7 @@ enum WsMsg {
 // PyronovaWebSocket — Python-facing PyronovaWebSocket connection object
 // ---------------------------------------------------------------------------
 
-#[pyclass(name = "WebSocket")]
+#[pyclass(name = "WebSocket", module = "pyronova.engine")]
 pub(crate) struct PyronovaWebSocket {
     // Bounded tokio channel so the hyper → Python path has TCP-level
     // backpressure: if the Python handler falls behind, the tokio

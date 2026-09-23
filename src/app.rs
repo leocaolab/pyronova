@@ -13,12 +13,16 @@ use tokio::signal;
 
 use crate::handlers::{handle_request, handle_request_subinterp};
 use crate::python::interp;
-use crate::router::{FrozenRoutes, MutableRoutes, RouteTable};
+use crate::router::{FrozenRoutes, MutableRoutes, RouteTable, Sealed};
 use crate::server::listener::{create_reuseport_listener, handle_accept_error, setup_tcp_quickack};
 use crate::state::SharedState;
 use crate::websocket;
 
-#[pyclass]
+/// The `PyronovaApp` a worker's script created: one per worker interpreter (Layer 2, C3).
+/// The worker takes its handlers from it after the script has run.
+static WORKER_APP: pyo3::sync::PyOnceLock<Py<PyronovaApp>> = pyo3::sync::PyOnceLock::new();
+
+#[pyclass(module = "pyronova.engine")]
 pub(crate) struct PyronovaApp {
     routes: MutableRoutes,
     script_path: Option<String>,
@@ -41,11 +45,11 @@ pub(crate) struct PyronovaApp {
 #[pymethods]
 impl PyronovaApp {
     #[new]
-    fn new() -> Self {
+    fn new(py: Python<'_>) -> Self {
         PyronovaApp {
             routes: Arc::new(parking_lot::RwLock::new(RouteTable::new())),
             script_path: None,
-            shared_state: Arc::new(dashmap::DashMap::new()),
+            shared_state: crate::state::map_for_new(py),
             cors_config: None,
             request_logging: false,
             request_log_sample_n: 1,
@@ -128,8 +132,22 @@ impl PyronovaApp {
     }
 
     /// Set max request body size in bytes. Default: 10 MB.
-    fn set_max_body_size(&self, size: usize) {
-        crate::handlers::set_max_body_size(size);
+    ///
+    /// The limit is process-wide, so only the main interpreter sets it. A worker replaying
+    /// the script calls this again; there it only warns if the value differs (FR-17).
+    fn set_max_body_size(&self, py: Python<'_>, size: usize) {
+        if crate::run_context::on_main(py) {
+            crate::handlers::set_max_body_size(size);
+            return;
+        }
+        let current = crate::handlers::max_body_size();
+        if size != current {
+            tracing::warn!(
+                target: "pyronova::server",
+                "set_max_body_size({size}) in a worker is ignored: the limit is process-wide, \
+                 and the main interpreter set it to {current}"
+            );
+        }
     }
 
     /// Register a fast-path route — a response that never enters Python.
@@ -205,6 +223,7 @@ impl PyronovaApp {
     #[allow(clippy::too_many_arguments)]
     fn configure_compression(
         &self,
+        py: Python<'_>,
         enabled: bool,
         min_size: usize,
         gzip: bool,
@@ -212,7 +231,70 @@ impl PyronovaApp {
         gzip_level: u32,
         brotli_quality: u32,
     ) {
-        crate::compression::configure(enabled, min_size, gzip, brotli, gzip_level, brotli_quality);
+        let wanted = crate::compression::Settings::new(
+            enabled,
+            min_size,
+            gzip,
+            brotli,
+            gzip_level,
+            brotli_quality,
+        );
+        // Process-wide, like set_max_body_size: main sets it, a worker only warns (FR-17).
+        if crate::run_context::on_main(py) {
+            crate::compression::configure(
+                enabled,
+                min_size,
+                gzip,
+                brotli,
+                gzip_level,
+                brotli_quality,
+            );
+            return;
+        }
+        let current = crate::compression::current();
+        if wanted != current {
+            tracing::warn!(
+                target: "pyronova::server",
+                "configure_compression({wanted:?}) in a worker is ignored: compression is \
+                 process-wide, and the main interpreter set {current:?}"
+            );
+        }
+    }
+
+    /// Marks the end of the script's registrations. `Pyronova.run()` calls it on the main
+    /// interpreter before anything registered at run time (`/mcp`, logging hooks, startup
+    /// hooks). Idempotent: TestClient retries `run()`, and the first boundary stays
+    /// (Layer 2, FR-2). A worker is never sealed: its table is the script's registrations.
+    fn _seal_registrations(&self, py: Python<'_>) -> PyResult<()> {
+        if !crate::run_context::on_main(py) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "_seal_registrations runs on the main interpreter only",
+            ));
+        }
+        let mut routes = self.routes.write();
+        if routes.sealed.is_none() {
+            routes.sealed = Some(Sealed {
+                routes: routes.handlers.len(),
+                before_hooks: routes.before_hooks.len(),
+                after_hooks: routes.after_hooks.len(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Records this app as the one the worker's script created, so the worker can take its
+    /// handlers from it (Layer 2, C3). A no-op on the main interpreter. `Pyronova.__init__`
+    /// calls it.
+    fn _register_worker_app(slf: Bound<'_, Self>) -> PyResult<()> {
+        let py = slf.py();
+        if crate::run_context::on_main(py) {
+            return Ok(());
+        }
+        WORKER_APP.set(py, slf.unbind()).map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "the script created a second Pyronova app; a worker serves exactly one",
+            )
+        })
     }
 
     /// Access the shared state (cross-sub-interpreter, nanosecond latency).
@@ -386,36 +468,7 @@ impl PyronovaApp {
 
         // Freeze route table: extract from RwLock into read-only Arc.
         // After this point, no more route registration — zero-lock reads.
-        let frozen: FrozenRoutes = {
-            let table = self.routes.read();
-            // Clone the RouteTable into a new Arc (no lock needed at runtime)
-            Arc::new(RouteTable {
-                handlers: table.handlers.iter().map(|h| h.clone_ref(py)).collect(),
-                handler_names: table.handler_names.clone(),
-                requires_gil: table.requires_gil.clone(),
-                is_async: table.is_async.clone(),
-                is_stream: table.is_stream.clone(),
-                routers: table.routers.clone(),
-                ws_handlers: table
-                    .ws_handlers
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone_ref(py)))
-                    .collect(),
-                before_hooks: table.before_hooks.iter().map(|h| h.clone_ref(py)).collect(),
-                after_hooks: table.after_hooks.iter().map(|h| h.clone_ref(py)).collect(),
-                before_hook_names: table.before_hook_names.clone(),
-                after_hook_names: table.after_hook_names.clone(),
-                fallback_handler: table.fallback_handler.as_ref().map(|h| h.clone_ref(py)),
-                fallback_handler_name: table.fallback_handler_name.clone(),
-                static_dirs: table.static_dirs.clone(),
-                cors_config: self.cors_config.clone(),
-                request_logging: self.request_logging,
-                request_log_sample_n: self.request_log_sample_n,
-                request_log_always_status: self.request_log_always_status,
-                request_log_counter: Arc::clone(&self.request_log_counter),
-                fast_responses: table.fast_responses.clone(),
-            })
-        };
+        let frozen: FrozenRoutes = Arc::new(self.snapshot(py));
 
         // The route table holds main-interpreter `Py<T>`s. Worker, bridge and Tokio threads
         // hold clones and may drop theirs anywhere, including at runtime shutdown; this one
@@ -671,6 +724,40 @@ async fn serve_connection<S>(
 }
 
 impl PyronovaApp {
+    /// A copy of the route table for serving, with this app's CORS and logging settings.
+    /// Each copy holds its own references to the handlers.
+    fn snapshot(&self, py: Python<'_>) -> RouteTable {
+        let table = self.routes.read();
+        RouteTable {
+            handlers: table.handlers.iter().map(|h| h.clone_ref(py)).collect(),
+            handler_names: table.handler_names.clone(),
+            requires_gil: table.requires_gil.clone(),
+            is_async: table.is_async.clone(),
+            is_stream: table.is_stream.clone(),
+            routers: table.routers.clone(),
+            ws_handlers: table
+                .ws_handlers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone_ref(py)))
+                .collect(),
+            before_hooks: table.before_hooks.iter().map(|h| h.clone_ref(py)).collect(),
+            after_hooks: table.after_hooks.iter().map(|h| h.clone_ref(py)).collect(),
+            before_hook_names: table.before_hook_names.clone(),
+            after_hook_names: table.after_hook_names.clone(),
+            fallback_handler: table.fallback_handler.as_ref().map(|h| h.clone_ref(py)),
+            fallback_handler_name: table.fallback_handler_name.clone(),
+            static_dirs: table.static_dirs.clone(),
+            cors_config: self.cors_config.clone(),
+            request_logging: self.request_logging,
+            request_log_sample_n: self.request_log_sample_n,
+            request_log_always_status: self.request_log_always_status,
+            request_log_counter: Arc::clone(&self.request_log_counter),
+            fast_responses: table.fast_responses.clone(),
+            route_keys: table.route_keys.clone(),
+            sealed: table.sealed,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn add_route(
         &mut self,
@@ -713,6 +800,15 @@ impl PyronovaApp {
         }
 
         let mut routes = self.routes.write();
+        // Workers only know the routes the script registered (Layer 2, FR-2). A route added
+        // after `run()` began, e.g. from an `on_startup` hook, exists only on main.
+        if routes.sealed.is_some() && !gil {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "{} {path} is registered after app.run() started (for example from an on_startup \
+                 hook). Such a route exists only in the main interpreter, so it needs gil=True.",
+                method.to_uppercase()
+            )));
+        }
         routes
             .insert(method, path, handler, handler_name, gil, is_async, stream)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("route error: {e}")))?;
@@ -977,6 +1073,7 @@ impl PyronovaApp {
                 routes.is_async.clone(),
                 self.cors_config.clone(),
                 self.request_logging,
+                &self.shared_state,
             )
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -1183,9 +1280,6 @@ impl PyronovaApp {
         all_func_names.extend(routes.before_hook_names.iter().cloned());
         all_func_names.extend(routes.after_hook_names.iter().cloned());
 
-        // PYRONOVA_WORKER=1 so sub-interps know they're replays.
-        std::env::set_var("PYRONOVA_WORKER", "1");
-
         // Read the user script once.
         let raw_script = std::fs::read_to_string(&script_path).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("read script '{script_path}': {e}"))
@@ -1209,6 +1303,7 @@ impl PyronovaApp {
                     &script_path,
                     &all_func_names,
                     pool_id,
+                    &self.shared_state,
                 )
                 .map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -1287,35 +1382,7 @@ impl PyronovaApp {
         // exclusive to the worker's P-core. Removes the cross-core
         // ping-pong from per-request Arc::clone(&routes) at the cost
         // of N × Py handler IncRefs at startup (one-time).
-        let build_one = |py: Python<'_>| -> FrozenRoutes {
-            let table = self.routes.read();
-            Arc::new(RouteTable {
-                handlers: table.handlers.iter().map(|h| h.clone_ref(py)).collect(),
-                handler_names: table.handler_names.clone(),
-                requires_gil: table.requires_gil.clone(),
-                is_async: table.is_async.clone(),
-                is_stream: table.is_stream.clone(),
-                routers: table.routers.clone(),
-                ws_handlers: table
-                    .ws_handlers
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone_ref(py)))
-                    .collect(),
-                before_hooks: table.before_hooks.iter().map(|h| h.clone_ref(py)).collect(),
-                after_hooks: table.after_hooks.iter().map(|h| h.clone_ref(py)).collect(),
-                before_hook_names: table.before_hook_names.clone(),
-                after_hook_names: table.after_hook_names.clone(),
-                fallback_handler: table.fallback_handler.as_ref().map(|h| h.clone_ref(py)),
-                fallback_handler_name: table.fallback_handler_name.clone(),
-                static_dirs: table.static_dirs.clone(),
-                cors_config: self.cors_config.clone(),
-                request_logging: self.request_logging,
-                request_log_sample_n: self.request_log_sample_n,
-                request_log_always_status: self.request_log_always_status,
-                request_log_counter: Arc::clone(&self.request_log_counter),
-                fast_responses: table.fast_responses.clone(),
-            })
-        };
+        let build_one = |py: Python<'_>| -> FrozenRoutes { Arc::new(self.snapshot(py)) };
 
         // Route-shape validation uses one sample.
         let sample = build_one(py);
@@ -1355,7 +1422,6 @@ impl PyronovaApp {
         all_func_names.extend(after_hook_names);
 
         crate::monitor::init_metrics_flag();
-        std::env::set_var("PYRONOVA_WORKER", "1");
         let raw_script = std::fs::read_to_string(&script_path).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("read script '{script_path}': {e}"))
         })?;
@@ -1368,6 +1434,7 @@ impl PyronovaApp {
                     &script_path,
                     &all_func_names,
                     pool_id,
+                    &self.shared_state,
                 )
                 .map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -1399,35 +1466,7 @@ impl PyronovaApp {
         workers: Option<usize>,
         client_conns: usize,
     ) -> PyResult<(u64, f64, u16)> {
-        let routes: FrozenRoutes = {
-            let table = self.routes.read();
-            Arc::new(RouteTable {
-                handlers: table.handlers.iter().map(|h| h.clone_ref(py)).collect(),
-                handler_names: table.handler_names.clone(),
-                requires_gil: table.requires_gil.clone(),
-                is_async: table.is_async.clone(),
-                is_stream: table.is_stream.clone(),
-                routers: table.routers.clone(),
-                ws_handlers: table
-                    .ws_handlers
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone_ref(py)))
-                    .collect(),
-                before_hooks: table.before_hooks.iter().map(|h| h.clone_ref(py)).collect(),
-                after_hooks: table.after_hooks.iter().map(|h| h.clone_ref(py)).collect(),
-                before_hook_names: table.before_hook_names.clone(),
-                after_hook_names: table.after_hook_names.clone(),
-                fallback_handler: table.fallback_handler.as_ref().map(|h| h.clone_ref(py)),
-                fallback_handler_name: table.fallback_handler_name.clone(),
-                static_dirs: table.static_dirs.clone(),
-                cors_config: self.cors_config.clone(),
-                request_logging: self.request_logging,
-                request_log_sample_n: self.request_log_sample_n,
-                request_log_always_status: self.request_log_always_status,
-                request_log_counter: Arc::clone(&self.request_log_counter),
-                fast_responses: table.fast_responses.clone(),
-            })
-        };
+        let routes: FrozenRoutes = Arc::new(self.snapshot(py));
 
         if routes.requires_gil.iter().any(|&g| g)
             || routes.is_async.iter().any(|&a| a)
@@ -1450,7 +1489,6 @@ impl PyronovaApp {
         all_func_names.extend(routes.after_hook_names.iter().cloned());
 
         crate::monitor::init_metrics_flag();
-        std::env::set_var("PYRONOVA_WORKER", "1");
         let raw_script = std::fs::read_to_string(&script_path).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("read script '{script_path}': {e}"))
         })?;
@@ -1463,6 +1501,7 @@ impl PyronovaApp {
                     &script_path,
                     &all_func_names,
                     pool_id,
+                    &self.shared_state,
                 )
                 .map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(

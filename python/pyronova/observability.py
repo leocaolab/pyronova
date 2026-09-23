@@ -30,9 +30,9 @@ atomic DashMap op shared by every interpreter.
 from __future__ import annotations
 
 import logging
-import threading
 import time
 import uuid
+from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
 from pyronova.engine import Response
@@ -44,10 +44,11 @@ if TYPE_CHECKING:
 _STATUS_CLASSES = ("1xx", "2xx", "3xx", "4xx", "5xx")
 _TRACKED_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS")
 
-# Thread-local start timestamp. before_request and after_request for the
-# same request run on the same worker thread, so a thread-local is
-# sufficient in both GIL and sub-interpreter modes.
-_tls = threading.local()
+# Per-request values the before hook hands to the after hook. ContextVars, not a
+# thread-local: async requests interleave on one event-loop thread, and each one runs in
+# its own context, so a thread-local would hand one request's value to another.
+_request_id: ContextVar[str | None] = ContextVar("pyronova_obs_request_id", default=None)
+_metrics_start_ns: ContextVar[int | None] = ContextVar("pyronova_obs_metrics_start_ns", default=None)
 
 
 def install_request_id(app: "Pyronova", header: str) -> None:
@@ -59,16 +60,16 @@ def install_request_id(app: "Pyronova", header: str) -> None:
         # Fresh context per request — prevents leftover keys from a
         # recycled worker thread from leaking into the next caller.
         _reset_for_new_request()
-        # Stash the incoming id (or a freshly-minted one) onto the thread so
+        # Stash the incoming id (or a freshly-minted one) for this request so
         # the after-hook can echo it back without mutating the frozen req.
         headers = req.headers
         rid = headers.get(header_lower) or headers.get(header) or uuid.uuid4().hex
-        _tls.request_id = rid
+        _request_id.set(rid)
         ctx.set_request_id(rid)
         return None
 
     def _after(req, resp):
-        rid = getattr(_tls, "request_id", None)
+        rid = _request_id.get()
         if rid is None:
             return resp
         # HTTP header names are case-insensitive, but a Python dict is not.
@@ -94,7 +95,7 @@ def install_metrics(app: "Pyronova", path: str) -> None:
     state = app.state
 
     def _before(req):
-        _tls.metrics_start_ns = time.monotonic_ns()
+        _metrics_start_ns.set(time.monotonic_ns())
         return None
 
     def _after(req, resp):
@@ -115,8 +116,8 @@ def install_metrics(app: "Pyronova", path: str) -> None:
             if method in _TRACKED_METHODS:
                 state.incr(f"_m:req:method:{method}", 1)
 
-            start = getattr(_tls, "metrics_start_ns", None)
-            _tls.metrics_start_ns = None
+            start = _metrics_start_ns.get()
+            _metrics_start_ns.set(None)
             if start is not None:
                 elapsed_us = max(0, (time.monotonic_ns() - start) // 1000)
                 state.incr("_m:lat:sum_us", int(elapsed_us))

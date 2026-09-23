@@ -21,7 +21,7 @@ const STREAM_CHANNEL_CAP: usize = 1024;
 type StreamItem = Result<Bytes, std::convert::Infallible>;
 
 /// Python-facing stream object. Handler calls send()/send_event()/close().
-#[pyclass(frozen, name = "Stream")]
+#[pyclass(frozen, name = "Stream", module = "pyronova.engine")]
 pub(crate) struct PyronovaStream {
     // Wrapped in Option so close() can deterministically drop the Sender,
     // decoupling channel lifetime from Python GC (Haskell bracket pattern).

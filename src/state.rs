@@ -15,14 +15,39 @@ use pyo3::prelude::*;
 /// Thread-safe, lock-free reads for different keys, nanosecond latency.
 /// All sub-interpreters share the same underlying DashMap via Arc.
 /// Values are `Bytes` — clone is atomic refcount bump, not deep copy.
-#[pyclass]
+/// The map behind a `SharedState`.
+pub(crate) type SharedMap = Arc<DashMap<String, Bytes>>;
+
+/// The running app's map, handed to a worker before its script runs; one value per
+/// interpreter (Layer 2, C2). Unset on main and in any interpreter pyronova didn't create.
+static WORKER_MAP: pyo3::sync::PyOnceLock<SharedMap> = pyo3::sync::PyOnceLock::new();
+
+/// Gives the worker interpreter the calling thread is attached to the running app's map.
+pub(crate) fn hand_to_worker(py: Python<'_>, map: &SharedMap) -> Result<(), String> {
+    // A worker interpreter is created for one run, so the cell must be empty here.
+    WORKER_MAP
+        .set(py, Arc::clone(map))
+        .map_err(|_| "this worker interpreter already has a shared-state map".to_string())
+}
+
+/// The map a new `PyronovaApp` or `SharedState` uses: in a worker the running app's, so every
+/// interpreter sees the same values (FR-5); otherwise a fresh one, as before (TestClient apps
+/// in one process keep separate maps).
+pub(crate) fn map_for_new(py: Python<'_>) -> SharedMap {
+    match WORKER_MAP.get(py) {
+        Some(map) => Arc::clone(map),
+        None => Arc::new(DashMap::new()),
+    }
+}
+
+#[pyclass(module = "pyronova.engine")]
 pub(crate) struct SharedState {
-    inner: Arc<DashMap<String, Bytes>>,
+    inner: SharedMap,
 }
 
 impl SharedState {
     /// Create a new SharedState with the given Arc (for sharing across workers).
-    pub fn with_inner(inner: Arc<DashMap<String, Bytes>>) -> Self {
+    pub fn with_inner(inner: SharedMap) -> Self {
         SharedState { inner }
     }
 }
@@ -30,9 +55,9 @@ impl SharedState {
 #[pymethods]
 impl SharedState {
     #[new]
-    fn new() -> Self {
+    fn new(py: Python<'_>) -> Self {
         SharedState {
-            inner: Arc::new(DashMap::new()),
+            inner: map_for_new(py),
         }
     }
 

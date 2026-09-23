@@ -95,6 +95,11 @@
     (FR-13, main-side half of E2E-15).
   - E2E-7b in GIL mode (`mode="gil"` async route + `enable_request_id`, 200 concurrent
     requests): each echoes its own id (FR-14; the worker-side run is in M4).
+    **Deviation (M3 implementation):** this E2E passes with the old `threading.local` too
+    (measured), because in GIL mode one request's hooks run back to back on one thread. The
+    FR-14 guard at M3 is a unit test that interleaves two requests' hooks on one event loop
+    (`tests/test_layer2_m3.py::test_request_id_hooks_keep_interleaved_requests_apart`; fails
+    with a thread-local: `['id-2', 'id-2'] != ['id-1', 'id-2']`).
   - The existing suite stays green.
 - **Shippable:** yes. There is no behaviour change while workers still run the mock.
 

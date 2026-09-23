@@ -167,6 +167,14 @@ class PyronovaApp:
     def enable_request_logging(self, enabled: bool) -> None: ...
     @property
     def state(self) -> SharedState: ...
+    def _seal_registrations(self) -> None:
+        """Main interpreter only, idempotent: marks the end of the script's registrations.
+        A route registered after it must be ``gil=True``."""
+        ...
+    def _register_worker_app(self) -> None:
+        """In a worker, records this app as the one whose routes the worker serves.
+        A no-op on the main interpreter."""
+        ...
     def run(
         self,
         host: Optional[str] = None,
@@ -174,3 +182,7 @@ class PyronovaApp:
         workers: Optional[int] = None,
         mode: Optional[str] = None,
     ) -> None: ...
+
+def _in_worker() -> bool:
+    """Whether this code runs in a sub-interpreter worker (not the main interpreter)."""
+    ...

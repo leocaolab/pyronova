@@ -62,6 +62,36 @@ static BROTLI_QUALITY: AtomicUsize = AtomicUsize::new(4);
 const ALGO_GZIP: usize = 0b01;
 const ALGO_BR: usize = 0b10;
 
+/// A compression configuration as stored: the algorithms as a mask, levels clamped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Settings {
+    enabled: bool,
+    min_size: usize,
+    algo_mask: usize,
+    gzip_level: usize,
+    brotli_quality: usize,
+}
+
+impl Settings {
+    pub(crate) fn new(
+        enabled: bool,
+        min_size: usize,
+        gzip: bool,
+        brotli: bool,
+        gzip_level: u32,
+        brotli_quality: u32,
+    ) -> Self {
+        Settings {
+            enabled,
+            min_size,
+            algo_mask: (if gzip { ALGO_GZIP } else { 0 }) | (if brotli { ALGO_BR } else { 0 }),
+            gzip_level: gzip_level.clamp(1, 9) as usize,
+            brotli_quality: brotli_quality.clamp(0, 11) as usize,
+        }
+    }
+}
+
+/// Sets the process-wide compression configuration.
 pub(crate) fn configure(
     enabled: bool,
     min_size: usize,
@@ -70,12 +100,23 @@ pub(crate) fn configure(
     gzip_level: u32,
     brotli_quality: u32,
 ) {
-    let mask = (if gzip { ALGO_GZIP } else { 0 }) | (if brotli { ALGO_BR } else { 0 });
-    ALGO_MASK.store(mask, Ordering::Relaxed);
-    MIN_SIZE.store(min_size, Ordering::Relaxed);
-    GZIP_LEVEL.store(gzip_level.clamp(1, 9) as usize, Ordering::Relaxed);
-    BROTLI_QUALITY.store(brotli_quality.clamp(0, 11) as usize, Ordering::Relaxed);
-    ENABLED.store(enabled, Ordering::Release);
+    let s = Settings::new(enabled, min_size, gzip, brotli, gzip_level, brotli_quality);
+    ALGO_MASK.store(s.algo_mask, Ordering::Relaxed);
+    MIN_SIZE.store(s.min_size, Ordering::Relaxed);
+    GZIP_LEVEL.store(s.gzip_level, Ordering::Relaxed);
+    BROTLI_QUALITY.store(s.brotli_quality, Ordering::Relaxed);
+    ENABLED.store(s.enabled, Ordering::Release);
+}
+
+/// The process-wide compression configuration.
+pub(crate) fn current() -> Settings {
+    Settings {
+        enabled: ENABLED.load(Ordering::Acquire),
+        min_size: MIN_SIZE.load(Ordering::Relaxed),
+        algo_mask: ALGO_MASK.load(Ordering::Relaxed),
+        gzip_level: GZIP_LEVEL.load(Ordering::Relaxed),
+        brotli_quality: BROTLI_QUALITY.load(Ordering::Relaxed),
+    }
 }
 
 #[inline]

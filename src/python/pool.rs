@@ -204,11 +204,9 @@ impl InterpreterPool {
         is_async_handler: Vec<bool>,
         cors_config: Option<crate::router::CorsConfig>,
         request_logging: bool,
+        shared_state: &crate::state::SharedMap,
     ) -> Result<Self, String> {
         let has_any_async = is_async_handler.iter().any(|&a| a);
-        // Set PYRONOVA_WORKER=1 so user's app.run() becomes a no-op in sub-interpreters.
-        // This replaces the fragile AST-based script filtering.
-        std::env::set_var("PYRONOVA_WORKER", "1");
 
         let raw_script = std::fs::read_to_string(script_path)
             .map_err(|e| format!("Failed to read script: {e}"))?;
@@ -250,9 +248,14 @@ impl InterpreterPool {
         let mut threads = Vec::new();
 
         for i in 0..n {
-            let worker =
-                SubInterpreterWorker::new(&raw_script, script_path, &all_func_names, pool_id)
-                    .map_err(|e| format!("sub-interpreter {i}: {e}"))?;
+            let worker = SubInterpreterWorker::new(
+                &raw_script,
+                script_path,
+                &all_func_names,
+                pool_id,
+                shared_state,
+            )
+            .map_err(|e| format!("sub-interpreter {i}: {e}"))?;
             workers.push(worker);
         }
 

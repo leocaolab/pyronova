@@ -10,14 +10,9 @@ import json as _json_module
 
 import os
 
-from pyronova.engine import PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log
+from pyronova.engine import PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log, _in_worker
 from pyronova.mcp import MCPServer
 import logging as _logging
-
-try:
-    from pydantic import ValidationError as _PydanticValidationError
-except ImportError:
-    _PydanticValidationError = Exception  # type: ignore[assignment,misc]
 
 
 class LogConfig(TypedDict, total=False):
@@ -33,8 +28,8 @@ class LogConfig(TypedDict, total=False):
     format: str
 
 def _is_worker() -> bool:
-    """Check if we're running inside a sub-interpreter worker."""
-    return os.environ.get("PYRONOVA_WORKER") == "1"
+    """Whether this code runs in a sub-interpreter worker (not the main interpreter)."""
+    return _in_worker()
 
 
 # Env vars BLAS libraries read for their thread-pool size. If the user set any
@@ -191,6 +186,8 @@ class Pyronova:
         log_config: LogConfig | None = None,
     ) -> None:
         self._engine = _PyronovaApp()
+        # In a worker, the engine takes this app's routes as the worker's handlers.
+        self._engine._register_worker_app()
         self._fallback_handler: Callable | None = None
         self._fallback_name: str | None = None
         self._mcp = MCPServer()
@@ -475,6 +472,10 @@ class Pyronova:
 
         def _wrap_with_model(fn: Callable, mdl: type) -> Callable:
             """Wrap handler to auto-validate request body with Pydantic model."""
+            # Imported here, only for routes that declare model=: importing pydantic at
+            # module level would load pydantic_core in every worker of every app. If it
+            # can't be imported, route registration fails with the ImportError.
+            from pydantic import ValidationError
             import inspect
             sig = inspect.signature(fn)
             params = list(sig.parameters.values())
@@ -504,7 +505,7 @@ class Pyronova:
             # All of these are client-side "bad body" → 422, never 500.
             # _validation_error_response degrades to a generic 422 for the
             # non-pydantic cases via its hasattr(e, "errors") guard.
-            _BODY_ERRORS = (_PydanticValidationError, ValueError, TypeError)
+            _BODY_ERRORS = (ValidationError, ValueError, TypeError)
             if is_async:
                 async def wrapper(req):
                     try:
@@ -1059,6 +1060,13 @@ class Pyronova:
                       Required together with ``tls_key``. Default None → plain HTTP.
             tls_key:  Path to PEM private key. Required together with ``tls_cert``.
         """
+        # In a worker the script only registers routes; the server runs on main.
+        if _is_worker():
+            return
+        # Everything registered from here on (/mcp, logging hooks, startup hooks) exists
+        # only on main. Idempotent: TestClient may call run() again.
+        self._engine._seal_registrations()
+
         # Priority: param > env var > default
         host = host or os.environ.get("PYRONOVA_HOST", "127.0.0.1")
 
@@ -1168,11 +1176,6 @@ class Pyronova:
         # Auto-detect best mode if not explicitly set
         if mode is None:
             mode = "subinterp"
-
-        # In worker mode (sub-interpreter), don't start the server —
-        # just loading the script to register routes is enough.
-        if _is_worker():
-            return
 
         if mode in ("subinterp", "auto") and workers != 1:
             print(f"  BLAS: {_limit_blas_threads()} (override: set OPENBLAS_NUM_THREADS)", flush=True)

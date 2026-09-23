@@ -73,6 +73,12 @@ pub(crate) fn capture_main(py: Python<'_>) {
     }
 }
 
+/// Whether the calling thread is attached to the main interpreter.
+pub(crate) fn on_main(_py: Python<'_>) -> bool {
+    // SAFETY: `_py` witnesses a current thread state; both calls are then valid.
+    unsafe { ffi::PyInterpreterState_Get() == ffi::PyInterpreterState_Main() }
+}
+
 /// The main interpreter.
 ///
 /// # Panics

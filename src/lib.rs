@@ -41,6 +41,14 @@ fn workrequest_counts() -> (u64, u64) {
     )
 }
 
+/// Whether this code runs in a sub-interpreter worker, i.e. not in the main interpreter
+/// (Layer 2, FR-15). Replaces the process-wide `PYRONOVA_WORKER` env var, which leaked
+/// into child processes.
+#[pyo3::pyfunction]
+fn _in_worker(py: Python<'_>) -> bool {
+    !run_context::on_main(py)
+}
+
 #[pymodule]
 fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Remembers the main interpreter (no-op elsewhere), for threads that must attach to
@@ -59,6 +67,7 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(logging::init_logger, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(logging::emit_python_log, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(workrequest_counts, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(_in_worker, m)?)?;
     #[cfg(feature = "leak_detect")]
     m.add_function(pyo3::wrap_pyfunction!(leak_detect_dump, m)?)?;
     Ok(())

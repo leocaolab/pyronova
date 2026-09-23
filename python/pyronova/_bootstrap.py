@@ -117,7 +117,6 @@ _root.setLevel(_PYRONOVA_LEVEL_MAP.get(_log_level_str, _logging.DEBUG))
 # -- Mock pyronova modules ----------------------------------------------------
 
 import sys, types, os
-os.environ["PYRONOVA_WORKER"] = "1"
 
 # -- Smart GC: hand Python GC scheduling off to the Rust engine --------------
 #

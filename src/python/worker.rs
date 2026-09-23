@@ -66,6 +66,7 @@ impl SubInterpreterWorker {
         script_path: &str,
         func_names: &[String],
         pool_id: u64,
+        shared_state: &crate::state::SharedMap,
     ) -> Result<Self, String> {
         let main_tstate = ffi::PyThreadState_Get();
 
@@ -91,7 +92,7 @@ impl SubInterpreterWorker {
         // (and the thread resources it pins) leak permanently. Delegate
         // init to a helper so `?` can short-circuit safely — we catch its
         // Err here and perform cleanup regardless of which step failed.
-        match Self::init_in_sub_interp(script, script_path, func_names, pool_id) {
+        match Self::init_in_sub_interp(script, script_path, func_names, pool_id, shared_state) {
             Ok(worker) => {
                 ffi::PyThreadState_Swap(main_tstate);
                 Ok(worker)
@@ -116,6 +117,7 @@ impl SubInterpreterWorker {
         script_path: &str,
         func_names: &[String],
         pool_id: u64,
+        shared_state: &crate::state::SharedMap,
     ) -> Result<Self, String> {
         // Run the bootstrap (from external .py file) + user script.
         let bootstrap_src = include_str!("../../python/pyronova/_bootstrap.py");
@@ -212,6 +214,10 @@ impl SubInterpreterWorker {
                 );
             }
         }
+
+        // Before the script runs: a `PyronovaApp` or `SharedState` it creates in this
+        // interpreter must see the running app's map (Layer 2, C2 / FR-5).
+        crate::state::hand_to_worker(py, shared_state)?;
 
         let code_cstr = std::ffi::CString::new(bootstrap.as_bytes())
             .map_err(|e| format!("CString error: {e}"))?;

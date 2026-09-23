@@ -73,6 +73,22 @@ pub(crate) struct RouteTable {
     /// hot path. At 2M+ req/s the old `(method.to_string(), path.to_string())`
     /// key cost two heap allocations per request.
     pub(crate) fast_responses: HashMap<String, HashMap<String, FastResponse>>,
+    /// Per route index, its `(METHOD, path)`. `routers` is a `matchit` map and can't be
+    /// iterated back into keys; a worker compares its table against main's with these
+    /// (Layer 2, C3).
+    pub(crate) route_keys: Vec<(String, String)>,
+    /// Route, before-hook and after-hook counts when `Pyronova.run()` began, i.e. the part
+    /// of the table the script registered. Everything after it (`/mcp`, logging hooks,
+    /// startup-hook routes) exists only on main. Set once, on main (Layer 2, FR-2).
+    pub(crate) sealed: Option<Sealed>,
+}
+
+/// See [`RouteTable::sealed`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Sealed {
+    pub(crate) routes: usize,
+    pub(crate) before_hooks: usize,
+    pub(crate) after_hooks: usize,
 }
 
 impl RouteTable {
@@ -98,6 +114,8 @@ impl RouteTable {
             request_log_always_status: 0,
             request_log_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_responses: HashMap::new(),
+            route_keys: Vec::new(),
+            sealed: None,
         }
     }
 
@@ -118,8 +136,10 @@ impl RouteTable {
         // early without having mutated any vector, so RouteTable stays
         // consistent — no orphaned handler, no length skew, no leaked Py ref.
         let idx = self.handlers.len();
-        let router = self.routers.entry(method.to_uppercase()).or_default();
+        let method = method.to_uppercase();
+        let router = self.routers.entry(method.clone()).or_default();
         router.insert(path, idx).map_err(|e| e.to_string())?;
+        self.route_keys.push((method, path.to_string()));
         self.handlers.push(handler);
         self.handler_names.push(handler_name);
         self.requires_gil.push(gil);

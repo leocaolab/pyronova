@@ -343,7 +343,7 @@ enum CursorMsg {
 /// (GIL released), which works from any thread, including one inside a Tokio context.
 /// Dropping the cursor before EOF closes the channel, which stops the driver task on
 /// its next send; the sqlx connection returns to the pool cleanly.
-#[pyclass]
+#[pyclass(module = "pyronova.engine")]
 pub(crate) struct PgCursor {
     state: Mutex<CursorState>,
 }
@@ -417,7 +417,7 @@ impl PgCursor {
 // Python-visible PgPool
 // ---------------------------------------------------------------------------
 
-#[pyclass(frozen)]
+#[pyclass(frozen, module = "pyronova.engine")]
 pub(crate) struct PgPool;
 
 #[pymethods]

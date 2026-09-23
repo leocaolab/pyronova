@@ -80,7 +80,7 @@ pub(crate) fn empty_body_stream_rx() -> BodyStreamRx {
 /// Only one logical iterator should consume a given stream — attempting to
 /// call `next()` on a stream that's already been drained yields
 /// `StopIteration` immediately.
-#[pyclass(name = "BodyStream")]
+#[pyclass(name = "BodyStream", module = "pyronova.engine")]
 pub(crate) struct PyronovaBodyStream {
     rx: Mutex<Option<tokio::sync::mpsc::Receiver<ChunkMsg>>>,
 }
