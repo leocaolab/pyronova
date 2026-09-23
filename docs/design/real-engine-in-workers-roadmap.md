@@ -22,20 +22,22 @@
 ## Milestones
 
 ### M0: Main-side attach and drop discipline (highest risk)
-- **Scope:** C2 (the `RunContext` with the main `InterpreterHandle`; `shared_state` field
-  present but not yet read by workers), C4 (every site in the C4 table), FR-6, and the
-  FR-12 grep allowlist + E2E log panic-text scan helper (`tests/conftest.py`).
-  - Bridge threads get a persistent main tstate.
-  - WebSocket per-connection tstate.
-  - `spawn_blocking` / `LoopGuard` use `main_attach`.
-  - Bridge threads are joined in `run()`; `FrozenRoutes` / `Py<T>` drops happen while
-    attached.
-  - R-4 debug assertion.
+- **Scope** (revised by the fresh review, B2–B5, B8, B9, N15, N16): C2's main handle
+  (`MAIN`, captured in `engine()`; no run context), C4 (every site in the C4 table), FR-6,
+  the FR-12 allowlist gate + E2E log panic-text scan (`tests/conftest.py`).
+  - Every main-side thread that serves many requests (bridge, `spawn_blocking` in every
+    mode) keeps one main tstate for its life (thread-local, TLS destructor).
+  - WebSocket: no Python on the TPC/Tokio thread; lookup + handler on the connection
+    thread, attached to main for the connection's life.
+  - `LoopGuard` attaches to the interpreter recorded at loop creation; R-4 debug assertion.
+  - Bridge threads joined after the TPC threads; `run()` keeps the last `Arc<RouteTable>`.
+  - Shared `feature_server` fixture: log to a file, stop with SIGINT, scan the log.
 - **Depends:** —
 - **Verification:**
-  - E2E-8, the sync/async `gil=True` + WebSocket + `/metrics` parts. The test app's script
-    execs the real engine in each worker, as in `spike/r3_app.py`. Result: 0 non-2xx,
-    WebSocket echoes, and no fork panic text in the logs, including across SIGINT.
+  - E2E-8 over `PYRONOVA_TPC=1` and `=0`: sync/async `gil=True` + WebSocket + `/metrics`
+    under concurrent load while each worker's script execs the real engine; 0 non-2xx,
+    WebSocket echoes, exit 0, no `panicked at` / fork panic text in the log, SIGINT
+    included. Plus 3 concurrent TestClient servers in one process.
   - E2E-9: the allowlist gate catches a seeded bare attach.
   - The existing suite stays green on macOS + Linux.
 - **Shippable:** yes. There is no user-visible change, and it removes the latent
@@ -72,9 +74,10 @@
   - C8's `run()` reordering (seal → `_is_worker` return → run-time registrations) and the
     `__init__` call.
   - FR-2.
-  - C2's `PyronovaApp::new` / `SharedState::new` reading `RunContext.shared_state` when
-    not on main.
-- **Depends:** M0 (C2 struct).
+  - C2's shared state: `init_in_sub_interp` sets a per-interpreter cell with the running
+    app's map before the script executes; `PyronovaApp::new` / `SharedState::new` read it
+    when not on main.
+- **Depends:** M0 (C2 main handle).
 - **Verification:**
   - Main-interpreter unit tests: a post-seal non-gil route raises.
   - `/mcp` and `PYRONOVA_LOG=1` still work (E2E-1 subset).

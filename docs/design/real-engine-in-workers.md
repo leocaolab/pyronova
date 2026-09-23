@@ -95,7 +95,7 @@ one code path for main and workers. Concretely:
 |---|---|---|
 | F1: Real package import in workers | CUJ-1, CUJ-6 | `import pyronova` in a worker loads `python/pyronova/__init__.py` + the real extension |
 | F2: Handler resolution from the worker's own route table | CUJ-1, CUJ-6 | replaces lookup by `__name__`; `model=`, path-param shims and closure hooks behave as on main |
-| F3: Process-wide run context | CUJ-2, CUJ-5 | the running app's `SharedState` map and the main `InterpreterHandle`, reachable from any interpreter |
+| F3: Main interpreter handle + per-worker shared state | CUJ-2, CUJ-5 | the main `InterpreterHandle` reachable from any thread (M0); the running app's `SharedState` map handed to each worker (M3) — see C2 |
 | F4: Foreign-thread attach discipline | CUJ-5, CUJ-7 | every Rust thread that attaches names its interpreter explicitly |
 | F5: Worker API as `#[pyfunction]`s | CUJ-4, CUJ-6 | recv/send/log become normal module functions; headers on the async path |
 | F6: Real `PgPool` in workers | CUJ-3 | sync methods run through the DB runtime without nested `block_on` |
@@ -113,13 +113,13 @@ one code path for main and workers. Concretely:
 | FR-3 | After the script runs, the worker takes its handlers, before hooks and after hooks from the worker's own `PyronovaApp` route table. The worker's sealed prefix must equal main's sealed prefix, checked per index on `(method, path, gil)` plus the before/after hook counts. A mismatch fails worker startup with both lists in the error. Post-seal hooks (e.g. the `enable_logging` hooks) run only on main paths, as today. | F2 |
 | FR-4 | Exactly one `Pyronova` app per script. Zero or more than one registered app in a worker fails startup with a message naming the count. | F2 |
 | FR-5 | `app.state` and `SharedState` obtained in any interpreter during a server run refer to the running app's single `Arc<DashMap<String, Bytes>>`. | F3 |
-| FR-6 | A bare `Python::attach` **or a `Py<T>` drop** on a thread with no thread state never runs in production code. Main-side threads (GIL bridge, WebSocket, `spawn_blocking` GIL path, `LoopGuard` drop, DB async resolver) attach through an explicit `InterpreterHandle`. Long-lived threads keep one persistent thread state and drop every `Py<T>` they own (including `FrozenRoutes` clones) while attached before exiting. `run()` joins them before it returns, so the last `Arc<RouteTable>` drop happens on main while attached. | F4 |
+| FR-6 | A bare `Python::attach` **or a `Py<T>` drop** on a thread with no thread state never runs in production code, and no main-interpreter object is touched on a thread bound to a sub-interpreter. Main-side threads (GIL bridge, WebSocket, `spawn_blocking` GIL path in every mode, `LoopGuard` drop, DB async resolver) attach through `main_attach` / `attach_to` (C4). Every thread that serves many requests keeps one main thread state for its life. Threads drop every `Py<T>` they own (including `FrozenRoutes` clones) while attached before exiting. `run()` joins the bridge threads before it returns and keeps the last `Arc<RouteTable>`, dropped on main while attached. | F4 |
 | FR-7 | The async worker loop uses `pyronova.engine._worker_recv(worker_id, pool_id)` and `pyronova.engine._worker_send(worker_id, pool_id, req_id, response)`. `response` may be a `Response`, and its headers reach the client. | F5 |
 | FR-8 | Worker logging uses `pyronova.engine.emit_python_log` (`logging.rs:203-233`) and carries the real worker index. | F5 |
 | FR-9 | `PgPool.fetch_all / fetch_one / fetch_scalar / execute` and `fetch_iter` iteration work from a TPC worker thread. They release the GIL during I/O and never call `Runtime::block_on` or Tokio `blocking_recv` from inside a Tokio context. `*_async` called in a worker raises `NotImplementedError` with the existing message. `*_async` on main resolves through C9. | F6 |
 | FR-10 | `_bootstrap.py` contains only the logging-handler install, the GC policy and the isolation machinery (`_bootstrap.py:660-1160`). The injected globals `_Request`, `_Response`, `_pyronova_emit_log`, `_pyronova_db_*`, `_pyronova_recv`, `_pyronova_send` and `_pyronova_pool_id` are gone. | F7 |
 | FR-11 | `pyronova` / `pyronova.engine` are never cloned by `app.isolate` or reactive auto-isolate. Requesting it is an error: one shared copy is required, because the engine's process-global statics must be one instance. | F1 |
-| FR-12 | A CI test imports `pyronova` in a real worker and compares its public surface with main's (names in `pyronova.__all__`, `Pyronova` public methods, `pyronova.engine` classes and functions). A CI check fails on any `Python::attach(` / `Python::with_gil(` in `src/` outside an allowlist. Every E2E server log is scanned for the fork's two panic texts (`Python::attach was called on a thread that has no Python thread state`, `a Py<T> was dropped on a thread that has no Python thread state`); any hit fails the test. | F8 |
+| FR-12 | A CI test imports `pyronova` in a real worker and compares its public surface with main's (names in `pyronova.__all__`, `Pyronova` public methods, `pyronova.engine` classes and functions). A CI check fails on any `Python::attach(` / `Python::with_gil(` in `src/` outside an allowlist. Every E2E server log is scanned for the fork's two panic texts (`Python::attach was called on a thread that has no Python thread state`, `a Py<T> was dropped on a thread that has no Python thread state`); any hit fails the test (`tests/conftest.py` `fork_panic_lines`; the shared `feature_server` fixture now stops servers with SIGINT and scans their full log, shutdown included). | F8 |
 
 **Non-functional** (measured on bluewhale unless noted)
 
@@ -167,32 +167,30 @@ one code path for main and workers. Concretely:
   `docs/logging-design*.md:180`.
 - **Interface:** unchanged.
 
-### C2: Run context (process-wide)
-- **Responsibility:** during `PyronovaApp.run`, publish the state that any interpreter's
-  `PyronovaApp` / `SharedState` must attach to, plus the main interpreter's handle.
-- **Reuses:** `PyronovaApp.shared_state: Arc<DashMap<String, Bytes>>` (`app.rs:25,48`),
-  `SharedState::with_inner` (`state.rs:25-27`), `InterpreterHandle::current`.
-- **New:** `src/run_context.rs`.
+### C2: Main interpreter handle + per-worker shared state
+> Revised 2026-09-23 (fresh review B4, implemented in M0). The original single process-wide
+> `RUN` slot (`RunContext` published by `run()`) was dropped: TestClient runs several
+> servers concurrently in one process (`testing.py:200,247`), `run_gil`/`run_tpc_gil`/bench
+> need a main attach too, and threads such as WebSocket connections and Tokio blocking
+> threads can outlive a run. None of that needs per-run state; the main interpreter is a
+> process constant.
+- **Main handle (M0, done):** `src/run_context.rs`.
   ```rust
-  pub struct RunContext {
-      pub shared_state: Arc<DashMap<String, Bytes>>,
-      pub main: pyo3::sync::InterpreterHandle,
-      pub worker_count: usize,
-  }
-  static RUN: parking_lot::RwLock<Option<Arc<RunContext>>> = parking_lot::const_rwlock(None);
-
-  /// Called by PyronovaApp::run on the main interpreter before any worker is created.
-  pub fn publish(ctx: RunContext) -> RunGuard;   // RunGuard::drop clears RUN
-  pub fn current() -> Option<Arc<RunContext>>;
+  static MAIN: OnceLock<Interp> = OnceLock::new();   // Interp = InterpreterHandle + raw ptr
+  pub(crate) fn capture_main(py);   // called from engine() exec; no-op off main
+  pub(crate) fn main_interp() -> Interp;
+  pub(crate) fn main_attach<F, R>(f: F) -> R;       // see C4
+  pub(crate) fn attach_to<F, R>(interp: Interp, f: F) -> R;
   ```
-  Only data that holds no Python objects goes into `RUN`. `InterpreterHandle` is a raw
-  interpreter pointer, valid while the main interpreter lives, which outlives every
-  server run.
-- **Change in `PyronovaApp::new` (`app.rs:43`):** if `run_context::current()` is `Some`
-  and the calling interpreter is not the main one, use `ctx.shared_state` instead of a
-  fresh `DashMap`. `SharedState::new()` (`state.rs:32-37`) does the same, so `app.state`
-  and a bare `SharedState()` in a worker both see main's map (FR-5). Main-interpreter
-  behaviour does not change: TestClient apps in one pytest process keep separate maps.
+  `engine()` (`lib.rs`) calls `capture_main` first; the main interpreter always executes
+  the module before any server can start, because the server is started through it.
+- **Shared state (M3):** instead of a published run context, `init_in_sub_interp` hands the
+  running app's `Arc<DashMap<String, Bytes>>` (`app.rs:25,48`) to each worker through a
+  per-interpreter cell set before the script executes. `PyronovaApp::new` and
+  `SharedState::new()` (`state.rs:32-37`) in a worker read that cell
+  (`SharedState::with_inner`, `state.rs:25-27`), so `app.state` and a bare `SharedState()`
+  see main's map (FR-5). Main-interpreter behaviour does not change: TestClient apps in one
+  process keep separate maps.
 
 ### C3: Worker app registry and handler resolution
 - **Responsibility:** find the worker's own `PyronovaApp` after the script runs, and build
@@ -228,24 +226,38 @@ one code path for main and workers. Concretely:
 - **Responsibility:** every Rust→Python entry on a thread that has no current thread state
   targets an explicit interpreter.
 - **Reuses:**
-  - `InterpreterHandle::attach` (fork).
-  - `rebind_tstate_to_current_thread` / `SubInterpGilGuard` (`ffi.rs:624-732`), the same
-    pattern used for main-side persistent threads.
-  - `RunContext.main` (C2).
-- **Sites that change** (from Phase 0; all currently bare `Python::attach`):
+  - `InterpreterHandle::attach` (fork), only on threads with no thread state (see B3 below).
+  - `PyGILState_Ensure` via plain `Python::attach` on threads already bound to the target
+    interpreter.
+  - `MAIN` (C2).
+- **Invariant (review B2):** no Python-level operation on a main-interpreter object
+  (attach, `clone_ref`, `Py<T>` drop) happens on a thread bound to a sub-interpreter (TPC
+  threads, pool workers). `Arc<RouteTable>` clones may pass through those threads as plain
+  Rust values: `run()` keeps the last clone and drops it on main, attached (B9).
+- **Sites that change** (M0, implemented; all were bare `Python::attach`):
 
   | Site | Thread | New form |
   |---|---|---|
-  | `handlers.rs:536` `call_handler_with_hooks` | GIL bridge threads (`main_bridge.rs:262`), pool-mode `spawn_blocking` (`handlers/subinterp.rs:183-277`), `run_gil` | persistent main tstate per bridge thread (created once at `MainInterpBridge::spawn`, `main_bridge.rs:111-195`), then `ctx.main.attach` (fast path). `spawn_blocking`: `ctx.main.attach` (fresh tstate per call; this is the pool-mode GIL path, which is not the TPC hot path) |
-  | `handlers.rs:225` `LoopGuard::drop` | same threads | `ctx.main.attach` |
-  | `websocket.rs:192,282` | Tokio worker / per-connection `std::thread` | `ctx.main.attach`; the per-connection thread keeps one tstate for the connection's life |
-  | `db.rs:585,614,644` + `future_into_py` (`db.rs:578,607,637,666`) | pyo3-async-runtimes Tokio threads | replaced by C9 (spike: 2× `tokio-rt-worker` panic) |
-  | `main_bridge.rs:96-99` detached bridge threads holding `FrozenRoutes` | bridge threads at shutdown | join in `run()` (keep the `JoinHandle`s); drop the `routes` clone inside the thread's persistent main tstate before exit (FR-6) |
-  | `worker.rs:421`, `db_bridge.rs:131` | worker thread with its tstate current | already attached; becomes `Python::assume_attached()` / the `py` passed down |
+  | `handlers.rs` `call_handler_with_hooks` | GIL bridge threads, `spawn_blocking` in `run_gil` (`handlers/gil.rs:125`, the whole `mode="gil"`/TestClient path) and pool mode (`handlers/subinterp.rs:230`) | `main_attach`. A thread with no thread state gets **one main tstate for its life** in a thread-local, released by its TLS destructor (review B5): no per-request tstate create/destroy on any path |
+  | `handlers.rs` `LoopGuard::drop` | same threads (TLS destructor) | the loop records its interpreter at creation; drop uses `attach_to(that)`. Long-lived bridge threads close it explicitly first (`close_thread_event_loop`) |
+  | `websocket.rs` handshake | TPC thread (**bound to the worker**, `worker.rs:157-166`) or tstate-less Tokio worker (pool mode) | **no Python at all**: existence check `ws_handlers.contains_key` only (review B2). Before M0 the bare attach here re-attached the *worker's* thread state and `clone_ref`'d main's handler under the worker GIL |
+  | `websocket.rs` per-connection `std::thread` | fresh thread | `attach_to(main)` for the connection's life; the handler is looked up **there**, and the thread's `routes` clone is dropped inside the attach. Not `main_attach`: the thread can outlive `run()` |
+  | `db.rs:585,614,644` + `future_into_py` | pyo3-async-runtimes Tokio threads | replaced by C9 in M1; allowlisted until then |
+  | `main_bridge.rs` bridge threads | bridge threads at shutdown | `JoinHandle`s kept; order (N15): TPC threads joined → their bridge `Arc`s dropped → `MainInterpBridge::shutdown_join` drops the `Sender` and joins; each thread closes its loop and drops its `routes` clone inside `main_attach`, then its TLS destructor releases the main tstate before `join` returns |
+  | `worker.rs:421`, `db_bridge.rs:131` | worker thread with its tstate current | **kept** as `Python::attach` (allowlisted): a re-entrant attach on the thread's current tstate. `assume_attached()` would not register the attach with PyO3, so a `Py<T>` dropped inside would be deferred instead of decref'd |
 
-- **New:** a `fn main_attach<R>(f: impl for<'py> FnOnce(Python<'py>) -> R) -> R` helper in
-  `run_context.rs` that fails loudly (`expect` with an explanation) if no run context is
-  published. This is the only allowed spelling outside the allowlist in FR-12.
+- **New:** `main_attach` / `attach_to` in `run_context.rs`. `attach_to(interp)`:
+  bound tstate null → `InterpreterHandle::attach` (fresh tstate); bound tstate of `interp` →
+  `Python::attach` (re-attaches through `PyGILState_Ensure`, correct whether or not that
+  tstate is current); bound to another interpreter → panic. `main_attach` additionally
+  creates the thread-local main tstate on first use. This is the only allowed spelling
+  outside the allowlist in FR-12.
+- **Fork bug avoided (review B3):** `InterpreterHandle::attach`'s fast path compares only
+  the thread's *bound* (gilstate) tstate, so on a bound-but-detached thread (the main
+  thread inside `py.detach`, a bridge thread between items) it runs `f` without the GIL,
+  and its non-fast path asserts on a thread bound to another interpreter even when that
+  tstate is detached. `attach_to` never calls it on a bound thread. Fork fix tracked
+  separately.
 - **Ordering (§8.8):** C4 and C9 land, and E2E-8 passes, before any change that makes a
   worker execute the engine (C1 activation, C7).
 
@@ -345,12 +357,12 @@ one code path for main and workers. Concretely:
 
 | Direction | Module | Symbol / signature | Purpose |
 |---|---|---|---|
-| worker.rs → run_context | C2 | `run_context::current() -> Option<Arc<RunContext>>` | worker creation asserts a context exists |
-| app.rs → run_context | C2 | `run_context::publish(RunContext) -> RunGuard` (in `run`, before `InterpreterPool::new` `app.rs:961` / `SubInterpreterWorker::new` `app.rs:1199`) | publish shared state + main handle |
+| lib.rs `engine()` → run_context | C2 | `run_context::capture_main(py)` (no-op off main) | record the main interpreter (M0) |
+| worker.rs `init_in_sub_interp` → worker cell | C2 | per-interpreter cell with the app's `Arc<DashMap<String, Bytes>>`, set before the script executes | shared state for workers (M3) |
 | PyronovaApp::new → run_context | C2 | reads `shared_state` when not main | FR-5 |
 | worker.rs → engine (Python) | C3 | `WORKER_APP.get(py) -> Option<&Py<PyronovaApp>>` | handler table source |
 | worker.rs ← handlers/tpc.rs, pool.rs | C3 | `call_handler(&mut self, idx: usize, method, path, params, query, body, headers, client_ip) -> Result<SubInterpResponse, String>` | index-based call |
-| main_bridge.rs, handlers.rs, websocket.rs → run_context | C4 | `main_attach(f)` / `ctx.main.attach(f)` | explicit main attach |
+| main_bridge.rs, handlers.rs, websocket.rs → run_context | C4 | `main_attach(f)`, `attach_to(interp, f)`, `main_interp()` | explicit main attach |
 | _async_engine.py → engine | C5 | `_worker_recv(worker_id, pool_id)`, `_worker_send(worker_id, pool_id, req_id, response)`, `_worker_app_handler(idx)`, `_worker_app_hooks()` | async bridge |
 | app.py → engine | C3/C8 | `PyronovaApp._register_worker_app()`, `PyronovaApp._seal_registrations()` | worker app + seal boundary |
 | db.rs → asyncio (any interpreter) | C9 | `await_on_loop(py, fut)`: `loop.create_future()`, `InterpreterHandle::current`, `call_soon_threadsafe` | async DB without foreign attach |
@@ -364,7 +376,7 @@ one code path for main and workers. Concretely:
 ```
 main (PyronovaApp.run, main interpreter, GIL held):
  1. freeze routes (app.rs:389-418) → FrozenRoutes F
- 2. guard = run_context::publish(RunContext{shared_state, main: InterpreterHandle::current(py), n})
+ 2. (M3) each worker's per-interpreter shared-state cell is set in init_in_sub_interp (C2); MAIN was captured at engine() exec
  3. for i in 0..n: SubInterpreterWorker::new(i, script, &F)      (app.rs:1199 / pool.rs:252)
  worker i (new interpreter, own GIL, created on main thread as today worker.rs:70-104):
  4. globals = {__builtins__, __name__="__pyronova_worker__", __file__=script, WORKER_ID=i}
@@ -384,7 +396,7 @@ Invariants:
 - A worker never serves a request unless its sealed table equals main's by index.
 - Post-seal routes are `gil=True`, so a worker is never asked for an index beyond its
   sealed prefix.
-- `RUN` is set for the whole lifetime of any worker.
+- `MAIN` is set before any worker exists (the engine executed on main first).
 
 Edge cases:
 - A script that registers routes conditionally on `PYRONOVA_WORKER`: this fails at step 7
@@ -402,21 +414,35 @@ request and per hook. Request construction (`worker.rs:389-426`), the vectorcall
 
 ### 8.3 Attach discipline (C4)
 ```
-long-lived main-side thread (GIL bridge thread k, WS connection thread):
-  on start:  ctx = run_context::current().expect(..)
-             ctx.main.attach(|_| ())          # fast path check only
-             tstate = PyThreadState_New(main_interp); PyEval_RestoreThread(tstate); PyEval_SaveThread()
-  per item:  SubInterpGilGuard::acquire(tstate) → ctx.main.attach(f)   # fast path: already attached
-  on exit:   PyEval_RestoreThread; PyThreadState_Clear; PyThreadState_DeleteCurrent
-short-lived / spawn_blocking: ctx.main.attach(f)   # fresh tstate per call
+main_attach(f):                       # any thread not bound to a sub-interpreter
+  bound = PyGILState_GetThisThreadState()
+  if bound == NULL:
+      THREAD_MAIN_TSTATE.try_with(ensure)     # PyThreadState_New(main): binds gilstate
+  attach_to(MAIN, f)
+
+attach_to(interp, f):
+  bound = PyGILState_GetThisThreadState()
+  NULL          → interp.handle.attach(f)      # fresh tstate, destroyed after
+  interp(bound) == interp → Python::attach(f)  # PyGILState_Ensure re-attaches it,
+                                               # current or not; counter 1→2→1
+  otherwise     → panic("attach_to(interp A) on a thread bound to interpreter B")
+
+THREAD_MAIN_TSTATE drop (thread exit, before join returns):
+  if Py_IsInitialized: PyEval_RestoreThread(t); PyThreadState_Clear(t); DeleteCurrent()
 ```
+(Revised in M0 per fresh review B3/B5: the earlier sketch used the handle's fast path on
+a persistent tstate, which runs `f` without the GIL when the tstate is bound but not
+current, and created a fresh tstate per `spawn_blocking` request.)
 Why it is required: the fork resolves a bare foreign-thread `Python::attach` to "the
 interpreter that executed this extension copy's module", and panics when several
 interpreters executed it (fork `CHANGELOG-FORK.md:80-85`). Once workers import the engine,
 every bare attach on a main-side thread becomes a panic. Today it silently lands in main.
 
-CI gate (FR-12): `rg -n 'Python::(attach|with_gil)\(' src/` must match only the allowlist,
-which is `run_context.rs` and sites proven to hold a current tstate.
+CI gate (FR-12, `tests/test_attach_allowlist.py`): non-comment `Python::(attach|with_gil|
+try_attach)(` in `src/` must match an allowlist with **exact** per-file counts and a stated
+reason: `run_context.rs` (1), `python/worker.rs` (1), `bridge/db_bridge.rs` (1, gone in
+M4), `db.rs` (3, gone in M1). E2E-9 seeds a bare attach into a copy of `src/` and asserts
+the gate reports it.
 
 **Dependency audit:** `pyo3-async-runtimes` (`Cargo.toml:27`) calls `Python::attach` on
 its runtime threads inside `future_into_py`. The spike shows it panics. It is replaced by
@@ -493,8 +519,8 @@ sub-interpreter permanently disables `PyGILState_Check` in its process.
 | E2E-5 | CUJ-3 | PG service in CI; `test_db_subinterp.py` with TPC default → 5 tests pass (today always skipped) + a new `fetch_iter` iteration case from a worker route → all rows, no panic |
 | E2E-6 | CUJ-3 | worker route calls `pool.fetch_all_async` → 500 with body containing `NotImplementedError` message; server stays up |
 | E2E-7 | CUJ-4 | `PYRONOVA_TPC=0`, async route returns `Response(headers={"x-a":"1"})` and a before hook sets a header → both headers present |
-| E2E-8 | CUJ-5 | mixed app (the spike's `r3_app.py` shape): worker route + `gil=True` sync/async routes + `gil=True` async DB (`fetch_all_async`) + WebSocket echo + `/metrics` + a main Python thread awaiting `fetch_all_async`; 30 s concurrent load, then SIGINT → 0 non-2xx, WS echoes, the async DB result arrives, and the log scan finds neither fork panic text (including at shutdown) |
-| E2E-9 | CUJ-5 | attach-allowlist check (FR-12) fails on a seeded bare `Python::attach` in a scratch copy |
+| E2E-8 | CUJ-5 | `tests/test_layer2_main_side.py`, **parametrized over `PYRONOVA_TPC=1` and `=0`** (review B8: pool mode has its own sites). App (`tests/_l2_main_side_app.py`) whose own script execs the real engine in each worker; worker route + `gil=True` sync/async routes + WebSocket echo + `/metrics` under concurrent load, then SIGINT → 0 non-2xx, WS echoes, exit 0, and the log has no `panicked at` line and neither fork panic text (including at shutdown). M1 adds the `gil=True` async DB route + a main Python thread awaiting `fetch_all_async`. Plus `test_concurrent_in_process_servers`: 3 TestClient servers at once in one process (B4) |
+| E2E-9 | CUJ-5 | `tests/test_attach_allowlist.py`: the allowlist gate (FR-12) reports a bare `Python::attach` seeded into a copy of `src/` |
 | E2E-10 | CUJ-6 | surface parity: worker route returns `sorted(dir(pyronova))`, `pyronova.__all__`, `sorted(m for m in dir(pyronova.Pyronova) if not m.startswith("_"))`, `dir(pyronova.engine)` → equals main's |
 | E2E-11 | CUJ-6 | worker `logging.getLogger().info("x")` with 4 workers → log lines show worker ids {0,1,2,3} |
 | E2E-12 | CUJ-7 | `test_subinterp_memory_regression.py` (Linux, 9 tests) + grill W=16 180 s + 20× graceful SIGINT → NFR-3/4/5 |
@@ -544,7 +570,7 @@ sub-interpreter permanently disables `PyGILState_Check` in its process.
     never serves requests from a misaligned table.
   - No app, or two apps, in the script: fail startup (FR-4).
   - Engine cloned by isolation: refuse (FR-11). A cloned engine would have its own
-    `WORKER_STATES`, `LOGGER` and `RUN`, and workers would silently talk to nothing.
+    `WORKER_STATES`, `LOGGER` and `MAIN`, and workers would silently talk to nothing.
   - Bare foreign attach: the CI gate prevents it. At run time the fork panics with a
     message, which PyO3 surfaces as `PanicException`; the request gets a 500.
   - Main bridge thread without a run context: `main_attach` panics with an explanation.
@@ -552,8 +578,9 @@ sub-interpreter permanently disables `PyGILState_Check` in its process.
 - **Teardown:** worker modules are torn down by `Py_EndInterpreter` as today
   (`ffi.rs:747-753`). The engine module object is per interpreter
   (`PerInterpreterCell<Py<PyModule>>`), so ending a worker frees only that worker's
-  module. `RunGuard` drops after all workers have ended (after `InterpreterPool` drop,
-  `pool.rs:128-184`, and after TPC thread join). The `os._exit` on graceful stop
+  module. The last `Arc<RouteTable>` is `run()`'s own clone, dropped on main while
+  attached after all workers and bridge threads have ended (after `InterpreterPool` drop,
+  `pool.rs:128-184`, the TPC thread join and `MainInterpBridge::shutdown_join`). The `os._exit` on graceful stop
   (`app.py:1245-1253`) stays until the item-3 investigation (branch
   `fix/singlephase-finalize`) shows finalization is clean. This design must not depend on
   either outcome.
@@ -592,7 +619,7 @@ sub-interpreter permanently disables `PyGILState_Check` in its process.
 | `RouteTable` / `FrozenRoutes` | `src/router.rs:34-48,196-199` | worker binding source + reference signature |
 | route freeze in `run` | `src/app.rs:389-418` | reference order for 8.1 step 7 |
 | `add_route` | `src/app.rs:670-715` | unchanged; now also runs in workers |
-| `PyronovaApp.shared_state`, `state` getter | `src/app.rs:25,48,220` | source for `RunContext.shared_state` |
+| `PyronovaApp.shared_state`, `state` getter | `src/app.rs:25,48,220` | source for each worker's shared-state cell (M3) |
 | `SharedState::with_inner` | `src/state.rs:25-27` | worker `SharedState()` / `app.state` |
 | `InterpreterHandle` | fork `src/sync/interpreter_handle.rs:53-110` | main handle + explicit attach |
 | `rebind_tstate_to_current_thread` | `src/python/ffi.rs:687-732` | pattern for persistent main tstate on bridge threads |
@@ -616,9 +643,10 @@ sub-interpreter permanently disables `PyGILState_Check` in its process.
 | subprocess test harness | `tests/conftest.py:69-138` | all E2E tests |
 
 **New abstractions and why each is needed:**
-- `RunContext` (C2): the one place where "the server that is running" is visible to other
-  interpreters. Without it, `SharedState` in a worker cannot find main's map, since today
-  nothing hands it over (`state.rs:32-37`). Foreign threads would also have no main handle.
+- `MAIN` + the per-worker shared-state cell (C2): foreign threads need the main handle
+  (a process constant), and a worker's `SharedState` needs main's map, which today nothing
+  hands over (`state.rs:32-37`). A process-wide "current run" slot was rejected: servers
+  can run concurrently in one process (TestClient).
 - `WORKER_APP` + `bind_routes` (C3): replaces name-based lookup, which is the root of the
   mock/real divergence (wrapped vs unwrapped handlers, skipped closure hooks).
 - `main_attach` (C4): a single audited spelling for "run on main from any thread". It makes

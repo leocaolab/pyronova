@@ -5,6 +5,13 @@
 > is on branch `spike/layer2-r3` (`07ed94e`, `spike/R3-RESULTS.md`).
 > **Gate status: 0 blocking after round 2** (see §3). Round 1 had 7 blocking findings,
 > all resolved by amending the design.
+>
+> **Superseded in part (2026-09-23, fresh review, implemented in M0 on `layer2/m0`):** the
+> process-wide `RunContext` / `run_context::publish` / `RunGuard` below were replaced by a
+> `MAIN` handle captured in `engine()` plus a per-worker shared-state cell (M3), because
+> TestClient runs servers concurrently in one process (B4). Main-side threads keep one
+> thread-local main tstate (B5); WebSocket handshakes do no Python on TPC/Tokio threads
+> (B2). The design doc C2/C4/§8.3 are authoritative; the prose below is the original map.
 
 ## 1. CUJ implementations (prose)
 
