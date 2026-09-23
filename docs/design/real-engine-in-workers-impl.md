@@ -20,8 +20,9 @@
 >
 > **rev3 (2026-09-23, branch `design/layer2-rev3`, base `8d89297` = M0–M3 merged):** resolves
 > the M4 readiness review (fresh auditor, 5 blocking + 15 non-blocking). Gate record: §3
-> "Round 5" and "Round 6". Two items are decisions pending with the user (Q-2, Q-3 in the
-> design); M4 does not start until they are answered.
+> "Round 5" and "Round 6". Both user decisions were made on 2026-09-23: Q-2 → option (a)
+> (register on first route/hook/fallback; raw-engine files unchanged), Q-3 → approved
+> (rewrite the three Layer-2 probe apps and their tests at activation).
 
 ## 1. CUJ implementations (prose)
 
@@ -250,13 +251,13 @@ missed them. Blocking, each re-checked against the code by the writer before res
   (`app.rs:419`) and `__bench_*_impl` (`app.rs:1371,1462`) never do, so raw-engine runs and
   benches have no sealed prefix. → FR-2: engine seals at the freeze if unsealed.
 - B2: `_register_worker_app` is called only from `Pyronova.__init__` (`app.py:190`), so raw
-  `PyronovaApp()` scripts (5 files) fail FR-4. → FR-4 + design Q-2, **decision pending**.
+  `PyronovaApp()` scripts (5 files) fail FR-4. → FR-4 + design Q-2, **decided 2026-09-23: option (a)**.
 - B3: `SubInterpreterWorker` fields become `Py<T>` in M4, but every exit ends the
   interpreter before dropping the worker (`tpc.rs:514-518,657-661`, `pool.rs:511`), and
   failed-start paths drop built workers with main's tstate current. → FR-19
   `SubInterpreterWorker::end(self)`, §12, E2E-19.
 - B4: the three Layer-2 probe apps detect workers by a global M4 deletes. → design §9 +
-  Q-3, **approval needed** before those tests change.
+  Q-3, **approved by the user 2026-09-23**.
 - B5: `_iso_import` evicts the user's outer package (`_bootstrap.py:1353`), so a reactive
   isolation under `from pyronova.config import …` re-executes `pyronova` (measured by the
   reviewer: a second `pyronova.engine` module object). → FR-11 extended to the finder,
@@ -276,6 +277,5 @@ blocking" as weak evidence. Checked:
   E2E-21; FR-4 (B2) → E2E-22; NFR-2b/3b → M5 measurement; every new item is in roadmap M4.
 - Consistency: C3 no longer binds a fallback; §8.1, §7 and C3 use the plain
   `RouteSignature`; §12 and NFR-5 no longer assume `os._exit`.
-- Result: no new blocking finding from the writer. **M4 cannot start** until Q-2 and Q-3
-  are decided; a fresh auditor pass on rev3 is recommended if either decision changes the
-  design beyond the options written down.
+- Result: no new blocking finding from the writer. Q-2 and Q-3 were decided within the
+  options written down (option (a); rewrite approved), so M4 is unblocked.

@@ -6,9 +6,9 @@
 > Baseline: v2.7.2 (`c050396`); M0–M3 merged at `8d89297`. PyO3 from `leocaolab/pyo3` tag
 > `subinterp-2026-09-23.2` (`Cargo.toml:83`, `Cargo.lock:1291` → `97b2098`). Minimum Python 3.13.
 > **Rev3 (2026-09-23):** resolves the M4 readiness review (B1–B5 blocking, N1–N15). Line
-> numbers in this revision are at `8d89297`. Two decisions are pending with the user (B2,
-> B4; see "Open questions").
-> Gate: rounds 1–6 in the impl map (rev3: 5 blocking from the M4 readiness review resolved, two decisions pending). The impl map and audit record are
+> numbers in this revision are at `8d89297`. Both user decisions from that review were made on
+> 2026-09-23 (B2 → Q-2 option (a); B4 → Q-3 approved; see "Open questions").
+> Gate: rounds 1–6 in the impl map (rev3: 5 blocking from the M4 readiness review resolved; Q-2/Q-3 decided 2026-09-23). The impl map and audit record are
 > in `real-engine-in-workers-impl.md`; spike evidence is in `spike/R3-RESULTS.md` on branch
 > `spike/layer2-r3`.
 
@@ -114,7 +114,7 @@ one code path for main and workers. Concretely:
 | FR-1 | A worker's `sys.modules["pyronova"]` is the real package, and `pyronova.engine` is the real extension (per-interpreter module object). No `types.ModuleType` stand-ins for `pyronova*` remain. | F1, F7 |
 | FR-2 | `Pyronova.run()` first returns if it runs in a worker (`_is_worker()`, FR-15), before any side effect. On main it then calls `self._engine._seal_registrations()`, which marks the end of the script's registrations; `init_logger`, `/mcp` auto-registration, the `enable_logging` auto-enable, startup hooks and reload handling all run after the seal (today they run before the `_is_worker()` check, `app.py:1086-1174`). The seal is **main-only and idempotent**: TestClient calls `app.run()` up to 8 times on port races (`testing.py:197-201`), and only the first call sets the boundary. Every route registered after the seal must be `gil=True` (asserted in `add_route`, with a message naming the route). A worker never needs the seal (review B1): a script may call `app.run()` only under `if __name__ == "__main__"`, which a worker never executes. **The engine also seals** (M4 review B1): `PyronovaApp.run()` (`app.rs:419`) and `__bench_inmem_impl` / `__bench_loopback_impl` (`app.rs:1371,1462`) call the same idempotent seal at the freeze if nothing sealed yet, so raw-engine scripts and benches (`examples/hello_subinterp.py:33`, `benchmarks/bench_subinterp.py:29`, `benchmarks/suite/servers/pyronova_subinterp.py:72`, `benchmarks/bench_inmem.py:24`, `bench_loopback.py:22`) have a sealed table too. An unsealed table never reaches `route_signature`. **Raw `PyronovaApp.run()` off main raises** (M4 review N10): the mock made it a no-op in workers; the real one would start a nested server from inside a worker's init. | F1, F2 |
 | FR-3 | After the script runs, the worker takes its handlers, before hooks and after hooks from the worker's own `PyronovaApp` route table. **The worker's whole table** (everything registered while the script executed; a worker has no run-time registrations) must equal **main's sealed prefix**, checked per index on `(method, path, gil)` (`RouteTable.route_keys`, C3) plus the before/after hook counts. A mismatch fails worker startup with both lists in the error. Post-seal routes and hooks (e.g. `/mcp`, the `enable_logging` hooks) exist only on main and are `gil=True`, as today. | F2 |
-| FR-4 | Exactly one app per script: a worker with zero apps, or more than one app that registered anything, fails startup with a message naming the count. **Which objects count as "an app" is decision pending (M4 review B2, see Open questions):** option (a, recommended) — a worker registers a `PyronovaApp` in `WORKER_APP` on its **first** route / hook / fallback registration (`add_route`, `before_request`, `after_request`, `fallback` take `slf: Bound<Self>`), so raw-engine `PyronovaApp()` scripts work unchanged; `Pyronova.__init__`'s explicit `_register_worker_app()` call (`app.py:190`) goes. Option (b) — only `Pyronova()` registers; raw `PyronovaApp` is unsupported in workers and 5 files migrate. | F2 |
+| FR-4 | Exactly one app per script: a worker with zero apps, or more than one app that registered anything, fails startup with a message naming the count. **Decided 2026-09-23 (Q-2, option (a); M4 review B2):** in a worker, a `PyronovaApp` registers itself in `WORKER_APP` on its **first** route / hook / fallback registration (`add_route`, `before_request`, `after_request`, `fallback` take `slf: Bound<Self>`), so raw-engine `PyronovaApp()` scripts (examples, benchmarks, tests) work unchanged; `Pyronova.__init__`'s explicit `_register_worker_app()` call (`app.py:190`) goes. An app that registers nothing does not count. | F2 |
 | FR-5 | `app.state` and `SharedState` obtained in any interpreter during a server run refer to the running app's single `Arc<DashMap<String, Bytes>>`. | F3 |
 | FR-6 | A bare `Python::attach` **or a `Py<T>` drop** on a thread with no thread state never runs in production code, and no main-interpreter object is touched on a thread bound to a sub-interpreter. Main-side threads (GIL bridge, WebSocket, `spawn_blocking` GIL path in every mode, `LoopGuard` drop, DB async resolver) attach through `main_attach` / `attach_to` (C4). Every thread that serves many requests keeps one main thread state for its life. Threads drop every `Py<T>` they own (including `FrozenRoutes` clones) while attached before exiting. `run()` joins the bridge threads before it returns and keeps the last `Arc<RouteTable>`, dropped on main while attached. `attach_to` asserts that the **current** tstate (`PyThreadState_GetUnchecked()`) is null or the thread's bound one before it calls `Python::attach` (M4 review N4): with another tstate current (the main thread during a worker's init, which runs the whole real package in M4) `PyGILState_Ensure` → `PyEval_RestoreThread` is a fatal error. | F4 |
 | FR-7 | The async worker loop uses `pyronova.engine._worker_recv(worker_id, pool_id)` and `pyronova.engine._worker_send(worker_id, pool_id, req_id, response)`. `response` may be a `Response`, and its headers reach the client. | F5 |
@@ -500,7 +500,7 @@ main (PyronovaApp.run, main interpreter, GIL held):
  4. exec the slim bootstrap in its own namespace (__pyronova_bootstrap__, WORKER_ID=i)
  5. register ModuleType("__pyronova_worker__") in sys.modules; exec(compile(script, script_path), mod.__dict__)   (FR-20)
       - `from pyronova import Pyronova` → real package → engine module exec (per-interp, no global side effects)
-      - the app registers into WORKER_APP (FR-4; how depends on decision B2): a second app that registers anything → error
+      - the first route/hook/fallback registration puts that app in WORKER_APP (FR-4, Q-2 (a)); a second app that registers anything → error
       - decorators register into app's own RouteTable (real add_route, real model= wrap)
       - app.run(), if the script calls it unguarded → returns at its first line (_in_worker);
         under `if __name__ == "__main__"` it is never called. Either way nothing is
@@ -520,7 +520,7 @@ Invariants:
 Edge cases:
 - A script that registers routes conditionally on `PYRONOVA_WORKER`: this fails at step 7
   with a readable diff. That is intended, because it would have silently misrouted before.
-- A raw-engine script (`PyronovaApp()` directly): see FR-4 / decision B2. Its unguarded
+- A raw-engine script (`PyronovaApp()` directly): registers on its first route (FR-4, Q-2 (a)) and works unchanged. Its unguarded
   `app.run()` raises in a worker (FR-2, M4 N10).
 - `pyronova run module:app`: workers exec the module file set by `set_script_path` (C8,
   M4 N15).
@@ -689,7 +689,7 @@ sub-interpreter permanently disables `PyGILState_Check` in its process.
 | E2E-6 | CUJ-3 | worker route calls `pool.fetch_all_async` → 500; the **server log** contains the `NotImplementedError` message (the 500 body is the generic "handler raised an exception", `worker.rs` ~987, review N8); server stays up |
 | E2E-7 | CUJ-4 | `PYRONOVA_TPC=0`, async route returns `Response(headers={"x-a":"1"})` and a before hook sets a header → both headers present |
 | E2E-7b | CUJ-4 | `PYRONOVA_TPC=0`, `app.enable_request_id()`, async route that `await asyncio.sleep(random)`; 200 concurrent requests, each with a distinct `x-request-id` → every response echoes its own id (review B6, FR-14) |
-| E2E-8 | CUJ-5 | `tests/test_layer2_main_side.py`, **parametrized over `PYRONOVA_TPC=1` and `=0`** (review B8: pool mode has its own sites). App (`tests/_l2_main_side_app.py`) whose own script execs the real engine in each worker (at activation the probe apps are rewritten, decision B4); worker route + `gil=True` sync/async routes + WebSocket echo + `/metrics` under concurrent load, then SIGINT → 0 non-2xx, WS echoes, exit 0, and the log has no `panicked at` line and neither fork panic text (including at shutdown). M1 adds the `gil=True` async DB route + a main Python thread awaiting `fetch_all_async`. Plus `test_concurrent_in_process_servers`: 3 TestClient servers at once in one process (B4) |
+| E2E-8 | CUJ-5 | `tests/test_layer2_main_side.py`, **parametrized over `PYRONOVA_TPC=1` and `=0`** (review B8: pool mode has its own sites). App (`tests/_l2_main_side_app.py`) whose own script execs the real engine in each worker (at activation the probe apps are rewritten, approved 2026-09-23, Q-3); worker route + `gil=True` sync/async routes + WebSocket echo + `/metrics` under concurrent load, then SIGINT → 0 non-2xx, WS echoes, exit 0, and the log has no `panicked at` line and neither fork panic text (including at shutdown). M1 adds the `gil=True` async DB route + a main Python thread awaiting `fetch_all_async`. Plus `test_concurrent_in_process_servers`: 3 TestClient servers at once in one process (B4) |
 | E2E-9 | CUJ-5 | `tests/test_attach_allowlist.py`: the allowlist gate (FR-12) reports a bare `Python::attach` seeded into a copy of `src/` |
 | E2E-10 | CUJ-6 | surface parity: a worker route returns `pyronova.__all__`, the public methods of `pyronova.Pyronova` (`sorted(m for m in vars(pyronova.Pyronova) if not m.startswith("_"))`), and an explicit list of `pyronova.engine` names checked with `hasattr` → equal to main's. Not `dir(pyronova)`, which varies with lazily imported submodules (review N9) |
 | E2E-11 | CUJ-6 | script logs `logging.getLogger().info("init")` **at top level** (runs once per worker at init, and once on main) with 4 workers → **exactly one** "init" line per worker id 0–3, plus main's line, which carries no worker id (M4 N14: `emit_python_log` maps `worker_id=None` to 0, `logging.rs:213`; main must log without an id so it can't stand in for worker 0). Not per request: on macOS SO_REUSEPORT sends almost all traffic to one TPC thread (`tpc.rs:372`) |
@@ -704,7 +704,7 @@ sub-interpreter permanently disables `PyGILState_Check` in its process.
 | E2E-19 | CUJ-7 | teardown (FR-19): (a) 4 workers serve, SIGINT → exit 0, no fork panic text, no abort; (b) failed start: worker 2's script raises at import (conditional on `_in_worker()` and a worker id) → the server exits non-zero with the script's error, no abort, no panic text |
 | E2E-20 | CUJ-1 | worker script that starts with `from __future__ import annotations` and has a dataclass → starts; `typing.get_type_hints` on it works in a worker route; a raising handler's logged traceback names the script path and line (FR-20) |
 | E2E-21 | CUJ-1 | `pyronova run module:app` with 2 workers → worker routes answer (C8 CLI, M4 N15) |
-| E2E-22 | CUJ-1 | raw-engine scripts: `examples/hello_subinterp.py`-style `PyronovaApp()` server answers in subinterp mode (valid under decision B2 option a; under option b, starts fail with the FR-4 message) |
+| E2E-22 | CUJ-1 | raw-engine scripts: `examples/hello_subinterp.py`-style `PyronovaApp()` server answers in subinterp mode, with no edits to the script (Q-2 (a)) |
 
 **Existing tests that must change** (the `test_ffi_panic_safety.py` rewrite below was approved by the user on 2026-09-23; any other test change still needs a report first):
 - `tests/test_ffi_panic_safety.py:22-60` greps for `pyronova_recv_cfunc`,
@@ -729,7 +729,7 @@ sub-interpreter permanently disables `PyGILState_Check` in its process.
     instances. This is a pre-existing test bug; report it with M4.
 - **Become redundant, no change needed:** the three scripts that reset
   `os.environ["PYRONOVA_WORKER"] = ""` (FR-15).
-- **Must change at activation — approval needed (decision B4, M4 review):** the three Layer-2
+- **Must change at activation — approved by the user 2026-09-23 (Q-3, M4 review B4):** the three Layer-2
   probe apps detect a worker by `"_pyronova_emit_log" in globals()`, which M4 removes, so in
   workers they take the main branch: `tests/_l2_main_side_app.py:16`,
   `tests/_l2_async_db_app.py:17`, `tests/_l2_m3_worker_app.py:19`. Broken as a result:
@@ -739,10 +739,11 @@ sub-interpreter permanently disables `PyGILState_Check` in its process.
   `pyronova.engine._in_worker()`, drop the manual `ExtensionFileLoader` load (the real
   package is imported normally), delete the M3 probe app and its two tests (M4's real
   activation covers them).
-- **Break, report before changing (decision B2 option b only):**
-  `tests/test_c_extensions.py:5`, `tests/test_subinterp_hooks.py:4` (raw `PyronovaApp()`),
-  plus the non-test files `examples/hello_subinterp.py:12`, `benchmarks/bench_subinterp.py:6`,
-  `benchmarks/suite/servers/pyronova_subinterp.py:5`.
+- **No change (Q-2 (a)):** the raw-`PyronovaApp()` files `tests/test_c_extensions.py:5`,
+  `tests/test_subinterp_hooks.py:4`, `examples/hello_subinterp.py:12`,
+  `benchmarks/bench_subinterp.py:6`, `benchmarks/suite/servers/pyronova_subinterp.py:5` keep
+  working as they are (their `_Response`-global use in `test_subinterp_hooks.py:11` is the
+  separate N7 item above).
 - **Source-grep tests that constrain M4's code (keep the strings, or report first; M4
   review N6):** `test_pyerr_no_stderr.py:43` greps `src/python/*.rs` for "failed to create
   _Response"; `test_admission_control.py:71` greps `src/python` for `total_permits = n *
@@ -755,7 +756,7 @@ sub-interpreter permanently disables `PyGILState_Check` in its process.
 - [ ] `pyo3-async-runtimes` removed from `Cargo.toml`; C9 serves every `*_async`.
 - [ ] No E2E server log contains either fork panic text (FR-12 scan), including across shutdown.
 - [ ] NFR-1 … NFR-6 thresholds hit (§4), with bench numbers from a quiet bluewhale.
-- [ ] E2E-1 … E2E-22 pass on macOS and Linux (E2E-22's expectation per decision B2); the parity/attach gates are in CI.
+- [ ] E2E-1 … E2E-22 pass on macOS and Linux (E2E-22: raw-engine scripts unchanged, Q-2 (a)); the parity/attach gates are in CI.
 - [ ] `_bootstrap.py` contains only the three kept sections of the C7 table (≈ 830 of 1365
   lines at `8d89297`); `rg -n "_Fake|_Mock|PYRONOVA_WORKER|ModuleType\(\"pyronova" python/pyronova/_bootstrap.py` returns nothing.
 - [ ] `rg -n "_iso_evict\(|find_spec" python/pyronova/_bootstrap.py` shows the `pyronova` guards (FR-11).
@@ -899,23 +900,24 @@ sub-interpreter permanently disables `PyGILState_Check` in its process.
 
 - **Q-1: pydantic stub — DECIDED 2026-09-23: remove it.** Real pydantic reaches workers through
   auto-isolate, one copy per worker (§8.6).
-- **Q-2 (DECISION PENDING, M4 review B2): raw `PyronovaApp()` scripts in workers.** FR-4's
+- **Q-2 — DECIDED 2026-09-23: option (a)** (M4 review B2): raw `PyronovaApp()` scripts in workers. FR-4's
   registry is filled only by `Pyronova.__init__` (`app.py:190`), so every script that builds
   the raw engine fails worker startup with "no app": `examples/hello_subinterp.py:12`,
   `benchmarks/bench_subinterp.py:6`, `benchmarks/suite/servers/pyronova_subinterp.py:5` (used
   by `benchmarks/suite/runner.py:75`), `tests/test_c_extensions.py:5`,
   `tests/test_subinterp_hooks.py:4`.
-  - **(a) Recommended:** in a worker, a `PyronovaApp` registers itself in `WORKER_APP` on its
+  - **(a) Chosen:** in a worker, a `PyronovaApp` registers itself in `WORKER_APP` on its
     first route / hook / fallback registration (those pymethods take `slf: Bound<Self>`).
     FR-4 then counts "apps that registered anything". Raw-engine examples, benchmarks and
     tests keep working with no edits, and `Pyronova` needs no special call.
-  - **(b)** Raw `PyronovaApp` is unsupported in workers; migrate the five files above to
-    `Pyronova` (two are tests: report before editing, CLAUDE.md rule 5).
-  - Recommendation: (a). It keeps the engine usable on its own and costs one check per
-    registration, off the hot path.
-- **Q-3 (DECISION PENDING, M4 review B4): rewrite of the three Layer-2 probe apps** at
-  activation (§9 "Must change at activation — approval needed"). These are existing tests;
-  they are rewritten only with approval.
+  - (b), not chosen: raw `PyronovaApp` unsupported in workers and the five files above
+    migrated to `Pyronova`.
+  - Why (a): it keeps the engine usable on its own and costs one check per registration,
+    off the hot path.
+- **Q-3 — APPROVED 2026-09-23** (M4 review B4): the three Layer-2 probe apps and their tests
+  are rewritten at M4 activation as described in §9 ("Must change at activation"): detect a
+  worker with `pyronova.engine._in_worker()`, drop the manual `ExtensionFileLoader` load,
+  delete the M3 probe app and its two tests.
 - **R-1: closure hooks now run in workers (§8.7).**
   - CORS: `_cors_before` returns the preflight response, and Rust's `apply_cors` uses
     `insert` (`handlers.rs:320-341`), so there are no duplicate headers. Verified in E2E-1.
@@ -938,7 +940,7 @@ sub-interpreter permanently disables `PyGILState_Check` in its process.
   must follow the same main-only rule; the attach allowlist doesn't cover this, so it is a
   review item, not a gate.
 - **M4 readiness review (fresh auditor, 2026-09-23), resolved in rev3:** B1 → FR-2, §8.1;
-  B2 → FR-4 + Q-2 (pending); B3 → FR-19, C3, §12, E2E-19; B4 → §9 + Q-3 (pending); B5 →
+  B2 → FR-4 + Q-2 (decided: (a)); B3 → FR-19, C3, §12, E2E-19; B4 → §9 + Q-3 (approved); B5 →
   FR-11, E2E-14/14b; N1 → C5 (a–g), §8.7; N2 → C3 (no fallback binding); N3 → C3, §7, §8.1;
   N4 → FR-6, C4; N5 → C4 table; N6 → C5, C7, §9; N7 → header, C3, C5, C6, C7, §8.5, reuse
   map; N8 → NFR-5, §12; N9 → FR-20, C7, E2E-20; N10 → FR-2, §8.7; N11 → NFR-2b/3b, E2E-15;
