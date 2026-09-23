@@ -365,3 +365,39 @@ def test_builtin_single_phase_ext_loads_in_workers(tmp_path):
         assert r["loaded"], "faulthandler did not load in the sub-interpreter workers"
     finally:
         _stop(proc)
+
+
+_SERVER_PYO3_MULTIPHASE = '''
+from pyronova import Pyronova
+app = Pyronova()
+app.isolate("pydantic", "pydantic_core")
+import os as _os
+_ISO_DIR = _os.environ["PYRONOVA_ISOLATE_DIR"]
+@app.get("/pc")
+def h(req):
+    import pydantic_core
+    return {{"isolated": pydantic_core.__file__.startswith(_ISO_DIR),
+             "ok": pydantic_core.SchemaValidator({{"type": "int"}}).validate_python("7") == 7}}
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port={port}, mode="subinterp")
+'''
+
+
+@_supported
+def test_isolated_pyo3_multiphase_ext_loads_in_workers(tmp_path):
+    """A PyO3 extension is multi-phase: its PyInit returns a static PyModuleDef.
+    PyO3's def starts at refcount 1 (a C extension's is immortal), so the
+    in-worker PyInit path must not take ownership of the returned pointer. When it
+    did (ctypes restype=py_object, v2.7.2), dropping the wrapper freed static
+    memory and the worker aborted on import ("pointer being freed was not
+    allocated"; measured with polars' runtime)."""
+    pytest.importorskip("pydantic_core")
+    port = 8994
+    copies = tmp_path / "copies"
+    proc, log = _start_server(_SERVER_PYO3_MULTIPHASE, tmp_path, "pyo3mp", port,
+                              workers=2, isolate_dir=copies)
+    try:
+        r = _wait_ready(f"http://127.0.0.1:{port}/pc", proc, log)
+        assert r == {"isolated": True, "ok": True}, r
+    finally:
+        _stop(proc)

@@ -1027,11 +1027,21 @@ def _iso_init_here(spec):
         init = getattr(lib, "PyInit_" + short)
     except AttributeError:
         return None
-    init.restype = ctypes.py_object
-    obj = init()
-    if not isinstance(obj, type(sys)):
-        return None  # a PyModuleDef: multi-phase
+    # Take the result as a raw pointer. A multi-phase PyInit returns its static
+    # PyModuleDef; wrapping that as an owned object (restype=py_object) decrefs it
+    # when dropped. A C extension's def is immortal, so nothing happens, but PyO3's
+    # starts at refcount 1: the decref frees static memory -> abort ("pointer being
+    # freed was not allocated", measured with polars' _polars_runtime on 3.14).
+    init.restype = ctypes.c_void_p
+    ptr = init()
+    if not ptr:
+        raise SystemError(f"PyInit_{short} returned NULL without an exception")
+    ob_type = ctypes.c_void_p.from_address(ptr + ctypes.sizeof(ctypes.c_ssize_t)).value
     api = ctypes.pythonapi
+    if ob_type == ctypes.addressof(ctypes.c_char.in_dll(api, "PyModuleDef_Type")):
+        return None  # multi-phase: CPython creates it in this interpreter anyway
+    obj = ctypes.cast(ptr, ctypes.py_object).value  # takes its own reference
+    api.Py_DecRef(ctypes.c_void_p(ptr))             # release the one PyInit returned
     api.PyModule_GetDef.restype = ctypes.c_void_p
     api.PyModule_GetDef.argtypes = [ctypes.py_object]
     api.PyState_AddModule.argtypes = [ctypes.py_object, ctypes.c_void_p]
