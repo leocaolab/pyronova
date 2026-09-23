@@ -40,7 +40,13 @@ pub(crate) use tpc::handle_request_tpc_inline;
 /// the pre-split behavior. Measured 2% regression on bench_inmem
 /// Python w=6 without these hints.
 #[inline]
-pub(crate) async fn collect_body_bounded(body: Incoming) -> Result<Vec<u8>, Response<BoxBody>> {
+///
+/// The rejection response is boxed: it is the rare path, and a full `Response` in the `Err`
+/// variant made every `Result` from this per-request hot function that large
+/// (`clippy::result_large_err`).
+pub(crate) async fn collect_body_bounded(
+    body: Incoming,
+) -> Result<Vec<u8>, Box<Response<BoxBody>>> {
     use http_body_util::Limited;
     let max = max_body_size();
     let limited = Limited::new(body, max);
@@ -50,14 +56,14 @@ pub(crate) async fn collect_body_bounded(body: Incoming) -> Result<Vec<u8>, Resp
             if e.downcast_ref::<http_body_util::LengthLimitError>()
                 .is_some()
             {
-                Err(full_body(payload_too_large_response()))
+                Err(Box::new(full_body(payload_too_large_response())))
             } else {
                 tracing::warn!(
                     target: "pyronova::server",
                     error = %e,
                     "request body read failed"
                 );
-                Err(full_body(error_response("body read failed")))
+                Err(Box::new(full_body(error_response("body read failed"))))
             }
         }
     }

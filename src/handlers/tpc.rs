@@ -147,7 +147,8 @@ pub(crate) async fn handle_request_tpc_inline(
     } else {
         match collect_body_bounded(body_obj).await {
             Ok(b) => (b, None),
-            Err(mut r) => {
+            Err(r) => {
+                let mut r = *r;
                 apply_cors(&mut r, routes.cors_config.as_ref());
                 return Ok(r);
             }
