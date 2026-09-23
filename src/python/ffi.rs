@@ -731,6 +731,27 @@ pub(crate) unsafe fn rebind_tstate_to_current_thread(
     ffi::PyEval_SaveThread()
 }
 
+/// Ends a worker's sub-interpreter from the worker's own OS thread, at worker exit.
+///
+/// `tstate` is the worker's saved (detached) thread state, as left by
+/// [`rebind_tstate_to_current_thread`] and every handler call. A worker that exits without
+/// this leaves its interpreter alive; `Py_Finalize` then finds "remaining subinterpreters",
+/// finalizes them from the main thread, and aborts in `type_dealloc` (measured: every Ctrl-C
+/// shutdown of the TPC server, exit 134).
+///
+/// Skipped once the runtime is finalized (a forgotten zombie worker): `PyEval_RestoreThread` +
+/// `Py_EndInterpreter` on a finalized VM is a use-after-free.
+///
+/// # Safety
+/// Must run on the thread `tstate` is bound to, with no Python thread state current.
+pub(crate) unsafe fn end_worker_interpreter(tstate: &mut *mut ffi::PyThreadState) {
+    if !tstate.is_null() && pyo3::ffi::Py_IsInitialized() != 0 {
+        ffi::PyEval_RestoreThread(*tstate);
+        ffi::Py_EndInterpreter(ffi::PyThreadState_Get());
+    }
+    *tstate = std::ptr::null_mut();
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------

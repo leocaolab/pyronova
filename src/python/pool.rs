@@ -503,13 +503,7 @@ fn worker_thread_loop(
     // + `Py_EndInterpreter` on a finalized VM is UAF → segfault at
     // shutdown. Skip cleanup in that case; the OS will reclaim whatever
     // the sub-interp was holding as the process exits.
-    unsafe {
-        if !worker.tstate.is_null() && pyo3::ffi::Py_IsInitialized() != 0 {
-            ffi::PyEval_RestoreThread(worker.tstate);
-            ffi::Py_EndInterpreter(ffi::PyThreadState_Get());
-            worker.tstate = std::ptr::null_mut();
-        }
-    }
+    unsafe { super::ffi::end_worker_interpreter(&mut worker.tstate) };
 }
 
 /// Async worker: Python asyncio event loop drives execution.

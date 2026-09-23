@@ -114,6 +114,7 @@ pub(crate) fn run_inmem_bench(
                     crate::python::interp::rebind_tstate_to_current_thread(worker.tstate)
                 };
                 let worker = std::rc::Rc::new(std::cell::RefCell::new(worker));
+                let worker_exit = std::rc::Rc::clone(&worker);
                 local.block_on(&rt, async move {
                     // Spawn K virtual connections on this worker's LocalSet.
                     for _ in 0..conns_per_worker {
@@ -141,6 +142,14 @@ pub(crate) fn run_inmem_bench(
                     }
                     shutdown.cancelled().await;
                 });
+                // Tear down: drop the LocalSet (its tasks hold the other `Rc`s), then end the
+                // sub-interpreter on this thread, as the channel pool's workers do.
+                drop(local);
+                unsafe {
+                    crate::python::interp::end_worker_interpreter(
+                        &mut worker_exit.borrow_mut().tstate,
+                    )
+                };
             })
             .map_err(|e| {
                 // Pre-fix the `?` propagated immediately, leaving
@@ -355,6 +364,7 @@ pub(crate) fn run_loopback_bench(
                     crate::python::interp::rebind_tstate_to_current_thread(worker.tstate)
                 };
                 let worker = std::rc::Rc::new(std::cell::RefCell::new(worker));
+                let worker_exit = std::rc::Rc::clone(&worker);
                 local.block_on(&rt, async move {
                     tpc_accept_loop_inline(
                         addr,
@@ -368,6 +378,14 @@ pub(crate) fn run_loopback_bench(
                     )
                     .await;
                 });
+                // Tear down: drop the LocalSet (its tasks hold the other `Rc`s), then end the
+                // sub-interpreter on this thread, as the channel pool's workers do.
+                drop(local);
+                unsafe {
+                    crate::python::interp::end_worker_interpreter(
+                        &mut worker_exit.borrow_mut().tstate,
+                    )
+                };
             })
             .map_err(|e| {
                 // Cancel + join already-spawned threads on spawn fail

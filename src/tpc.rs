@@ -493,6 +493,7 @@ fn run_tpc_subinterp_per_thread_listener(
                     crate::python::interp::rebind_tstate_to_current_thread(worker.tstate)
                 };
                 let worker = std::rc::Rc::new(std::cell::RefCell::new(worker));
+                let worker_exit = std::rc::Rc::clone(&worker);
                 local.block_on(&rt, async move {
                     tpc_accept_loop_inline(
                         addr,
@@ -506,6 +507,14 @@ fn run_tpc_subinterp_per_thread_listener(
                     )
                     .await;
                 });
+                // Tear down: drop the LocalSet (its tasks hold the other `Rc`s), then end the
+                // sub-interpreter on this thread, as the channel pool's workers do.
+                drop(local);
+                unsafe {
+                    crate::python::interp::end_worker_interpreter(
+                        &mut worker_exit.borrow_mut().tstate,
+                    )
+                };
             });
         match handle {
             Ok(h) => handles.push(h),
@@ -627,6 +636,7 @@ fn run_tpc_subinterp_fanout(
                     crate::python::interp::rebind_tstate_to_current_thread(worker.tstate)
                 };
                 let worker = std::rc::Rc::new(std::cell::RefCell::new(worker));
+                let worker_exit = std::rc::Rc::clone(&worker);
                 local.block_on(&rt, async move {
                     tpc_worker_loop_fanout(
                         rx,
@@ -639,6 +649,14 @@ fn run_tpc_subinterp_fanout(
                     )
                     .await;
                 });
+                // Tear down: drop the LocalSet (its tasks hold the other `Rc`s), then end the
+                // sub-interpreter on this thread, as the channel pool's workers do.
+                drop(local);
+                unsafe {
+                    crate::python::interp::end_worker_interpreter(
+                        &mut worker_exit.borrow_mut().tstate,
+                    )
+                };
             });
         match handle {
             Ok(h) => handles.push(h),

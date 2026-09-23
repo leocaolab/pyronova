@@ -160,9 +160,16 @@ impl SubInterpreterWorker {
 
         // Inject the `_Request` / `_Response` types into `globals` BEFORE the
         // bootstrap + user script run. They are `crate::types::PyronovaRequest`
-        // / `PyronovaResponse`, PyO3 `#[pyclass(frozen)]` types whose type
-        // objects are process-global (one `GILOnceCell`) and shared across
-        // sub-interpreters — `py.get_type` returns that shared object.
+        // / `PyronovaResponse`, PyO3 `#[pyclass(frozen)]` types. With the PyO3
+        // fork (leocaolab/pyo3), `py.get_type` for this sub-interpreter returns
+        // this interpreter's own type object.
+        //
+        // That matters: with upstream PyO3 the type object is process-global,
+        // shared by every sub-interpreter. Each request allocates and frees
+        // instances, which incref/decref that one heap type from N threads
+        // under N different GILs; lost updates drive its refcount to zero and
+        // `type_dealloc` segfaults (upstream 0.29.1+, where instance dealloc
+        // releases the type reference; 0.29.0 leaked it, hiding the race).
         //
         // Ordering matters: `_bootstrap.py` wires these into the mock
         // `pyronova` modules (`_mock_*.Request/Response = _Request/_Response`)
@@ -172,26 +179,31 @@ impl SubInterpreterWorker {
         // — injecting after the script would leave user code holding a stale
         // placeholder and every `Response(...)` call would fail.
         //
-        // Why pyclasses are safe in a sub-interp now: PyO3 0.29 supports
-        // `#[pyclass]` there (pyo3#576), and PyO3's generated `tp_dealloc`
-        // Rust-drops every field, so per-request data is reclaimed despite
-        // PEP 684's dead Python finalizers — no custom C `tp_dealloc`. No
-        // `__traverse__` ⇒ no `Py_TPFLAGS_HAVE_GC` (which had reintroduced the
-        // leak), and no `__dict__` ⇒ stray attributes are still rejected.
+        // PyO3's generated `tp_dealloc` Rust-drops every field, so per-request
+        // data is reclaimed despite PEP 684's dead Python finalizers — no custom
+        // C `tp_dealloc`. No `__traverse__` ⇒ no `Py_TPFLAGS_HAVE_GC` (which had
+        // reintroduced the leak), and no `__dict__` ⇒ stray attributes are still
+        // rejected.
+        // NOT `Python::attach`: on this (main) thread it goes through
+        // `PyGILState_Ensure`, which returns to the MAIN interpreter, so the
+        // types injected here were main's. The sub-interpreter's thread state
+        // is current and holds its GIL (`Py_NewInterpreterFromConfig` in
+        // `new`), so take the token for it directly.
+        let py = Python::assume_attached();
         for (name, ty_ptr) in [
             (
                 c"_Request".as_ptr(),
-                Python::attach(|py| py.get_type::<crate::types::PyronovaRequest>().into_ptr()),
+                py.get_type::<crate::types::PyronovaRequest>().into_ptr(),
             ),
             (
                 c"_Response".as_ptr(),
-                Python::attach(|py| py.get_type::<crate::types::PyronovaResponse>().into_ptr()),
+                py.get_type::<crate::types::PyronovaResponse>().into_ptr(),
             ),
         ] {
             let rc = ffi::PyDict_SetItemString(globals.as_ptr(), name, ty_ptr);
-            // The globals dict takes its own ref on success; PyO3's process-
-            // global type cache keeps the type object alive regardless. Drop
-            // our `into_ptr` ref either way.
+            // The globals dict takes its own ref on success; PyO3's
+            // per-interpreter type cache keeps the type object alive for this
+            // interpreter's lifetime. Drop our `into_ptr` ref either way.
             ffi::Py_DECREF(ty_ptr);
             if rc != 0 {
                 ffi::PyErr_Print();
@@ -244,12 +256,15 @@ impl SubInterpreterWorker {
             ffi::Py_INCREF(sky_response_cls);
         }
 
-        // Try orjson first (10-40x faster than stdlib json), fall back to json
+        // isojson (orjson-compatible, and safe in own-GIL sub-interpreters), falling back to
+        // json. Not orjson: it keeps its types and strings in process-global statics, so every
+        // sub-interpreter got the first one's objects, and ending any sub-interpreter freed
+        // objects another one still used (teardown crash with >= 2 workers).
         let json_dumps_func = {
-            let orjson_mod = ffi::PyImport_ImportModule(c"orjson".as_ptr());
-            if !orjson_mod.is_null() {
-                let f = ffi::PyObject_GetAttrString(orjson_mod, c"dumps".as_ptr());
-                ffi::Py_DECREF(orjson_mod);
+            let fast_mod = ffi::PyImport_ImportModule(c"isojson".as_ptr());
+            if !fast_mod.is_null() {
+                let f = ffi::PyObject_GetAttrString(fast_mod, c"dumps".as_ptr());
+                ffi::Py_DECREF(fast_mod);
                 f
             } else {
                 ffi::PyErr_Clear();

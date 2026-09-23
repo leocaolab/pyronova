@@ -20,7 +20,7 @@ pub(crate) enum LazyHeaders {
     Converted(HashMap<String, String>),
 }
 
-#[pyclass(frozen, skip_from_py_object, name = "Request")]
+#[pyclass(frozen, name = "Request")]
 pub(crate) struct PyronovaRequest {
     /// Arc<str> — shared with access log, zero-cost clone.
     pub(crate) method: Arc<str>,
