@@ -65,7 +65,8 @@ Single-request full ecosystem: works with (1)+(2). Concurrent: works with (1)+(2
 | tokenizers | ✅ | isolate; 6.35M req, bluewhale |
 | pydantic / pydantic_core | ✅ | isolate + override; 432k req, bluewhale |
 | polars (in a UDF) | ✅ but | must isolate BOTH `polars` AND `_polars_runtime_32` (215 MB); for heavy work prefer polars-rs at the engine layer; 1.29M req, bluewhale |
-| cryptography / rpds-py / others | ❓ | not tested — verify each; "it's PyO3 ⇒ X" is wrong both ways |
+| cryptography | ✅ | loads in 4/4 own-GIL sub-interps with the override, no copy needed (cryptography 50.0.0; `subinterp-c-extension-status.en.md` §2) |
+| rpds-py / others | ❓ | not tested — verify each; "it's PyO3 ⇒ X" is wrong both ways |
 
 ### Approaches
 | approach | verdict | why |
@@ -195,7 +196,7 @@ Single-request full ecosystem: works with (1)+(2). Concurrent: works with (1)+(2
       252k req/s, ZERO Non-2xx (W=4, isolate + PYTHONMALLOC=malloc).
   - **Rule: test each lib.** "It's PyO3 ⇒ broken" is WRONG (tokenizers/pydantic_core are
     fine, numpy-class). "It's PyO3 ⇒ needs no isolate" is also WRONG (they're single-
-    phase, need the copy). cryptography/orjson/rpds-py UNTESTED — verify, don't infer.
+    phase, need the copy). rpds-py UNTESTED — verify, don't infer. (cryptography: loads without a copy, status doc §2; orjson: needs a copy, measured in the grill soak.)
 - **pyre isolate BUG (surfaced by pydantic_core) — FIXED & verified.** pydantic_core is
   a package (`pydantic_core/__init__.py`) whose real ext is an INTERNAL submodule .so
   (`pydantic_core/_pydantic_core...so`). Two bugs in `_pyronova_isolate_libs`:
