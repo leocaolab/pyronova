@@ -1036,8 +1036,11 @@ def _iso_init_here(spec):
     ptr = init()
     if not ptr:
         raise SystemError(f"PyInit_{short} returned NULL without an exception")
-    ob_type = ctypes.c_void_p.from_address(ptr + ctypes.sizeof(ctypes.c_ssize_t)).value
     api = ctypes.pythonapi
+    api.PyObject_Type.restype = ctypes.c_void_p      # new ref to the TYPE; the object is untouched
+    api.PyObject_Type.argtypes = [ctypes.c_void_p]
+    ob_type = api.PyObject_Type(ptr)
+    api.Py_DecRef(ctypes.c_void_p(ob_type))
     if ob_type == ctypes.addressof(ctypes.c_char.in_dll(api, "PyModuleDef_Type")):
         return None  # multi-phase: CPython creates it in this interpreter anyway
     obj = ctypes.cast(ptr, ctypes.py_object).value  # takes its own reference
