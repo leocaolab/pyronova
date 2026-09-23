@@ -8,6 +8,9 @@ __pycache__/
 dist/
 .venv/
 *.lock
+# Cargo.lock is tracked: it pins PyO3 to the leocaolab/pyo3 fork commit, and an untracked
+# lock let fresh builds pick up upstream PyO3 0.29.1, which crashes sub-interpreter mode.
+!/Cargo.lock
 .arc/
 arc.log.jsonl
 python/pyronova/engine.cpython-314-darwin.so.dSYM/
