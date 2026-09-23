@@ -311,11 +311,12 @@ if __name__ == "__main__":
 
 @_supported
 def test_graceful_sigint_no_abort_and_hooks_run(tmp_path):
-    """Finalizing a worker that loaded an isolated single-phase ext aborted on a
-    cross-arena free at Py_EndInterpreter (~50% on macOS). On a graceful SIGINT
-    stop, app.run() now os._exit(0)s after shutdown hooks (skipping finalization),
-    and SIG_IGNs SIGINT first so the same signal can't interrupt the hooks or
-    skip the hard exit. Assert: clean exit (rc==0, not SIGABRT) AND hook ran."""
+    """Finalizing a worker that loaded an isolated single-phase ext used to abort on a
+    cross-arena free at Py_EndInterpreter (~50% on macOS): the extension's objects were
+    created by the main interpreter. Isolated extensions are now initialized inside
+    their worker, so a graceful SIGINT stop runs the shutdown hooks and then finalizes
+    normally (SIGINT is ignored first so it can't interrupt the hooks).
+    Assert: clean exit (rc==0, not SIGABRT) AND hook ran."""
     pytest.importorskip("numpy")
     mark = tmp_path / "shutdown.mark"
     port = 8992
@@ -333,8 +334,8 @@ def test_graceful_sigint_no_abort_and_hooks_run(tmp_path):
         "sub-interpreter teardown aborted (SIGABRT) on graceful shutdown:\n"
         f"{log.read_text(errors='replace')[-1800:]}"
     )
-    assert rc == 0, f"expected clean exit via os._exit(0), got rc={rc}"
-    assert mark.exists(), "shutdown hook did not run before the hard exit"
+    assert rc == 0, f"expected a clean exit after normal finalization, got rc={rc}"
+    assert mark.exists(), "shutdown hook did not run before the process exited"
 
 
 _SERVER_BUILTIN = '''

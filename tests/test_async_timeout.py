@@ -45,7 +45,9 @@ def start_server(script_path, port):
                 out = proc.stdout.read().decode(errors="replace")
                 raise RuntimeError(f"Server exited early:\n{out}")
     else:
-        out = proc.stdout.read().decode(errors="replace")
+        # Stop it before reading: read() waits for EOF, which a live server never sends.
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        out = proc.communicate(timeout=10)[0].decode(errors="replace")
         raise RuntimeError(f"Server failed to start:\n{out}")
     # Phase 2: wait for async workers (_async_engine.py init: asyncio event
     # loop + sub-interpreter bootstrap). Workers start lazily; on this hardware
