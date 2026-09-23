@@ -361,36 +361,36 @@ impl PgCursor {
     fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         // A poisoned mutex becomes a PyRuntimeError, never a panic across FFI
         // (arc finding db-3).
-        let msg = {
-            let mut st = self
-                .state
+        let lock = || {
+            self.state
                 .lock()
-                .map_err(|e| PyRuntimeError::new_err(format!("cursor mutex poisoned: {e}")))?;
-            if st.buf.is_empty() {
-                if let Some(rx) = st.rx.take() {
-                    let (rx, batch) = py
-                        .detach(|| recv_batch(rx, CURSOR_CAPACITY))
-                        .map_err(PyRuntimeError::new_err)?;
-                    if !batch.is_empty() {
-                        st.rx = Some(rx);
-                    }
-                    st.buf.extend(batch);
-                }
-            }
-            st.buf.pop_front()
+                .map_err(|e| PyRuntimeError::new_err(format!("cursor mutex poisoned: {e}")))
         };
-        match msg {
-            Some(CursorMsg::Row(row)) => row_to_dict(py, &row),
-            Some(CursorMsg::Err(e)) => {
-                // The driver stops after an error; nothing follows it.
-                if let Ok(mut st) = self.state.lock() {
-                    st.rx = None;
-                    st.buf.clear();
-                }
-                Err(PyRuntimeError::new_err(e))
+        // Take the receiver out and release the lock before waiting. Waiting with the
+        // lock held while the GIL is released deadlocks against a second thread that
+        // holds the GIL and wants the lock.
+        let rx = {
+            let mut st = lock()?;
+            match st.buf.pop_front() {
+                Some(m) => return deliver(&self.state, py, Some(m)),
+                None => st.rx.take(),
             }
-            None => Err(PyStopIteration::new_err(py.None())),
-        }
+        };
+        let msg = match rx {
+            None => None,
+            Some(rx) => {
+                let (rx, batch) = py
+                    .detach(|| recv_batch(rx, CURSOR_CAPACITY))
+                    .map_err(PyRuntimeError::new_err)?;
+                let mut st = lock()?;
+                if !batch.is_empty() {
+                    st.rx = Some(rx);
+                }
+                st.buf.extend(batch);
+                st.buf.pop_front()
+            }
+        };
+        deliver(&self.state, py, msg)
     }
 
     /// Eager-drain helper: materialize every remaining row as a list
@@ -766,6 +766,26 @@ impl PgPool {
             .map_err(|e| PyRuntimeError::new_err(format!("execute runtime: {e}")))?
             .map_err(|e| PyRuntimeError::new_err(format!("execute: {e}")))?;
         Ok(result.rows_affected())
+    }
+}
+
+/// Turns one cursor message into the iterator's result.
+fn deliver(
+    state: &Mutex<CursorState>,
+    py: Python<'_>,
+    msg: Option<CursorMsg>,
+) -> PyResult<Py<PyDict>> {
+    match msg {
+        Some(CursorMsg::Row(row)) => row_to_dict(py, &row),
+        Some(CursorMsg::Err(e)) => {
+            // The driver stops after an error; nothing follows it.
+            if let Ok(mut st) = state.lock() {
+                st.rx = None;
+                st.buf.clear();
+            }
+            Err(PyRuntimeError::new_err(e))
+        }
+        None => Err(PyStopIteration::new_err(py.None())),
     }
 }
 
