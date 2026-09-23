@@ -38,6 +38,7 @@ pub(crate) mod interp;
 pub(crate) mod pool;
 pub(crate) mod stream;
 pub(crate) mod worker;
+pub(crate) mod worker_api;
 
 /// Stack size for every thread that runs Python code.
 ///

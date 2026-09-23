@@ -1,7 +1,6 @@
 //! Raw CPython FFI primitives: `PyObjRef` RAII, the `SubInterpGilGuard`,
-//! tstate rebinding, the per-worker state registry, and the C-FFI bridge
-//! functions (`pyronova_recv`/`pyronova_send`/`pyronova_emit_log`) that
-//! let async engines in sub-interpreters pull work and emit logs.
+//! tstate rebinding, and the per-worker state registry that the async engine's
+//! `_worker_recv` / `_worker_send` (`worker_api.rs`) use to pull work and answer it.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,14 +8,13 @@ use std::sync::{Arc, Mutex};
 
 use pyo3::ffi;
 
-use super::convert::*;
 use super::pool::*;
 
 // ---------------------------------------------------------------------------
 // Phase 7.2: Global worker state for async C-FFI bridge
 // ---------------------------------------------------------------------------
 
-/// Per-worker state accessible from C-FFI functions (no closure environment).
+/// Per-async-worker state, reached by `_worker_recv` / `_worker_send` through `WORKER_ID`.
 pub(crate) struct WorkerState {
     pub(crate) rx: crossbeam_channel::Receiver<WorkRequest>,
     pub(crate) response_map:
@@ -24,8 +22,8 @@ pub(crate) struct WorkerState {
     pub(crate) next_req_id: AtomicU64,
     /// Identifier for the `InterpreterPool` instance that created this
     /// state. A zombie worker from a prior pool (test / hot-reload)
-    /// carries the OLD pool_id in its Python globals; the C-FFI bridge
-    /// compares the caller's pool_id to the state's and rejects
+    /// carries the OLD pool_id as its `POOL_ID`; `_worker_recv` / `_worker_send`
+    /// compare the caller's pool_id to the state's and reject
     /// mismatches so the zombie can't steal requests from the new pool.
     /// See POOL_ID_COUNTER docstring for the rationale.
     pub(crate) pool_id: u64,
@@ -33,8 +31,8 @@ pub(crate) struct WorkerState {
 
 /// Monotonic counter for pool instance IDs. Each call to
 /// `InterpreterPool::new()` consumes one. This exists exclusively so
-/// `pyronova_recv` / `pyronova_send` can detect cross-pool calls — see
-/// `WorkerState::pool_id` and the guard in `pyronova_recv_cfunc`.
+/// `_worker_recv` / `_worker_send` can detect cross-pool calls — see
+/// `WorkerState::pool_id`.
 pub(crate) static POOL_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Allocate a fresh pool id. Same counter the InterpreterPool uses, so
@@ -55,438 +53,11 @@ pub(crate) fn next_pool_id() -> u64 {
 pub(crate) static WORKER_STATES: std::sync::RwLock<Vec<Arc<WorkerState>>> =
     std::sync::RwLock::new(Vec::new());
 
-fn get_worker_state(worker_id: usize) -> Option<Arc<WorkerState>> {
+pub(crate) fn get_worker_state(worker_id: usize) -> Option<Arc<WorkerState>> {
     WORKER_STATES
         .read()
         .ok()
         .and_then(|v| v.get(worker_id).cloned())
-}
-
-// ---------------------------------------------------------------------------
-// C-FFI bridge functions for async engine
-// ---------------------------------------------------------------------------
-
-/// Wrap an `extern "C"` body in `catch_unwind` so a Rust panic never
-/// crosses into CPython's stack. Since Rust 1.81 a panic through
-/// `extern "C"` aborts the process (was UB before) — still not
-/// graceful under a 500k-rps flood that hits a `.unwrap()` on
-/// a poisoned Mutex or a PyArg_ParseTuple failure we missed.
-///
-/// On a caught panic:
-///   1. log via tracing (async, non-blocking — no stderr storm),
-///   2. set a `PyRuntimeError` via `PyErr_SetString` so the caller's
-///      next C-API call surfaces a normal Python exception rather
-///      than the cryptic "returned NULL without setting an exception"
-///      warning,
-///   3. return NULL.
-///
-/// Callers whose semantics are "None == no data" (e.g. `pyronova_recv`
-/// returns `None` when the channel is closed) should NOT use this
-/// for normal signaling — that's a return value of `Py_None` via
-/// `Py_INCREF`. This helper's NULL-return is strictly for the panic
-/// path.
-unsafe fn ffi_catch_unwind<F>(context: &'static str, f: F) -> *mut ffi::PyObject
-where
-    F: FnOnce() -> *mut ffi::PyObject + std::panic::UnwindSafe,
-{
-    match std::panic::catch_unwind(f) {
-        Ok(p) => p,
-        Err(panic_payload) => {
-            let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                (*s).to_string()
-            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "<non-string panic payload>".to_string()
-            };
-            tracing::error!(
-                target: "pyronova::server",
-                context,
-                panic = %msg,
-                "Rust panic caught at FFI boundary"
-            );
-            let msg_c = format!("Rust panic in {context}: {msg}\0");
-            ffi::PyErr_SetString(
-                ffi::PyExc_RuntimeError,
-                msg_c.as_ptr() as *const std::os::raw::c_char,
-            );
-            std::ptr::null_mut()
-        }
-    }
-}
-
-/// pyronova_recv(worker_id, pool_id) → (req_id, handler_idx, method, path, params, query, body, headers, client_ip) or None
-/// RELEASES GIL during blocking recv — lets asyncio loop run freely.
-///
-/// `pool_id` is the worker's "birth certificate". If the state currently
-/// installed at `worker_id` belongs to a DIFFERENT pool (i.e. we're a
-/// zombie from a prior `app.run()` that finally woke up), we return None
-/// so the zombie's caller sees EOF and exits rather than stealing
-/// requests from the live pool.
-pub(crate) unsafe extern "C" fn pyronova_recv_cfunc(
-    _self: *mut ffi::PyObject,
-    args: *mut ffi::PyObject,
-) -> *mut ffi::PyObject {
-    ffi_catch_unwind(
-        "pyronova_recv",
-        std::panic::AssertUnwindSafe(|| pyronova_recv_inner(args)),
-    )
-}
-
-/// Body of pyronova_recv — panic-catchable. Separated so the outer
-/// `extern "C"` is just a catch_unwind wrapper and we avoid propagating
-/// Rust panics into CPython's stack.
-unsafe fn pyronova_recv_inner(args: *mut ffi::PyObject) -> *mut ffi::PyObject {
-    let mut worker_id: isize = 0;
-    let mut pool_id: u64 = 0;
-    if ffi::PyArg_ParseTuple(args, c"nK".as_ptr(), &mut worker_id, &mut pool_id) == 0 {
-        return std::ptr::null_mut();
-    }
-
-    let state = match get_worker_state(worker_id as usize) {
-        Some(s) if s.pool_id == pool_id => s,
-        // Mismatch or missing slot — either stale pool or race after
-        // InterpreterPool::drop. Return None; the async engine treats
-        // this as shutdown and exits cleanly.
-        _ => {
-            ffi::Py_INCREF(ffi::Py_None());
-            return ffi::Py_None();
-        }
-    };
-
-    // Release GIL while blocking on channel recv
-    let saved = ffi::PyEval_SaveThread();
-    let req_opt = state.rx.recv().ok();
-    ffi::PyEval_RestoreThread(saved);
-
-    match req_opt {
-        Some(req) => {
-            let req_id = state.next_req_id.fetch_add(1, Ordering::Relaxed);
-
-            // Build ALL Python objects BEFORE inserting response_tx into map.
-            // If any allocation fails, response_tx drops → sender gets error
-            // instead of leaking in response_map and causing 504 timeout.
-            // extract_headers deferred here from Tokio thread — O(n_headers)
-            // HashMap build now runs on the worker thread.
-            let headers_map = crate::types::extract_headers(&req.headers);
-            let py_params = py_str_dict_from_vec(&req.params);
-            let py_headers = py_str_dict(&headers_map);
-            if py_params.is_none() || py_headers.is_none() {
-                // response_tx not inserted → dropped → oneshot Err on Tokio side
-                //
-                // arc finding interp-1: returning Py_None on alloc failure
-                // is indistinguishable from the "channel closed, exit
-                // gracefully" sentinel — workers silently exit under
-                // memory pressure with no log, no exception, no trace.
-                // Surface via tracing::error so the OOM condition is at
-                // least observable in logs before the worker disappears.
-                tracing::error!(
-                    target: "pyronova::app",
-                    "pyronova_recv: Python dict allocation failed (params/headers); \
-                     returning channel-closed sentinel — worker will exit silently. \
-                     Likely cause: OOM under memory pressure."
-                );
-                ffi::Py_INCREF(ffi::Py_None());
-                return ffi::Py_None();
-            }
-            let py_params = py_params.unwrap();
-            let py_headers = py_headers.unwrap();
-
-            let tuple = ffi::PyTuple_New(9);
-            if tuple.is_null() {
-                tracing::error!(
-                    target: "pyronova::app",
-                    "pyronova_recv: PyTuple_New(9) returned null (likely OOM); \
-                     returning channel-closed sentinel — worker will exit silently."
-                );
-                ffi::PyErr_Clear();
-                ffi::Py_INCREF(ffi::Py_None());
-                return ffi::Py_None();
-            }
-
-            // Allocate every leaf Python object UP FRONT and NULL-check
-            // before any PyTuple_SetItem call. PyTuple_SetItem steals the
-            // reference it's given — embedding a NULL leaks nothing but
-            // guarantees a hard segfault the next time anything reads
-            // that slot (GC, item access, repr, refcount). Building the
-            // full set first lets us reject atomically: if ANY allocation
-            // fails, DECREF the successful ones and bail.
-            let id_obj = ffi::PyLong_FromUnsignedLongLong(req_id);
-            let idx_obj = ffi::PyLong_FromUnsignedLongLong(req.handler_idx as u64);
-            let method_obj = ffi::PyUnicode_FromStringAndSize(
-                req.method.as_ptr() as *const _,
-                req.method.len() as isize,
-            );
-            let path_obj = ffi::PyUnicode_FromStringAndSize(
-                req.path.as_ptr() as *const _,
-                req.path.len() as isize,
-            );
-            let query_obj = ffi::PyUnicode_FromStringAndSize(
-                req.query.as_ptr() as *const _,
-                req.query.len() as isize,
-            );
-            let body_obj = ffi::PyBytes_FromStringAndSize(
-                req.body.as_ptr() as *const _,
-                req.body.len() as isize,
-            );
-            let ip_str = req.client_ip.to_string();
-            let ip_obj = ffi::PyUnicode_FromStringAndSize(
-                ip_str.as_ptr() as *const _,
-                ip_str.len() as isize,
-            );
-
-            let raw_items = [
-                id_obj, idx_obj, method_obj, path_obj, query_obj, body_obj, ip_obj,
-            ];
-            if raw_items.iter().any(|p| p.is_null()) {
-                for p in &raw_items {
-                    if !p.is_null() {
-                        ffi::Py_DECREF(*p);
-                    }
-                }
-                // py_params / py_headers still owned by PyObjRef — dropped here.
-                ffi::Py_DECREF(tuple);
-                tracing::error!(
-                    target: "pyronova::app",
-                    "pyronova_recv: per-item Python object allocation failed; \
-                     returning channel-closed sentinel — worker will exit silently. \
-                     Likely cause: OOM (arc finding interp-1)."
-                );
-                ffi::PyErr_Clear();
-                ffi::Py_INCREF(ffi::Py_None());
-                return ffi::Py_None();
-            }
-
-            // All Python objects built successfully — NOW insert response_tx.
-            // Any earlier bail keeps the sender alive; caller's oneshot will
-            // close, returning a 503 instead of an orphaned response_map entry.
-            // Recover from a poisoned Mutex instead of panicking. A panic in
-            // any worker while holding this lock would poison it; a plain
-            // .unwrap() here would then panic the next worker → ffi_catch_unwind
-            // → PyRuntimeError → worker exit, cascading to zero workers under
-            // load. Continuing is strictly less bad than dying, but it is NOT
-            // a guarantee the map is consistent: Rust's HashMap is only
-            // unwind-safe for alloc-triggered panics — a panic mid-resize or
-            // in a custom hasher could leave it half-written. We can't detect
-            // that, so we log on recovery to make the (rare) poison observable
-            // in telemetry rather than swallowing it silently.
-            state
-                .response_map
-                .lock()
-                .unwrap_or_else(|e| {
-                    tracing::error!(
-                        target: "pyronova::server",
-                        "response_map mutex poisoned (a worker panicked while \
-                         holding the lock); recovering inner guard — map state \
-                         may be inconsistent"
-                    );
-                    e.into_inner()
-                })
-                .insert(req_id, req.response_tx);
-
-            ffi::PyTuple_SetItem(tuple, 0, id_obj);
-            ffi::PyTuple_SetItem(tuple, 1, idx_obj);
-            ffi::PyTuple_SetItem(tuple, 2, method_obj);
-            ffi::PyTuple_SetItem(tuple, 3, path_obj);
-            // params / headers as PyDict; PyObjRef.into_raw() transfers ownership.
-            ffi::PyTuple_SetItem(tuple, 4, py_params.into_raw());
-            ffi::PyTuple_SetItem(tuple, 5, query_obj);
-            ffi::PyTuple_SetItem(tuple, 6, body_obj);
-            ffi::PyTuple_SetItem(tuple, 7, py_headers.into_raw());
-            ffi::PyTuple_SetItem(tuple, 8, ip_obj);
-            tuple
-        }
-        None => {
-            ffi::Py_INCREF(ffi::Py_None());
-            ffi::Py_None()
-        }
-    }
-}
-
-/// pyronova_send(worker_id, pool_id, req_id, status, content_type, body_bytes)
-/// Wakes up Tokio via oneshot channel. The `pool_id` is checked against the
-/// installed state to guard against zombie-worker cross-pool writes —
-/// see `pyronova_recv_cfunc` docstring for the rationale.
-pub(crate) unsafe extern "C" fn pyronova_send_cfunc(
-    _self: *mut ffi::PyObject,
-    args: *mut ffi::PyObject,
-) -> *mut ffi::PyObject {
-    ffi_catch_unwind(
-        "pyronova_send",
-        std::panic::AssertUnwindSafe(|| pyronova_send_inner(args)),
-    )
-}
-
-/// See `pyronova_recv_inner` — same rationale.
-unsafe fn pyronova_send_inner(args: *mut ffi::PyObject) -> *mut ffi::PyObject {
-    let mut worker_id: isize = 0;
-    let mut pool_id: u64 = 0;
-    let mut req_id: u64 = 0;
-    let mut status: u16 = 0;
-    let mut ctype_str: *const std::os::raw::c_char = std::ptr::null();
-    let mut body_ptr: *const std::os::raw::c_char = std::ptr::null();
-    let mut body_len: isize = 0;
-
-    // n=isize, K=u64, H=u16, z=str|None, y#=bytes+len
-    // Returning NULL with the exception still set is how Python signals
-    // parse failure from a C extension — don't PyErr_Print here or the
-    // exception gets cleared and the caller sees the confusing
-    // "returned NULL without setting an exception" warning.
-    if ffi::PyArg_ParseTuple(
-        args,
-        c"nKKHzy#".as_ptr(),
-        &mut worker_id,
-        &mut pool_id,
-        &mut req_id,
-        &mut status,
-        &mut ctype_str,
-        &mut body_ptr,
-        &mut body_len,
-    ) == 0
-    {
-        return std::ptr::null_mut();
-    }
-
-    let ctype = if !ctype_str.is_null() {
-        Some(
-            std::ffi::CStr::from_ptr(ctype_str)
-                .to_string_lossy()
-                .into_owned(),
-        )
-    } else {
-        None
-    };
-
-    let body: Vec<u8> = if !body_ptr.is_null() && body_len > 0 {
-        let slice = std::slice::from_raw_parts(body_ptr as *const u8, body_len as usize);
-        slice.to_vec()
-    } else {
-        Vec::new()
-    };
-
-    // Same pool-id guard as pyronova_recv. Dropping the send here rather
-    // than just skipping means the tokio side times out naturally (504)
-    // instead of getting a response from the wrong pool.
-    if let Some(state) = get_worker_state(worker_id as usize).filter(|s| s.pool_id == pool_id) {
-        // Recover from poison rather than panicking — see pyronova_recv_inner.
-        let mut map = state.response_map.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(tx) = map.remove(&req_id) {
-            // Check if the receiver is still alive (client may have timed out).
-            // If closed, skip the send — the response would be discarded anyway.
-            if tx.is_closed() {
-                tracing::debug!(
-                    target: "pyronova::server",
-                    req_id,
-                    worker_id,
-                    "response_map: receiver gone (client timed out), dropping result"
-                );
-            } else {
-                let resp = SubInterpResponse {
-                    body,
-                    status,
-                    content_type: ctype,
-                    headers: Vec::new(),
-                    is_json: false,
-                };
-                let _ = tx.send(Ok(resp));
-            }
-        } else {
-            tracing::debug!(
-                target: "pyronova::server",
-                req_id,
-                worker_id,
-                "response_map miss — client already timed out (504)"
-            );
-        }
-
-        // Periodic orphan sweep: when the map grows large, purge entries whose
-        // receivers have been dropped (Rust side timed out). Prevents unbounded
-        // memory growth from handlers that crash after pyronova_recv but before pyronova_send.
-        if map.len() > 64 {
-            map.retain(|_id, tx| !tx.is_closed());
-        }
-    }
-
-    ffi::Py_INCREF(ffi::Py_None());
-    ffi::Py_None()
-}
-
-// ---------------------------------------------------------------------------
-// C-FFI bridge: emit_python_log for sub-interpreter logging
-// ---------------------------------------------------------------------------
-
-/// _pyronova_emit_log(level, name, message, pathname, lineno, worker_id)
-/// Routes Python logging.Handler.emit() calls through Rust tracing.
-/// Minimal GIL hold time — extract strings, dispatch to tracing, return.
-pub(crate) unsafe extern "C" fn pyronova_emit_log_cfunc(
-    _self: *mut ffi::PyObject,
-    args: *mut ffi::PyObject,
-) -> *mut ffi::PyObject {
-    ffi_catch_unwind(
-        "pyronova_emit_log",
-        std::panic::AssertUnwindSafe(|| pyronova_emit_log_inner(args)),
-    )
-}
-
-unsafe fn pyronova_emit_log_inner(args: *mut ffi::PyObject) -> *mut ffi::PyObject {
-    let mut level_ptr: *const std::os::raw::c_char = std::ptr::null();
-    let mut name_ptr: *const std::os::raw::c_char = std::ptr::null();
-    let mut msg_ptr: *const std::os::raw::c_char = std::ptr::null();
-    let mut path_ptr: *const std::os::raw::c_char = std::ptr::null();
-    let mut lineno: i32 = 0;
-    let mut worker_id: isize = 0;
-
-    // Parse: (str, str, str, str, int, int)
-    if ffi::PyArg_ParseTuple(
-        args,
-        c"zzzzin".as_ptr(),
-        &mut level_ptr,
-        &mut name_ptr,
-        &mut msg_ptr,
-        &mut path_ptr,
-        &mut lineno,
-        &mut worker_id,
-    ) == 0
-    {
-        // Return None on parse error (don't crash the handler)
-        ffi::PyErr_Clear();
-        ffi::Py_INCREF(ffi::Py_None());
-        return ffi::Py_None();
-    }
-
-    let level = if !level_ptr.is_null() {
-        std::ffi::CStr::from_ptr(level_ptr)
-            .to_str()
-            .unwrap_or("INFO")
-    } else {
-        "INFO"
-    };
-    let name = if !name_ptr.is_null() {
-        std::ffi::CStr::from_ptr(name_ptr)
-            .to_str()
-            .unwrap_or("unknown")
-    } else {
-        "unknown"
-    };
-    let message = if !msg_ptr.is_null() {
-        std::ffi::CStr::from_ptr(msg_ptr).to_str().unwrap_or("")
-    } else {
-        ""
-    };
-    let pathname = if !path_ptr.is_null() {
-        std::ffi::CStr::from_ptr(path_ptr).to_str().unwrap_or("")
-    } else {
-        ""
-    };
-
-    let wid = worker_id as usize;
-
-    // Shared dispatch macro (see `crate::logging::dispatch_python_log`): expands
-    // inline so each branch keeps its own static tracing callsite.
-    crate::logging::dispatch_python_log!(level, wid, name, pathname, lineno, message);
-
-    ffi::Py_INCREF(ffi::Py_None());
-    ffi::Py_None()
 }
 
 // ---------------------------------------------------------------------------
@@ -729,27 +300,6 @@ pub(crate) unsafe fn rebind_tstate_to_current_thread(
     ffi::PyThreadState_Delete(creator_tstate);
     // Release GIL; hand back the fresh tstate for future attach cycles.
     ffi::PyEval_SaveThread()
-}
-
-/// Ends a worker's sub-interpreter from the worker's own OS thread, at worker exit.
-///
-/// `tstate` is the worker's saved (detached) thread state, as left by
-/// [`rebind_tstate_to_current_thread`] and every handler call. A worker that exits without
-/// this leaves its interpreter alive; `Py_Finalize` then finds "remaining subinterpreters",
-/// finalizes them from the main thread, and aborts in `type_dealloc` (measured: every Ctrl-C
-/// shutdown of the TPC server, exit 134).
-///
-/// Skipped once the runtime is finalized (a forgotten zombie worker): `PyEval_RestoreThread` +
-/// `Py_EndInterpreter` on a finalized VM is a use-after-free.
-///
-/// # Safety
-/// Must run on the thread `tstate` is bound to, with no Python thread state current.
-pub(crate) unsafe fn end_worker_interpreter(tstate: &mut *mut ffi::PyThreadState) {
-    if !tstate.is_null() && pyo3::ffi::Py_IsInitialized() != 0 {
-        ffi::PyEval_RestoreThread(*tstate);
-        ffi::Py_EndInterpreter(ffi::PyThreadState_Get());
-    }
-    *tstate = std::ptr::null_mut();
 }
 
 // ---------------------------------------------------------------------------

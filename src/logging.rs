@@ -36,12 +36,12 @@ static LOGGER: OnceLock<LoggerState> = OnceLock::new();
 ///
 /// This `macro_rules!` expands *inline* at every call site, so each `level`
 /// branch remains a distinct static tracing callsite — `EnvFilter` keeps its
-/// near-zero-cost skip. Extracted so the main-interpreter path
-/// (`emit_python_log`) and the sub-interpreter C-FFI bridge
-/// (`python::interp`) can never drift apart.
+/// near-zero-cost skip. `emit_python_log` serves every interpreter (main and
+/// sub-interpreter workers).
 ///
 /// `$level` must be `&str`; `$name`/`$pathname`/`$message` are formatted via
-/// `Display`; `$wid`/`$lineno` are recorded as integer fields.
+/// `Display`; `$wid` (an `Option<usize>`: no field when `None`) and `$lineno`
+/// are recorded as integer fields.
 macro_rules! dispatch_python_log {
     ($level:expr, $wid:expr, $name:expr, $pathname:expr, $lineno:expr, $message:expr $(,)?) => {
         match $level {
@@ -98,7 +98,6 @@ macro_rules! dispatch_python_log {
         }
     };
 }
-pub(crate) use dispatch_python_log;
 
 /// Initialize the Rust tracing engine. Called once at Pyronova startup.
 ///

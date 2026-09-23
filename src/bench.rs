@@ -146,11 +146,7 @@ pub(crate) fn run_inmem_bench(
                 // Tear down: drop the LocalSet (its tasks hold the other `Rc`s), then end the
                 // sub-interpreter on this thread, as the channel pool's workers do.
                 drop(local);
-                unsafe {
-                    crate::python::interp::end_worker_interpreter(
-                        &mut worker_exit.borrow_mut().tstate,
-                    )
-                };
+                SubInterpreterWorker::end_shared(worker_exit);
             })
             .map_err(|e| {
                 // Pre-fix the `?` propagated immediately, leaving
@@ -383,11 +379,7 @@ pub(crate) fn run_loopback_bench(
                 // Tear down: drop the LocalSet (its tasks hold the other `Rc`s), then end the
                 // sub-interpreter on this thread, as the channel pool's workers do.
                 drop(local);
-                unsafe {
-                    crate::python::interp::end_worker_interpreter(
-                        &mut worker_exit.borrow_mut().tstate,
-                    )
-                };
+                SubInterpreterWorker::end_shared(worker_exit);
             })
             .map_err(|e| {
                 // Cancel + join already-spawned threads on spawn fail

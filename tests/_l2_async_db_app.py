@@ -1,7 +1,7 @@
 """E2E-8, async-DB part (Layer 2, M1): `PgPool.*_async` on main while workers execute the
 real engine.
 
-Like `_l2_main_side_app.py`, every worker also loads the real `pyronova.engine`, so more
+Like `_l2_main_side_app.py`, every worker imports the real `pyronova.engine` (M4), so more
 than one interpreter has executed it and the PyO3 fork refuses a bare foreign-thread attach.
 `pyo3-async-runtimes` resolved `*_async` futures with exactly such an attach on its own
 threads (spike R-3). Two callers are driven here:
@@ -13,24 +13,9 @@ threads (spike R-3). Two callers are driven here:
 import os
 
 import pyronova.engine as _engine
+from pyronova import Pyronova
 
-IN_WORKER = "_pyronova_emit_log" in globals()
-
-if IN_WORKER:
-    import importlib.machinery
-    import importlib.util
-
-    _loader = importlib.machinery.ExtensionFileLoader(
-        "pyronova.engine", os.environ["L2_ENGINE_PATH"]
-    )
-    _real_engine = importlib.util.module_from_spec(
-        importlib.util.spec_from_loader("pyronova.engine", _loader)
-    )
-    _loader.exec_module(_real_engine)
-else:
-    os.environ["L2_ENGINE_PATH"] = _engine.__file__
-
-from pyronova import Pyronova  # noqa: E402
+IN_WORKER = _engine._in_worker()
 
 app = Pyronova()
 
@@ -63,7 +48,8 @@ if not IN_WORKER:
 
 @app.get("/w")
 def worker_route(req):
-    return {"real_engine": "_real_engine" in globals()}
+    # Served by a worker, which runs the real engine.
+    return {"real_engine": _engine._in_worker() and hasattr(_engine, "_worker_recv")}
 
 
 @app.get("/adb", gil=True)

@@ -1,52 +1,54 @@
-"""Regression for the FFI-panic UB (audit round 5 bug #5).
+"""A Rust panic in a worker API call must reach Python as a normal exception.
 
-Since Rust 1.81 a panic crossing an `extern "C"` boundary aborts the
-process (was UB before). Either way: a .unwrap() on a poisoned Mutex
-or an unexpected None in pyronova_recv / pyronova_send / pyronova_emit_log would
-take the whole server down at the worst possible moment.
+The async engine in a sub-interpreter worker pulls requests and sends responses
+through `pyronova.engine._worker_recv` / `_worker_send` (`src/python/worker_api.rs`).
+They used to be `extern "C"` functions injected into worker globals, each wrapped in
+`ffi_catch_unwind`, because a panic crossing `extern "C"` aborts the process (Rust
+1.81+). Layer 2 (M4) replaced them with PyO3 `#[pyfunction]`s. PyO3 would turn a panic
+into `PanicException`, a `BaseException` the engine's fetcher thread (which catches
+`Exception`) would die on, so each one maps a panic to `RuntimeError` instead.
 
-Fix: each FFI entry point is now a one-line `extern "C"` wrapper that
-calls `ffi_catch_unwind` around a safe `_inner` body. On a caught
-panic the helper logs via tracing (async, non-blocking) and sets a
-Python RuntimeError so the Python caller sees a normal exception.
-
-Structural test: verify the three C-FFI entry points all go through
-ffi_catch_unwind. An actual panic test would require triggering a
-Rust panic from inside a C callback, which is fiddly; the structural
-check stops the wrapper from being accidentally stripped.
+Structural test: the pyfunctions exist and go through that mapping, and no raw
+`extern "C"` entry point is left in `src/python/`. (Rewritten for Layer 2 M4, approved
+by the user on 2026-09-23.)
 """
 
 import pathlib
+import re
+
+_SRC = pathlib.Path("src/python")
 
 
-def test_ffi_catch_unwind_helper_defined():
-    src = "\n".join(p.read_text() for p in pathlib.Path("src/python").glob("*.rs"))
-    assert "unsafe fn ffi_catch_unwind" in src
-    assert "std::panic::catch_unwind" in src
-    # On caught panic, must log + set PyRuntimeError + return NULL.
-    helper_idx = src.find("unsafe fn ffi_catch_unwind")
-    helper_body = src[helper_idx:helper_idx + 2000]
-    assert "PyErr_SetString" in helper_body, (
-        "caught panic must set a Python RuntimeError so callers see a "
-        "normal exception rather than 'returned NULL without setting "
-        "an exception'"
-    )
-    assert 'tracing::error!' in helper_body, (
-        "caught panic must also log to tracing so ops sees what happened"
-    )
+def _worker_api() -> str:
+    return (_SRC / "worker_api.rs").read_text()
 
 
-def test_all_three_ffi_entry_points_guarded():
-    src = "\n".join(p.read_text() for p in pathlib.Path("src/python").glob("*.rs"))
-    # The 3 functions registered into sub-interpreter globals as
-    # _pyronova_recv / _pyronova_send / _pyronova_emit_log.
-    ffi_fns = ["pyronova_recv_cfunc", "pyronova_send_cfunc", "pyronova_emit_log_cfunc"]
-    for fn in ffi_fns:
-        idx = src.find(f'unsafe extern "C" fn {fn}')
-        assert idx != -1, f"entry point {fn} not found"
-        # First 1000 chars of the function body should contain the guard.
-        body = src[idx:idx + 1000]
-        assert "ffi_catch_unwind" in body, (
-            f"{fn} must be wrapped in ffi_catch_unwind — a Rust panic "
-            f"through this extern C would abort the process"
+def test_no_extern_c_entry_points_left():
+    for path in _SRC.glob("*.rs"):
+        code = "\n".join(line.split("//", 1)[0] for line in path.read_text().splitlines())
+        assert 'extern "C" fn' not in code, (
+            f"{path}: a raw extern \"C\" entry point is back; expose it as a #[pyfunction] "
+            "in worker_api.rs instead"
         )
+
+
+def test_panic_maps_to_runtime_error():
+    src = _worker_api()
+    idx = src.find("fn no_panic")
+    assert idx != -1, "worker_api.rs must define the panic → RuntimeError helper"
+    body = src[idx:idx + 1200]
+    assert "std::panic::catch_unwind" in body
+    assert "PyRuntimeError::new_err" in body, (
+        "a caught panic must become a RuntimeError, not PyO3's PanicException "
+        "(a BaseException the fetcher thread would die on)"
+    )
+    assert "tracing::error!" in body, "a caught panic must also be logged"
+
+
+def test_worker_api_functions_guarded():
+    src = _worker_api()
+    for fn in ("_worker_recv", "_worker_send", "_worker_to_response"):
+        m = re.search(r"#\[pyfunction\]\s*pub\(crate\) fn " + fn + r"\(", src)
+        assert m, f"{fn} must be a #[pyfunction] in worker_api.rs"
+        body = src[m.end():m.end() + 800]
+        assert f'no_panic("{fn}"' in body, f"{fn} must run its body through no_panic"

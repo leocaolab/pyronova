@@ -11,7 +11,6 @@ use matchit::Router;
 use pyo3::ffi;
 use pyo3::prelude::*;
 
-use super::convert::*;
 use super::ffi::*;
 use super::worker::*;
 
@@ -114,7 +113,6 @@ pub(crate) struct InterpreterPool {
     /// Worker threads — joined on drop to ensure clean sub-interpreter shutdown.
     worker_threads: Option<Vec<std::thread::JoinHandle<()>>>,
     routers: HashMap<String, Router<usize>>,
-    _handler_names: Vec<String>,
     pub(crate) requires_gil: Vec<bool>,
     pub(crate) is_async_handler: Vec<bool>,
     pub(crate) static_dirs: Vec<(String, String)>,
@@ -195,10 +193,8 @@ impl InterpreterPool {
         n: usize,
         _py: Python<'_>,
         script_path: &str,
-        handler_names: &[String],
+        expected: &crate::router::RouteSignature,
         routers: HashMap<String, Router<usize>>,
-        before_hook_names: &[String],
-        after_hook_names: &[String],
         static_dirs: Vec<(String, String)>,
         requires_gil: Vec<bool>,
         is_async_handler: Vec<bool>,
@@ -210,14 +206,6 @@ impl InterpreterPool {
 
         let raw_script = std::fs::read_to_string(script_path)
             .map_err(|e| format!("Failed to read script: {e}"))?;
-
-        // Collect all function names we need
-        let mut all_func_names: Vec<String> = handler_names.to_vec();
-        all_func_names.extend(before_hook_names.iter().cloned());
-        all_func_names.extend(after_hook_names.iter().cloned());
-        // Deduplicate
-        all_func_names.sort();
-        all_func_names.dedup();
 
         // Create work channels
         // Sync pool: handles def handlers (220k req/s)
@@ -248,15 +236,21 @@ impl InterpreterPool {
         let mut threads = Vec::new();
 
         for i in 0..n {
-            let worker = SubInterpreterWorker::new(
+            match SubInterpreterWorker::new(
+                i,
                 &raw_script,
                 script_path,
-                &all_func_names,
+                expected,
                 pool_id,
                 shared_state,
-            )
-            .map_err(|e| format!("sub-interpreter {i}: {e}"))?;
-            workers.push(worker);
+            ) {
+                Ok(worker) => workers.push(worker),
+                Err(e) => {
+                    // End the workers built so far here, on their creating thread (FR-19).
+                    SubInterpreterWorker::end_all(workers);
+                    return Err(format!("sub-interpreter {i}: {e}"));
+                }
+            }
         }
 
         // Initialize async worker states if needed
@@ -283,21 +277,19 @@ impl InterpreterPool {
         let logging_flag = Arc::new(AtomicBool::new(request_logging));
 
         // Spawn workers: first sync_count as sync, rest as async
-        for (i, worker) in workers.into_iter().enumerate() {
-            let handler_names_clone = handler_names.to_vec();
-            let before_hooks_clone = before_hook_names.to_vec();
-            let after_hooks_clone = after_hook_names.to_vec();
+        let mut pending = workers.into_iter().enumerate();
+        while let Some((i, worker)) = pending.next() {
             let logging = Arc::clone(&logging_flag);
 
-            let handle = if i >= sync_count && has_any_async {
+            let spawned = if i >= sync_count && has_any_async {
                 // Async worker
                 std::thread::Builder::new()
                     .name(format!("pyronova-async-worker-{i}"))
                     .stack_size(crate::python::PYTHON_THREAD_STACK)
                     .spawn(move || {
-                        worker_thread_loop_async(worker, &handler_names_clone, i);
+                        worker_thread_loop_async(worker);
                     })
-                    .map_err(|e| format!("failed to spawn async worker {i}: {e}"))?
+                    .map_err(|e| format!("failed to spawn async worker {i}: {e}"))
             } else {
                 // Sync worker
                 let rx = sync_work_rx.clone();
@@ -305,19 +297,21 @@ impl InterpreterPool {
                     .name(format!("pyronova-worker-{i}"))
                     .stack_size(crate::python::PYTHON_THREAD_STACK)
                     .spawn(move || {
-                        worker_thread_loop(
-                            worker,
-                            rx,
-                            &handler_names_clone,
-                            &before_hooks_clone,
-                            &after_hooks_clone,
-                            &logging,
-                        );
+                        worker_thread_loop(worker, rx, &logging);
                     })
-                    .map_err(|e| format!("failed to spawn worker thread {i}: {e}"))?
+                    .map_err(|e| format!("failed to spawn worker thread {i}: {e}"))
             };
 
-            threads.push(handle);
+            match spawned {
+                Ok(handle) => threads.push(handle),
+                Err(e) => {
+                    // The worker moved into the failed spawn is gone (its drop logs and
+                    // leaks it); end the ones not yet handed to a thread (FR-19). The
+                    // spawned ones exit when the channels close as this returns.
+                    SubInterpreterWorker::end_all(pending.map(|(_, w)| w));
+                    return Err(e);
+                }
+            }
         }
 
         // Admission semaphore: one permit per total queue slot across
@@ -334,7 +328,6 @@ impl InterpreterPool {
             async_work_tx,
             worker_threads: Some(threads),
             routers,
-            _handler_names: handler_names.to_vec(),
             requires_gil,
             is_async_handler: is_async_handler.clone(),
             static_dirs,
@@ -403,9 +396,6 @@ impl InterpreterPool {
 fn worker_thread_loop(
     mut worker: SubInterpreterWorker,
     rx: crossbeam_channel::Receiver<WorkRequest>,
-    handler_names: &[String],
-    before_hook_names: &[String],
-    after_hook_names: &[String],
     request_logging: &AtomicBool,
 ) {
     // Rebind the sub-interp tstate to this OS thread (fixes the
@@ -438,11 +428,8 @@ fn worker_thread_loop(
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let _guard = SubInterpGilGuard::acquire(tstate_cell.get(), &tstate_cell);
 
-            let handler_name = &handler_names[req.handler_idx];
             worker.call_handler(
-                handler_name,
-                before_hook_names,
-                after_hook_names,
+                req.handler_idx,
                 &req.method,
                 &req.path,
                 &req.params,
@@ -508,28 +495,18 @@ fn worker_thread_loop(
     // + `Py_EndInterpreter` on a finalized VM is UAF → segfault at
     // shutdown. Skip cleanup in that case; the OS will reclaim whatever
     // the sub-interp was holding as the process exits.
-    unsafe { super::ffi::end_worker_interpreter(&mut worker.tstate) };
+    if unsafe { pyo3::ffi::Py_IsInitialized() != 0 } {
+        // SAFETY: on the worker's own thread, no thread state current.
+        unsafe { worker.end() };
+    } else {
+        worker.abandon();
+    }
 }
 
 /// Async worker: Python asyncio event loop drives execution.
 /// Fetcher thread pulls requests from channel (releasing GIL during wait),
 /// asyncio loop runs handlers as concurrent tasks.
-fn worker_thread_loop_async(
-    mut worker: SubInterpreterWorker,
-    handler_names: &[String],
-    worker_idx: usize,
-) {
-    let handlers_array = handler_names
-        .iter()
-        .map(|n| format!("'{}'", n))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    // Load async engine from external Python file (syntax highlighting + maintainability)
-    let engine_template = include_str!("../../python/pyronova/_async_engine.py");
-    let engine_script =
-        format!("WORKER_ID = {worker_idx}\nHANDLER_NAMES = [{handlers_array}]\n{engine_template}");
-
+fn worker_thread_loop_async(mut worker: SubInterpreterWorker) {
     unsafe {
         // Rebind tstate to this OS thread — same cross-thread leak as
         // the sync worker loop. See `rebind_tstate_to_current_thread`
@@ -537,178 +514,23 @@ fn worker_thread_loop_async(
         worker.tstate = rebind_tstate_to_current_thread(worker.tstate);
 
         ffi::PyEval_RestoreThread(worker.tstate);
-
-        // Register C-FFI functions in sub-interpreter globals.
-        // transmute: PyCFunction (2 args) → PyCFunctionWithKeywords (3 args) —
-        // safe because METH_VARARGS ignores the third (kwargs) parameter.
-        #[allow(clippy::missing_transmute_annotations)]
-        let recv_def = Box::into_raw(Box::new(ffi::PyMethodDef {
-            ml_name: c"_pyronova_recv".as_ptr(),
-            ml_meth: ffi::PyMethodDefPointer {
-                PyCFunctionWithKeywords: std::mem::transmute(pyronova_recv_cfunc as *const ()),
-            },
-            ml_flags: ffi::METH_VARARGS,
-            ml_doc: std::ptr::null(),
-        }));
-        #[allow(clippy::missing_transmute_annotations)]
-        let send_def = Box::into_raw(Box::new(ffi::PyMethodDef {
-            ml_name: c"_pyronova_send".as_ptr(),
-            ml_meth: ffi::PyMethodDefPointer {
-                PyCFunctionWithKeywords: std::mem::transmute(pyronova_send_cfunc as *const ()),
-            },
-            ml_flags: ffi::METH_VARARGS,
-            ml_doc: std::ptr::null(),
-        }));
-
-        // Build the logging-bridge PyMethodDef up front so the registration
-        // closure below can reclaim its Box on any early-failure path.
-        #[allow(clippy::missing_transmute_annotations)]
-        let emit_log_def = Box::into_raw(Box::new(ffi::PyMethodDef {
-            ml_name: c"_pyronova_emit_log".as_ptr(),
-            ml_meth: ffi::PyMethodDefPointer {
-                PyCFunctionWithKeywords: std::mem::transmute(pyronova_emit_log_cfunc as *const ()),
-            },
-            ml_flags: ffi::METH_VARARGS,
-            ml_doc: std::ptr::null(),
-        }));
-
-        // Register the C-FFI async bridge (_pyronova_recv/_pyronova_send), the
-        // zombie-guard pool_id, and the logging bridge (_pyronova_emit_log) into
-        // the sub-interpreter globals. Every one of these is on the async
-        // engine's hot path: the fetcher thread calls _pyronova_recv /
-        // _pyronova_send on each request, reads _pyronova_pool_id to detect a
-        // replaced slot, and routes logs through _pyronova_emit_log. So a null
-        // from PyCFunction_NewEx / PyLong_FromUnsignedLongLong (OOM or corrupted
-        // interpreter state) is FATAL — continuing would spawn a worker that
-        // crashes with AttributeError on its very first request. We must not let
-        // that worker run; we abort it instead (see the bail-out below).
-        //
-        // (PyDict_SetItemString also rejects null values per the CPython
-        // contract — passing one would segfault — so the null check is required
-        // for safety as well as correctness.)
-        //
-        // Ownership: on success PyCFunction_NewEx borrows the PyMethodDef for the
-        // function object's lifetime, so we intentionally leak the Box; on a null
-        // path no object took ownership, so we reclaim every not-yet-consumed Box
-        // to avoid leaking ~80 bytes each (mirrors db_bridge.rs).
-        let globals = worker.globals;
-        let pool_id = worker.pool_id;
-        // Already inside the function's outer `unsafe` block (above), so the
-        // closure body inherits that context — no inner `unsafe` needed.
-        let register_bridge = || -> bool {
-            let recv_func =
-                ffi::PyCFunction_NewEx(recv_def, std::ptr::null_mut(), std::ptr::null_mut());
-            if recv_func.is_null() {
-                let _ = Box::from_raw(recv_def);
-                let _ = Box::from_raw(send_def);
-                let _ = Box::from_raw(emit_log_def);
-                return false;
-            }
-            // PyDict_SetItemString returns -1 on failure (e.g. allocation
-            // failure growing the dict). Unchecked, the bridge function would
-            // be silently missing from globals → AttributeError on the first
-            // async request, with the root cause hidden. DECREF the function
-            // we still own (SetItemString does not steal the ref), reclaim the
-            // not-yet-consumed defs, and bail so the caller's
-            // log_and_clear_pyerr surfaces it. Mirrors the null branches above.
-            let rc = ffi::PyDict_SetItemString(globals, c"_pyronova_recv".as_ptr(), recv_func);
-            ffi::Py_DECREF(recv_func);
-            if rc != 0 {
-                let _ = Box::from_raw(send_def);
-                let _ = Box::from_raw(emit_log_def);
-                return false;
-            }
-
-            let send_func =
-                ffi::PyCFunction_NewEx(send_def, std::ptr::null_mut(), std::ptr::null_mut());
-            if send_func.is_null() {
-                let _ = Box::from_raw(send_def);
-                let _ = Box::from_raw(emit_log_def);
-                return false;
-            }
-            let rc = ffi::PyDict_SetItemString(globals, c"_pyronova_send".as_ptr(), send_func);
-            ffi::Py_DECREF(send_func);
-            if rc != 0 {
-                let _ = Box::from_raw(emit_log_def);
-                return false;
-            }
-
-            // Zombie-guard: each sub-interpreter stamps its pool_id as a
-            // module-level constant. The async engine reads it once and
-            // passes it as the second arg to every _pyronova_recv /
-            // _pyronova_send call. If a later pool's WorkerState has replaced
-            // our slot, the C-FFI bridge detects the id mismatch and returns
-            // None (sentinel for "your pool is gone, clean up and exit") so
-            // this worker can't receive requests meant for the live pool.
-            let pool_id_obj = ffi::PyLong_FromUnsignedLongLong(pool_id);
-            if pool_id_obj.is_null() {
-                let _ = Box::from_raw(emit_log_def);
-                return false;
-            }
-            let rc = ffi::PyDict_SetItemString(globals, c"_pyronova_pool_id".as_ptr(), pool_id_obj);
-            ffi::Py_DECREF(pool_id_obj);
-            if rc != 0 {
-                let _ = Box::from_raw(emit_log_def);
-                return false;
-            }
-
-            let emit_log_func =
-                ffi::PyCFunction_NewEx(emit_log_def, std::ptr::null_mut(), std::ptr::null_mut());
-            if emit_log_func.is_null() {
-                let _ = Box::from_raw(emit_log_def);
-                return false;
-            }
-            let rc =
-                ffi::PyDict_SetItemString(globals, c"_pyronova_emit_log".as_ptr(), emit_log_func);
-            ffi::Py_DECREF(emit_log_func);
-            if rc != 0 {
-                return false;
-            }
-
-            true
-        };
-
-        if !register_bridge() {
+        // Runs the async engine (`_async_engine.py`) in its own namespace; blocks until the
+        // request channel is closed.
+        if let Err(e) = worker.run_async_engine() {
             tracing::error!(
                 target: "pyronova::server",
-                worker = worker_idx,
-                "failed to register C-FFI bridge in sub-interpreter (OOM or \
-                 corrupted interpreter state); aborting async worker instead of \
-                 running an engine that would crash on first request"
+                worker = worker.worker_id,
+                "async engine failed: {e}"
             );
-            // Clean up the half-initialized sub-interpreter and exit the worker.
-            // Same zombie-safety guard as the normal cleanup path below.
-            if pyo3::ffi::Py_IsInitialized() != 0 {
-                ffi::Py_EndInterpreter(ffi::PyThreadState_Get());
-            }
-            worker.tstate = std::ptr::null_mut();
-            return;
         }
+        worker.tstate = ffi::PyEval_SaveThread();
+    }
 
-        // Sub-interp DB bridge — see sync worker path + src/db_bridge.rs
-        // for the rationale. Same 4 C-FFI functions injected into the
-        // async worker's globals so async handlers can also issue DB
-        // queries without the `gil=True` escape hatch.
-        crate::bridge::db_bridge::register_db_bridge(worker.globals);
-
-        // Run the async engine — this blocks until the channel is closed
-        let code = std::ffi::CString::new(engine_script).unwrap();
-        let result = ffi::PyRun_String(
-            code.as_ptr(),
-            ffi::Py_file_input,
-            worker.globals,
-            worker.globals,
-        );
-        if result.is_null() {
-            log_and_clear_py_exception("async engine script");
-        } else {
-            ffi::Py_DECREF(result);
-        }
-
-        // Cleanup — same zombie-safety as the sync worker loop.
-        if pyo3::ffi::Py_IsInitialized() != 0 {
-            ffi::Py_EndInterpreter(ffi::PyThreadState_Get());
-        }
-        worker.tstate = std::ptr::null_mut();
+    // Cleanup — same zombie-safety as the sync worker loop.
+    if unsafe { pyo3::ffi::Py_IsInitialized() != 0 } {
+        // SAFETY: on the worker's own thread, no thread state current.
+        unsafe { worker.end() };
+    } else {
+        worker.abandon();
     }
 }

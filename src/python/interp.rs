@@ -10,7 +10,9 @@
 //! separating orthogonal concerns:
 //!
 //!   - [`super::ffi`]     — raw FFI primitives (`PyObjRef`, `SubInterpGilGuard`,
-//!     tstate rebinding, the worker-state registry, and the C-FFI bridge).
+//!     tstate rebinding, and the async worker-state registry).
+//!   - [`super::worker_api`] — the engine functions the async engine calls
+//!     (`_worker_recv`, `_worker_send`, ...).
 //!   - [`super::convert`] — Python `str`/`dict` conversion helpers.
 //!   - [`super::worker`]  — `SubInterpreterWorker` (owns one sub-interpreter).
 //!   - [`super::pool`]    — `InterpreterPool`, `WorkRequest`,

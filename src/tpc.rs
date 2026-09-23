@@ -512,11 +512,7 @@ fn run_tpc_subinterp_per_thread_listener(
                 // Tear down: drop the LocalSet (its tasks hold the other `Rc`s), then end the
                 // sub-interpreter on this thread, as the channel pool's workers do.
                 drop(local);
-                unsafe {
-                    crate::python::interp::end_worker_interpreter(
-                        &mut worker_exit.borrow_mut().tstate,
-                    )
-                };
+                SubInterpreterWorker::end_shared(worker_exit);
             });
         match handle {
             Ok(h) => handles.push(h),
@@ -530,6 +526,12 @@ fn run_tpc_subinterp_per_thread_listener(
                     let _ = h.join();
                 }
                 unsafe { drop(Arc::from_raw(routes_raw)) };
+                // End the workers not yet handed to a thread, on this (their creating)
+                // thread; none of them was rebound yet (FR-19). The one moved into the
+                // failed spawn is gone: its drop logs and leaks it.
+                // SAFETY: called from `run_tpc_subinterp` on the main thread inside
+                // `py.detach`, so no thread state is current.
+                unsafe { SubInterpreterWorker::end_all(workers.drain(..)) };
                 return Err(format!("spawn tpc-{i}: {e}"));
             }
         }
@@ -655,11 +657,7 @@ fn run_tpc_subinterp_fanout(
                 // Tear down: drop the LocalSet (its tasks hold the other `Rc`s), then end the
                 // sub-interpreter on this thread, as the channel pool's workers do.
                 drop(local);
-                unsafe {
-                    crate::python::interp::end_worker_interpreter(
-                        &mut worker_exit.borrow_mut().tstate,
-                    )
-                };
+                SubInterpreterWorker::end_shared(worker_exit);
             });
         match handle {
             Ok(h) => handles.push(h),
@@ -672,6 +670,12 @@ fn run_tpc_subinterp_fanout(
                     let _ = h.join();
                 }
                 unsafe { drop(Arc::from_raw(routes_raw)) };
+                // End the workers not yet handed to a thread, on this (their creating)
+                // thread; none of them was rebound yet (FR-19). The one moved into the
+                // failed spawn is gone: its drop logs and leaks it.
+                // SAFETY: called from `run_tpc_subinterp` on the main thread inside
+                // `py.detach`, so no thread state is current.
+                unsafe { SubInterpreterWorker::end_all(workers.drain(..)) };
                 return Err(format!("spawn tpc-{i}: {e}"));
             }
         }

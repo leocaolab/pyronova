@@ -282,21 +282,6 @@ impl PyronovaApp {
         self.script_path = Some(path);
     }
 
-    /// Records this app as the one the worker's script created, so the worker can take its
-    /// handlers from it (Layer 2, C3). A no-op on the main interpreter. `Pyronova.__init__`
-    /// calls it.
-    fn _register_worker_app(slf: Bound<'_, Self>) -> PyResult<()> {
-        let py = slf.py();
-        if crate::run_context::on_main(py) {
-            return Ok(());
-        }
-        WORKER_APP.set(py, slf.unbind()).map_err(|_| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "the script created a second Pyronova app; a worker serves exactly one",
-            )
-        })
-    }
-
     /// Access the shared state (cross-sub-interpreter, nanosecond latency).
     #[getter]
     fn state(&self) -> SharedState {
@@ -304,82 +289,77 @@ impl PyronovaApp {
     }
 
     #[pyo3(signature = (path, handler, gil=false))]
-    fn get(&mut self, path: &str, handler: Py<PyAny>, gil: bool, py: Python<'_>) -> PyResult<()> {
-        let name = handler.getattr(py, "__name__")?.extract::<String>(py)?;
-        self.add_route("GET", path, handler, name, gil, false, py)
+    fn get(slf: &Bound<'_, Self>, path: &str, handler: Py<PyAny>, gil: bool) -> PyResult<()> {
+        Self::register_route(slf, "GET", path, handler, gil, false)
     }
 
     #[pyo3(signature = (path, handler, gil=false, stream=false))]
     fn post(
-        &mut self,
+        slf: &Bound<'_, Self>,
         path: &str,
         handler: Py<PyAny>,
         gil: bool,
         stream: bool,
-        py: Python<'_>,
     ) -> PyResult<()> {
-        let name = handler.getattr(py, "__name__")?.extract::<String>(py)?;
-        self.add_route("POST", path, handler, name, gil, stream, py)
+        Self::register_route(slf, "POST", path, handler, gil, stream)
     }
 
     #[pyo3(signature = (path, handler, gil=false, stream=false))]
     fn put(
-        &mut self,
+        slf: &Bound<'_, Self>,
         path: &str,
         handler: Py<PyAny>,
         gil: bool,
         stream: bool,
-        py: Python<'_>,
     ) -> PyResult<()> {
-        let name = handler.getattr(py, "__name__")?.extract::<String>(py)?;
-        self.add_route("PUT", path, handler, name, gil, stream, py)
+        Self::register_route(slf, "PUT", path, handler, gil, stream)
     }
 
     #[pyo3(signature = (path, handler, gil=false))]
-    fn delete(
-        &mut self,
-        path: &str,
-        handler: Py<PyAny>,
-        gil: bool,
-        py: Python<'_>,
-    ) -> PyResult<()> {
-        let name = handler.getattr(py, "__name__")?.extract::<String>(py)?;
-        self.add_route("DELETE", path, handler, name, gil, false, py)
+    fn delete(slf: &Bound<'_, Self>, path: &str, handler: Py<PyAny>, gil: bool) -> PyResult<()> {
+        Self::register_route(slf, "DELETE", path, handler, gil, false)
     }
 
     #[pyo3(signature = (method, path, handler, gil=false, stream=false))]
     fn route(
-        &mut self,
+        slf: &Bound<'_, Self>,
         method: &str,
         path: &str,
         handler: Py<PyAny>,
         gil: bool,
         stream: bool,
-        py: Python<'_>,
     ) -> PyResult<()> {
-        let name = handler.getattr(py, "__name__")?.extract::<String>(py)?;
-        self.add_route(method, path, handler, name, gil, stream, py)
+        Self::register_route(slf, method, path, handler, gil, stream)
     }
 
-    fn before_request(&mut self, handler: Py<PyAny>, py: Python<'_>) -> PyResult<()> {
+    fn before_request(slf: &Bound<'_, Self>, handler: Py<PyAny>) -> PyResult<()> {
+        let py = slf.py();
         let name = handler.getattr(py, "__name__")?.extract::<String>(py)?;
-        let mut routes = self.routes.write();
+        Self::serve_in_worker(slf)?;
+        let this = slf.borrow();
+        let mut routes = this.routes.write();
         routes.before_hooks.push(handler);
         routes.before_hook_names.push(name);
         Ok(())
     }
 
-    fn after_request(&mut self, handler: Py<PyAny>, py: Python<'_>) -> PyResult<()> {
+    fn after_request(slf: &Bound<'_, Self>, handler: Py<PyAny>) -> PyResult<()> {
+        let py = slf.py();
         let name = handler.getattr(py, "__name__")?.extract::<String>(py)?;
-        let mut routes = self.routes.write();
+        Self::serve_in_worker(slf)?;
+        let this = slf.borrow();
+        let mut routes = this.routes.write();
         routes.after_hooks.push(handler);
         routes.after_hook_names.push(name);
         Ok(())
     }
 
-    fn fallback(&mut self, handler: Py<PyAny>, py: Python<'_>) -> PyResult<()> {
+    fn fallback(slf: &Bound<'_, Self>, handler: Py<PyAny>) -> PyResult<()> {
+        let py = slf.py();
         let name = handler.getattr(py, "__name__")?.extract::<String>(py)?;
-        let mut routes = self.routes.write();
+        Self::serve_in_worker(slf)?;
+        let this = slf.borrow();
+        let mut routes = this.routes.write();
         routes.fallback_handler = Some(handler);
         routes.fallback_handler_name = Some(name);
         Ok(())
@@ -737,7 +717,66 @@ async fn serve_connection<S>(
     }
 }
 
+/// The handlers and hooks of the app a worker's script registered on, indexed like main's
+/// table, with their signature (Layer 2, C3).
+pub(crate) struct WorkerRoutes {
+    pub(crate) signature: crate::router::RouteSignature,
+    pub(crate) handlers: Vec<Py<PyAny>>,
+    pub(crate) before_hooks: Vec<Py<PyAny>>,
+    pub(crate) after_hooks: Vec<Py<PyAny>>,
+}
+
+/// The routes of the app this worker's script registered on, or `None` if it registered
+/// none. Meaningful only in a worker, after its script ran.
+pub(crate) fn worker_routes(py: Python<'_>) -> Option<WorkerRoutes> {
+    let app = WORKER_APP.get(py)?.bind(py).borrow();
+    let table = app.routes.read();
+    Some(WorkerRoutes {
+        signature: crate::router::RouteSignature::of(&table),
+        handlers: table.handlers.iter().map(|h| h.clone_ref(py)).collect(),
+        before_hooks: table.before_hooks.iter().map(|h| h.clone_ref(py)).collect(),
+        after_hooks: table.after_hooks.iter().map(|h| h.clone_ref(py)).collect(),
+    })
+}
+
 impl PyronovaApp {
+    /// In a worker, the app the script registers routes or hooks on is the one the worker
+    /// serves: the first registration records it, and a registration on a second app is an
+    /// error (Layer 2, FR-4; decision Q-2 (a)). Raw `PyronovaApp()` scripts and `Pyronova`
+    /// apps work the same way. A no-op on the main interpreter.
+    fn serve_in_worker(slf: &Bound<'_, Self>) -> PyResult<()> {
+        let py = slf.py();
+        if crate::run_context::on_main(py) {
+            return Ok(());
+        }
+        match WORKER_APP.get(py) {
+            Some(app) if app.bind(py).is(slf) => Ok(()),
+            Some(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "the script registers routes or hooks on a second app; a worker serves \
+                 exactly one app per script (create one Pyronova()/PyronovaApp() and register \
+                 everything on it)",
+            )),
+            None => WORKER_APP.set(py, slf.clone().unbind()).map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err("worker app already recorded")
+            }),
+        }
+    }
+
+    fn register_route(
+        slf: &Bound<'_, Self>,
+        method: &str,
+        path: &str,
+        handler: Py<PyAny>,
+        gil: bool,
+        stream: bool,
+    ) -> PyResult<()> {
+        let py = slf.py();
+        let name = handler.getattr(py, "__name__")?.extract::<String>(py)?;
+        Self::serve_in_worker(slf)?;
+        slf.borrow_mut()
+            .add_route(method, path, handler, name, gil, stream, py)
+    }
+
     /// Records the script's registration boundary unless one is already set; idempotent
     /// (Layer 2, FR-2).
     fn seal_if_unsealed(&self) {
@@ -1026,21 +1065,13 @@ impl PyronovaApp {
             main_mod.getattr("__file__")?.extract::<String>()?
         };
 
-        let (
-            handler_names,
-            routers,
-            before_hook_names,
-            after_hook_names,
-            static_dirs,
-            requires_gil,
-        ) = (
-            routes.handler_names.clone(),
+        let (routers, static_dirs, requires_gil) = (
             routes.routers.clone(),
-            routes.before_hook_names.clone(),
-            routes.after_hook_names.clone(),
             routes.static_dirs.clone(),
             routes.requires_gil.clone(),
         );
+        // What every worker's script must register (Layer 2, C3), as plain values.
+        let expected = crate::router::RouteSignature::of(&routes);
 
         let gil_count = requires_gil.iter().filter(|&&g| g).count();
         let subinterp_count = requires_gil.len() - gil_count;
@@ -1091,10 +1122,8 @@ impl PyronovaApp {
                 workers,
                 py,
                 &script_path,
-                &handler_names,
+                &expected,
                 routers,
-                &before_hook_names,
-                &after_hook_names,
                 static_dirs,
                 requires_gil,
                 routes.is_async.clone(),
@@ -1302,10 +1331,8 @@ impl PyronovaApp {
             main_mod.getattr("__file__")?.extract::<String>()?
         };
 
-        // Combine handler + hook names — same pattern as InterpreterPool::new.
-        let mut all_func_names: Vec<String> = routes.handler_names.clone();
-        all_func_names.extend(routes.before_hook_names.iter().cloned());
-        all_func_names.extend(routes.after_hook_names.iter().cloned());
+        // What every worker's script must register (Layer 2, C3), as plain values.
+        let expected = crate::router::RouteSignature::of(&routes);
 
         // Read the user script once.
         let raw_script = std::fs::read_to_string(&script_path).map_err(|e| {
@@ -1324,21 +1351,27 @@ impl PyronovaApp {
         let n_threads = workers;
         let mut sub_workers = Vec::with_capacity(n_threads);
         for i in 0..n_threads {
-            let w = unsafe {
+            let built = unsafe {
                 interp::SubInterpreterWorker::new(
+                    i,
                     &raw_script,
                     &script_path,
-                    &all_func_names,
+                    &expected,
                     pool_id,
                     &self.shared_state,
                 )
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "TPC sub-interp {i} init: {e}"
-                    ))
-                })?
             };
-            sub_workers.push(w);
+            match built {
+                Ok(w) => sub_workers.push(w),
+                Err(e) => {
+                    // End the workers built so far, here on their creating thread (FR-19).
+                    // SAFETY: main thread, main's thread state current, none rebound yet.
+                    unsafe { interp::SubInterpreterWorker::end_all(sub_workers) };
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "TPC sub-interp {i} init: {e}"
+                    )));
+                }
+            }
         }
 
         // Phase 3 gil=True bridge: spawn a dedicated main-interp thread
@@ -1431,9 +1464,7 @@ impl PyronovaApp {
                 "bench_inmem does not support stream=True routes",
             ));
         }
-        let handler_names_from_routes = sample.handler_names.clone();
-        let before_hook_names = sample.before_hook_names.clone();
-        let after_hook_names = sample.after_hook_names.clone();
+        let expected = crate::router::RouteSignature::of(&sample);
 
         let mut per_worker_routes: Vec<FrozenRoutes> = Vec::with_capacity(n_threads);
         per_worker_routes.push(sample);
@@ -1447,9 +1478,6 @@ impl PyronovaApp {
             let main_mod = py.import("__main__")?;
             main_mod.getattr("__file__")?.extract::<String>()?
         };
-        let mut all_func_names: Vec<String> = handler_names_from_routes;
-        all_func_names.extend(before_hook_names);
-        all_func_names.extend(after_hook_names);
 
         crate::monitor::init_metrics_flag();
         let raw_script = std::fs::read_to_string(&script_path).map_err(|e| {
@@ -1460,9 +1488,10 @@ impl PyronovaApp {
         for i in 0..n_threads {
             let w = unsafe {
                 interp::SubInterpreterWorker::new(
+                    i,
                     &raw_script,
                     &script_path,
-                    &all_func_names,
+                    &expected,
                     pool_id,
                     &self.shared_state,
                 )
@@ -1515,9 +1544,7 @@ impl PyronovaApp {
             let main_mod = py.import("__main__")?;
             main_mod.getattr("__file__")?.extract::<String>()?
         };
-        let mut all_func_names: Vec<String> = routes.handler_names.clone();
-        all_func_names.extend(routes.before_hook_names.iter().cloned());
-        all_func_names.extend(routes.after_hook_names.iter().cloned());
+        let expected = crate::router::RouteSignature::of(&routes);
 
         crate::monitor::init_metrics_flag();
         let raw_script = std::fs::read_to_string(&script_path).map_err(|e| {
@@ -1528,9 +1555,10 @@ impl PyronovaApp {
         for i in 0..n_threads {
             let w = unsafe {
                 interp::SubInterpreterWorker::new(
+                    i,
                     &raw_script,
                     &script_path,
-                    &all_func_names,
+                    &expected,
                     pool_id,
                     &self.shared_state,
                 )

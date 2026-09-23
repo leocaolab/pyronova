@@ -1,8 +1,10 @@
 """Layer 2, M3 (issue #5): registration seal, worker-app registry and inert prerequisites.
 
-Workers still run the mock `pyronova` package, so most of M3 changes nothing for them.
-These tests cover the main-interpreter behaviour directly, and the worker side through a
-test app whose script executes the real engine in each worker (`_l2_m3_worker_app.py`).
+These tests cover the main-interpreter behaviour. The worker side of M3 (FR-4, FR-5,
+FR-15, FR-17, FR-18) was tested through a probe app that loaded the real engine next to
+the mock; since M4 workers run the real package, so that coverage is in
+`test_layer2_m4.py` (probe app and test removed at M4, approved by the user on
+2026-09-23).
 """
 from __future__ import annotations
 
@@ -312,41 +314,3 @@ def test_main_guard_logging_and_mcp_in_subinterp_mode(tmp_path):
     log = open(log_path).read()
     assert fork_panic_lines(log) == []
     assert "Traceback" not in log, log[-3000:]
-
-
-# ---------------------------------------------------------------------------
-# worker side, through a worker that executes the real engine
-# ---------------------------------------------------------------------------
-
-
-@subinterp_only
-def test_worker_side_m3_api(tmp_path):
-    port = _free_port()
-    log_path = str(tmp_path / "server.log")
-    base = f"http://127.0.0.1:{port}"
-    proc = _start(os.path.join(HERE, "_l2_m3_worker_app.py"), port, log_path)
-    try:
-        _wait_up(base, "/w", proc, log_path)
-        info = httpx.get(base + "/w", timeout=5).json()
-        # FR-5: bare SharedState() in workers writes the running app's map.
-        for _ in range(40):
-            assert httpx.get(base + "/incr", timeout=5).status_code == 200
-        hits = httpx.get(base + "/main_hits", timeout=5).json()["hits"]
-        main_in_worker = httpx.get(base + "/main_in_worker", timeout=5).json()
-        # FR-17: main's 2048-byte limit is in force despite the worker's 999_999.
-        big = httpx.post(base + "/upload", content=b"x" * 4000, timeout=5)
-        small = httpx.post(base + "/upload", content=b"x" * 100, timeout=5)
-    finally:
-        _stop(proc)
-    log = open(log_path).read()
-
-    assert info["real_engine"] is True
-    assert info["in_worker"] is True  # FR-15
-    assert main_in_worker == {"in_worker": False}
-    assert info["request_type"] == "<class 'pyronova.engine.Request'>"  # FR-18
-    assert "second Pyronova app" in (info["second_app_error"] or "")  # FR-4
-    assert hits == "40"  # FR-5
-    assert big.status_code == 413 and small.json() == {"len": 100}  # FR-17
-    assert "set_max_body_size(999999) in a worker is ignored" in log  # FR-17
-    assert "configure_compression(" in log and "in a worker is ignored" in log
-    assert fork_panic_lines(log) == []

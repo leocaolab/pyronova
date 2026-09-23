@@ -1,6 +1,6 @@
 """Type stubs for pyronova.engine (Rust extension module)."""
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable, List, Optional, Tuple
 
 def init_logger(level: str, access_log: bool, format: str) -> None:
     """Initialize the Rust tracing engine. Call once at startup.
@@ -171,9 +171,9 @@ class PyronovaApp:
         """Main interpreter only, idempotent: marks the end of the script's registrations.
         A route registered after it must be ``gil=True``."""
         ...
-    def _register_worker_app(self) -> None:
-        """In a worker, records this app as the one whose routes the worker serves.
-        A no-op on the main interpreter."""
+    def set_script_path(self, path: str) -> None:
+        """The script sub-interpreter workers execute, when it isn't
+        ``__main__.__file__`` (the CLI sets it to the app's module)."""
         ...
     def run(
         self,
@@ -186,3 +186,12 @@ class PyronovaApp:
 def _in_worker() -> bool:
     """Whether this code runs in a sub-interpreter worker (not the main interpreter)."""
     ...
+
+
+# Called by the async engine in sub-interpreter workers (Layer 2, C5); not a
+# public API.
+def _worker_recv(worker_id: int, pool_id: int) -> Optional[Tuple[int, int, Request]]: ...
+def _worker_send(worker_id: int, pool_id: int, req_id: int, response: Any) -> None: ...
+def _worker_to_response(value: Any) -> Response: ...
+def _worker_app_handlers() -> List[Callable[..., Any]]: ...
+def _worker_app_hooks() -> Tuple[List[Callable[..., Any]], List[Callable[..., Any]]]: ...

@@ -1,12 +1,11 @@
-"""Async engine script — injected into each sub-interpreter worker.
+"""Async engine — run in each async sub-interpreter worker (pool mode).
 
-This script runs inside a sub-interpreter with its own GIL.
-It drives a Python asyncio event loop that processes requests
-received from Rust via the _pyronova_recv/_pyronova_send C-FFI bridge.
-
-Template variables (replaced by Rust before exec):
-  {worker_idx}     — this worker's index (0..N)
-  {handlers_array}  — comma-separated quoted handler names
+It drives a Python asyncio event loop that processes requests received from
+Rust through `pyronova.engine._worker_recv` / `_worker_send` (Layer 2, C5).
+It runs as the module `__pyronova_async_engine__`, in its own namespace; Rust
+sets `WORKER_ID` (this worker's slot) and `POOL_ID` (its pool, the zombie
+guard) in it before it runs. The handlers and hooks are the ones the user's
+script registered on its app, indexed like the main interpreter's routes.
 """
 
 import asyncio
@@ -14,100 +13,69 @@ import logging
 import threading
 import time
 
+import pyronova.engine as _engine
+
 _log = logging.getLogger("pyronova.async")
-
-try:
-    # isojson: orjson-compatible and safe in own-GIL sub-interpreters (orjson is not).
-    import isojson as _isojson
-
-    def _isojson_default(obj):
-        if isinstance(obj, (set, frozenset)):
-            return list(obj)
-        raise TypeError(f'Object of type {type(obj).__name__} is not JSON serializable')
-
-    def _json_dumps_bytes(obj):
-        return _isojson.dumps(obj, default=_isojson_default)
-
-except ImportError:
-    import json as _json_mod
-
-    def _json_dumps_bytes(obj):
-        return _json_mod.dumps(obj).encode("utf-8")
-
-# Injected by Rust: WORKER_ID = {worker_idx}
-# Injected by Rust: HANDLER_NAMES = [{handlers_array}]
-# Injected by Rust: _pyronova_pool_id (sub-interp pool identifier; passed to
-#   every _pyronova_send/_pyronova_recv call — see src/python/interp.rs:2480
-#   for the injection site).
-
 
 # Timeout for async handlers — 2s before Rust's 30s gateway timeout,
 # so Python can abort cleanly instead of computing a result nobody wants.
 _HANDLER_TIMEOUT = 28
 
+# Fetched once (M4 review N1e): the script has run, so the app's table is final.
+_HANDLERS = _engine._worker_app_handlers()
+_BEFORE_HOOKS, _AFTER_HOOKS = _engine._worker_app_hooks()
 
-async def _process_request(req_id, handler_idx, method, path, params, query, body_bytes, headers, client_ip):
+
+def _error_response(status, text):
+    return _engine.Response(text, status_code=status, content_type="text/plain")
+
+
+async def _call(fn, *args):
+    res = fn(*args)
+    if asyncio.iscoroutine(res) or asyncio.isfuture(res) or hasattr(res, "__await__"):
+        res = await res
+    return res
+
+
+async def _handle(handler, req):
+    # Hooks and handler run in this request's own Task, so per-request state kept
+    # in ContextVars (observability's request id, pyronova.context) stays apart
+    # from concurrent requests on this loop (FR-14). Same order and semantics as
+    # the sync worker path: a before hook that returns something short-circuits;
+    # one that raises fails the request; after hooks get a Response and may
+    # replace it; one that raises is logged and skipped.
+    for hook in _BEFORE_HOOKS:
+        res = await _call(hook, req)
+        if res is not None:
+            return _engine._worker_to_response(res)
+    res = await _call(handler, req)
+    res = _engine._worker_to_response(res)
+    for hook in _AFTER_HOOKS:
+        try:
+            replaced = await _call(hook, req, res)
+        except Exception:
+            _log.exception("worker=%s after_request hook raised", WORKER_ID)
+            continue
+        if replaced is not None:
+            res = _engine._worker_to_response(replaced)
+    return res
+
+
+async def _process_request(req_id, handler_idx, req):
     try:
         try:
-            handler_name = HANDLER_NAMES[int(handler_idx)]
-        except (ValueError, IndexError) as e:
-            _log.error("worker=%s invalid handler_idx=%r: %s", WORKER_ID, handler_idx, e)
-            _pyronova_send(WORKER_ID, _pyronova_pool_id, req_id, 500, "text/plain", b"routing error")
+            handler = _HANDLERS[handler_idx]
+        except IndexError:
+            _log.error("worker=%s invalid handler_idx=%r", WORKER_ID, handler_idx)
+            _engine._worker_send(WORKER_ID, POOL_ID, req_id, _error_response(500, "routing error"))
             return
-        handler = globals().get(handler_name)
-        if handler is None:
-            _pyronova_send(WORKER_ID, _pyronova_pool_id, req_id, 500, "text/plain", b"handler not found")
-            return
-
-        req = _Request(method, path, params, query, body_bytes, headers, client_ip)
-        res = handler(req)
-
-        if asyncio.iscoroutine(res) or asyncio.isfuture(res) or hasattr(res, '__await__'):
-            # Bracket pattern: bound the coroutine's lifetime so cancelled/timed-out
-            # requests don't accumulate as phantom load in the event loop.
-            # ensure_future wraps any awaitable (coroutine, Future, __await__) into
-            # a Task so wait_for can cancel it uniformly on timeout.
-            res = await asyncio.wait_for(asyncio.ensure_future(res), timeout=_HANDLER_TIMEOUT)
-
-        if isinstance(res, _Response):
-            body = (
-                str(res.body).encode("utf-8")
-                if not isinstance(res.body, bytes)
-                else res.body
-            )
-            _pyronova_send(
-                WORKER_ID,
-                _pyronova_pool_id,
-                req_id,
-                res.status_code,
-                res.content_type or "text/plain",
-                body,
-            )
-        elif isinstance(res, dict):
-            _pyronova_send(
-                WORKER_ID,
-                _pyronova_pool_id,
-                req_id,
-                200,
-                "application/json",
-                _json_dumps_bytes(res),
-            )
-        elif isinstance(res, bytes):
-            _pyronova_send(WORKER_ID, _pyronova_pool_id, req_id, 200, "application/octet-stream", res)
-        elif res is None:
-            _pyronova_send(WORKER_ID, _pyronova_pool_id, req_id, 200, "text/plain", b"")
-        else:
-            body = str(res).encode("utf-8")
-            body_stripped = body.lstrip()
-            ct = (
-                "application/json"
-                if body_stripped.startswith(b"{") or body_stripped.startswith(b"[")
-                else "text/plain"
-            )
-            _pyronova_send(WORKER_ID, _pyronova_pool_id, req_id, 200, ct, body)
+        # Bracket pattern: bound the request's lifetime so cancelled/timed-out
+        # requests don't accumulate as phantom load in the event loop.
+        res = await asyncio.wait_for(_handle(handler, req), timeout=_HANDLER_TIMEOUT)
+        _engine._worker_send(WORKER_ID, POOL_ID, req_id, res)
     except asyncio.TimeoutError:
         try:
-            _pyronova_send(WORKER_ID, _pyronova_pool_id, req_id, 504, "text/plain", b"handler timeout")
+            _engine._worker_send(WORKER_ID, POOL_ID, req_id, _error_response(504, "handler timeout"))
         except Exception:
             _log.exception("async handler req_id=%s: send timeout response failed", req_id)
     except asyncio.CancelledError:
@@ -115,9 +83,11 @@ async def _process_request(req_id, handler_idx, method, path, params, query, bod
         # Re-raise to let asyncio mark the task as CANCELLED (required by asyncio contract).
         raise
     except Exception:
-        _log.exception("async handler req_id=%s path=%s raised", req_id, path)
+        _log.exception("async handler req_id=%s path=%s raised", req_id, req.path)
         try:
-            _pyronova_send(WORKER_ID, _pyronova_pool_id, req_id, 500, "text/plain", b"internal server error")
+            _engine._worker_send(
+                WORKER_ID, POOL_ID, req_id, _error_response(500, "internal server error")
+            )
         except Exception:
             _log.exception("async handler req_id=%s: send error response failed", req_id)
 
@@ -126,17 +96,13 @@ def _fetcher_thread(loop):
     consecutive_errors = 0
     while True:
         try:
-            # The pool_id argument is the zombie-worker guard (see
-            # src/interp.rs :: pyronova_recv_cfunc). A stale worker whose pool
-            # has been replaced will see None here and exit the loop.
-            req_data = _pyronova_recv(WORKER_ID, _pyronova_pool_id)
+            # POOL_ID is the zombie-worker guard: a stale worker whose pool has
+            # been replaced sees None here and exits the loop.
+            req_data = _engine._worker_recv(WORKER_ID, POOL_ID)
             if req_data is None:
                 break
-            req_id, handler_idx, method, path, params, query, body_bytes, headers, client_ip = req_data
-            asyncio.run_coroutine_threadsafe(
-                _process_request(req_id, handler_idx, method, path, params, query, body_bytes, headers, client_ip),
-                loop,
-            )
+            req_id, handler_idx, req = req_data
+            asyncio.run_coroutine_threadsafe(_process_request(req_id, handler_idx, req), loop)
             consecutive_errors = 0
         except RuntimeError:
             # run_coroutine_threadsafe raises RuntimeError once the event loop
@@ -148,14 +114,15 @@ def _fetcher_thread(loop):
                 )
                 break
             # A RuntimeError while the loop is still alive is unexpected but
-            # potentially transient; fall through to the retriable path.
+            # potentially transient (a Rust panic in the engine call surfaces as
+            # one too); fall through to the retriable path.
             consecutive_errors += 1
             _log.exception("worker=%s fetcher error — continuing", WORKER_ID)
             time.sleep(min(0.05 * consecutive_errors, 1.0))
         except Exception:
-            # Retriable error (e.g. recv unpacking failure, transient
-            # scheduling failure). Back off proportionally so a persistent
-            # error does not pin a core or flood the log.
+            # Retriable error (e.g. transient scheduling failure). Back off
+            # proportionally so a persistent error does not pin a core or
+            # flood the log.
             #
             # A closed loop is fatal here too: if the loop is torn down while
             # this path keeps firing (e.g. OOM during shutdown), the back-off
@@ -219,30 +186,20 @@ async def _pyronova_engine():
             _log.exception("asyncio shutdown error")
 
 
-# Fail-fast contract check. Every name below is injected into this module's
-# namespace by the Rust host at sub-interpreter creation — C-FFI bridge
-# functions (_pyronova_recv/_pyronova_send), the _Request/_Response pyclasses,
-# and template-substituted constants (WORKER_ID, HANDLER_NAMES,
-# _pyronova_pool_id). None of them can be defined in Python. If injection ever
-# fails, surface it here with a clear diagnostic on the main thread BEFORE the
-# engine starts — otherwise the first missing reference (e.g. _pyronova_recv)
-# raises NameError inside the fetcher thread, which its except-Exception
-# back-off loop catches and retries forever, pinning a core and flooding logs.
-_REQUIRED_INJECTED = (
-    "WORKER_ID",
-    "HANDLER_NAMES",
-    "_pyronova_pool_id",
-    "_pyronova_recv",
-    "_pyronova_send",
-    "_Request",
-    "_Response",
-)
-_missing = [_name for _name in _REQUIRED_INJECTED if _name not in globals()]
+# Fail-fast contract check: `WORKER_ID` and `POOL_ID` are set by the Rust host
+# before this runs, and the engine functions come from `pyronova.engine`. If
+# either is missing, say so here, before the fetcher thread starts — otherwise
+# the first missing reference raises NameError inside the fetcher, whose
+# back-off loop catches and retries it forever, pinning a core.
+_missing = [_name for _name in ("WORKER_ID", "POOL_ID") if _name not in globals()]
+_missing += [
+    _name for _name in ("_worker_recv", "_worker_send", "_worker_to_response")
+    if not hasattr(_engine, _name)
+]
 if _missing:
     raise RuntimeError(
-        "pyronova async engine: required Rust-injected globals missing: "
-        + ", ".join(_missing)
-        + " — the sub-interpreter namespace was not populated by the host; "
+        "pyronova async engine: missing " + ", ".join(_missing)
+        + " — the worker namespace or the engine is not what this engine expects; "
         "refusing to start the fetcher thread"
     )
 

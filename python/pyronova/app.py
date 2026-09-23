@@ -186,8 +186,6 @@ class Pyronova:
         log_config: LogConfig | None = None,
     ) -> None:
         self._engine = _PyronovaApp()
-        # In a worker, the engine takes this app's routes as the worker's handlers.
-        self._engine._register_worker_app()
         self._fallback_handler: Callable | None = None
         self._fallback_name: str | None = None
         self._mcp = MCPServer()
@@ -411,11 +409,6 @@ class Pyronova:
             new code path. Only when the signature declares additional
             parameters do we build a wrapper that pulls them from
             ``req.params``.
-
-            Sub-interp note: each worker re-execs the user script and
-            looks up handlers by ``__name__`` from module globals, so we
-            return the shim (not the original) when wrapping — that's the
-            object the global binding must point to.
             """
             try:
                 sig = inspect.signature(fn)
@@ -563,10 +556,8 @@ class Pyronova:
             self._engine.route(method, path, wrapped, gil, stream)
             _record(fn)
             # When wrapping was a no-op `wrapped is fn` — return fn for
-            # type hints (today's behavior). When we injected a shim,
-            # return the shim so the module-global binding points at it;
-            # sub-interp workers look handlers up by __name__ from globals
-            # and would otherwise resurrect the original on each worker.
+            # type hints. When we injected a shim, return the shim, so the
+            # module-global name refers to what the route calls.
             return fn if wrapped is fn else wrapped
 
         return decorator

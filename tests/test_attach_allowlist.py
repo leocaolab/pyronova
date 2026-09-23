@@ -26,13 +26,8 @@ ALLOWLIST = {
     ),
     "src/python/worker.rs": (
         1,
-        "build_request: on a worker thread whose own thread state is current "
+        "call_handler: on a worker thread whose own thread state is current "
         "(SubInterpGilGuard); a re-entrant attach",
-    ),
-    "src/bridge/db_bridge.rs": (
-        1,
-        "C-FFI DB bridge, called from worker Python with its thread state current; "
-        "deleted in Layer 2 M4 (#6)",
     ),
 }
 

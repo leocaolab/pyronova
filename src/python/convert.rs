@@ -5,8 +5,6 @@
 //! `PyObjRef`s (see `super::ffi::PyObjRef`) and clear any pending
 //! Python exception on failure.
 
-use std::collections::HashMap;
-
 use pyo3::ffi;
 
 use super::ffi::*;
@@ -91,31 +89,6 @@ pub(crate) unsafe fn log_and_clear_py_exception(context: &str) {
 
     ffi::Py_DECREF(exc);
     tracing::error!(target: "pyronova::server", %context, error = %msg, "Python exception");
-}
-
-pub(crate) unsafe fn py_str_dict(map: &HashMap<String, String>) -> Option<PyObjRef> {
-    let dict = PyObjRef::from_owned(ffi::PyDict_New())?;
-    for (k, v) in map {
-        let pk = match py_str(k) {
-            Some(p) => p,
-            None => {
-                ffi::PyErr_Clear();
-                return None;
-            }
-        };
-        let pv = match py_str(v) {
-            Some(p) => p,
-            None => {
-                ffi::PyErr_Clear();
-                return None;
-            }
-        };
-        if ffi::PyDict_SetItem(dict.as_ptr(), pk.as_ptr(), pv.as_ptr()) < 0 {
-            ffi::PyErr_Clear();
-            return None;
-        }
-    }
-    Some(dict)
 }
 
 /// Same as `py_str_dict` but from a Vec of key-value pairs (for path params).

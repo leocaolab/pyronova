@@ -316,9 +316,7 @@ pub(crate) async fn handle_request_tpc_inline(
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let _guard = interp::SubInterpGilGuard::acquire(tstate_cell.get(), &tstate_cell);
             worker_ref.call_handler(
-                handler_name,
-                &routes.before_hook_names,
-                &routes.after_hook_names,
+                handler_idx,
                 method_str,
                 path,
                 &params,

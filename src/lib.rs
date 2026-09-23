@@ -68,6 +68,21 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(logging::emit_python_log, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(workrequest_counts, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(_in_worker, m)?)?;
+    // Called by the async engine in sub-interpreter workers (Layer 2, C5).
+    m.add_function(pyo3::wrap_pyfunction!(python::worker_api::_worker_recv, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(python::worker_api::_worker_send, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        python::worker_api::_worker_to_response,
+        m
+    )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        python::worker_api::_worker_app_handlers,
+        m
+    )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        python::worker_api::_worker_app_hooks,
+        m
+    )?)?;
     #[cfg(feature = "leak_detect")]
     m.add_function(pyo3::wrap_pyfunction!(leak_detect_dump, m)?)?;
     Ok(())

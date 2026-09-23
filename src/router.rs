@@ -91,6 +91,75 @@ pub(crate) struct Sealed {
     pub(crate) after_hooks: usize,
 }
 
+/// The routes and hook counts a worker's script must register, as plain values (Layer 2,
+/// C3). Main computes it from its sealed table before creating workers; a worker compares
+/// its own whole table against it. Plain values, so a worker's init, which runs with the
+/// worker's thread state current, never touches main's `Py<T>` handlers (M4 review N3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RouteSignature {
+    /// Per route index: `(METHOD, path, gil)`.
+    pub(crate) routes: Vec<(String, String, bool)>,
+    pub(crate) before_hooks: usize,
+    pub(crate) after_hooks: usize,
+}
+
+impl RouteSignature {
+    /// `table` up to its seal, or the whole table if it has none (a worker's table: a
+    /// worker is never sealed).
+    pub(crate) fn of(table: &RouteTable) -> Self {
+        let sealed = table.sealed.unwrap_or(Sealed {
+            routes: table.route_keys.len(),
+            before_hooks: table.before_hooks.len(),
+            after_hooks: table.after_hooks.len(),
+        });
+        RouteSignature {
+            routes: table.route_keys[..sealed.routes]
+                .iter()
+                .zip(&table.requires_gil)
+                .map(|((method, path), &gil)| (method.clone(), path.clone(), gil))
+                .collect(),
+            before_hooks: sealed.before_hooks,
+            after_hooks: sealed.after_hooks,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.routes.is_empty() && self.before_hooks == 0 && self.after_hooks == 0
+    }
+
+    /// Both signatures, one route per line, with the first differing index marked.
+    pub(crate) fn describe_mismatch(expected: &Self, got: &Self) -> String {
+        let first_diff = expected
+            .routes
+            .iter()
+            .zip(&got.routes)
+            .position(|(a, b)| a != b)
+            .unwrap_or_else(|| expected.routes.len().min(got.routes.len()));
+        let list = |s: &Self| {
+            let mut out = String::new();
+            for (i, (m, p, gil)) in s.routes.iter().enumerate() {
+                let mark = if i == first_diff {
+                    "  <-- first difference"
+                } else {
+                    ""
+                };
+                let gil = if *gil { " gil=True" } else { "" };
+                out.push_str(&format!("    [{i}] {m} {p}{gil}{mark}\n"));
+            }
+            out.push_str(&format!(
+                "    before_request hooks: {}, after_request hooks: {}\n",
+                s.before_hooks, s.after_hooks
+            ));
+            out
+        };
+        format!(
+            "the main interpreter registered:\n{}this worker's script registered:\n{}",
+            list(expected),
+            list(got)
+        )
+    }
+}
+
 impl RouteTable {
     pub(crate) fn new() -> Self {
         RouteTable {
