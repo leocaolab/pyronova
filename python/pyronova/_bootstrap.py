@@ -683,9 +683,11 @@ _ISO = {"worker_dir": None, "path_inserted": False, "isolated": set()}
 _ISO_WARN_BYTES = int(_os.environ.get("PYRONOVA_ISOLATE_WARN_BYTES", str(100 * 1024 * 1024)))
 
 
-def _iso_transient_override():
-    """Force-allow single-phase extension loads in THIS interpreter, returning
-    (previous_value, ok). Pair with `_iso_restore_override` in a try/finally.
+def _iso_transient_override(value=-1):
+    """Set THIS interpreter's multi-interp extension check override (-1: allow
+    extensions that don't support sub-interpreters; 1: enforce the check),
+    returning (previous_value, ok). Pair with `_iso_restore_override` in a
+    try/finally.
 
     The override MUST be transient. `_override_multi_interp_extensions_check` is a
     per-interpreter GLOBAL switch: leaving it on lets the NEXT un-isolated
@@ -697,7 +699,7 @@ def _iso_transient_override():
     raises there — no per-worker copy is needed anyway)."""
     import _imp
     try:
-        return _imp._override_multi_interp_extensions_check(-1), True
+        return _imp._override_multi_interp_extensions_check(value), True
     except RuntimeError:
         return None, False
 
@@ -709,22 +711,39 @@ def _iso_restore_override(prev):
 
 
 def _iso_resolve_src(lib):
-    """On-disk source dir (package) or file (single-file ext) for `lib`, or None.
+    """On-disk source dir (package) or file (single-file ext) for `lib` in the
+    ORIGINAL install, or None.
 
-    Uses PathFinder (searches sys.path directly, ignoring sys.modules) rather
-    than importlib.util.find_spec: a single-phase extension re-init can leave the
-    module in sys.modules with __spec__=None (seen with pydantic_core's internal
-    _pydantic_core.so), and find_spec() raises ValueError on such an entry."""
-    import importlib.util, importlib.machinery
+    Searches sys.path without the isolate root. Once one lib is isolated, this
+    worker's clone dir is on sys.path, and it can already hold a clone of the
+    NEXT lib (clone dirs are reused across runs). Resolving to that clone made
+    `_iso_clone_lib` compare the clone against itself, find the signature
+    stale, rmtree it and copy from the path it had just deleted; the retry then
+    loaded the shared site-packages file (sklearn after scipy: "Interpreter
+    change detected - this module can only be loaded into one interpreter per
+    process").
+
+    Uses PathFinder (searches the given path directly, ignoring sys.modules)
+    rather than importlib.util.find_spec: a single-phase extension re-init can
+    leave the module in sys.modules with __spec__=None (seen with pydantic_core's
+    internal _pydantic_core.so), and find_spec() raises ValueError on such an
+    entry."""
+    import sys, importlib.util, importlib.machinery
+    root = _os.path.realpath(_os.environ.get("PYRONOVA_ISOLATE_DIR", "/tmp/pyronova-isolate"))
+    path = [p for p in sys.path
+            if not (_os.path.realpath(p or ".") + _os.sep).startswith(root + _os.sep)]
     try:
-        spec = importlib.machinery.PathFinder().find_spec(lib)
+        spec = importlib.machinery.PathFinder.find_spec(lib, path)
     except (ValueError, ImportError, AttributeError):
         spec = None
     if spec is None:
+        # Not on a plain path entry (e.g. an editable install's own finder).
         try:
             spec = importlib.util.find_spec(lib)
         except (ValueError, ImportError, AttributeError):
             spec = None
+        if spec is not None and (_os.path.realpath(spec.origin or "") + _os.sep).startswith(root + _os.sep):
+            spec = None  # that's a clone, not the original
     if spec is None:
         return None
     if spec.submodule_search_locations:
@@ -981,15 +1000,16 @@ def _pyronova_isolate_libs():
 
 # -- Load-time override: a meta_path finder for C extensions -----------------
 #
-# A single-phase C extension refuses to load in a sub-interpreter unless the
-# per-interpreter override is set. We set it BEFORE the load (not after a failed
-# attempt): a meta_path finder swaps the real ExtensionFileLoader for one that
-# flips the transient override around exec_module. Because the load never fails-
-# then-retries, it can't leave a half-registered def in CPython's PROCESS-GLOBAL
+# An extension that doesn't support per-interpreter GILs refuses to load in a
+# worker unless the per-interpreter override is set. A meta_path finder swaps the
+# real ExtensionFileLoader for one that sets the override only for this worker's
+# private copies, and builds those in the worker without CPython's PROCESS-GLOBAL
 # extension table (`_PyRuntime.imports.extensions`) — the table `sys.modules`
-# eviction can't clear, whose pollution made a warm restart (reused clone) abort
-# with "cannot load module more than once per process". Declared libs (pre-staged
-# clones already on sys.path) therefore load isolated on the first try.
+# eviction can't clear, whose pollution by a failed-then-retried load of the same
+# clone made a warm restart abort with "cannot load module more than once per
+# process". A load that fails is always of a shared file, and its retry is of a
+# clone: a different file, so a different key. Declared libs (pre-staged clones
+# already on sys.path) load isolated on the first try.
 
 import builtins as _builtins
 import importlib.machinery as _machinery
@@ -1006,21 +1026,105 @@ def _iso_is_private_clone(path):
     return _os.path.realpath(path).startswith(wd + _os.sep)
 
 
-def _iso_init_here(spec):
-    """Run a single-phase extension's PyInit in THIS interpreter, or return None
-    for a multi-phase one (CPython already creates those here).
+def _iso_dynamic_strtab(path):
+    """The string table of `path`'s dynamic symbols (ELF `.dynstr`, Mach-O
+    `LC_SYMTAB` strings), or None if the file isn't a binary this can read.
 
-    Since 3.13 CPython runs every single-phase init function in the MAIN
-    interpreter and hands the sub-interpreter a shallow copy of the resulting
-    module dict (import.c `switch_to_main_interpreter` /
-    `reload_singlephase_extension`). The module's objects then live on main's
-    obmalloc heap, and the first one the worker mutates frees main's memory into
-    its own allocator. Measured with scipy's f2py `_fblas` on 3.14: a setattr on a
-    fortran object resizes its dict -> `free(): invalid size`.
+    Only the string table: the names of the symbols the binary imports are all
+    in it, and it is a small slice of a file that can be hundreds of MB.
 
-    Only for a private clone: nothing else loads that file, so skipping CPython's
-    process-wide extension registry can't double-initialize its C statics."""
-    import ctypes, sys
+    Imports nothing: it runs while an extension is being loaded, which can be in
+    the middle of importing `struct` (for its `_struct`)."""
+    def le(b):
+        return int.from_bytes(b, "little")
+
+    def be(b):
+        return int.from_bytes(b, "big")
+
+    with open(path, "rb") as f:
+        head = f.read(64)
+        base = 0
+        if head[:4] == b"\xca\xfe\xba\xbe":  # universal Mach-O: pick this arch's slice
+            want = {"arm64": 0x0100000C, "x86_64": 0x01000007}.get(_os.uname().machine)
+            f.seek(8)
+            for _ in range(be(head[4:8])):
+                arch = f.read(20)  # cputype, cpusubtype, offset, size, align
+                if be(arch[0:4]) == want:
+                    base = be(arch[8:12])
+                    break
+            else:
+                return None
+            f.seek(base)
+            head = f.read(64)
+        if head[:4] == b"\xcf\xfa\xed\xfe":  # Mach-O 64, little-endian
+            f.seek(base + 32)
+            for _ in range(le(head[16:20])):  # ncmds
+                cmd = f.read(8)
+                body = f.read(le(cmd[4:8]) - 8)
+                if le(cmd[0:4]) == 0x2:  # LC_SYMTAB: symoff, nsyms, stroff, strsize
+                    f.seek(base + le(body[8:12]))
+                    return f.read(le(body[12:16]))
+            return None
+        if head[:4] == b"\x7fELF" and head[4] == 2 and head[5] == 1:  # ELF64 LE
+            shoff, shentsize, shnum = le(head[0x28:0x30]), le(head[0x3A:0x3C]), le(head[0x3C:0x3E])
+            if not shoff or not shnum:
+                return None
+            f.seek(shoff)
+            sections = []  # (sh_type, sh_offset, sh_size, sh_link)
+            for _ in range(shnum):
+                sh = f.read(shentsize)
+                sections.append((le(sh[4:8]), le(sh[24:32]), le(sh[32:40]), le(sh[40:44])))
+            for sh_type, _off, _size, link in sections:
+                if sh_type == 11:  # SHT_DYNSYM; sh_link = its string table
+                    _t, off, size, _l = sections[link]
+                    f.seek(off)
+                    return f.read(size)
+            return None
+    return None
+
+
+def _iso_is_single_phase_file(path):
+    """True if the extension at `path` is (or may be) single-phase init, decided
+    WITHOUT running its init.
+
+    A single-phase `PyInit_*` builds its module with `PyModule_Create2` (what the
+    `PyModule_Create` macro calls); a multi-phase one only returns its def
+    through `PyModuleDef_Init`. So a binary that imports `PyModule_Create2` is
+    treated as single-phase. Checked against the runtime answer (the def's
+    `m_slots`) for every extension module numpy, scipy, sklearn, orjson,
+    pydantic_core, msgpack and isojson load (203 on macOS/Mach-O, 186 on
+    Linux/ELF): all 9 single-phase ones flagged, no multi-phase one flagged. A binary this can't read counts as single-phase:
+    the cost of a wrong yes is one extra per-worker copy."""
+    try:
+        strtab = _iso_dynamic_strtab(path)
+    except (OSError, ValueError, IndexError):
+        strtab = None
+    if strtab is None:
+        return True
+    return b"PyModule_Create2\x00" in strtab
+
+
+def _iso_create_here(spec):
+    """Create an extension module entirely in THIS interpreter: call its
+    `PyInit_*` here, and for a multi-phase one build the module from the
+    returned def here. None if the binary has no `PyInit_<name>` symbol.
+
+    CPython 3.13+ runs every extension's `PyInit_*` in the MAIN interpreter
+    (import.c `import_run_extension` -> `switch_to_main_interpreter`):
+    - single-phase: the module is built there and the worker gets a shallow
+      copy of its dict, so its objects live on main's obmalloc heap and the
+      first one the worker mutates frees main's memory into its own allocator
+      (scipy's f2py `_fblas`: setattr on a fortran object -> `free(): invalid
+      size`);
+    - multi-phase: `PyInit_*` should only return the def, but many also call
+      `import_array()` there (scipy's `_arpacklib`), which then imports numpy in
+      main and stores MAIN's numpy C-API table in the binary's statics.
+
+    Only for a private clone: nothing else loads that file, so skipping
+    CPython's process-wide extension registry can't double-initialize its C
+    statics. Exec slots run later through the loader's `exec_module`."""
+    import sys
+    ctypes = _iso_ctypes
     short = spec.name.rpartition(".")[2]
     lib = ctypes.PyDLL(spec.origin, mode=sys.getdlopenflags())
     try:
@@ -1042,7 +1146,12 @@ def _iso_init_here(spec):
     ob_type = api.PyObject_Type(ptr)
     api.Py_DecRef(ctypes.c_void_p(ob_type))
     if ob_type == ctypes.addressof(ctypes.c_char.in_dll(api, "PyModuleDef_Type")):
-        return None  # multi-phase: CPython creates it in this interpreter anyway
+        # multi-phase: CPython's own next step, here instead of after its switch
+        # to main (it also enforces Py_mod_multiple_interpreters under the
+        # current override). The def stays borrowed, as CPython keeps it.
+        api.PyModule_FromDefAndSpec2.restype = ctypes.py_object
+        api.PyModule_FromDefAndSpec2.argtypes = [ctypes.c_void_p, ctypes.py_object, ctypes.c_int]
+        return api.PyModule_FromDefAndSpec2(ptr, spec, sys.api_version)
     obj = ctypes.cast(ptr, ctypes.py_object).value  # takes its own reference
     api.Py_DecRef(ctypes.c_void_p(ptr))             # release the one PyInit returned
     api.PyModule_GetDef.restype = ctypes.c_void_p
@@ -1057,23 +1166,73 @@ def _iso_init_here(spec):
 
 
 class _IsolatingExtensionLoader:
-    """Wraps an ExtensionFileLoader so its dlopen+PyInit runs under a transient
-    override. Delegates the rest of the loader protocol to the real loader."""
+    """Wraps an ExtensionFileLoader. Decides, per file, how a worker may load it:
+
+    - a file in this worker's private clone dir: under the override, built
+      entirely in this worker (`_iso_create_here`);
+    - a shared file (site-packages, stdlib): with CPython's own
+      `Py_mod_multiple_interpreters` check enforced, so an extension that
+      doesn't support per-interpreter GILs fails with an isolation error and
+      `_iso_import` clones its package. A single-phase one is refused before its
+      init runs (CPython would run that init in the main interpreter).
+
+    Any ImportError leaving the loader carries the module's name, so
+    `_iso_import` knows which package to clone even when a package re-raises it
+    as its own error."""
 
     def __init__(self, inner):
         self._inner = inner
 
     def create_module(self, spec):
-        # For an extension the .so is dlopen'd + PyInit run HERE, and the
-        # single-phase "does not support loading in subinterpreters" check fires
-        # here (not in exec_module, which is a no-op for single-phase exts). So
-        # the override must wrap create_module.
+        try:
+            if _iso_is_private_clone(spec.origin):
+                prev, _ok = _iso_transient_override()
+                try:
+                    mod = _iso_create_here(spec)
+                    return mod if mod is not None else self._inner.create_module(spec)
+                finally:
+                    _iso_restore_override(prev)
+            prev, ok = _iso_transient_override(1)  # enforce the check
+            try:
+                if ok and _iso_is_single_phase_file(spec.origin):
+                    raise _iso_shared_single_phase_error(spec)
+                return self._inner.create_module(spec)
+            finally:
+                _iso_restore_override(prev)
+        except ImportError as exc:
+            if exc.name is None:
+                exc.name = spec.name
+            raise
+
+    def exec_module(self, module):
+        clone = _iso_is_private_clone(getattr(module, "__file__", None))
+        prev, _ok = _iso_transient_override(-1 if clone else 1)
+        try:
+            self._inner.exec_module(module)
+        except ImportError as exc:
+            if exc.name is None:
+                exc.name = module.__name__
+            raise
+        finally:
+            _iso_restore_override(prev)
+
+    def __getattr__(self, attr):
+        # get_filename / is_package / get_code / get_source / etc.
+        return getattr(self._inner, attr)
+
+
+class _SharedBuiltinLoader:
+    """A built-in single-phase module (faulthandler, pulled in by
+    sklearn -> joblib -> loky) has no file to clone, so it can only load
+    shared, under the override. Known hazard: CPython runs its init in the main
+    interpreter, so its objects are main's."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def create_module(self, spec):
         prev, _ok = _iso_transient_override()
         try:
-            if _ok and _iso_is_private_clone(spec.origin):
-                mod = _iso_init_here(spec)
-                if mod is not None:
-                    return mod
             return self._inner.create_module(spec)
         finally:
             _iso_restore_override(prev)
@@ -1086,17 +1245,21 @@ class _IsolatingExtensionLoader:
             _iso_restore_override(prev)
 
     def __getattr__(self, attr):
-        # get_filename / is_package / get_code / get_source / etc.
         return getattr(self._inner, attr)
 
 
 class _IsolatingExtensionFinder:
-    """meta_path finder that, for C-extension imports ONLY, swaps in a loader
-    that sets the transient override around the load. Everything else returns
-    None so the default finders handle it. Uses PathFinder (which does not
-    consult meta_path) to resolve the real spec, so there's no recursion."""
+    """meta_path finder that, for C-extension and built-in imports ONLY, swaps
+    in the loaders above. Everything else returns None so the default finders
+    handle it. Uses PathFinder / BuiltinImporter (which don't consult
+    meta_path) to resolve the real spec, so there's no recursion."""
 
     def find_spec(self, fullname, path, target=None):
+        if path is None:
+            spec = _machinery.BuiltinImporter.find_spec(fullname)
+            if spec is not None:
+                spec.loader = _SharedBuiltinLoader(spec.loader)
+                return spec
         try:
             spec = _machinery.PathFinder.find_spec(fullname, path, target)
         except (ImportError, AttributeError, ValueError):
@@ -1107,24 +1270,58 @@ class _IsolatingExtensionFinder:
         return spec
 
 
-# -- REACTIVE self-heal: clone an undeclared lib on the load that still collides
+# -- REACTIVE self-heal: clone an undeclared lib on the load that collides
 #
-# With the override always set at load time (finder above), a single-phase ext
-# loads shared into the FIRST worker that touches it; a LATER worker loading the
-# same shared file gets "cannot load module more than once per process". That is
-# the signal that this undeclared lib needs a per-worker copy. We catch it at the
-# top-level import, clone the package, and restart the import — which now resolves
-# to the private clone (a DIFFERENT file → different registry key, so no double-
-# load). The failed attempt was on the original file; the retry is on the clone.
+# A shared extension file that doesn't support per-interpreter GILs fails to
+# load in a worker (CPython's own check, enforced by the loader above; or the
+# lib's own guard: numpy "cannot load module more than once per process",
+# Cython "can only be loaded into one interpreter per process"). That is the
+# signal that the lib needs a per-worker copy. We catch it at the top-level
+# import, clone the package the failing module belongs to, and restart the
+# import, which then resolves to the private clone (a DIFFERENT file).
 
-def _iso_is_isolation_error(exc):
-    """True for the isolation-class ImportErrors a per-worker clone can fix."""
-    msg = str(exc)
-    return (
-        "does not support loading in subinterpreters" in msg  # single-phase, no override
-        or "cannot load module more than once per process" in msg  # shared 2nd load
-        or "do not yet support subinterpreters" in msg  # PyO3 #576
+_ISO_SHARED_SINGLE_PHASE = "single-phase extension loaded from a shared file"
+
+
+def _iso_shared_single_phase_error(spec):
+    return ImportError(
+        f"{spec.name}: {_ISO_SHARED_SINGLE_PHASE} ({spec.origin}). CPython 3.13+ "
+        "runs a single-phase init in the main interpreter and gives this worker "
+        "objects owned by main's heap, so it must load from this worker's private "
+        f"copy; pyronova clones {spec.name.split('.')[0]!r} for that. If this "
+        "error reached you, the clone could not be made.",
+        name=spec.name, path=spec.origin,
     )
+
+
+_ISO_ERROR_MARKERS = (
+    "does not support loading in subinterpreters",  # CPython's multi-interp check
+    "cannot load module more than once per process",  # numpy's guard
+    "do not yet support subinterpreters",  # PyO3 #576
+    "this module can only be loaded into one interpreter per process",  # Cython
+    # CPython ran PyInit in main (import.c) and it raised there, e.g. an
+    # `import_array()` in PyInit hitting numpy's guard in the main interpreter
+    "failed to import from subinterpreter due to exception",
+    _ISO_SHARED_SINGLE_PHASE,
+)
+
+
+def _iso_offending_module(exc):
+    """The module whose load raised an isolation-class ImportError, found along
+    the cause/context chain (packages re-raise their extension's error as their
+    own: scipy "The `scipy` install you are using seems to be broken", sklearn
+    `raise_build_error`). "" if it is one but carries no name; None if the
+    chain has no isolation-class error."""
+    seen = set()
+    found = None
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, ImportError) and any(m in str(exc) for m in _ISO_ERROR_MARKERS):
+            if exc.name:
+                return exc.name
+            found = ""
+        exc = exc.__cause__ or exc.__context__
+    return found
 
 
 def _iso_import(name, globals=None, locals=None, fromlist=(), level=0):
@@ -1136,38 +1333,34 @@ def _iso_import(name, globals=None, locals=None, fromlist=(), level=0):
         return _iso_real_import(name, globals, locals, fromlist, level)
     _iso_in_hook = True
     try:
-        try:
-            return _iso_real_import(name, globals, locals, fromlist, level)
-        except ImportError as exc:
-            if not _iso_is_isolation_error(exc):
-                raise  # unrelated ImportError — surface the real error
-            # Try to isolate the top-level package (the outer import name is the
-            # top-level statement; fall back to the offending module's name).
-            top = (name or getattr(exc, "name", "") or "").split(".")[0]
-            if top and _iso_isolate(top):
-                _iso_evict(top)  # cloned → drop the partial so the retry loads it
-            # Retry under a TRANSIENT override — which covers BOTH cases:
-            #   • clonable file-ext (numpy/orjson/...): worker_dir is now on
-            #     sys.path, so it resolves to the private clone (loaded via the
-            #     override here or the finder's, both fine);
-            #   • UN-clonable single-phase ext (a built-in / stdlib .so like
-            #     `faulthandler`, pulled in transitively by sklearn→joblib→loky):
-            #     it has no clonable source, so `_iso_isolate` was a no-op — it
-            #     just needs the override to load SHARED, exactly as it did under
-            #     the old persistent override. The finder only wraps
-            #     ExtensionFileLoader, not BuiltinImporter, so this explicit
-            #     override is what makes built-ins load.
-            # A second failure propagates (never masked, never loops).
-            prev, _ok = _iso_transient_override()
+        outer = (name or "").split(".")[0] if level == 0 else ""
+        cloned = set()
+        while True:
             try:
                 return _iso_real_import(name, globals, locals, fromlist, level)
-            finally:
-                _iso_restore_override(prev)
+            except ImportError as exc:
+                bad = _iso_offending_module(exc)
+                if bad is None:
+                    raise  # unrelated ImportError — surface the real error
+                top = (bad or outer).split(".")[0]
+                # One clone per package per statement: a package that still
+                # fails from its clone surfaces its real error, never loops.
+                if not top or top in cloned or not _iso_isolate(top):
+                    raise
+                cloned.add(top)
+                # Drop the statement's partial import too, so the retry
+                # re-resolves it with the clone dir on sys.path.
+                if outer:
+                    _iso_evict(outer)
     finally:
         _iso_in_hook = False
 
 
 _pyronova_isolate_libs()
+# The loader's own helpers use ctypes. Import it fully BEFORE the finder is
+# installed: once installed, loading `_ctypes` goes through the loader, which
+# would then see a half-initialized `ctypes`.
+import ctypes as _iso_ctypes
 import sys as _sys_iso
 _sys_iso.meta_path.insert(0, _IsolatingExtensionFinder())
 _builtins.__import__ = _iso_import
