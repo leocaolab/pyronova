@@ -121,16 +121,35 @@
     `test_subinterp_hooks.py:11`, `test_env_var_worker.py:30` (injected `_Response`) and
     the already-vacuous `test_subinterp_memory_regression.py:94`.
   - FR-12 surface-parity test.
+  - **rev3 additions (M4 readiness review, 2026-09-23):**
+    - FR-2 engine-level seal (B1) and raw `run()` off-main raises (N10).
+    - FR-4 per decision Q-2 (B2, pending): option (a) registration on first route/hook in
+      a worker, or option (b) migrate the 5 raw-engine files.
+    - FR-19 `SubInterpreterWorker::end(self)` teardown incl. failed-start paths (B3), and
+      the "forgotten worker" exit path in §12 (N8).
+    - FR-11 guards in the finder / `_iso_evict` / `_iso_isolate` / `isolate()` (B5).
+    - FR-20 script executed as a registered module; bootstrap and async engine in their
+      own namespaces (N9, N1d).
+    - C5 N1 (a)–(g): `_worker_to_response`, unified return mapping, panic → RuntimeError,
+      handlers fetched once, Rust-built `Request` from `_worker_recv`.
+    - C3: plain `RouteSignature` instead of `&RouteTable` (N3); no fallback binding (N2).
+    - C4: `attach_to` current-tstate assertion; `assume_attached` allowlist; remove the
+      `db_bridge.rs` and `worker.rs` allowlist entries (N4, N5).
+    - C8: `PyronovaApp.set_script_path` for the CLI (N15).
+    - Tests: the three Layer-2 probe apps and their tests are rewritten **only after the
+      user approves** (Q-3, B4); source-grep tests kept green (N6).
+- **Starts only after** decisions Q-2 and Q-3.
 - **Depends:** M0, M1, M2, M3.
 - **Verification:** E2E-1, E2E-2, E2E-3 (a, b), E2E-4, E2E-5 (incl. worker `fetch_iter`),
-  E2E-6, E2E-7, E2E-7b, E2E-10, E2E-11 and E2E-13 … E2E-18 on macOS + Linux, plus
-  E2E-8/9 re-run against the real activation.
+  E2E-6, E2E-7, E2E-7b, E2E-10, E2E-11 and E2E-13 … E2E-22 (incl. 14b) on macOS + Linux,
+  plus E2E-8/9 re-run against the real activation (after the Q-3 rewrite). E2E-15 runs the
+  reactive pydantic path on both OSes.
 - **Shippable:** yes. This is the user-visible release: real `SharedState`/DB/`model=`
   validation in workers, and headers on the async path. Release notes are §8.7.
 
 ### M5: Hardening, performance and docs
 - **Scope:**
-  - NFR-1…NFR-6 measured on a quiet bluewhale: `bench-compare` (load avg < 3), worker
+  - NFR-1…NFR-6 (incl. NFR-2b/3b for `model=` apps) measured on a quiet bluewhale: `bench-compare` (load avg < 3), worker
     init time, RSS per worker, grill W=16 180 s, 20× graceful SIGINT.
   - E2E-12.
   - Doc reconciliation (impl map §2):

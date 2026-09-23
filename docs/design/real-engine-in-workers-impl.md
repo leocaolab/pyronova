@@ -17,6 +17,11 @@
 > review's remaining M3/M4 findings (B1, B6, B7, N1-N10, N12, N13, N17, N18). Prose steps
 > that changed are marked *(rev2)*; new mapping rows are at the end of §2; the gate record
 > is §3 "Round 3" and "Round 4".
+>
+> **rev3 (2026-09-23, branch `design/layer2-rev3`, base `8d89297` = M0–M3 merged):** resolves
+> the M4 readiness review (fresh auditor, 5 blocking + 15 non-blocking). Gate record: §3
+> "Round 5" and "Round 6". Two items are decisions pending with the user (Q-2, Q-3 in the
+> design); M4 does not start until they are answered.
 
 ## 1. CUJ implementations (prose)
 
@@ -236,3 +241,41 @@ auditor, so it is the writer re-checking the rev2 edits, not an independent audi
   §8.1 and the roadmap agree that the seal is main-only and idempotent.
 - No new blocking findings from this re-check. **Recommendation:** run one more fresh
   auditor pass on rev2 before M4 starts (M3 is inert and can start now).
+
+### Round 5: M4 readiness, fresh auditor (2026-09-23)
+A separate reviewer with no context audited main@`8d89297` (M0–M3 merged) for M4 readiness
+and found **5 blocking** and 15 non-blocking gaps. Again the writer's rev2 self-check had
+missed them. Blocking, each re-checked against the code by the writer before resolving:
+- B1: only `Pyronova.run()` seals (`app.py:1068`); engine-level `PyronovaApp.run()`
+  (`app.rs:419`) and `__bench_*_impl` (`app.rs:1371,1462`) never do, so raw-engine runs and
+  benches have no sealed prefix. → FR-2: engine seals at the freeze if unsealed.
+- B2: `_register_worker_app` is called only from `Pyronova.__init__` (`app.py:190`), so raw
+  `PyronovaApp()` scripts (5 files) fail FR-4. → FR-4 + design Q-2, **decision pending**.
+- B3: `SubInterpreterWorker` fields become `Py<T>` in M4, but every exit ends the
+  interpreter before dropping the worker (`tpc.rs:514-518,657-661`, `pool.rs:511`), and
+  failed-start paths drop built workers with main's tstate current. → FR-19
+  `SubInterpreterWorker::end(self)`, §12, E2E-19.
+- B4: the three Layer-2 probe apps detect workers by a global M4 deletes. → design §9 +
+  Q-3, **approval needed** before those tests change.
+- B5: `_iso_import` evicts the user's outer package (`_bootstrap.py:1353`), so a reactive
+  isolation under `from pyronova.config import …` re-executes `pyronova` (measured by the
+  reviewer: a second `pyronova.engine` module object). → FR-11 extended to the finder,
+  evict and isolate paths; E2E-14b.
+Non-blocking N1–N15: all resolved in the design (mapping in its Open questions). One writer
+correction during resolution: the reviewer's `extract_param` citation is `db.rs:149`, and
+the TPC worker constructor call is `app.rs:1301` (`app.rs:1063` constructs the pool).
+
+### Round 6: rev3 re-check (writer, 2026-09-23)
+**Method gap, stated plainly:** writer self-check in a fork that cannot spawn a fresh
+auditor. Rounds 3 and 5 show this self-check misses real gaps, so treat its "0 new
+blocking" as weak evidence. Checked:
+- Every new `file:line` in rev3 re-read at `8d89297` (freeze `app.rs:471`, worker
+  constructor callers, `run_on_db_rt` `db.rs:89`, `extract_param` `db.rs:149`,
+  `emit_python_log` `worker_id` default `logging.rs:213`, TPC fallback `handlers/tpc.rs:100-106`).
+- Traceability: FR-19 → E2E-19; FR-20 → E2E-20; FR-11 (extended) → E2E-14/14b; C8 CLI →
+  E2E-21; FR-4 (B2) → E2E-22; NFR-2b/3b → M5 measurement; every new item is in roadmap M4.
+- Consistency: C3 no longer binds a fallback; §8.1, §7 and C3 use the plain
+  `RouteSignature`; §12 and NFR-5 no longer assume `os._exit`.
+- Result: no new blocking finding from the writer. **M4 cannot start** until Q-2 and Q-3
+  are decided; a fresh auditor pass on rev3 is recommended if either decision changes the
+  design beyond the options written down.
