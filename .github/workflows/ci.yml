@@ -57,6 +57,21 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.13", "3.14"]
+    # Postgres for tests/test_db_pg.py and tests/test_db_subinterp.py, which skip
+    # without PYRONOVA_TEST_PG_DSN.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pyronova_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -78,6 +93,8 @@ jobs:
           maturin develop --release
 
       - name: Integration — full pytest suite (GIL + sub-interp)
+        env:
+          PYRONOVA_TEST_PG_DSN: postgres://postgres:postgres@localhost:5432/pyronova_test
         run: |
           source .venv/bin/activate
           # E2E drivers live under tests/e2e/ (not collected by pytest).

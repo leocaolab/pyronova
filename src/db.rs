@@ -15,11 +15,11 @@
 //! Architecture notes:
 //!   * Using a dedicated tokio runtime rather than the hyper server's
 //!     runtime avoids cross-runtime coupling and keeps DB I/O off the
-//!     accept loop. Worker threads (spawn_blocking in the GIL path or
-//!     sub-interp pool threads) block on `rt.block_on(future)`; the
-//!     pool-runtime drives the future to completion while the blocking
-//!     thread waits.
-//!   * `py.detach()` around block_on so the GIL is released during DB I/O.
+//!     accept loop. Callers hand the future to that runtime with
+//!     `run_on_db_rt` and wait on a std channel. They never call
+//!     `Runtime::block_on`, which panics on a thread already inside a
+//!     Tokio context (a TPC worker runs its handlers inside one).
+//!   * `py.detach()` around the wait so the GIL is released during DB I/O.
 //!     That's the whole point — other Python threads make progress while
 //!     this one waits on the wire.
 //!   * sqlx::PgPool is `Clone`-via-`Arc` internally, so the static
@@ -71,6 +71,54 @@ pub(crate) fn runtime() -> &'static Runtime {
 pub(crate) fn pool_ref() -> PyResult<&'static sqlx::PgPool> {
     PG_POOL.get().ok_or_else(|| {
         PyRuntimeError::new_err("PgPool not initialized — call PgPool.connect() first")
+    })
+}
+
+/// Run a `Send + 'static` future on the DB runtime and wait for its result on the
+/// calling thread.
+///
+/// `Runtime::block_on` panics with "Cannot start a runtime from within a runtime" when
+/// the calling thread is already inside a Tokio context, which is where TPC workers run
+/// handlers (a `current_thread` runtime + `LocalSet`). `spawn` has no such check, and
+/// the caller waits on a std channel instead. Callers release the GIL (`py.detach`)
+/// around this call.
+pub(crate) fn run_on_db_rt<F, T>(fut: F) -> Result<T, &'static str>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel::<T>(1);
+    runtime().spawn(async move {
+        // If the future panics, the sender drops unsent and `recv` below reports it.
+        let _ = tx.send(fut.await);
+    });
+    rx.recv()
+        .map_err(|_| "pyronova-db runtime task panicked (spawned future did not complete)")
+}
+
+/// Wait for the next messages on a cursor channel without `blocking_recv`.
+///
+/// `tokio::sync::mpsc::Receiver::blocking_recv` panics inside a Tokio context (a TPC
+/// worker). The receive runs on the DB runtime instead, and this thread waits on a std
+/// channel (`run_on_db_rt`). One round trip returns the first message plus whatever
+/// else is already buffered, up to `max`. An empty batch means the sender is gone (EOF).
+/// The receiver is moved into the task and handed back with the batch.
+pub(crate) fn recv_batch<T: Send + 'static>(
+    mut rx: tokio::sync::mpsc::Receiver<T>,
+    max: usize,
+) -> Result<(tokio::sync::mpsc::Receiver<T>, Vec<T>), &'static str> {
+    run_on_db_rt(async move {
+        let mut batch = Vec::new();
+        if let Some(first) = rx.recv().await {
+            batch.push(first);
+            while batch.len() < max {
+                match rx.try_recv() {
+                    Ok(m) => batch.push(m),
+                    Err(_) => break,
+                }
+            }
+        }
+        (rx, batch)
     })
 }
 
@@ -279,21 +327,27 @@ enum CursorMsg {
 
 /// Streaming result-set iterator. Constructed by `PgPool.fetch_iter(sql, ...)`.
 ///
-/// Memory contract: at any point in time at most `CURSOR_CAPACITY` rows
-/// (8) are buffered on the Rust side and 1 PyDict is live on the Python
-/// side (the one just yielded from `__next__`). This bounds memory at
-/// O(1) — compare to `fetch_all`, which peaks at O(2N) (Rust Vec<PgRow>
-/// AND Python list<dict> both alive while the conversion loop runs).
+/// Memory contract: at most `CURSOR_CAPACITY` rows (8) are buffered in the channel
+/// plus at most `CURSOR_CAPACITY` in `buf`, and 1 PyDict is live on the Python side
+/// (the one just yielded from `__next__`). This bounds memory at O(1), compared with
+/// `fetch_all`, which peaks at O(2N) (Rust Vec<PgRow> AND Python list<dict> both alive
+/// while the conversion loop runs).
 ///
-/// A dedicated task on the pool's tokio runtime drives the sqlx stream
-/// and pushes each row through a bounded mpsc channel. Python's
-/// blocking `__next__` reads from the receiver end with the GIL
-/// released. Dropping the cursor before EOF closes the channel, which
-/// aborts the driver task on its next send attempt — the sqlx
-/// connection returns to the pool cleanly.
+/// A dedicated task on the pool's tokio runtime drives the sqlx stream and pushes each
+/// row through a bounded async channel, so a slow consumer applies backpressure without
+/// blocking a runtime thread. `__next__` takes rows from that channel with `recv_batch`
+/// (GIL released), which works from any thread, including one inside a Tokio context.
+/// Dropping the cursor before EOF closes the channel, which stops the driver task on
+/// its next send; the sqlx connection returns to the pool cleanly.
 #[pyclass]
 pub(crate) struct PgCursor {
-    rx: Mutex<Option<tokio::sync::mpsc::Receiver<CursorMsg>>>,
+    state: Mutex<CursorState>,
+}
+
+struct CursorState {
+    /// `None` once the driver has finished (EOF or error delivered).
+    rx: Option<tokio::sync::mpsc::Receiver<CursorMsg>>,
+    buf: std::collections::VecDeque<CursorMsg>,
 }
 
 #[pymethods]
@@ -305,28 +359,36 @@ impl PgCursor {
     /// Pull the next row as a dict, or raise StopIteration at EOF,
     /// or raise RuntimeError on a database error.
     fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        // .unwrap() on poisoned mutex panics across FFI → UB per PyO3.
-        // Convert poisoning to PyRuntimeError so Python sees a normal
-        // exception (arc finding db-3). Same pattern on the put-back
-        // path below.
-        let rx_opt = {
-            self.rx
+        // A poisoned mutex becomes a PyRuntimeError, never a panic across FFI
+        // (arc finding db-3).
+        let msg = {
+            let mut st = self
+                .state
                 .lock()
-                .map_err(|e| PyRuntimeError::new_err(format!("cursor mutex poisoned: {e}")))?
-                .take()
-        };
-        let Some(mut rx) = rx_opt else {
-            return Err(PyStopIteration::new_err("cursor exhausted"));
-        };
-        let msg = py.detach(|| rx.blocking_recv());
-        match msg {
-            Some(CursorMsg::Row(row)) => {
-                *self.rx.lock().map_err(|e| {
-                    PyRuntimeError::new_err(format!("cursor mutex poisoned: {e}"))
-                })? = Some(rx);
-                row_to_dict(py, &row)
+                .map_err(|e| PyRuntimeError::new_err(format!("cursor mutex poisoned: {e}")))?;
+            if st.buf.is_empty() {
+                if let Some(rx) = st.rx.take() {
+                    let (rx, batch) = py
+                        .detach(|| recv_batch(rx, CURSOR_CAPACITY))
+                        .map_err(PyRuntimeError::new_err)?;
+                    if !batch.is_empty() {
+                        st.rx = Some(rx);
+                    }
+                    st.buf.extend(batch);
+                }
             }
-            Some(CursorMsg::Err(e)) => Err(PyRuntimeError::new_err(e)),
+            st.buf.pop_front()
+        };
+        match msg {
+            Some(CursorMsg::Row(row)) => row_to_dict(py, &row),
+            Some(CursorMsg::Err(e)) => {
+                // The driver stops after an error; nothing follows it.
+                if let Ok(mut st) = self.state.lock() {
+                    st.rx = None;
+                    st.buf.clear();
+                }
+                Err(PyRuntimeError::new_err(e))
+            }
             None => Err(PyStopIteration::new_err(py.None())),
         }
     }
@@ -374,11 +436,10 @@ impl PgPool {
             return Ok(PgPool);
         }
 
-        let rt = runtime();
         let dsn_owned = dsn.to_string();
         let pool = py
             .detach(|| {
-                rt.block_on(async move {
+                run_on_db_rt(async move {
                     PgPoolOptions::new()
                         .max_connections(max_connections)
                         .acquire_timeout(std::time::Duration::from_secs(acquire_timeout_secs))
@@ -386,6 +447,7 @@ impl PgPool {
                         .await
                 })
             })
+            .map_err(|e| PyConnectionError::new_err(format!("PgPool connect runtime: {e}")))?
             .map_err(|e| PyConnectionError::new_err(format!("PgPool connect: {e}")))?;
 
         let _ = PG_POOL.set(pool); // race-safe: first writer wins
@@ -401,19 +463,21 @@ impl PgPool {
         params: Vec<Py<PyAny>>,
     ) -> PyResult<Option<Py<PyDict>>> {
         let pool = pool_ref()?;
-        let rt = runtime();
         let bound = params
             .iter()
             .map(|p| extract_param(p.bind(py)))
             .collect::<PyResult<Vec<_>>>()?;
 
+        // The future runs on the DB runtime, so it must own its inputs.
+        let sql = sql.to_string();
         let row_opt = py
             .detach(|| {
-                rt.block_on(async {
-                    let q = sqlx::query(sql);
+                run_on_db_rt(async move {
+                    let q = sqlx::query(&sql);
                     bind_params_raw(q, &bound).fetch_optional(pool).await
                 })
             })
+            .map_err(|e| PyRuntimeError::new_err(format!("fetch_one runtime: {e}")))?
             .map_err(|e| PyRuntimeError::new_err(format!("fetch_one: {e}")))?;
 
         match row_opt {
@@ -480,7 +544,10 @@ impl PgPool {
         });
 
         Ok(PgCursor {
-            rx: Mutex::new(Some(rx)),
+            state: Mutex::new(CursorState {
+                rx: Some(rx),
+                buf: std::collections::VecDeque::new(),
+            }),
         })
     }
 
@@ -488,19 +555,21 @@ impl PgPool {
     #[pyo3(signature = (sql, *params))]
     fn fetch_all(&self, py: Python<'_>, sql: &str, params: Vec<Py<PyAny>>) -> PyResult<Py<PyList>> {
         let pool = pool_ref()?;
-        let rt = runtime();
         let bound = params
             .iter()
             .map(|p| extract_param(p.bind(py)))
             .collect::<PyResult<Vec<_>>>()?;
 
+        // The future runs on the DB runtime, so it must own its inputs.
+        let sql = sql.to_string();
         let rows = py
             .detach(|| {
-                rt.block_on(async {
-                    let q = sqlx::query(sql);
+                run_on_db_rt(async move {
+                    let q = sqlx::query(&sql);
                     bind_params_raw(q, &bound).fetch_all(pool).await
                 })
             })
+            .map_err(|e| PyRuntimeError::new_err(format!("fetch_all runtime: {e}")))?
             .map_err(|e| PyRuntimeError::new_err(format!("fetch_all: {e}")))?;
 
         let py_list = PyList::empty(py);
@@ -520,19 +589,21 @@ impl PgPool {
         params: Vec<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let pool = pool_ref()?;
-        let rt = runtime();
         let bound = params
             .iter()
             .map(|p| extract_param(p.bind(py)))
             .collect::<PyResult<Vec<_>>>()?;
 
+        // The future runs on the DB runtime, so it must own its inputs.
+        let sql = sql.to_string();
         let row = py
             .detach(|| {
-                rt.block_on(async {
-                    let q = sqlx::query(sql);
+                run_on_db_rt(async move {
+                    let q = sqlx::query(&sql);
                     bind_params_raw(q, &bound).fetch_one(pool).await
                 })
             })
+            .map_err(|e| PyRuntimeError::new_err(format!("fetch_scalar runtime: {e}")))?
             .map_err(|e| PyRuntimeError::new_err(format!("fetch_scalar: {e}")))?;
 
         let raw = row
@@ -678,20 +749,84 @@ impl PgPool {
     #[pyo3(signature = (sql, *params))]
     fn execute(&self, py: Python<'_>, sql: &str, params: Vec<Py<PyAny>>) -> PyResult<u64> {
         let pool = pool_ref()?;
-        let rt = runtime();
         let bound = params
             .iter()
             .map(|p| extract_param(p.bind(py)))
             .collect::<PyResult<Vec<_>>>()?;
 
+        // The future runs on the DB runtime, so it must own its inputs.
+        let sql = sql.to_string();
         let result = py
             .detach(|| {
-                rt.block_on(async {
-                    let q = sqlx::query(sql);
+                run_on_db_rt(async move {
+                    let q = sqlx::query(&sql);
                     bind_params_raw(q, &bound).execute(pool).await
                 })
             })
+            .map_err(|e| PyRuntimeError::new_err(format!("execute runtime: {e}")))?
             .map_err(|e| PyRuntimeError::new_err(format!("execute: {e}")))?;
         Ok(result.rows_affected())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A TPC worker runs handlers inside a `current_thread` runtime. These tests run the
+    /// waits from inside one.
+    fn inside_current_thread_runtime<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn recv_batch_drains_a_cursor_channel_from_a_tokio_context() {
+        let got = inside_current_thread_runtime(async {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<u32>(CURSOR_CAPACITY);
+            runtime().spawn(async move {
+                for i in 0..100 {
+                    tx.send(i).await.unwrap();
+                }
+            });
+            let mut got = Vec::new();
+            loop {
+                let (r, batch) = recv_batch(rx, CURSOR_CAPACITY).unwrap();
+                assert!(batch.len() <= CURSOR_CAPACITY);
+                if batch.is_empty() {
+                    break;
+                }
+                got.extend(batch);
+                rx = r;
+            }
+            got
+        });
+        assert_eq!(got, (0..100).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn run_on_db_rt_waits_from_a_tokio_context() {
+        let v = inside_current_thread_runtime(async { run_on_db_rt(async { 7 }).unwrap() });
+        assert_eq!(v, 7);
+    }
+
+    /// The failure `recv_batch` replaces: what `PgCursor.__next__` used to call.
+    #[test]
+    #[should_panic(expected = "Cannot block the current thread from within a runtime")]
+    fn blocking_recv_panics_in_a_tokio_context() {
+        inside_current_thread_runtime(async {
+            let (_tx, mut rx) = tokio::sync::mpsc::channel::<u32>(1);
+            rx.blocking_recv()
+        });
+    }
+
+    /// The failure `run_on_db_rt` replaces: what the sync `PgPool` methods used to call.
+    #[test]
+    #[should_panic(expected = "Cannot start a runtime from within a runtime")]
+    fn block_on_panics_in_a_tokio_context() {
+        inside_current_thread_runtime(async { runtime().block_on(async { 7 }) });
     }
 }

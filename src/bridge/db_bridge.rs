@@ -37,45 +37,9 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyString, PyTuple};
 
-use crate::db::{bind_params_raw, column_to_py, extract_param, pool_ref, row_to_dict, runtime};
-
-/// Run a `Send + 'static` future on the dedicated DB runtime and
-/// synchronously wait for the result on the calling thread.
-///
-/// Motivation: sub-interpreter workers under TPC run on a tokio
-/// `current_thread` runtime (one per TPC thread). Calling
-/// `rt.block_on(...)` from inside another tokio runtime context
-/// panics with "Cannot start a runtime from within a runtime", which
-/// is the whole reason DB-backed sub-interp routes used to be pinned
-/// to `gil=True` (main-interp bridge, which is on a plain std::thread).
-///
-/// `rt.spawn(...)` has no such check — it just queues a task onto the
-/// target runtime's worker pool. Pairing spawn with a sync mpsc
-/// channel gives us "block the caller while the DB future runs on
-/// the DB runtime", with no nested-runtime hazard.
-///
-/// The caller is responsible for releasing the GIL (via `py.detach`)
-/// around this call so peer sub-interpreters can make progress while
-/// we wait.
-fn run_on_db_rt<F, T>(fut: F) -> Result<T, &'static str>
-where
-    F: std::future::Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
-    let rt = runtime();
-    let (tx, rx) = std::sync::mpsc::sync_channel::<T>(1);
-    rt.spawn(async move {
-        // `let _ = ...` so a panic in fut.await doesn't double-panic the
-        // runtime. If the spawned task panics the sender drops unsent,
-        // the recv below sees Err, and we surface it as a Python
-        // exception (NOT .expect() — this is called inside an extern "C"
-        // cfunc and Rust 1.81+ aborts the process on an unwind across
-        // the FFI boundary).
-        let _ = tx.send(fut.await);
-    });
-    rx.recv()
-        .map_err(|_| "pyronova-db runtime task panicked (spawned future did not complete)")
-}
+use crate::db::{
+    bind_params_raw, column_to_py, extract_param, pool_ref, row_to_dict, run_on_db_rt,
+};
 
 // ---------------------------------------------------------------------------
 // Shared plumbing
