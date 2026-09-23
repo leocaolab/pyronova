@@ -81,8 +81,8 @@ strip = true           # Strip symbols: smaller binary, better icache
 # PyO3 with per-interpreter state for own-GIL sub-interpreters (leocaolab/pyo3).
 # Released as tags; the version stays 0.29.2 so `pyo3 = "0.29"` keeps matching.
 [patch.crates-io]
-pyo3 = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-09-23" }
-pyo3-ffi = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-09-23" }
-pyo3-macros = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-09-23" }
-pyo3-macros-backend = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-09-23" }
-pyo3-build-config = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-09-23" }
+pyo3 = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-09-23.2" }
+pyo3-ffi = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-09-23.2" }
+pyo3-macros = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-09-23.2" }
+pyo3-macros-backend = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-09-23.2" }
+pyo3-build-config = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-09-23.2" }
