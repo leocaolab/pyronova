@@ -27,7 +27,7 @@ def with_query(req):
 # Middleware (should work in sub-interp after_request fix)
 @my_server.after_request
 def add_header(req, resp):
-    return _Response(
+    return Response(
         body=resp.body,
         status_code=resp.status_code,
         content_type=resp.content_type,

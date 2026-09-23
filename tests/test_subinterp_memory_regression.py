@@ -88,11 +88,13 @@ def rss_kb(req):
 
 @app.get("/pyronovareq_alive")
 def pyronovareq_alive(req):
-    # Count _Request instances alive in THIS sub-interp.
+    # Request instances alive in THIS sub-interp. Request is not GC-tracked, so
+    # gc.get_objects() never lists it; every live instance holds one reference to
+    # its type, so the type's refcount rises and falls with them (measured: +100
+    # after retaining 100 requests, flat after 100 normal ones).
     for _ in range(2):
         gc.collect()
-    n = sum(1 for o in gc.get_objects() if type(o).__name__ == "_Request")
-    return {"alive": n}
+    return {"alive": sys.getrefcount(type(req))}
 
 @app.get("/dicts_alive")
 def dicts_alive(req):
@@ -349,10 +351,10 @@ def test_pyronovarequest_does_not_accumulate(server):
     for _ in range(30):
         worst = max(worst, _get("/pyronovareq_alive")["alive"])
     # Pre-fix: ~130 alive per sub-interp after 2000 hits. Allow a
-    # generous 20 to account for in-flight + pool churn + debug builds.
-    assert worst < 20, (
-        f"_Request leaks — {worst} alive after 2000 hits "
-        f"(baseline {baseline}). Expected < 20."
+    # generous 20 above the baseline for in-flight + pool churn + debug builds.
+    assert worst - baseline < 20, (
+        f"Request leaks — type refcount {worst} after 2000 hits "
+        f"(baseline {baseline}). Expected < baseline + 20."
     )
 
 
