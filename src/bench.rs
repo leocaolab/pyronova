@@ -101,6 +101,7 @@ pub(crate) fn run_inmem_bench(
 
         let handle = std::thread::Builder::new()
             .name(format!("pyronova-inmem-{i}"))
+            .stack_size(crate::python::PYTHON_THREAD_STACK)
             .spawn(move || {
                 try_pin_current(core_id);
                 elevate_thread_qos_macos();
@@ -351,6 +352,7 @@ pub(crate) fn run_loopback_bench(
 
         let h = std::thread::Builder::new()
             .name(format!("pyronova-lb-srv-{i}"))
+            .stack_size(crate::python::PYTHON_THREAD_STACK)
             .spawn(move || {
                 try_pin_current(core_id);
                 elevate_thread_qos_macos();

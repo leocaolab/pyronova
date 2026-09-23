@@ -38,3 +38,13 @@ pub(crate) mod interp;
 pub(crate) mod pool;
 pub(crate) mod stream;
 pub(crate) mod worker;
+
+/// Stack size for every thread that runs Python code.
+///
+/// Rust's `std::thread` default is 2 MiB; CPython's own threads get the
+/// pthread default (8 MiB on Linux). C extensions are written against the
+/// latter: OpenBLAS's `dgetrf_parallel` recurses with a large on-stack job
+/// array, and on a 2 MiB pyronova worker `np.linalg.inv` under concurrent
+/// load overflowed the stack (SIGSEGV in `dgetrf_parallel`, bluewhale,
+/// numpy 2.5.1 / OpenBLAS 0.3.33). This is address space, not resident memory.
+pub(crate) const PYTHON_THREAD_STACK: usize = 8 << 20;

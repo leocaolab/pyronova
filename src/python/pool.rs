@@ -290,6 +290,7 @@ impl InterpreterPool {
                 // Async worker
                 std::thread::Builder::new()
                     .name(format!("pyronova-async-worker-{i}"))
+                    .stack_size(crate::python::PYTHON_THREAD_STACK)
                     .spawn(move || {
                         worker_thread_loop_async(worker, &handler_names_clone, i);
                     })
@@ -299,6 +300,7 @@ impl InterpreterPool {
                 let rx = sync_work_rx.clone();
                 std::thread::Builder::new()
                     .name(format!("pyronova-worker-{i}"))
+                    .stack_size(crate::python::PYTHON_THREAD_STACK)
                     .spawn(move || {
                         worker_thread_loop(
                             worker,

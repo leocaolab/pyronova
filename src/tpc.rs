@@ -197,6 +197,7 @@ pub(crate) fn run_tpc_gil(
 
         let handle = std::thread::Builder::new()
             .name(format!("pyronova-tpc-{i}"))
+            .stack_size(crate::python::PYTHON_THREAD_STACK)
             .spawn(move || {
                 try_pin_current(core_id);
                 elevate_thread_qos_macos();
@@ -477,6 +478,7 @@ fn run_tpc_subinterp_per_thread_listener(
         let extra_tls_clone = extra_tls.clone();
         let handle = std::thread::Builder::new()
             .name(format!("pyronova-tpc-{i}"))
+            .stack_size(crate::python::PYTHON_THREAD_STACK)
             .spawn(move || {
                 try_pin_current(core_id);
                 elevate_thread_qos_macos();
@@ -623,6 +625,7 @@ fn run_tpc_subinterp_fanout(
 
         let handle = std::thread::Builder::new()
             .name(format!("pyronova-tpc-{i}"))
+            .stack_size(crate::python::PYTHON_THREAD_STACK)
             .spawn(move || {
                 try_pin_current(core_id);
                 elevate_thread_qos_macos();

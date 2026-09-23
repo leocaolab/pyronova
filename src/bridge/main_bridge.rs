@@ -135,6 +135,7 @@ impl MainInterpBridge {
             let routes = Arc::clone(&routes);
             let res = std::thread::Builder::new()
                 .name(format!("pyronova-main-bridge-{i}"))
+                .stack_size(crate::python::PYTHON_THREAD_STACK)
                 .spawn(move || {
                     loop {
                         // crossbeam recv: blocks until item or all
