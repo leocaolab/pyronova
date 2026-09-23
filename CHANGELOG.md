@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.7.3 (2026-09-23) — Fix: isolated PyO3 extensions aborted workers
+
+### Fixed
+
+- **Every isolated PyO3 extension aborted its worker on import (regression in 2.7.2).**
+  2.7.2 runs a private copy's `PyInit_*` inside the worker through ctypes, and took the
+  result as an owned Python object. For a multi-phase extension that result is its static
+  `PyModuleDef`, and the ctypes wrapper decref'd it. A C extension's def is immortal, so
+  numpy/scipy/sklearn were unaffected, but PyO3's starts at refcount 1: the decref freed
+  static memory and the worker aborted ("pointer being freed was not allocated"). This hit
+  `app.isolate("pydantic", "pydantic_core")`, polars and any other PyO3 extension. The
+  result is now taken as a raw pointer, and only a module object is wrapped. New test:
+  `test_isolated_pyo3_multiphase_ext_loads_in_workers`.
+
 ## v2.7.2 (2026-09-23) — Linux grill crash fixes; BLAS threads per worker
 
 ### Fixed
