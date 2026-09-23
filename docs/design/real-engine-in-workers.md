@@ -109,8 +109,8 @@ one code path for main and workers. Concretely:
 | # | Requirement | Feature |
 |---|---|---|
 | FR-1 | A worker's `sys.modules["pyronova"]` is the real package, and `pyronova.engine` is the real extension (per-interpreter module object). No `types.ModuleType` stand-ins for `pyronova*` remain. | F1, F7 |
-| FR-2 | `Pyronova.run()` first calls `self._engine._seal_registrations()`, which marks the end of the script's registrations. In a worker it then returns before any side effect: `init_logger`, `/mcp` auto-registration, the `enable_logging` auto-enable and reload handling all run after the seal and only on main (today they run before the `_is_worker()` check, `app.py:1086-1174`). Every route registered after the seal must be `gil=True` (asserted in `add_route`). | F1, F2 |
-| FR-3 | After the script runs, the worker takes its handlers, before hooks and after hooks from the worker's own `PyronovaApp` route table. The worker's sealed prefix must equal main's sealed prefix, checked per index on `(method, path, gil)` plus the before/after hook counts. A mismatch fails worker startup with both lists in the error. Post-seal hooks (e.g. the `enable_logging` hooks) run only on main paths, as today. | F2 |
+| FR-2 | `Pyronova.run()` first returns if it runs in a worker (`_is_worker()`, FR-15), before any side effect. On main it then calls `self._engine._seal_registrations()`, which marks the end of the script's registrations; `init_logger`, `/mcp` auto-registration, the `enable_logging` auto-enable, startup hooks and reload handling all run after the seal (today they run before the `_is_worker()` check, `app.py:1086-1174`). The seal is **main-only and idempotent**: TestClient calls `app.run()` up to 8 times on port races (`testing.py:197-201`), and only the first call sets the boundary. Every route registered after the seal must be `gil=True` (asserted in `add_route`, with a message naming the route). A worker never needs the seal (review B1): a script may call `app.run()` only under `if __name__ == "__main__"`, which a worker never executes. | F1, F2 |
+| FR-3 | After the script runs, the worker takes its handlers, before hooks and after hooks from the worker's own `PyronovaApp` route table. **The worker's whole table** (everything registered while the script executed; a worker has no run-time registrations) must equal **main's sealed prefix**, checked per index on `(method, path, gil)` (`RouteTable.route_keys`, C3) plus the before/after hook counts. A mismatch fails worker startup with both lists in the error. Post-seal routes and hooks (e.g. `/mcp`, the `enable_logging` hooks) exist only on main and are `gil=True`, as today. | F2 |
 | FR-4 | Exactly one `Pyronova` app per script. Zero or more than one registered app in a worker fails startup with a message naming the count. | F2 |
 | FR-5 | `app.state` and `SharedState` obtained in any interpreter during a server run refer to the running app's single `Arc<DashMap<String, Bytes>>`. | F3 |
 | FR-6 | A bare `Python::attach` **or a `Py<T>` drop** on a thread with no thread state never runs in production code, and no main-interpreter object is touched on a thread bound to a sub-interpreter. Main-side threads (GIL bridge, WebSocket, `spawn_blocking` GIL path in every mode, `LoopGuard` drop, DB async resolver) attach through `main_attach` / `attach_to` (C4). Every thread that serves many requests keeps one main thread state for its life. Threads drop every `Py<T>` they own (including `FrozenRoutes` clones) while attached before exiting. `run()` joins the bridge threads before it returns and keeps the last `Arc<RouteTable>`, dropped on main while attached. | F4 |
@@ -120,14 +120,20 @@ one code path for main and workers. Concretely:
 | FR-10 | `_bootstrap.py` contains only the logging-handler install, the GC policy and the isolation machinery (`_bootstrap.py:660-1160`). The injected globals `_Request`, `_Response`, `_pyronova_emit_log`, `_pyronova_db_*`, `_pyronova_recv`, `_pyronova_send` and `_pyronova_pool_id` are gone. | F7 |
 | FR-11 | `pyronova` / `pyronova.engine` are never cloned by `app.isolate` or reactive auto-isolate. Requesting it is an error: one shared copy is required, because the engine's process-global statics must be one instance. | F1 |
 | FR-12 | A CI test imports `pyronova` in a real worker and compares its public surface with main's (names in `pyronova.__all__`, `Pyronova` public methods, `pyronova.engine` classes and functions). A CI check fails on any `Python::attach(` / `Python::with_gil(` in `src/` outside an allowlist. Every E2E server log is scanned for the fork's two panic texts (`Python::attach was called on a thread that has no Python thread state`, `a Py<T> was dropped on a thread that has no Python thread state`); any hit fails the test (`tests/conftest.py` `fork_panic_lines`; the shared `feature_server` fixture now stops servers with SIGINT and scans their full log, shutdown included). | F8 |
+| FR-13 | The `pyronova` package imports pydantic **only** when a route declares `model=` (review B7): no module-level `from pydantic import …` (today `app.py:17-20`). `_route` imports `pydantic.ValidationError` when `model is not None`; an import failure there raises, it never falls back to `Exception` (today `app.py:19-20,507`). A worker of an app that never uses `model=` does not import `pydantic_core`, so auto-isolate does not clone it. | F1 |
+| FR-14 | Per-request state kept by framework hooks uses a `ContextVar`, not `threading.local` (review B6): `observability.py:50` `_tls` (request id, metrics start time) moves to `ContextVar`s, as `context.py:50` already does. The async worker loop calls a request's before hooks, handler and after hooks inside that request's own asyncio Task, so they share one context; concurrent requests never see each other's values. | F5 |
+| FR-15 | `_is_worker()` is an interpreter check, `pyronova.engine._in_worker()` (Rust: `PyInterpreterState_Get() != PyInterpreterState_Main()`), not the process environment (review N17). Nothing sets `PYRONOVA_WORKER` any more: the four `std::env::set_var` sites (`app.rs:1187,1358,1453`, `pool.rs:211`) and `_bootstrap.py:120` are removed. The env var was process-wide, so it leaked into child processes started from `gil=True` routes; three test scripts reset it for that reason (`test_pyerr_no_stderr.py:69`, `test_subinterp_timeout.py:63`, `test_async_timeout.py:78`; harmless afterwards). | F1 |
+| FR-16 | A worker handler that returns a `Stream` fails loudly: a 500, and an error log saying streaming responses need `gil=True, stream=True` (review N18). Today `parse_result` (`worker.rs:432-504`) would stringify it, and with the real package the type becomes importable in workers. | F1 |
+| FR-17 | Setters that write **process-global** config apply only on main (review N13): `set_max_body_size` (→ `handlers.rs:144` `MAX_BODY_SIZE`) and `configure_compression` (→ `compression.rs:55-60`). A worker's script calls them again while it executes; there the call is a no-op, and if the value differs from the current global it logs a warning naming the setter and both values, instead of racing main's value. (`METRICS_ENABLED`, `monitor.rs:62`, is written only by `run()`, which returns early in a worker.) | F1 |
+| FR-18 | Every `#[pyclass]` declares `module = "pyronova.engine"`, so worker (and main) types print as `pyronova.engine.Request`, not `builtins.Request` (found by the polars probe). | F1 |
 
 **Non-functional** (measured on bluewhale unless noted)
 
 | # | Requirement | Threshold | Feature |
 |---|---|---|---|
 | NFR-1 | Hot-path throughput | `just bench-compare` within 3% of v2.7.2, run on a quiet box (load avg < 3) | F2, F5 |
-| NFR-2 | Worker startup | per-worker init time ≤ v2.7.2 + 50 ms (median of 16 workers, warm isolate dir) | F1 |
-| NFR-3 | Memory | RSS per worker ≤ v2.7.2 + 5 MB after startup; `test_subinterp_memory_regression.py` 9/9 on Linux | F1, F3 |
+| NFR-2 | Worker startup | per-worker init time ≤ v2.7.2 + 50 ms (median of 16 workers, warm isolate dir), measured **with pydantic installed** and an app that does not use `model=` (FR-13) | F1 |
+| NFR-3 | Memory | RSS per worker ≤ v2.7.2 + 5 MB after startup, measured with pydantic installed and no `model=` (FR-13); `test_subinterp_memory_regression.py` 9/9 on Linux | F1, F3 |
 | NFR-4 | Stability | grill soak W=16, `wrk -c128`, 180 s: 0 non-2xx, 0 crashes, RSS flat ±5% | all |
 | NFR-5 | Teardown | 20 graceful SIGINT runs with 16 workers: 0 aborts and 0 fork panic texts in the logs (with `os._exit` present; see §12) | F4 |
 | NFR-6 | Parity | the surface-parity test from FR-12 passes on Python 3.13 and 3.14 in CI | F8 |
@@ -142,10 +148,11 @@ one code path for main and workers. Concretely:
 | Persistent per-thread tstate helpers | ✅ | `rebind_tstate_to_current_thread` (`ffi.rs:687-732`), `SubInterpGilGuard` (`ffi.rs:624-648`) |
 | DB runtime with non-nested blocking | ✅ | `run_on_db_rt` (`bridge/db_bridge.rs:42-78`), `db::runtime()` (`db.rs:46`) |
 | Async result delivery | ➖ | `pyo3-async-runtimes` (`Cargo.toml:27`) is **removed**; replaced by C9 (spike: it panics once workers load the engine) |
-| Process-wide run context | ➕ | new `src/run_context.rs` (§6 C2) |
+| Main handle + attach helpers | ✅ (M0) | `src/run_context.rs` (§6 C2, C4) |
+| Per-worker shared-state cell | ➕ | M3 (§6 C2) |
 | Worker API functions | ➕ | new `src/python/worker_api.rs` (§6 C5) |
 | CI surface-parity + attach-allowlist gates | ➕ | new tests (§9) |
-| Postgres in CI for worker DB tests | ➕ | `ci.yml` has no PG service; `test_db_subinterp.py` is always skipped (`tests/test_db_subinterp.py:23-25`). Add a `services: postgres` job. |
+| Postgres in CI for worker DB tests | ✅ (M2) | `services: postgres` in `ci.yml` (`06ff8d1`); `test_db_pg.py` / `test_db_subinterp.py` run in CI |
 
 ## 6. Components
 
@@ -162,6 +169,13 @@ one code path for main and workers. Concretely:
     main-only (C4).
   - Every other static is plain Rust (`monitor.rs:30-127`, `logging.rs:33`,
     `compression.rs:28-60`, `static_fs.rs:31-36`, `db.rs:43-44`, `ffi.rs:38,55`).
+  - Plain-Rust statics that a **worker's script can now write** through the real
+    `PyronovaApp` setters (review N13): `MAX_BODY_SIZE` (`handlers.rs:144`, via
+    `set_max_body_size` `app.rs:131`) and the compression atomics (`compression.rs:55-60`,
+    via `configure_compression` `app.rs:206`). With the mock these calls were no-ops. Today
+    a replayed script writes the same value, but worker-conditional config would race
+    main's. FR-17 makes these setters main-only. `METRICS_ENABLED` (`monitor.rs:62`) is
+    written only by `run()` (`app.rs:354,1357,1452`), which returns early in a worker.
 - **New:** nothing in `engine()`. Delete the stale comments that claim the opposite:
   `_bootstrap.py:3-5,110-115,451-453,547-550`, `bridge/db_bridge.rs:3-8`,
   `docs/logging-design*.md:180`.
@@ -206,15 +220,28 @@ one code path for main and workers. Concretely:
     `Pyronova.__init__` (`app.py:188`) calls unconditionally. It is a no-op on the main
     interpreter and errors if already set (FR-4). It can't be set from `#[new]`: no
     `Py<Self>` exists there yet.
-  - `_seal_registrations(&mut self)` pymethod: stores `sealed: Option<(routes, before,
-    after)>` on `RouteTable` (`router.rs:34`). `add_route` rejects a non-`gil` route after
-    the seal.
-  - `fn route_signature(t: &RouteTable) -> Vec<(Method, String, bool)>` over the sealed
-    prefix, plus hook counts.
+  - `route_keys: Vec<(String, String)>` on `RouteTable` (review N1): per index `(METHOD,
+    path)`, pushed in `RouteTable::insert` (`router.rs:105-128`) next to `handlers`.
+    `routers` is a `matchit` map and cannot be iterated back into keys. Copied in the
+    freeze (`app.rs:389-418`) and in the two bench table builders (`app.rs:1290` `build_one`
+    and `app.rs:1402`, line numbers at `1b30a03`).
+  - `_seal_registrations(&mut self)` pymethod, **main only** (FR-2): stores `sealed:
+    Option<(usize, usize, usize)>` (route, before-hook, after-hook counts) on `RouteTable`
+    (`router.rs:34`). Idempotent: a second call keeps the first boundary (TestClient
+    retries `run()`). `add_route` rejects a non-`gil` route after the seal.
+  - `fn route_signature(t: &RouteTable, upto: usize) -> Vec<(String, String, bool)>` from
+    `route_keys` + `requires_gil`, plus hook counts. Main uses its sealed counts; a worker
+    uses its whole table (B1: a worker is never sealed).
   - `SubInterpreterWorker::bind_routes(&mut self, py, main: &RouteTable) -> PyResult<()>`
     replaces the globals lookup (`worker.rs:236-246`). It stores
     `Vec<Py<PyAny>>` handlers, `Vec<Py<PyAny>>` before hooks, `Vec<Py<PyAny>>` after
     hooks and `Option<Py<PyAny>>` fallback, **indexed like main**.
+- **Constructor changes (review N2):** `InterpreterPool::new` (`pool.rs:194`) today receives
+  only names (`app.rs:962-975`); `SubInterpreterWorker::new` (`worker.rs:64`) takes no
+  worker index (`pool.rs:254`, `app.rs:1202`). Both gain `routes: &RouteTable` (main's
+  frozen table, for `bind_routes`) and `worker_id: usize` (for the `WORKER_ID` global and
+  logging); the name lists (`handler_names`, `before_hook_names`, `after_hook_names`) are
+  dropped. `pool_id` is passed as today and exposed to Python as the `POOL_ID` global (C5).
 - **Interface change:** `call_handler(&mut self, handler_name: &str, before: &[String],
   after: &[String], …)` (`worker.rs:847`) becomes `call_handler(&mut self, idx: usize, …)`.
   Hooks come from the worker's own vectors. Callers:
@@ -242,7 +269,7 @@ one code path for main and workers. Concretely:
   | `handlers.rs` `LoopGuard::drop` | same threads (TLS destructor) | the loop records its interpreter at creation; drop uses `attach_to(that)`. Long-lived bridge threads close it explicitly first (`close_thread_event_loop`) |
   | `websocket.rs` handshake | TPC thread (**bound to the worker**, `worker.rs:157-166`) or tstate-less Tokio worker (pool mode) | **no Python at all**: existence check `ws_handlers.contains_key` only (review B2). Before M0 the bare attach here re-attached the *worker's* thread state and `clone_ref`'d main's handler under the worker GIL |
   | `websocket.rs` per-connection `std::thread` | fresh thread | `attach_to(main)` for the connection's life; the handler is looked up **there**, and the thread's `routes` clone is dropped inside the attach. Not `main_attach`: the thread can outlive `run()` |
-  | `db.rs:585,614,644` + `future_into_py` | pyo3-async-runtimes Tokio threads | replaced by C9 in M1; allowlisted until then |
+  | `db.rs:656,685,715` + `future_into_py` (`:649,678,708,737`; lines at `1b30a03`, after M2) | pyo3-async-runtimes Tokio threads | replaced by C9 in M1; allowlisted until then |
   | `main_bridge.rs` bridge threads | bridge threads at shutdown | `JoinHandle`s kept; order (N15): TPC threads joined → their bridge `Arc`s dropped → `MainInterpBridge::shutdown_join` drops the `Sender` and joins; each thread closes its loop and drops its `routes` clone inside `main_attach`, then its TLS destructor releases the main tstate before `join` returns |
   | `worker.rs:421`, `db_bridge.rs:131` | worker thread with its tstate current | **kept** as `Python::attach` (allowlisted): a re-entrant attach on the thread's current tstate. `assume_attached()` would not register the attach with PyO3, so a `Py<T>` dropped inside would be deferred instead of decref'd |
 
@@ -267,8 +294,14 @@ one code path for main and workers. Concretely:
   - The bodies of `pyronova_recv_cfunc` (`ffi.rs:126-304`: `WORKER_STATES` lookup,
     `pool_id` check, `next_req_id`, `response_map` insert, `extract_headers`) and
     `pyronova_send_cfunc` (`ffi.rs:310-412`).
-  - `parse_sky_response` (`worker.rs:649-840`) so the async path returns headers.
-  - `emit_python_log` (`logging.rs:203-233`).
+  - `parse_sky_response` / `parse_result` (`worker.rs:649-840`, `432-504`) so the async
+    path returns headers. Today they are `&self` methods on `SubInterpreterWorker` using
+    per-worker cached pointers (`sky_response_cls`, `json_dumps_func`); `_worker_send` has
+    no worker object, so they become **free functions** taking `py` and reading
+    per-interpreter `PyOnceLock` caches (`Response` type via `py.get_type::<PyronovaResponse>()`,
+    `isojson.dumps`), used by both the sync path and `_worker_send` (review N4).
+  - `emit_python_log` (`logging.rs:205-233`), which **already** takes `worker_id:
+    Option<usize>` (review N5).
 - **New:** `src/python/worker_api.rs`, registered in `engine()`.
   ```rust
   #[pyfunction]
@@ -286,16 +319,24 @@ one code path for main and workers. Concretely:
   ```
   These replace `HANDLER_NAMES` + `globals().get(name)` (`_async_engine.py:52-57`,
   `pool.rs:519-528`). That lookup disappears with C3 (gate finding G-7).
-  `emit_python_log` gains `worker_id: Option<usize>`. PyO3 turns a Rust panic into
-  `PanicException`, which replaces `ffi_catch_unwind` (`ffi.rs:88-116`).
+  `_async_engine.py` also stops using injected names (review N3): `_Request(...)` /
+  `isinstance(res, _Response)` (`_async_engine.py:62,72`) become
+  `pyronova.engine.Request` / `Response`; `_pyronova_pool_id` becomes a `POOL_ID` global
+  set by Rust before exec, next to `WORKER_ID`; its fail-fast check of injected names
+  (`_async_engine.py:238-254`) checks `WORKER_ID`, `POOL_ID` and the engine functions
+  instead. PyO3 turns a Rust panic into `PanicException`, which replaces
+  `ffi_catch_unwind` (`ffi.rs:88-116`).
 - **Deleted:**
   - `pyronova_recv_cfunc`, `pyronova_send_cfunc`, `pyronova_emit_log_cfunc` and their
     `PyMethodDef` registration (`worker.rs:129-148`, `pool.rs:542-666`).
   - `bridge/db_bridge.rs` (C6).
 
 ### C6: `PgPool` usable from workers
-- **Reuses:** `run_on_db_rt` (`db_bridge.rs:42-78`), moved into `db.rs`; `PG_POOL` /
-  `PG_RUNTIME` (`db.rs:43-44`); `unpack_args` from `db_bridge.rs`.
+> Sync methods and `PgCursor` implemented in M2 (#4, `06ff8d1`, `2e89112`).
+- **Reuses:** `run_on_db_rt` (moved into `db.rs` in M2); `PG_POOL` / `PG_RUNTIME`
+  (`db.rs:43-44`); `extract_param` (`db.rs:145`) for parameters. `unpack_args`
+  (`db_bridge.rs:53`) is **not** reusable: it parses a raw cfunc argument tuple, and is
+  deleted with `db_bridge.rs` in M4 (review N5).
 - **Change:** `PgPool::{fetch_one, fetch_all, fetch_scalar, execute, connect}` (`db.rs:366-
   700`) call `py.detach(|| run_on_db_rt(fut))` instead of `rt.block_on`. `PgCursor`
   (`db.rs:300-321`): its receiver becomes a std/crossbeam channel, because Tokio's
@@ -327,26 +368,40 @@ one code path for main and workers. Concretely:
 - **Interface:** `PgPool.{fetch_one,fetch_all,fetch_scalar,execute}_async`, unchanged.
 
 ### C7: Slim worker bootstrap
-- **Keeps** (moved as-is):
-  - The logging handler (`_bootstrap.py:22-94`), which now calls
-    `pyronova.engine.emit_python_log(..., worker_id=WORKER_ID)`.
-  - The GC policy (`_bootstrap.py:143-156`).
-  - Isolation (`_bootstrap.py:660-1160`), including `_iso_init_here` and the reactive
-    import hook.
-- **Deletes:** `_bootstrap.py:158-657`, i.e. all mocks, the inline `cached_json`, cookies,
-  uploads and the pydantic stub (see Q-1).
+Every line of today's `_bootstrap.py` (1173 lines at `1b30a03`) is accounted for (review N6):
+
+| Lines | Content | Disposition |
+|---|---|---|
+| 1-16 | module docstring (mock rationale, pydantic warning) | **rewrite**: logging + GC + isolation only |
+| 17-94 | logging bridge (`_PyronovaRustHandler`, level map) | **keep**; `emit` calls `pyronova.engine.emit_python_log(..., worker_id=WORKER_ID)`; the "not injected" fallback (68-75) goes (the function is a real import now) |
+| 96-116 | comment block about injected `_Request`/`_Response` | **delete** |
+| 117-119 | mock header + `import sys, types, os` | **keep** `import sys, os` (isolation uses them); drop `types` |
+| 120 | `os.environ["PYRONOVA_WORKER"] = "1"` | **delete** (FR-15) |
+| 122-156 | GC policy | **keep** |
+| 158-659 | mock `pyronova*` modules, `cached_json`, cookies, `pyronova.db`, pydantic stub, uploads | **delete** (the real package provides all of it; stub per Q-1) |
+| 660-1173 | isolation (`_ISO`, `_iso_*`, `_iso_init_here`, loader/finder, reactive hook, install) | **keep**; add the `pyronova` refusal (FR-11) |
+
+Result ≈ 640 lines (isolation alone is 514). The success criterion is content, not a line
+count (§10).
 - **Adds:**
-  - `WORKER_ID` is set by Rust as a global before exec, as `_async_engine.py` already
-    does (`pool.rs:519-528`).
+  - `WORKER_ID` and `POOL_ID` are set by Rust as globals before exec, as `_async_engine.py`
+    already does for `WORKER_ID` (`pool.rs:519-528`).
+  - Rust side: `sky_response_cls` is taken from `py.get_type::<PyronovaResponse>()`
+    instead of the `_Response` global (`worker.rs:253-256`, review N3), and the
+    `_Request`/`_Response` injection (`worker.rs:192-214`) is removed.
   - A guard: `_iso_*` refuses `pyronova` (FR-11).
 - **Execution model:** unchanged. One `PyRun_String` of bootstrap + script in a fresh
   globals dict (`worker.rs:121-233`). Two differences: `__name__` is set explicitly to
   `"__pyronova_worker__"`, and the handler lookup is replaced by C3.
 
 ### C8: `Pyronova` Python class changes (`python/pyronova/app.py`)
-- `run()`: the first line becomes `self._engine._seal_registrations()`, followed by
-  `if _is_worker(): return` (moved from `app.py:1174`). Run-time registrations (`/mcp`,
-  `enable_logging` auto-enable) stay after it (FR-2).
+- `run()`: the first line becomes `if _is_worker(): return` (moved from `app.py:1174`),
+  then `self._engine._seal_registrations()` (main only, idempotent). Run-time
+  registrations (`/mcp`, `enable_logging` auto-enable, startup hooks) stay after it (FR-2).
+- `_is_worker()` (`app.py:35-37`): `return _engine_mod._in_worker()` (FR-15).
+- Module top (`app.py:17-20`): the pydantic `try/import` is removed. `_wrap_with_model`
+  (`app.py:476-529`, called from `_route`) imports `from pydantic import ValidationError` inside the
+  `model is not None` branch and builds `_BODY_ERRORS` from it (FR-13).
 - `__init__` (`app.py:188`): call `self._engine._register_worker_app()` (C3).
 - `isolate()` (`app.py:348-372`): in a worker it is now the real method. It keeps only
   recording the env var, which is harmless because the bootstrap has already acted on it.
@@ -359,12 +414,14 @@ one code path for main and workers. Concretely:
 |---|---|---|---|
 | lib.rs `engine()` → run_context | C2 | `run_context::capture_main(py)` (no-op off main) | record the main interpreter (M0) |
 | worker.rs `init_in_sub_interp` → worker cell | C2 | per-interpreter cell with the app's `Arc<DashMap<String, Bytes>>`, set before the script executes | shared state for workers (M3) |
-| PyronovaApp::new → run_context | C2 | reads `shared_state` when not main | FR-5 |
+| PyronovaApp::new / SharedState::new → worker cell | C2 | read the per-interpreter shared-state cell when not main | FR-5 |
 | worker.rs → engine (Python) | C3 | `WORKER_APP.get(py) -> Option<&Py<PyronovaApp>>` | handler table source |
 | worker.rs ← handlers/tpc.rs, pool.rs | C3 | `call_handler(&mut self, idx: usize, method, path, params, query, body, headers, client_ip) -> Result<SubInterpResponse, String>` | index-based call |
 | main_bridge.rs, handlers.rs, websocket.rs → run_context | C4 | `main_attach(f)`, `attach_to(interp, f)`, `main_interp()` | explicit main attach |
 | _async_engine.py → engine | C5 | `_worker_recv(worker_id, pool_id)`, `_worker_send(worker_id, pool_id, req_id, response)`, `_worker_app_handler(idx)`, `_worker_app_hooks()` | async bridge |
-| app.py → engine | C3/C8 | `PyronovaApp._register_worker_app()`, `PyronovaApp._seal_registrations()` | worker app + seal boundary |
+| app.py → engine | C3/C8 | `PyronovaApp._register_worker_app()`, `PyronovaApp._seal_registrations()` (main only, idempotent), `_in_worker() -> bool` | worker app + seal boundary + worker check (FR-15) |
+| app.rs / pool.rs → worker.rs | C3 | `InterpreterPool::new(n, py, script, routes: &RouteTable, …)`, `SubInterpreterWorker::new(worker_id, script, script_path, routes: &RouteTable, pool_id)` | name lists replaced by main's table + worker index (N2) |
+| router.rs | C3 | `RouteTable.route_keys: Vec<(String, String)>`, `sealed: Option<(usize, usize, usize)>` | per-index keys for the signature (N1) |
 | db.rs → asyncio (any interpreter) | C9 | `await_on_loop(py, fut)`: `loop.create_future()`, `InterpreterHandle::current`, `call_soon_threadsafe` | async DB without foreign attach |
 | _bootstrap.py → engine | C5 | `emit_python_log(level, name, message, pathname, lineno, worker_id=None)` | logging |
 | db.rs → db runtime | C6 | `run_on_db_rt<F: Future + Send + 'static>(fut) -> Result<T, &'static str>` | non-nested blocking |
@@ -384,25 +441,29 @@ main (PyronovaApp.run, main interpreter, GIL held):
       - `from pyronova import Pyronova` → real package → engine module exec (per-interp, no global side effects)
       - `app = Pyronova()` → `_register_worker_app` sets WORKER_APP (error if already set)
       - decorators register into app's own RouteTable (real add_route, real model= wrap)
-      - app.run() → `_seal_registrations()`, then returns (_is_worker)
- 6. app = WORKER_APP.get(py) or fail "script created no Pyronova app"; not sealed → fail
-    "script never called app.run()" (a worker needs the seal)
- 7. sig_w = route_signature(sealed prefix of app.routes); sig_m = route_signature(sealed prefix of F)
+      - app.run(), if the script calls it unguarded → returns at its first line (_in_worker);
+        under `if __name__ == "__main__"` it is never called. Either way nothing is
+        registered after this point, and a worker is never sealed.
+ 6. app = WORKER_APP.get(py) or fail "script created no Pyronova app" (FR-4)
+ 7. sig_w = route_signature(app.routes, all);  sig_m = route_signature(F, F.sealed)
     if sig_w != sig_m: fail with both lists (first differing index highlighted)
  8. bind handlers/hooks/fallback by index; cache json dumps, loop, gc (worker.rs:263-356 unchanged)
  9. PyEval_SaveThread (worker.rs:360)
 ```
 Invariants:
 - A worker never serves a request unless its sealed table equals main's by index.
-- Post-seal routes are `gil=True`, so a worker is never asked for an index beyond its
-  sealed prefix.
+- Post-seal routes are `gil=True`, so a worker is never asked for an index beyond main's
+  sealed prefix, which is its whole table.
 - `MAIN` is set before any worker exists (the engine executed on main first).
 
 Edge cases:
 - A script that registers routes conditionally on `PYRONOVA_WORKER`: this fails at step 7
   with a readable diff. That is intended, because it would have silently misrouted before.
-- A script with `if __name__ == "__main__": app.run()`: `run` isn't called in the worker,
-  which is fine.
+- A script with `if __name__ == "__main__": app.run()` (47 files in tests/examples/
+  benchmarks at `1b30a03` call `.run(` under that guard, e.g. `tests/test_capi_hygiene.py:258`): `run` isn't called in the worker.
+  Fine, since a worker needs no seal (review B1).
+- A route registered from an `on_startup` hook (`app.py:1186`, after the seal): must be
+  `gil=True`, otherwise `add_route` raises at startup (§8.7).
 - Two `Pyronova()` instances: FR-4 error.
 
 ### 8.2 Request path (TPC inline, unchanged cost)
@@ -468,7 +529,14 @@ workers execute the engine.
 - The handler is taken from the worker app by index, not from `globals()` by name
   (`_async_engine.py:52-57`).
 - Before/after hooks run, matching the sync path. Today this path skips them
-  (`pool.rs:514-518`).
+  (`pool.rs:514-518`). They run **inside the request's own Task**
+  (`_process_request`), together with the handler, so each request has its own
+  `contextvars` context. Framework hooks keep per-request state in `ContextVar`s (FR-14):
+  `observability.py:50`'s `threading.local` would be shared by every coroutine on the loop
+  thread, so one client could receive another request's `x-request-id` and the metrics
+  latencies would mix (review B6). On the sync paths Rust calls the hooks and the handler
+  one after another on one thread in that thread's context, so a `ContextVar` behaves like
+  the thread-local did.
 
 ### 8.5 DB from workers
 `py.detach(|| run_on_db_rt(async move { pool.fetch_all(...) }))`. The future runs on the
@@ -486,7 +554,11 @@ Removing the stub has a consequence:
   is measured working: 432k requests (`docs/subinterp-ecosystem-isolation.md:211-216`).
 - `model=` then validates for real in workers. Today it silently passes an empty instance
   (`_bootstrap.py:552-571`: `model_validate_json` returns `cls()`).
-- Cost: one pydantic copy per worker.
+- Cost: one pydantic copy per worker **for apps that use `model=`**. Without FR-13 it would
+  be every worker of every app with pydantic merely installed, because `app.py:17-20`
+  imports it at module load (review B7). With FR-13 the import happens in
+  `_wrap_with_model`, so an app with no `model=` never imports `pydantic_core` in a
+  worker; NFR-2/3 are measured that way.
 
 **Decision (2026-09-23):** remove the stub. The stub violates "don't cover": it returns an empty
 model and skips validation. **Alternative:** keep a stub that *raises* on validation in
@@ -504,6 +576,20 @@ workers, so the lie becomes a loud error.
   Rust, so the risk is double handling. Verify in E2E-1.
 - `app.state` in workers is shared instead of a fresh `{}`.
 - The async pool path runs hooks and returns headers.
+- A route added from an `on_startup` hook, or any other route registered after `run()`
+  begins, must be `gil=True`; a non-`gil` one raises at startup with its method and path.
+  It runs in `mode="gil"` too, where there are no workers, because the rule is about the
+  table, not the mode (review N12).
+- `PYRONOVA_WORKER` is no longer set in the process environment (FR-15). Code that read it
+  should use `pyronova.engine._in_worker()`; child processes no longer inherit it.
+- A worker handler returning a `Stream` gets a 500 with an error log, instead of a
+  stringified body (FR-16).
+- `app.max_body_size = …` / `app.enable_compression(…)` executed in a worker's replay are
+  no-ops (main's call already set the process-wide value); a differing value logs a
+  warning (FR-17).
+- `pydantic` is imported only by apps that use `model=` (FR-13); an app with `model=` and
+  a broken pydantic install fails at route registration instead of catching every
+  `Exception` as a validation error.
 
 ## 9. Integration / E2E tests
 
@@ -514,16 +600,23 @@ sub-interpreter permanently disables `PyGILState_Check` in its process.
 |---|---|---|
 | E2E-1 | CUJ-1 | existing `feature_server_factory` suites (`test_cookies_e2e`, `test_cors_e2e`, `test_routing_e2e`, `test_uploads_e2e`) in `subinterp` mode + `test_capi_hygiene.py` → unchanged assertions pass; new cases assert: one CORS header value (no double application); `enable_request_id` echoes `x-request-id` from a worker route; `PYRONOVA_LOG=1` still starts (post-seal hooks main-only) |
 | E2E-2 | CUJ-1 | `test_isolate.py` (all 5) + grill W=4 smoke → pass |
-| E2E-3 | CUJ-1 | script registering route only `if os.environ.get("PYRONOVA_WORKER")` → server exits non-zero; stderr contains both route lists |
-| E2E-4 | CUJ-2 | 4 workers, route `app.state.incr("n")`; 400 requests → main-side `gil=True` route reads `n == 400` |
+| E2E-3 | CUJ-1 | (a) script registering a route only `if pyronova.engine._in_worker()` → server exits non-zero; stderr contains both route lists. (b) script with `app.run()` only under `if __name__ == "__main__"` + `enable_logging` + an MCP tool → starts, routes answer (B1: no seal needed in workers; post-seal `/mcp` main-only) |
+| E2E-4 | CUJ-2 | 4 workers; one route does `app.state.incr("n")`, another a bare `SharedState().incr("m")`; 400 requests each → a main-side `gil=True` route reads `n == 400` and `m == 400` (N10) |
 | E2E-5 | CUJ-3 | PG service in CI; `test_db_subinterp.py` with TPC default → 5 tests pass (today always skipped) + a new `fetch_iter` iteration case from a worker route → all rows, no panic |
-| E2E-6 | CUJ-3 | worker route calls `pool.fetch_all_async` → 500 with body containing `NotImplementedError` message; server stays up |
+| E2E-6 | CUJ-3 | worker route calls `pool.fetch_all_async` → 500; the **server log** contains the `NotImplementedError` message (the 500 body is the generic "handler raised an exception", `worker.rs` ~987, review N8); server stays up |
 | E2E-7 | CUJ-4 | `PYRONOVA_TPC=0`, async route returns `Response(headers={"x-a":"1"})` and a before hook sets a header → both headers present |
+| E2E-7b | CUJ-4 | `PYRONOVA_TPC=0`, `app.enable_request_id()`, async route that `await asyncio.sleep(random)`; 200 concurrent requests, each with a distinct `x-request-id` → every response echoes its own id (review B6, FR-14) |
 | E2E-8 | CUJ-5 | `tests/test_layer2_main_side.py`, **parametrized over `PYRONOVA_TPC=1` and `=0`** (review B8: pool mode has its own sites). App (`tests/_l2_main_side_app.py`) whose own script execs the real engine in each worker; worker route + `gil=True` sync/async routes + WebSocket echo + `/metrics` under concurrent load, then SIGINT → 0 non-2xx, WS echoes, exit 0, and the log has no `panicked at` line and neither fork panic text (including at shutdown). M1 adds the `gil=True` async DB route + a main Python thread awaiting `fetch_all_async`. Plus `test_concurrent_in_process_servers`: 3 TestClient servers at once in one process (B4) |
 | E2E-9 | CUJ-5 | `tests/test_attach_allowlist.py`: the allowlist gate (FR-12) reports a bare `Python::attach` seeded into a copy of `src/` |
-| E2E-10 | CUJ-6 | surface parity: worker route returns `sorted(dir(pyronova))`, `pyronova.__all__`, `sorted(m for m in dir(pyronova.Pyronova) if not m.startswith("_"))`, `dir(pyronova.engine)` → equals main's |
-| E2E-11 | CUJ-6 | worker `logging.getLogger().info("x")` with 4 workers → log lines show worker ids {0,1,2,3} |
+| E2E-10 | CUJ-6 | surface parity: a worker route returns `pyronova.__all__`, the public methods of `pyronova.Pyronova` (`sorted(m for m in vars(pyronova.Pyronova) if not m.startswith("_"))`), and an explicit list of `pyronova.engine` names checked with `hasattr` → equal to main's. Not `dir(pyronova)`, which varies with lazily imported submodules (review N9) |
+| E2E-11 | CUJ-6 | script logs `logging.getLogger().info("init")` **at top level** (runs once per worker at init) with 4 workers → the log shows worker ids {0,1,2,3}. Not per request: on macOS SO_REUSEPORT sends almost all traffic to one TPC thread (`tpc.rs:372`, review N9) |
 | E2E-12 | CUJ-7 | `test_subinterp_memory_regression.py` (Linux, 9 tests) + grill W=16 180 s + 20× graceful SIGINT → NFR-3/4/5 |
+| E2E-13 | CUJ-1 | script creating two `Pyronova()` apps → startup fails; message names the count (FR-4, N10) |
+| E2E-14 | CUJ-1 | `app.isolate("pyronova")` → startup fails with the FR-11 message (N10) |
+| E2E-15 | CUJ-1 | app with pydantic installed and no `model=` → in a worker `"pydantic_core" not in sys.modules`; app with `model=` → invalid body gets 422 from a worker route (FR-13, B7) |
+| E2E-16 | CUJ-1 | worker handler returns `Stream()` → 500, log names `gil=True, stream=True` (FR-16) |
+| E2E-17 | CUJ-1 | script sets `app.max_body_size` to a different value only in workers (`if pyronova.engine._in_worker()`) → main's value is enforced; log has the FR-17 warning |
+| E2E-18 | CUJ-6 | `repr(type(req))` in a worker route → `pyronova.engine.Request` (FR-18) |
 
 **Existing tests that must change** (the `test_ffi_panic_safety.py` rewrite below was approved by the user on 2026-09-23; any other test change still needs a report first):
 - `tests/test_ffi_panic_safety.py:22-60` greps for `pyronova_recv_cfunc`,
@@ -537,6 +630,17 @@ sub-interpreter permanently disables `PyGILState_Check` in its process.
   passing against `#[new] py_new` (`types.rs:124-148`), so no change is expected.
 - `tests/test_async_shutdown.py:24` greps `_async_engine.py` for shutdown steps. These are
   kept, so no change is expected.
+- **Break, report before changing (review N7):**
+  - `tests/test_subinterp_hooks.py:11` and `tests/test_env_var_worker.py:30` build the
+    injected `_Response` global in an after hook. Both are manual scripts (pytest collects
+    no `test_` function), but they stop working: `_Response` no longer exists. Proposed:
+    `from pyronova import Response`.
+  - `tests/test_subinterp_memory_regression.py:94` counts objects whose type is named
+    `"_Request"`, but the class has been `"Request"` since v2.6 (`types.rs:23`), so the
+    assertion is already vacuous today. Proposed: count `pyronova.engine.Request`
+    instances. This is a pre-existing test bug; report it with M4.
+- **Become redundant, no change needed:** the three scripts that reset
+  `os.environ["PYRONOVA_WORKER"] = ""` (FR-15).
 
 ## 10. Success criteria
 - [ ] FR-1 … FR-12 met; `rg '_pyronova_(recv|send|emit_log|db_)|_mock_engine|types.ModuleType\("pyronova' src python` returns nothing.
@@ -544,7 +648,11 @@ sub-interpreter permanently disables `PyGILState_Check` in its process.
 - [ ] No E2E server log contains either fork panic text (FR-12 scan), including across shutdown.
 - [ ] NFR-1 … NFR-6 thresholds hit (§4), with bench numbers from a quiet bluewhale.
 - [ ] E2E-1 … E2E-12 pass on macOS and Linux; CI gains the PG job and the parity/attach gates.
-- [ ] `_bootstrap.py` ≤ ~560 lines (isolation + logging + GC), down from 1160.
+- [ ] `_bootstrap.py` contains only the three kept sections of the C7 table (≈ 640 of 1173
+  lines at `1b30a03`); `rg -n "ModuleType|_Fake|_Mock|PYRONOVA_WORKER" python/pyronova/_bootstrap.py` returns nothing.
+- [ ] `rg -n "^(from|import) pydantic|^\s+from pydantic" python/pyronova` hits only `_wrap_with_model` (FR-13).
+- [ ] `rg -n "threading.local" python/pyronova` returns nothing (FR-14).
+- [ ] `rg -n "PYRONOVA_WORKER\b|\"PYRONOVA_WORKER\"" src python` returns nothing (FR-15).
 
 ## 11. Performance considerations
 - **Hot path (TPC inline).** The per-request work is unchanged apart from dropping a
@@ -557,10 +665,9 @@ sub-interpreter permanently disables `PyGILState_Check` in its process.
 - **Memory.** The real package adds module objects per worker. Its type objects were
   already per interpreter for `Request`/`Response`; now there are 9 pyclasses per worker.
   Budget NFR-3.
-- **GIL bridge.** Persistent tstate per bridge thread (§8.3). A per-call
-  `InterpreterHandle::attach` on a cold thread would create and destroy a tstate per
-  request (fork `interpreter_handle.rs:88-110`). That is acceptable only for pool-mode
-  `spawn_blocking`.
+- **GIL bridge and `spawn_blocking`.** Every thread that attaches to main keeps one main
+  tstate for its life (M0, §8.3), including the `mode="gil"`/TestClient `spawn_blocking`
+  path (review B5). No path creates and destroys a tstate per request.
 - **Measure:** `just bench-compare` on a quiet bluewhale (the 2.7.2 run was invalidated
   by load avg 43), grill throughput W=4/8/16, worker init time, RSS per worker.
 
@@ -573,8 +680,9 @@ sub-interpreter permanently disables `PyGILState_Check` in its process.
     `WORKER_STATES`, `LOGGER` and `MAIN`, and workers would silently talk to nothing.
   - Bare foreign attach: the CI gate prevents it. At run time the fork panics with a
     message, which PyO3 surfaces as `PanicException`; the request gets a 500.
-  - Main bridge thread without a run context: `main_attach` panics with an explanation.
-    That is a programming error, not user input.
+  - `main_attach` before the engine executed on main, or on a thread bound to a
+    sub-interpreter: panics with an explanation. That is a programming error, not user
+    input.
 - **Teardown:** worker modules are torn down by `Py_EndInterpreter` as today
   (`ffi.rs:747-753`). The engine module object is per interpreter
   (`PerInterpreterCell<Py<PyModule>>`), so ending a worker frees only that worker's
@@ -630,16 +738,18 @@ sub-interpreter permanently disables `PyGILState_Check` in its process.
 | `parse_sky_response`, `parse_result` | `src/python/worker.rs:432-504,649-840` | response mapping for `_worker_send` |
 | `build_request` | `src/python/worker.rs:389-426` | unchanged |
 | `call_handler` | `src/python/worker.rs:847-1059` | signature → index-based |
-| `emit_python_log` | `src/logging.rs:203-233` | worker logging (+ `worker_id`) |
+| `emit_python_log` | `src/logging.rs:205-233` | worker logging; `worker_id` already exists |
+| `ContextVar` pattern | `python/pyronova/context.py:50` | model for FR-14 (`observability.py:50`) |
+| `RouteTable::insert` | `src/router.rs:105-128` | also pushes `route_keys` (N1) |
 | `run_on_db_rt` | `src/bridge/db_bridge.rs:42-78` | moved to `db.rs`, used by `PgPool` sync methods |
-| `unpack_args` | `src/bridge/db_bridge.rs` | param conversion before `detach` |
+| `extract_param` | `src/db.rs:145` | param conversion before `detach` (`unpack_args` is cfunc-only, deleted in M4) |
 | `db::runtime`, `PG_POOL` | `src/db.rs:43-46` | unchanged; also C9's runtime |
 | `MainInterpBridge::spawn` | `src/bridge/main_bridge.rs:111-195` | add persistent main tstate per thread |
 | `call_handler_with_hooks` | `src/handlers.rs:521-714` | attach via `main_attach` |
 | isolation machinery | `python/pyronova/_bootstrap.py:660-1160` | kept verbatim + `pyronova` refusal |
 | logging handler / GC policy | `python/pyronova/_bootstrap.py:22-94,143-156` | kept; call real `emit_python_log` |
 | `_async_engine.py` loop | `python/pyronova/_async_engine.py:125-226` | kept; recv/send/handler lookup swapped |
-| `_is_worker` | `python/pyronova/app.py:35-37` | moved to top of `run` |
+| `_is_worker` | `python/pyronova/app.py:35-37` | first line of `run`; body → `_in_worker()` (FR-15) |
 | subprocess test harness | `tests/conftest.py:69-138` | all E2E tests |
 
 **New abstractions and why each is needed:**
@@ -684,6 +794,14 @@ sub-interpreter permanently disables `PyGILState_Check` in its process.
   process-global side effects; add an assertion test.
 - **R-3: CLOSED → C9.** Measured by the spike: `future_into_py` panics on
   `tokio-rt-worker` once workers exec the engine (`spike/R3-RESULTS.md`).
+- **Fresh review (2026-09-23), remaining items resolved in this revision:** B1 → FR-2/FR-3,
+  §8.1; B6 → FR-14, §8.4, E2E-7b; B7 → FR-13, §8.6, NFR-2/3, E2E-15; N1-N3 → C3/C5/C7,
+  §7; N4-N5 → C5/C6, reuse map; N6 → C7 table, §10; N7 → §9 list; N8-N10 → E2E-4/6/10/11/13/14;
+  N12 → FR-2, §8.7; N13 → C1, FR-17; N17 → FR-15; N18 → FR-16. No disagreements.
+- **R-5 (new): FR-17's "differing value" warning** only catches worker-conditional config
+  for the two setters that exist today. A future setter that writes process-global state
+  must follow the same main-only rule; the attach allowlist doesn't cover this, so it is a
+  review item, not a gate.
 - **R-4: `thread_local! LOOP` (`handlers.rs:248-249`)** binds an asyncio loop to whichever
   interpreter first touched a thread. It must only ever be touched on main-side threads.
   Add a debug assertion that compares the interpreter id recorded at creation.

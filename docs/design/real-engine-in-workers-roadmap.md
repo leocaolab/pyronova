@@ -3,9 +3,10 @@
 > Built from the gated design `real-engine-in-workers.md` and impl map
 > `real-engine-in-workers-impl.md`, gate at 0 blocking (commit `9028756`, branch
 > `design/layer2-gate`). 2026-09-23.
-> **Caveat:** the gate audit was done by the writer (the fork could not spawn a fresh
-> auditor; impl map §3 "Auditor note"). Re-run a fresh-auditor pass before M3 starts. If it
-> changes the design, re-run this roadmap.
+> **Fresh-auditor pass done (2026-09-23):** 9 blocking + 18 non-blocking findings. The M0
+> ones were implemented in M0; the rest were resolved in the design in rev2 (branch
+> `design/layer2-rev2`), which re-scopes M3/M4 below. Status: M0 (#2) and M2 (#4) are
+> done and merged on main (`3c71651`, `06ff8d1`, `2e89112`).
 
 ## Sequencing logic
 
@@ -21,7 +22,7 @@
 
 ## Milestones
 
-### M0: Main-side attach and drop discipline (highest risk)
+### M0: Main-side attach and drop discipline (highest risk) — DONE (#2)
 - **Scope** (revised by the fresh review, B2–B5, B8, B9, N15, N16): C2's main handle
   (`MAIN`, captured in `engine()`; no run context), C4 (every site in the C4 table), FR-6,
   the FR-12 allowlist gate + E2E log panic-text scan (`tests/conftest.py`).
@@ -46,7 +47,8 @@
 ### M1: Async DB resolver (C9)
 - **Scope:** C9 `await_on_loop`; the `*_async` methods move to it; `pyo3-async-runtimes`
   is removed from `Cargo.toml` (success criterion); FR-9 (`*_async` on main).
-- **Depends:** M0 (uses `InterpreterHandle` + the panic-text scan).
+- **Depends:** M0 (uses `InterpreterHandle` + the panic-text scan) and M2 (the Postgres CI
+  job its verification needs; review N11). Both are done.
 - **Verification:**
   - E2E-8, the async-DB parts: a `gil=True` async DB route plus the main Python thread
     awaiting `fetch_all_async`, with workers exec'ing the engine. The result arrives with
@@ -55,7 +57,7 @@
 - **Shippable:** yes. Main-interpreter async DB is unchanged for users and has one less
   dependency.
 
-### M2: `PgPool` safe from any thread (C6) + Postgres in CI
+### M2: `PgPool` safe from any thread (C6) + Postgres in CI — DONE (#4)
 - **Scope:** C6. Sync methods use `run_on_db_rt` (moved into `db.rs`); the `PgCursor`
   receiver becomes std/crossbeam; FR-9 (sync + `fetch_iter`). Infra: a `services:
   postgres` job in `ci.yml`, so `test_db_pg.py` and `test_db_subinterp.py` stop being
@@ -67,20 +69,32 @@
     context does not panic.
 - **Shippable:** yes. It fixes a latent nested-runtime hazard; CI gains DB coverage.
 
-### M3: Registration seal and worker-app registry (inert)
-- **Scope:**
-  - C3's `_seal_registrations` + the `add_route` post-seal `gil` assertion.
+### M3: Registration seal, worker-app registry and inert prerequisites
+- **Scope** (everything here changes nothing while workers still run the mock):
+  - C3's `route_keys` on `RouteTable` (N1), `_seal_registrations` (main only, idempotent)
+    + the `add_route` post-seal `gil` assertion (FR-2, N12).
   - C3's `_register_worker_app` / `WORKER_APP` (a no-op on main).
-  - C8's `run()` reordering (seal → `_is_worker` return → run-time registrations) and the
+  - C8's `run()` reordering (`_is_worker` return → seal → run-time registrations) and the
     `__init__` call.
-  - FR-2.
+  - FR-15: `pyronova.engine._in_worker()`; `_is_worker()` uses it; the four
+    `std::env::set_var("PYRONOVA_WORKER")` sites and `_bootstrap.py:120` go. (While the
+    mock is active, a worker's `app.run()` is the mock's no-op, so this is inert too.)
+  - FR-13: lazy pydantic import in `_wrap_with_model`.
+  - FR-14: `observability.py` `_tls` → `ContextVar`s.
+  - FR-17: `set_max_body_size` / `configure_compression` main-only.
+  - FR-18: `module = "pyronova.engine"` on every `#[pyclass]`.
   - C2's shared state: `init_in_sub_interp` sets a per-interpreter cell with the running
     app's map before the script executes; `PyronovaApp::new` / `SharedState::new` read it
     when not on main.
 - **Depends:** M0 (C2 main handle).
 - **Verification:**
-  - Main-interpreter unit tests: a post-seal non-gil route raises.
+  - Main-interpreter unit tests: a post-seal non-gil route raises; a second `run()` keeps
+    the first seal; an `on_startup` non-gil route raises with its method and path.
   - `/mcp` and `PYRONOVA_LOG=1` still work (E2E-1 subset).
+  - `import pyronova` on main with pydantic installed does not import `pydantic_core`
+    (FR-13, main-side half of E2E-15).
+  - E2E-7b in GIL mode (`mode="gil"` async route + `enable_request_id`, 200 concurrent
+    requests): each echoes its own id (FR-14; the worker-side run is in M4).
   - The existing suite stays green.
 - **Shippable:** yes. There is no behaviour change while workers still run the mock.
 
@@ -92,14 +106,20 @@
   - C7 slim `_bootstrap.py`, with the pydantic stub removed (Q-1 decided) and the
     `pyronova` isolate refusal (FR-10, FR-11).
   - C1 stale-comment cleanup; FR-1, FR-5 end-to-end.
+  - Constructor changes (N2): `InterpreterPool::new` / `SubInterpreterWorker::new` take
+    main's `RouteTable` + worker index; `WORKER_ID` / `POOL_ID` globals; `sky_response_cls`
+    from `py.get_type` (N3); `parse_result` / `parse_sky_response` as free functions (N4).
+  - FR-16: a `Stream` from a worker handler is a loud 500.
   - Delete the raw cfuncs and `bridge/db_bridge.rs`.
   - Rewrite `tests/test_ffi_panic_safety.py` as approved by the user on 2026-09-23. Any
-    other red test is reported before it is changed.
+    other red test is reported before it is changed; known in advance (design §9, N7):
+    `test_subinterp_hooks.py:11`, `test_env_var_worker.py:30` (injected `_Response`) and
+    the already-vacuous `test_subinterp_memory_regression.py:94`.
   - FR-12 surface-parity test.
 - **Depends:** M0, M1, M2, M3.
-- **Verification:** E2E-1, E2E-2, E2E-3, E2E-4, E2E-5 (incl. worker `fetch_iter`), E2E-6,
-  E2E-7, E2E-10 and E2E-11 on macOS + Linux, plus E2E-8/9 re-run against the real
-  activation.
+- **Verification:** E2E-1, E2E-2, E2E-3 (a, b), E2E-4, E2E-5 (incl. worker `fetch_iter`),
+  E2E-6, E2E-7, E2E-7b, E2E-10, E2E-11 and E2E-13 … E2E-18 on macOS + Linux, plus
+  E2E-8/9 re-run against the real activation.
 - **Shippable:** yes. This is the user-visible release: real `SharedState`/DB/`model=`
   validation in workers, and headers on the async path. Release notes are §8.7.
 
@@ -126,7 +146,12 @@
 - The planned `src/bridge/state_bridge.rs` (`optimize-crud.md`, `ROADMAP.md:430`) is
   superseded by C2 and gets no milestone.
 
-## Tracker reconciliation (proposed, NOT executed; needs user approval)
+## Tracker reconciliation (executed 2026-09-23 with the user's approval)
+
+Milestone "Layer 2: real engine in workers" and issues #2 (M0), #3 (M1), #4 (M2), #5 (M3),
+#6 (M4), #7 (M5) were created; `ROADMAP.md:430` was marked superseded (`2fb2675`). #2 and
+#4 are closed. rev2 changes the scope of #5 and #6 as above; their issue bodies should be
+updated to point at this section. The original proposal follows.
 
 State read on 2026-09-23 (`gh issue list --repo leocaolab/pyronova --state all`;
 `gh api repos/leocaolab/pyronova/milestones`): the only issue is #1 (closed, grill crash).

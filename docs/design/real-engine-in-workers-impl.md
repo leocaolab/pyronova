@@ -12,14 +12,20 @@
 > TestClient runs servers concurrently in one process (B4). Main-side threads keep one
 > thread-local main tstate (B5); WebSocket handshakes do no Python on TPC/Tokio threads
 > (B2). The design doc C2/C4/§8.3 are authoritative; the prose below is the original map.
+>
+> **rev2 (2026-09-23, branch `design/layer2-rev2`, base `1b30a03`):** resolves the fresh
+> review's remaining M3/M4 findings (B1, B6, B7, N1-N10, N12, N13, N17, N18). Prose steps
+> that changed are marked *(rev2)*; new mapping rows are at the end of §2; the gate record
+> is §3 "Round 3" and "Round 4".
 
 ## 1. CUJ implementations (prose)
 
 **CUJ-1: existing app, unchanged.**
 1. `python app.py` imports `pyronova` on main. The script registers routes and hooks on
    the main `PyronovaApp` and calls `app.run()`.
-2. `run()` first calls `self._engine._seal_registrations()`. That records how many
-   routes, before hooks and after hooks the *script* registered.
+2. *(rev2)* `run()` first returns if it runs in a worker (`_in_worker()`). On main it
+   calls `self._engine._seal_registrations()` (idempotent), which records how many routes,
+   before hooks and after hooks the *script* registered.
 3. It then does its run-time registrations: `/mcp` (gil=True), the `enable_logging`
    hooks when `PYRONOVA_LOG=1` or `debug`, and the logger init. Then the engine's `run`.
 4. The engine freezes routes, publishes the `RunContext` (shared-state `Arc` + the main
@@ -28,11 +34,12 @@
    `from pyronova import Pyronova` loads the real package. The engine module executes
    per interpreter, with no global side effects.
 6. `Pyronova()` registers itself as the worker's app via `_register_worker_app`. The
-   script's decorators populate the worker's own route table. `app.run()` in the worker
-   calls `_seal_registrations()` and returns immediately.
-7. Rust reads the worker app and checks that its sealed prefix equals main's sealed
-   prefix: `(method, path, gil)` per index plus the hook counts. It then binds handlers
-   and hooks by index.
+   script's decorators populate the worker's own route table. *(rev2)* `app.run()`, if the
+   script calls it outside a `__main__` guard, returns at its first line; a worker is never
+   sealed.
+7. *(rev2)* Rust reads the worker app and checks that its **whole** table equals main's
+   sealed prefix: `(method, path, gil)` per index from `route_keys` plus the hook counts.
+   It then binds handlers and hooks by index.
 8. Requests arrive with main's route index. The worker calls its own handler at that
    index, runs its own hooks, and replies.
 9. On Ctrl-C, workers end their interpreters on their own threads. Main-side threads have
@@ -59,8 +66,9 @@ map.
    `pyronova.engine._worker_recv(WORKER_ID, POOL_ID)` (GIL released while waiting).
 2. It gets `handler_idx` and takes the handler from `pyronova.engine._worker_app_handler(idx)`.
 3. It runs the before hooks, awaits the handler, runs the after hooks, and calls
-   `_worker_send(..., response)`. The Rust side maps the `Response` with
-   `parse_sky_response`, headers included.
+   `_worker_send(..., response)`, all inside that request's Task *(rev2: so framework hooks'
+   `ContextVar` state is per request)*. The Rust side maps the `Response` with
+   `parse_sky_response` (a free function in rev2), headers included.
 
 **CUJ-5: main-interpreter routes keep working.**
 - Every main-side thread gets its interpreter from `RunContext.main`:
@@ -107,8 +115,8 @@ Every row's contract column is therefore `无契约`, citing the nearest archite
 | 1.9 teardown | EXISTING | `end_worker_interpreter` `src/python/ffi.rs:747-753`; `Drop for InterpreterPool` `src/python/pool.rs:128-184` | 无契约 |
 | 2 state | EXISTING→changed | `PyronovaApp::new` `src/app.rs:43-58`, `shared_state` `:25`, getter `:220`; `SharedState::with_inner` `src/state.rs:25-27`, `#[new]` `:32-37` | 无契约 (CLAUDE.md: "state.rs — SharedState backed by Arc<DashMap>") |
 | 3.1 connect | EXISTING | `PgPool::connect` `src/db.rs:364-392` (early return `:373`) | 无契约 |
-| 3.2 sync query | EXISTING→changed | `fetch_one` `src/db.rs:397`, `fetch_all` `:489`, `fetch_scalar` `:516`, `execute` `:679`: all `rt.block_on` → `run_on_db_rt` (moved from `src/bridge/db_bridge.rs:42-78`), with `unpack_args` (`db_bridge.rs:89`) | 无契约 |
-| 3.4 cursor | EXISTING→changed | `PgCursor::__next__` `src/db.rs:307-321` (`rx.blocking_recv()` `:321`, which panics inside a Tokio context) → std/crossbeam receiver; producer in `fetch_iter` `:442` | 无契约 |
+| 3.2 sync query | DONE (M2) | `fetch_one`/`fetch_all`/`fetch_scalar`/`execute` use `run_on_db_rt` (moved into `db.rs`); parameters via `extract_param` (`db.rs:145`). *(rev2: `unpack_args` is cfunc-only and not reused, N5)* | 无契约 |
+| 3.4 cursor | DONE (M2) | `PgCursor::__next__` waits via `recv_batch` on the DB runtime, lock released while waiting (`2e89112`) | 无契约 |
 | 4.1 recv | NEW (moved) | `#[pyfunction] _worker_recv` `src/python/worker_api.rs`; body from `pyronova_recv_cfunc` `src/python/ffi.rs:126-304`. Search: `rg -n "_worker_recv\|worker_api" src` → none | 无契约 |
 | 4.2 handler by index | NEW | `#[pyfunction] _worker_app_handler(py, idx) -> Py<PyAny>` in `worker_api.rs`, reading `WORKER_APP` | 无契约 |
 | 4.3 send | NEW (moved) | `#[pyfunction] _worker_send`; body from `pyronova_send_cfunc` `ffi.rs:310-412` + `parse_sky_response` `src/python/worker.rs:649-840` | 无契约 |
@@ -118,9 +126,19 @@ Every row's contract column is therefore `无契约`, citing the nearest archite
 | 5 main attach helper | NEW | `run_context::main_attach<R>(f: impl for<'py> FnOnce(Python<'py>) -> R) -> R`. Search: `rg -n "main_attach" src` → none; fork `InterpreterHandle::attach` (`interpreter_handle.rs:88`) is what it calls | 无契约 |
 | 5 WebSocket | EXISTING→changed | `src/websocket.rs:192` (handler lookup), `:282` (per-connection thread); spike: panics | 无契约 |
 | 5 LoopGuard | EXISTING→changed | `src/handlers.rs:208-240` (`Python::attach` `:225`), thread-local `:248-249` | 无契约 |
-| 5 async DB resolver | NEW | `db::await_on_loop<T: IntoPyObject + Send>(py, fut) -> PyResult<Bound<PyAny>>` in `src/db.rs`, replacing `pyo3_async_runtimes::tokio::future_into_py` (`db.rs:578,607,637,666`) and the in-future `Python::attach` (`db.rs:585,614,644`). Search: `rg -n "call_soon_threadsafe\|create_future" src` → only `src/handlers.rs` loop helpers (none reusable as a resolver). Spike: `future_into_py` panics on `tokio-rt-worker` | 无契约 |
+| 5 async DB resolver | NEW | `db::await_on_loop<T: IntoPyObject + Send>(py, fut) -> PyResult<Bound<PyAny>>` in `src/db.rs`, replacing `pyo3_async_runtimes::tokio::future_into_py` (`db.rs:578,607,637,666`) and the in-future `Python::attach` (`db.rs:585,614,644`). Search: `rg -n "call_soon_threadsafe\|create_future" src` → no hits *(rev2 correction, N5: an earlier version claimed hits in `handlers.rs`)*. Spike: `future_into_py` panics on `tokio-rt-worker` | 无契约 |
 | 6 parity | NEW | `tests/test_worker_surface_parity.py` | 无契约 |
-| 7 panic-text scan | NEW | `tests/conftest.py` `_boot`/teardown (`:69-112`) gains a log scan helper | 无契约 |
+| 7 panic-text scan | DONE (M0) | `tests/conftest.py` `fork_panic_lines`, SIGINT teardown | 无契约 |
+| rev2 N1 route keys | NEW | `RouteTable.route_keys: Vec<(String, String)>` pushed in `RouteTable::insert` `src/router.rs:105-128`; copied in the freeze `src/app.rs:389-418`, bench builders `:1290`, `:1402`. Search: `rg -n "route_keys" src` → none | 无契约 |
+| rev2 B1 seal (main only) | NEW (amends 1.2) | `_seal_registrations` idempotent, called after the worker return in `run`; worker compares its whole table | 无契约 |
+| rev2 FR-15 worker check | NEW | `#[pyfunction] _in_worker()` in `src/lib.rs` (`PyInterpreterState_Get() != PyInterpreterState_Main()`); `_is_worker` `python/pyronova/app.py:35-37`; removed: `std::env::set_var("PYRONOVA_WORKER")` `src/app.rs:1187,1358,1453`, `src/python/pool.rs:211`, `python/pyronova/_bootstrap.py:120` | 无契约 |
+| rev2 FR-13 lazy pydantic | EXISTING→changed | `python/pyronova/app.py:17-20` removed; import inside `_wrap_with_model` (`:476-529`, `_BODY_ERRORS` `:507`) | 无契约 |
+| rev2 FR-14 ContextVar | EXISTING→changed | `python/pyronova/observability.py:50` `_tls` → `ContextVar`s; model `python/pyronova/context.py:50` | 无契约 |
+| rev2 FR-16 Stream | EXISTING→changed | `parse_result` `src/python/worker.rs:432-504`: `PyronovaStream` instance → error | 无契约 |
+| rev2 FR-17 setters | EXISTING→changed | `set_max_body_size` `src/app.rs:131`, `configure_compression` `:206`: no-op + differing-value warning off main | 无契约 |
+| rev2 FR-18 module= | EXISTING→changed | the 9 `#[pyclass]` sites (`app.rs:21`, `types.rs:23,357`, `websocket.rs:27`, `state.rs:18`, `python/stream.rs:24`, `python/body_stream.rs:83`, `db.rs:342,416`; lines at `1b30a03`) | 无契约 |
+| rev2 N2 constructors | EXISTING→changed | `InterpreterPool::new` `src/python/pool.rs:194`, `SubInterpreterWorker::new` `src/python/worker.rs:64`; callers `src/app.rs:962-975,1202`, `pool.rs:254` | 无契约 |
+| rev2 N3/N4 response mapping | EXISTING→changed | `sky_response_cls` `worker.rs:253-256` → `py.get_type::<PyronovaResponse>()`; `parse_result`/`parse_sky_response` → free fns; `_async_engine.py:62,72` (`_Request`/`_Response`), `:238-254` (required-names check) | 无契约 |
 
 **Design-corpus sweep** (commands and hits, pasted):
 ```
@@ -191,4 +209,30 @@ planned duplicate (`state_bridge.rs`) is superseded.
   interpreter-generic. **Kept fail-closed** (NotImplementedError in workers) until an E2E
   proves it. This is a follow-up, not a blocker.
 
-**Result: 0 blocking.**
+**Result: 0 blocking** (writer self-audit; see Round 3).
+
+### Round 3: fresh auditor (2026-09-23)
+A separate reviewer with no context audited main@`2fde053` and found the "0 blocking"
+above did not hold: **9 blocking** (B1-B9) and 18 non-blocking (N1-N18). This confirms the
+auditor note: the writer's self-audit missed them. Dispositions:
+- B2, B3, B4, B5, B8, B9, N15, N16: implemented in M0 (`3c71651`, docs `bbb2bee`).
+- N11: M2 landed first, so M1's Postgres dependency is met.
+- B1, B6, B7, N1-N10, N12, N13, N17, N18: resolved in rev2 (design FR-2, FR-3, FR-13 …
+  FR-18, C1, C3, C5, C6, C7, C8, §7, §8.1, §8.4, §8.6, §8.7, §9, §10, §11, §12; roadmap
+  M3/M4). N14 (C9 details) is left to M1's implementation and listed in its issue.
+
+### Round 4: rev2 re-check (writer, 2026-09-23)
+**Method gap, stated plainly:** this round again ran in a fork that cannot spawn a fresh
+auditor, so it is the writer re-checking the rev2 edits, not an independent audit. Checked:
+- Every rev2 `file:line` re-read at `1b30a03`. One fix made: the bench table builders are
+  at `app.rs:1290`/`1402` (the review's `1276-1300`/`1390-1410` point at function
+  signatures).
+- The "53 files" in B1 re-counted: 54 files carry a `__main__` guard, 47 of them call
+  `.run(` (design §8.1 uses 47).
+- Traceability: every new FR has an E2E (FR-13 → E2E-15, FR-14 → E2E-7b, FR-15 → E2E-3a,
+  FR-16 → E2E-16, FR-17 → E2E-17, FR-18 → E2E-18; FR-4/FR-11 → E2E-13/14) and a milestone
+  (M3 or M4).
+- Internal consistency: §8.1 step 6 no longer requires a worker seal; FR-2, FR-3, C3, C8,
+  §8.1 and the roadmap agree that the seal is main-only and idempotent.
+- No new blocking findings from this re-check. **Recommendation:** run one more fresh
+  auditor pass on rev2 before M4 starts (M3 is inert and can start now).
