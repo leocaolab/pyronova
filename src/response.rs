@@ -12,35 +12,33 @@ use crate::types::{PyronovaResponse, ResponseData};
 use pyo3::types::PyBytes;
 
 // ---------------------------------------------------------------------------
-// orjson-backed serializer (required dep: always available)
+// isojson-backed serializer (required dep: always available)
 // ---------------------------------------------------------------------------
 
-// Cached `_dumps(obj)` wrapper compiled once via PyModule::from_code.
-// Py<T> is Send+Sync; GIL is held whenever this is accessed.
-static ORJSON_HELPER: std::sync::OnceLock<pyo3::Py<pyo3::PyAny>> = std::sync::OnceLock::new();
+// Cached `dumps(obj)` wrapper compiled once per interpreter via PyModule::from_code.
+//
+// Per interpreter: `PyOnceLock` is per-interpreter with the PyO3 fork, so each sub-interpreter
+// caches its own function. A process-global `std::sync::OnceLock<Py<_>>` here handed the first
+// interpreter's function (and module) to every other one.
+static JSON_HELPER: pyo3::sync::PyOnceLock<pyo3::Py<pyo3::PyAny>> = pyo3::sync::PyOnceLock::new();
 
 fn get_or_init_json_dumps(py: Python<'_>) -> pyo3::PyResult<pyo3::Bound<'_, pyo3::PyAny>> {
-    if let Some(f) = ORJSON_HELPER.get() {
-        return Ok(f.bind(py).clone());
-    }
-    // PyModule::from_code gives correct module-level scoping: _orjson and
-    // _default are in the module's __dict__, so the dumps closure sees them.
-    let module = pyo3::types::PyModule::from_code(
-        py,
-        c"import orjson as _orjson\n\ndef _default(obj):\n    if isinstance(obj, (set, frozenset)):\n        return list(obj)\n    raise TypeError(f'not serializable: {type(obj).__name__}')\n\ndef dumps(obj):\n    return _orjson.dumps(obj, default=_default)\n",
-        c"pyronova_json",
-        c"pyronova_json",
-    )?;
-    let f = module.getattr("dumps")?;
-    // Resolve the race: if another thread won the `set`, discard our local `f`
-    // and return the cached winner so every caller sees the same singleton.
-    match ORJSON_HELPER.set(f.clone().unbind()) {
-        Ok(()) => Ok(f),
-        Err(_) => Ok(ORJSON_HELPER.get().unwrap().bind(py).clone()),
-    }
+    JSON_HELPER
+        .get_or_try_init(py, || {
+            // PyModule::from_code gives correct module-level scoping: _isojson and _default are
+            // in the module's __dict__, so the dumps closure sees them.
+            let module = pyo3::types::PyModule::from_code(
+                py,
+                c"import isojson as _isojson\n\ndef _default(obj):\n    if isinstance(obj, (set, frozenset)):\n        return list(obj)\n    raise TypeError(f'not serializable: {type(obj).__name__}')\n\ndef dumps(obj):\n    return _isojson.dumps(obj, default=_default)\n",
+                c"pyronova_json",
+                c"pyronova_json",
+            )?;
+            Ok::<_, pyo3::PyErr>(module.getattr("dumps")?.unbind())
+        })
+        .map(|f| f.bind(py).clone())
 }
 
-fn orjson_dumps(py: Python<'_>, obj: &pyo3::Bound<'_, pyo3::PyAny>) -> Result<Bytes, String> {
+fn json_dumps(py: Python<'_>, obj: &pyo3::Bound<'_, pyo3::PyAny>) -> Result<Bytes, String> {
     let dumps = get_or_init_json_dumps(py).map_err(|e| format!("json init: {e}"))?;
     let result = dumps
         .call1((obj,))
@@ -62,7 +60,7 @@ pub(crate) fn extract_response_data(
     // dict / list → JSON — most common return type; checked first to skip
     // the PyronovaResponse cast on the hot path.
     if obj.cast::<PyDict>().is_ok() || obj.cast::<PyList>().is_ok() {
-        let json_bytes = orjson_dumps(py, &obj)?;
+        let json_bytes = json_dumps(py, &obj)?;
         return Ok(ResponseData {
             body: json_bytes,
             content_type: "application/json".to_string(),
@@ -102,7 +100,7 @@ pub(crate) fn extract_response_data(
             };
             (Bytes::from(st), ct)
         } else if body_bound.cast::<PyDict>().is_ok() || body_bound.cast::<PyList>().is_ok() {
-            let json_bytes = orjson_dumps(py, body_bound)?;
+            let json_bytes = json_dumps(py, body_bound)?;
             (json_bytes, "application/json")
         } else if let Ok(pb) = body_bound.cast::<PyBytes>() {
             // Fast path for PyBytes: one copy (PyBytes buffer → Bytes

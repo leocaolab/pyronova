@@ -17,15 +17,16 @@ import time
 _log = logging.getLogger("pyronova.async")
 
 try:
-    import orjson as _orjson
+    # isojson: orjson-compatible and safe in own-GIL sub-interpreters (orjson is not).
+    import isojson as _isojson
 
-    def _orjson_default(obj):
+    def _isojson_default(obj):
         if isinstance(obj, (set, frozenset)):
             return list(obj)
         raise TypeError(f'Object of type {type(obj).__name__} is not JSON serializable')
 
     def _json_dumps_bytes(obj):
-        return _orjson.dumps(obj, default=_orjson_default)
+        return _isojson.dumps(obj, default=_isojson_default)
 
 except ImportError:
     import json as _json_mod
