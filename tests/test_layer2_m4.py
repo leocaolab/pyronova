@@ -138,6 +138,37 @@ def test_route_only_in_worker_fails_startup_with_both_lists(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# E2E-1 (new cases): closure hooks now run in workers; CORS is not applied twice
+# ---------------------------------------------------------------------------
+
+
+def test_worker_cors_header_applied_once(tmp_path):
+    # `_cors_before` (a closure hook) now runs in workers too; with Rust's apply_cors
+    # also setting the header, it must still appear exactly once (design R-1).
+    s = Server(tmp_path, _app("""
+        app = Pyronova()
+        app.enable_cors(allow_origins="https://a.example")
+
+        @app.get("/ping")
+        def ping(req):
+            return "ok"
+
+        @app.get("/data")
+        def data(req):
+            return {"ok": True}
+    """))
+    try:
+        s.wait_up()
+        r = httpx.get(s.base + "/data", headers={"Origin": "https://a.example"}, timeout=10)
+    finally:
+        rc = s.stop()
+    assert r.status_code == 200 and r.json() == {"ok": True}
+    assert r.headers.get_list("access-control-allow-origin") == ["https://a.example"]
+    assert rc == 0, s.log()[-3000:]
+    _no_panics(s)
+
+
+# ---------------------------------------------------------------------------
 # E2E-4: app.state and a bare SharedState() in workers are main's map (FR-5)
 # ---------------------------------------------------------------------------
 
