@@ -195,7 +195,16 @@ numpy 2.5.1，scipy 1.18.0，OpenBLAS 0.3.33）暴露了三个问题，**都不�
 不带 Pyronova 即可复现，冷 import 100% 崩。每 worker 一份副本没用：副本只换了加载哪个文件，没换哪个
 解释器拥有对象。现在 Pyronova 的 loader 对私有副本自己在 worker 里调用 `PyInit_*`，并用
 `PyState_AddModule` 注册（即 3.12 的行为）。只有私有副本走这条路：别人不会加载那个文件，它的 C 静态
-状态只初始化一次。**仍未解决：** 从共享 site-packages 文件加载（未隔离）的单阶段扩展，对象仍归主解释器。
+状态只初始化一次。
+
+**更新（未发布）：共享文件。** worker 不再从共享文件加载单阶段扩展：loader 读二进制导入的符号
+（单阶段 init 调 `PyModule_Create2`；在 Linux 和 macOS 上对 numpy、scipy、sklearn、orjson、
+pydantic_core、msgpack、isojson 加载的全部扩展模块（macOS 203 个、Linux 186 个）与运行时结果核对，无漏判、无误判），
+在 CPython 把它的 init 放到主解释器跑之前就拒绝，改为复制该包。共享文件现在在 CPython 自己的
+`Py_mod_multiple_interpreters` 检查下加载（loader 以前对共享文件也开 override，于是自身没有守卫的
+orjson 被每个 worker 共享加载，`Ctrl-C` 时在 teardown 里 abort）。私有副本里的多阶段模块也在
+worker 里构建：CPython 把每个 `PyInit_*` 都放到主解释器跑，有的会在那里调 `import_array()`
+（scipy 的 `_arpacklib`）。内置的单阶段模块（`faulthandler`）没有文件可复制，仍然共享加载。
 
 **2. 线程栈大小。** `dgetrf_parallel` 递归，每层在栈上放一个大 job 数组。2 MiB 线程上溢出；
 `RUST_MIN_STACK=8M` 下同样负载干净。栈大小是 `src/python/mod.rs` 的 `PYTHON_THREAD_STACK`，

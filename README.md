@@ -456,6 +456,11 @@ So the per-worker copy is how numpy runs here.
   (`free(): invalid size`): CPython ≥ 3.13 runs their init in the main interpreter. Fixed in v2.7.2: Pyronova runs the init of each worker's private copy inside that worker.
 - **SIGSEGV in OpenBLAS under load**: worker threads had a 2 MiB stack. Fixed in v2.7.2
   (8 MiB, same as CPython's threads).
+- **Undeclared extensions loaded from the shared file; Ctrl-C aborted at teardown**
+  (orjson, and scipy failing every request). Fixed (unreleased): a worker loads an
+  extension from the shared file only if CPython's own multi-interpreter check allows it;
+  anything else is cloned into the worker automatically and built there. `Ctrl-C` now
+  finalizes normally (the old hard exit is gone).
 
 Details and measurements: [docs/subinterp-c-extension-status.en.md §10](docs/subinterp-c-extension-status.en.md#10-known-issues-and-fixes-linux).
 

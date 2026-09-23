@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Undeclared C extensions loaded from the shared file into every worker, and `Ctrl-C`
+  aborted at teardown.** The loader set CPython's override for every extension file,
+  shared ones included, which switched off CPython's own `Py_mod_multiple_interpreters`
+  check. An extension without a load-once guard of its own (orjson) then loaded shared
+  into all workers; finalizing them aborted (Linux `double free or corruption (out)`,
+  macOS `pointer being freed was not allocated`, 4/4). Shared files now load with the
+  check enforced; an extension that fails it is cloned into the worker.
+- **Undeclared scipy: every request failed** ("failed to import from subinterpreter due
+  to exception"). CPython ran scipy's single-phase init in the main interpreter, where its
+  `import_array()` hit numpy's "cannot load module more than once per process". A
+  single-phase extension in a shared file is now refused before its init runs (decided
+  from the binary's imported symbols) and its package is cloned.
+- **Multi-phase modules of a private copy are built in the worker too.** CPython runs
+  every `PyInit_*` in the main interpreter; some call `import_array()` there (scipy's
+  `_arpacklib`), storing main's numpy C-API table in the copy.
+- **Reactive isolation:** once a clone dir was on `sys.path`, the next package resolved
+  its clone as the "original", deleted it and loaded the shared file (sklearn after
+  scipy); it also retried only once and missed Cython's, scipy's and sklearn's wording of
+  the collision.
+
+### Changed
+
+- **`run()` no longer hard-exits after a graceful stop in sub-interpreter mode;** CPython
+  finalizes normally. The teardown abort the `os._exit` avoided had the same root cause
+  as the 2.7.2 import crash (objects owned by the main interpreter). Measured: macOS 13/13
+  clean with `MallocErrorAbort=1` (6/6 SIGABRT with the in-worker init reverted); Linux
+  grill W=4/8/16 SIGINT rc=0.
+
 ## v2.7.3 (2026-09-23) — Fix: isolated PyO3 extensions aborted workers
 
 ### Fixed

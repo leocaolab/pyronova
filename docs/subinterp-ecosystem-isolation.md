@@ -25,9 +25,17 @@ scipy 1.18 / scikit-learn 1.9) and **mac** (ARM, CPython 3.14, numpy=Accelerate)
 >   Single-threaded BLAS is still the right config for throughput (4 workers: 55 → 6,067
 >   req/s), and multi-worker runs now **default** to it (`*_NUM_THREADS=1` unless you set
 >   one); it is no longer needed to avoid a crash.
-> - **Still open:** the teardown abort (item 6 of the TODO list) is handled by the
->   `os._exit` on graceful stop; whether it had the same root cause as #2 is not yet
->   verified.
+> - **The teardown abort (item 6 of the TODO list) had the same root cause as #2
+>   (verified, unreleased fix).** Objects owned by the main interpreter reached the worker
+>   and were freed by the worker's allocator at `Py_EndInterpreter`. Two ways in: CPython
+>   running an extension's init in main (#2), and the loader setting the override for
+>   shared files too, which let an extension without its own guard (orjson) load shared
+>   into every worker. Both are fixed (every extension a worker uses is built in the
+>   worker), and `run()` no longer `os._exit`s. Measured with finalization: macOS 13/13
+>   clean (`MallocErrorAbort=1`); with the in-worker init reverted, 6/6 SIGABRT
+>   (`POINTER_BEING_FREED_WAS_NOT_ALLOCATED` in `dict_dealloc`). Linux: undeclared orjson
+>   4/4 `double free or corruption (out)` before, 4/4 clean after; grill W=4/8/16 SIGINT
+>   rc=0.
 >
 > The sections below are kept as the original record; statements they contain about #2
 > and #3 being required are superseded by this note.
@@ -318,8 +326,10 @@ Single-request full ecosystem: works with (1)+(2). Concurrent: works with (1)+(2
    shutdown hook or right before the hard exit), SIGINT is set to `SIG_IGN` before the hooks
    run. Verified: SIGABRT 0/6, shutdown hooks 6/6. Confirmed root cause independently:
    `PYTHONMALLOC=malloc` also eliminates it (0/4). (The IMPORT-time A-class crash on Linux
-   was later root-caused and fixed in v2.7.2 without `PYTHONMALLOC`; whether this teardown
-   abort shares that cause is not yet verified.)
+   was later root-caused and fixed in v2.7.2 without `PYTHONMALLOC`.)
+   **Superseded (2026-09-23, unreleased):** same root cause as the import-time crash:
+   main-owned objects freed by the worker's allocator. The `os._exit` is removed; see
+   the update note at the top of this file.
 
 ## OPEN / next design (其他的都是要解决的)
 - **Arrow Flight + HTTP server** dual-protocol node: HTTP (control/small, existing

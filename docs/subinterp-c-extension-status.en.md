@@ -233,8 +233,20 @@ per-worker copy didn't help, because a copy only changes which file is loaded, n
 interpreter owns the objects. Pyronova's loader now calls a private copy's `PyInit_*`
 itself, in the worker, and registers it with `PyState_AddModule` (what 3.12 did). Only
 private copies take this path: nothing else loads that file, so its C statics are
-initialized once. **Still open:** a single-phase extension loaded from the shared
-site-packages file (not isolated) still gets main-owned objects.
+initialized once.
+
+**Update (unreleased): shared files.** A worker no longer loads a single-phase extension
+from a shared file at all: the loader reads the binary's imported symbols (a single-phase
+init calls `PyModule_Create2`; checked against the runtime answer for every extension
+module numpy, scipy, sklearn, orjson, pydantic_core, msgpack and isojson load (203 on
+macOS, 186 on Linux): no miss, no false hit) and refuses it before CPython runs its init in main; the
+package is cloned instead. Shared files now load with CPython's own
+`Py_mod_multiple_interpreters` check enforced (the loader used to set the override for them
+too, so orjson, which has no guard of its own, loaded shared into every worker and
+`Ctrl-C` aborted at teardown). Multi-phase modules of a private copy are also built in the
+worker: CPython runs every `PyInit_*` in main, and some call `import_array()` there
+(scipy's `_arpacklib`). Built-in single-phase modules (`faulthandler`) have no file to
+clone and still load shared.
 
 **2. Thread stack size.** `dgetrf_parallel` recurses and keeps a large job array on the
 stack at each level. On a 2 MiB thread it overflowed; with `RUST_MIN_STACK=8M` the same
