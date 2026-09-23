@@ -398,7 +398,7 @@ to your code:
   copy-on-write (APFS `cp -c` / Linux `cp --reflink=auto`). This happens automatically the
   first time an import fails that way (v2.7). You can also declare the libraries up front
   with `app.isolate(...)` (v2.6). A copy costs memory: about 75 MB per worker for the
-  numpy + scipy + scikit-learn + orjson set.
+  numpy + scipy + scikit-learn + orjson set (measured on macOS, 16 workers).
 
 ```python
 app = Pyronova()
@@ -418,16 +418,15 @@ What has been measured (details and versions in
 |---------|---------------------------|-----|----------|
 | **numpy / scipy / scikit-learn** | ✅ | per-worker copy | 16-worker grill soak (`examples/stress_grill.py`), macOS + Linux; Linux: 2.71M requests in 180 s, no errors |
 | **orjson** | ✅ | per-worker copy | same soak |
-| **polars** | ✅ | per-worker copy of **both** `polars` and `_polars_runtime_32` (~215 MB) | 1.29M requests, Linux |
-| **tokenizers** | ✅ | per-worker copy | 6.35M requests, Linux |
-| **msgpack, cryptography** | ✅ | override only, no copy | 4 of 4 sub-interpreters |
-| **pydantic** | ⚠️ import works, **no validation** | Pyronova substitutes a stub in workers | real validation runs on `gil=True` routes |
+| **polars** | ✅ | per-worker copy of **both** `polars` and `_polars_runtime_32` (~215 MB); `POLARS_MAX_THREADS=1` | 1.29M requests, Linux (measured with `PYTHONMALLOC=malloc`, before v2.7.2) |
+| **tokenizers** | ✅ | per-worker copy | 6.35M requests, Linux (measured with `PYTHONMALLOC=malloc`, before v2.7.2) |
+| **msgpack, cryptography** | ✅ | override only, no copy | loads in 4 of 4 sub-interpreters |
+| **pydantic** | ⚠️ by default a stub: imports work, **no validation** | declare `app.isolate("pydantic", "pydantic_core")` for the real library in workers | declared: 432k requests with validation, Linux (with `PYTHONMALLOC=malloc`, before v2.7.2); or validate on `gil=True` routes |
 | **pandas, lxml, pillow, sqlalchemy, others** | ❓ not tested | — | use `gil=True`, or test before relying on it |
 | **Pure Python, stdlib** (`json`, `re`, `asyncio`, `httpx`, …) | ✅ | nothing needed | |
 
 **`gil=True` is still the right tool** when a library is untested or rejects
-sub-interpreters, when you need real pydantic validation, or when N per-worker copies cost
-too much memory. Those routes run on the main interpreter, next to the sub-interpreter
+sub-interpreters, or when N per-worker copies cost too much memory. Those routes run on the main interpreter, next to the sub-interpreter
 routes in the same server:
 
 ```python
@@ -439,9 +438,10 @@ def analyze(req, data):
 
 **Upstream status.** Pyronova builds against [leocaolab/pyo3](https://github.com/leocaolab/pyo3),
 a PyO3 fork with per-interpreter type objects, caches and decref pools; the proposal is on
-[PyO3#3451](https://github.com/PyO3/pyo3/issues/3451). numpy has closed sub-interpreter
-support as not planned ([numpy#27192](https://github.com/numpy/numpy/issues/27192)), so the
-per-worker copy is how numpy runs here.
+[PyO3#3451](https://github.com/PyO3/pyo3/issues/3451). numpy closed its sub-interpreter bug
+report as not planned ([numpy#27192](https://github.com/numpy/numpy/issues/27192)); the
+feature request ([numpy#24755](https://github.com/numpy/numpy/issues/24755)) is still open.
+So the per-worker copy is how numpy runs here.
 
 #### Known issues and solutions (C extensions on Linux)
 
@@ -788,7 +788,7 @@ Pyronova (Rust core, 12 modules)
 
 ## Sub-interpreter Safe Ecosystem
 
-Pyronova's sub-interpreters deliver 429k req/s. C extensions such as NumPy run in them through a per-worker copy (see [C Extension Compatibility](#c-extension-compatibility)), which costs memory per worker; Pydantic runs only on `gil=True` routes. The **Golden Path** is the lighter option: alternatives that mostly need neither (Polars is the exception, see the note below), and are **not just safe — they're faster**.
+Pyronova's sub-interpreters deliver 429k req/s. C extensions such as NumPy run in them through a per-worker copy (see [C Extension Compatibility](#c-extension-compatibility)), which costs memory per worker; Pydantic is a stub in workers unless you isolate it. The **Golden Path** is the lighter option: alternatives that mostly need neither (Polars is the exception, see the note below), and are **not just safe — they're faster**.
 
 | Category | Traditional (per-worker copy or `gil=True`) | Golden Path (sub-interp safe) |
 |----------|-------------------------------|-------------------------------|
@@ -813,7 +813,7 @@ Same endpoints, same logic. Pyronova with sub-interp safe libs vs FastAPI with t
 | CPU-bound (10k moving avg) | 263 req/s | **599 req/s** | **2.3x** | 374ms → 165ms |
 | Validation | 7,345 req/s | **208,439 req/s** | **28.4x** | 13.8ms → 0.41ms |
 
-The traditional stack is single-threaded — the GIL serializes every request. Pyronova runs 10 sub-interpreters in parallel, each with its own GIL. The Golden Path libraries load in every interpreter without a per-worker copy (Polars excepted, see above). The result: **24-28x throughput, 29-34x lower latency**.
+The traditional stack is single-threaded — the GIL serializes every request. Pyronova runs 10 sub-interpreters in parallel, each with its own GIL. The Pyronova side of this benchmark uses only pure Python and stdlib `json` ([benchmarks/pyronova_bench_app.py](benchmarks/pyronova_bench_app.py)), which load in every interpreter without a per-worker copy. The result: **24-28x throughput, 29-34x lower latency**.
 
 Run the benchmark yourself: `bash benchmarks/run_comparison.sh`
 
@@ -838,7 +838,8 @@ a per-worker copy, automatically or via `app.isolate(...)`. See
 **What remains:**
 - **Memory:** one copy of each such library per worker (about 75 MB per worker for
   numpy + scipy + scikit-learn + orjson).
-- **pydantic** is a stub in workers (imports work, no validation); validation runs on
+- **pydantic** is a stub in workers by default (imports work, no validation). Declare
+  `app.isolate("pydantic", "pydantic_core")` for real validation in workers, or validate on
   `gil=True` routes.
 - **Untested libraries** (pandas, lxml, pillow, sqlalchemy, …): use `gil=True`, or test
   them first.
@@ -855,8 +856,9 @@ def analyze(req):
 
 **Upstream:** PyO3 per-interpreter state is proposed on
 [PyO3#3451](https://github.com/PyO3/pyo3/issues/3451) (Pyronova uses the
-[leocaolab/pyo3](https://github.com/leocaolab/pyo3) fork meanwhile); numpy closed
-sub-interpreter support as not planned ([numpy#27192](https://github.com/numpy/numpy/issues/27192)).
+[leocaolab/pyo3](https://github.com/leocaolab/pyo3) fork meanwhile); numpy closed its
+sub-interpreter bug report as not planned ([numpy#27192](https://github.com/numpy/numpy/issues/27192)),
+and the feature request ([numpy#24755](https://github.com/numpy/numpy/issues/24755)) is open.
 
 ### Python 3.13+ required
 

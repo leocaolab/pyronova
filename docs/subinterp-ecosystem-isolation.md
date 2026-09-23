@@ -9,6 +9,29 @@ Measured on **bluewhale** (Linux, AMD 7840HS, CPython 3.14, numpy 2.5.1 /
 scipy 1.18 / scikit-learn 1.9) and **mac** (ARM, CPython 3.14, numpy=Accelerate),
 2026-08-02. This file is the durable record of a long investigation session.
 
+> **Update 2026-09-23 (v2.7.2): prerequisites #2 and #3 below are no longer needed on
+> Linux; their root causes were found and fixed in the engine.** Details and measurements:
+> [subinterp-c-extension-status.en.md §10](subinterp-c-extension-status.en.md#10-known-issues-and-fixes-linux).
+> - **#2 (A-class import-time `free(): invalid size`)** was not an arena mix-up inside the
+>   extension. CPython ≥ 3.13 runs a single-phase extension's init in the **main**
+>   interpreter and hands the sub-interpreter a shallow copy of the module dict, so the
+>   isolated copy's objects lived on main's heap. `PYTHONMALLOC=malloc` only hid it (no
+>   arenas to mismatch). Fixed in v2.7.2: pyre runs a private copy's `PyInit_*` inside the
+>   worker. The 16-worker grill (numpy + scipy + sklearn + orjson) now starts and runs on
+>   Linux without `PYTHONMALLOC`.
+> - **#3 (B-class OpenBLAS `dgetrf_parallel` segfault)** was a stack overflow: pyre's
+>   threads had Rust's 2 MiB default stack, CPython's own threads get 8 MiB. Fixed in
+>   v2.7.2 (8 MiB). With the default multi-threaded OpenBLAS the grill no longer crashes.
+>   Single-threaded BLAS is still the right config for throughput (4 workers: 55 → 6,067
+>   req/s), and multi-worker runs now **default** to it (`*_NUM_THREADS=1` unless you set
+>   one); it is no longer needed to avoid a crash.
+> - **Still open:** the teardown abort (item 6 of the TODO list) is handled by the
+>   `os._exit` on graceful stop; whether it had the same root cause as #2 is not yet
+>   verified.
+>
+> The sections below are kept as the original record; statements they contain about #2
+> and #3 being required are superseded by this note.
+
 ## TL;DR
 
 Running unmodified C-extension code in own-GIL sub-interps needs **three
@@ -37,7 +60,7 @@ Single-request full ecosystem: works with (1)+(2). Concurrent: works with (1)+(2
 ### Libraries — zero-mod on own-GIL sub-interpreters
 | lib | verdict | prerequisites |
 |---|---|---|
-| numpy / scipy / sklearn | ✅ | isolate + override (+ on Linux: `PYTHONMALLOC=malloc` and `*_NUM_THREADS=1`); 345k concurrent, bluewhale |
+| numpy / scipy / sklearn | ✅ | isolate + override; 345k concurrent, bluewhale (then also needed `PYTHONMALLOC=malloc` + `*_NUM_THREADS=1` on Linux — not since v2.7.2, see the update at the top) |
 | orjson | ✅ | reactive auto-isolate (measured this repo) |
 | tokenizers | ✅ | isolate; 6.35M req, bluewhale |
 | pydantic / pydantic_core | ✅ | isolate + override; 432k req, bluewhale |
@@ -50,7 +73,7 @@ Single-request full ecosystem: works with (1)+(2). Concurrent: works with (1)+(2
 | per-worker physical clone + transient override | ✅ | the foundation |
 | meta_path finder: override around `create_module` | ✅ | load succeeds first-try, no failed attempt to pollute the process ext table |
 | `os._exit` on graceful shutdown (skip finalize) | ✅ | fixes the sub-interp teardown cross-arena abort; zero hot-path cost |
-| `PYTHONMALLOC=malloc` | ✅ | fixes A-class (Linux import-time abort AND teardown abort) |
+| `PYTHONMALLOC=malloc` | ✅ (superseded) | hid A-class (Linux import-time abort AND teardown abort); import-time root cause fixed in v2.7.2 |
 | catch-then-retry the failed import | ❌ | the failed 1st attempt half-registers the ext in `_PyRuntime.imports.extensions` (uncleanable by sys.modules eviction) → "cannot load module more than once" on warm restart |
 | persistent override | ❌ | masks the hard-failure signal every later undeclared single-phase ext needs to isolate itself |
 | `use_main_obmalloc=1` | ❌ | removes A-class but races under load (shared pymalloc, no lock) |
@@ -59,9 +82,9 @@ Single-request full ecosystem: works with (1)+(2). Concurrent: works with (1)+(2
 
 ### Platform
 - **mac:** import-time A-class tolerated (only a warning); **teardown aborted** (fixed via `os._exit`).
-- **Linux:** import-time A-class **hard-aborts** (glibc) → **without `PYTHONMALLOC=malloc` (#2), sklearn won't even import**; concurrent needs `*_NUM_THREADS=1` (#3).
+- **Linux:** import-time A-class **hard-aborted** (glibc) → without `PYTHONMALLOC=malloc` (#2), sklearn wouldn't even import; concurrent needed `*_NUM_THREADS=1` (#3). **Both fixed at the root in v2.7.2** (update at the top).
 
-**One line:** declared `app.isolate` + the above = solid; reactive auto-isolate is the convenience layer; heavy work belongs in the Rust engine. Linux production still needs #2 and #3 (below).
+**One line:** declared `app.isolate` + the above = solid; reactive auto-isolate is the convenience layer; heavy work belongs in the Rust engine. ~~Linux production still needs #2 and #3~~ — not since v2.7.2.
 
 ## The three failure classes (independent)
 
@@ -82,8 +105,13 @@ Single-request full ecosystem: works with (1)+(2). Concurrent: works with (1)+(2
   (`PyObject_SetAttr → PyDict_SetItemString → PyMem_Free`), glibc abort / core dump.
 - Cause: own-GIL requires `use_main_obmalloc=0` → each interp has its own pymalloc
   arena; the ext's import frees a chunk allocated in another arena.
-- Fix: route PyMem to a thread-safe non-arena allocator (`PYTHONMALLOC=malloc`).
-  Verified. `use_main_obmalloc=1` also removes it but is **racy under load** (shared
+- **Root cause (found 2026-09-23, fixed in v2.7.2):** CPython ≥ 3.13 runs a single-phase
+  ext's init in the main interpreter and gives the sub-interpreter a shallow copy of the
+  module dict (`import.c` `switch_to_main_interpreter` / `reload_singlephase_extension`);
+  the crash is the worker's first mutation of a main-owned object (scipy f2py `_fblas`,
+  `blas.py` `_get_funcs`). The cause line above is superseded.
+- Old fix: route PyMem to a thread-safe non-arena allocator (`PYTHONMALLOC=malloc`).
+  Verified — but it only hid the cross-heap free. `use_main_obmalloc=1` also removes it but is **racy under load** (shared
   pymalloc has no lock) → rejected.
 - mac does NOT abort here (its allocator tolerates the bad free); **Linux glibc is
   strict** → aborts.
@@ -98,7 +126,12 @@ Single-request full ecosystem: works with (1)+(2). Concurrent: works with (1)+(2
   own instance per worker — confirmed `_iso1.so` in the crash path) **still crashes**
   in `dgetrf_parallel`. So isolating the instance does NOT help; the lib's threaded
   mode itself is incompatible with being driven from these worker threads.
-- **Only fix that works: single-threaded native pools** (`*_NUM_THREADS=1`).
+- **Root cause (found 2026-09-23, fixed in v2.7.2):** stack overflow — `dgetrf_parallel`
+  recurses with a large on-stack job array, and pyre's threads had Rust's 2 MiB default
+  (CPython threads: 8 MiB). That is why isolating the instance didn't help. With 8 MiB
+  stacks the default multi-threaded OpenBLAS no longer crashes. The cause lines above are
+  superseded; the notes below still hold for **throughput**.
+- **Only fix that works (then): single-threaded native pools** (`*_NUM_THREADS=1`).
   345k concurrent req survived. This is the correct serving/pipeline config anyway
   (parallelism at worker level, avoid N×M oversubscription).
 - **Generic, not numpy-specific:** hits any lib with its own pool — OpenBLAS/MKL/BLIS,
@@ -187,7 +220,9 @@ Single-request full ecosystem: works with (1)+(2). Concurrent: works with (1)+(2
 - **BLAS backend:** mac ARM numpy uses **Apple Accelerate** (OS/GCD-managed threads)
   → no self-managed pthread pool → B-class doesn't bite. Linux uses **OpenBLAS**
   (own pool) → crashes.
-- **Allocator:** mac tolerates the cross-arena free; Linux glibc aborts (A-class).
+- **Allocator:** mac tolerates the cross-arena free; Linux glibc aborts (A-class). (Also: the
+  import-time crash needs a cold import, and arm64 numpy uses Accelerate — see the update at
+  the top.)
 - **Linker dedup:** mac dyld dedups by realpath/inode → per-worker copies isolate
   vendored libs; Linux ld.so dedups by **SONAME** → copies do NOT isolate vendored
   libs (needs patchelf unique-SONAME) — but that isolation doesn't fix B-class, so
@@ -221,11 +256,15 @@ Single-request full ecosystem: works with (1)+(2). Concurrent: works with (1)+(2
 ## Engine work to land (TODO — user changes nothing)
 1. `.libs` by distribution name — DONE in `_bootstrap.py` (committed 6f499de).
 2. PyMem → mimalloc/malloc via `PyMem_SetAllocator` at pymodule init (or re-exec with
-   `PYTHONMALLOC=malloc`). NOT done. Note: measured mimalloc via LD_PRELOAD did NOT
+   `PYTHONMALLOC=malloc`). **Dropped** — the import-time root cause was fixed instead
+   (v2.7.2, see the update at the top). Note: measured mimalloc via LD_PRELOAD did NOT
    beat glibc malloc (both ≈ −6% vs pymalloc; pymalloc's small-object specialization
    is the lost win) — so this is a real ~6% cost when the ecosystem mode is on.
 3. Default the `*_NUM_THREADS=1` env set for isolated workers (before their first
-   numpy import). NOT done.
+   numpy import). **DONE in v2.7.2** — `app.run()` with >1 sub-interpreter worker sets
+   OPENBLAS/OMP/MKL/VECLIB to 1 and shrinks already-loaded BLAS via threadpoolctl, unless
+   the user set any of them (`_limit_blas_threads` in `python/pyronova/app.py`).
+   `NUMEXPR_`/`RAYON_`/`POLARS_MAX_THREADS` and torch are not covered.
 4. isolate package + internal-.so layout (find_spec ValueError + sys.modules stub) —
    DONE & verified (committed 7b7a0a1). Unblocked pydantic_core; no regression.
 5. **Auto-isolate — DONE & verified.** Closes the last user-visible line: an unmodified
@@ -277,8 +316,9 @@ Single-request full ecosystem: works with (1)+(2). Concurrent: works with (1)+(2
    also raises `KeyboardInterrupt` on the Python main thread (often landing on the first
    shutdown hook or right before the hard exit), SIGINT is set to `SIG_IGN` before the hooks
    run. Verified: SIGABRT 0/6, shutdown hooks 6/6. Confirmed root cause independently:
-   `PYTHONMALLOC=malloc` also eliminates it (0/4) — that remains the proper fix for the
-   IMPORT-time A-class crash on Linux (#2), still not done.
+   `PYTHONMALLOC=malloc` also eliminates it (0/4). (The IMPORT-time A-class crash on Linux
+   was later root-caused and fixed in v2.7.2 without `PYTHONMALLOC`; whether this teardown
+   abort shares that cause is not yet verified.)
 
 ## OPEN / next design (其他的都是要解决的)
 - **Arrow Flight + HTTP server** dual-protocol node: HTTP (control/small, existing
