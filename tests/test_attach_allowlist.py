@@ -34,11 +34,6 @@ ALLOWLIST = {
         "C-FFI DB bridge, called from worker Python with its thread state current; "
         "deleted in Layer 2 M4 (#6)",
     ),
-    "src/db.rs": (
-        3,
-        "PgPool *_async resolvers on pyo3-async-runtimes threads; replaced by the "
-        "interpreter-generic resolver in Layer 2 M1 (#3)",
-    ),
 }
 
 

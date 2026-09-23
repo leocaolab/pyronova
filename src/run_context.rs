@@ -47,6 +47,12 @@ impl Interp {
         }
     }
 
+    /// True for the main interpreter.
+    pub(crate) fn is_main(&self) -> bool {
+        // SAFETY: always safe to call.
+        self.raw == unsafe { ffi::PyInterpreterState_Main() }
+    }
+
     pub(crate) fn id(&self) -> i64 {
         // SAFETY: the interpreter is alive for as long as anything that captured it can run.
         unsafe { ffi::PyInterpreterState_GetID(self.raw) }

@@ -24,7 +24,6 @@ leak_detect = ["dep:metrics", "dep:metrics-util"]
 
 [dependencies]
 pyo3 = { version = "0.29", features = ["extension-module"] }
-pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }

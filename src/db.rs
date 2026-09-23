@@ -27,13 +27,17 @@
 
 use std::sync::{Mutex, OnceLock};
 
-use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyStopIteration, PyValueError};
+use pyo3::exceptions::{
+    PyConnectionError, PyNotImplementedError, PyRuntimeError, PyStopIteration, PyValueError,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString};
 use pyo3::BoundObject;
 use sqlx::postgres::{PgPoolOptions, PgRow, PgValueRef};
 use sqlx::{Column, Row, TypeInfo, ValueRef};
 use tokio::runtime::Runtime;
+
+use crate::run_context::{attach_to, main_attach, Interp};
 
 /// Channel capacity for `PgCursor`. 8 rows in flight keeps memory
 /// bounded while allowing enough prefetch to hide server-round-trip
@@ -615,22 +619,15 @@ impl PgPool {
     // ----------------------------------------------------------------
     // Async variants — return Python awaitables.
     //
-    // Each `*_async` method kicks off the sqlx future on the pool's
-    // dedicated tokio runtime and hands back a Python awaitable via
-    // `pyo3_async_runtimes::tokio::future_into_py`. From an `async def`
-    // handler the caller writes `await pool.fetch_one_async(sql, ...)`
-    // exactly like any asyncio coroutine.
+    // `await pool.fetch_one_async(sql, ...)` from an `async def` handler. The query
+    // runs on the `pyronova-db` runtime and its result reaches the caller's asyncio
+    // loop through `await_on_loop` (see there).
     //
-    // Why separate from the sync methods: a single method that magically
-    // does the right thing based on caller context would mean "returns
-    // dict or coroutine depending on where you call it" — confusing and
-    // brittle. Explicit `_async` suffix makes the cost model obvious.
+    // Why separate from the sync methods: a single method that returns a dict or a
+    // coroutine depending on where it is called is confusing and brittle. The
+    // explicit `_async` suffix makes the cost model obvious.
     //
-    // The tokio runtime that pyo3-async-runtimes uses is globally
-    // configured on first use; we don't pass our `runtime()` handle to
-    // it because that would bind two runtimes together. Instead pool
-    // futures are spawned via sqlx::query which internally drives
-    // itself on the runtime that's `current` at spawn time.
+    // Main interpreter only: workers keep these fail-closed (Layer 2 design, FR-9).
     // ----------------------------------------------------------------
 
     #[pyo3(signature = (sql, *params))]
@@ -640,26 +637,27 @@ impl PgPool {
         sql: String,
         params: Vec<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        refuse_async_in_worker(py, "fetch_one")?;
         let pool = pool_ref()?;
         let bound = params
             .iter()
             .map(|p| extract_param(p.bind(py)))
             .collect::<PyResult<Vec<_>>>()?;
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let q = sqlx::query(&sql);
-            let row_opt = bind_params_raw(q, &bound)
-                .fetch_optional(pool)
-                .await
-                .map_err(|e| PyRuntimeError::new_err(format!("fetch_one_async: {e}")))?;
-
-            Python::attach(|py| -> PyResult<Py<PyAny>> {
-                match row_opt {
-                    Some(row) => Ok(row_to_dict(py, &row)?.into_any()),
-                    None => Ok(py.None()),
-                }
-            })
-        })
+        await_on_loop(
+            py,
+            async move {
+                let q = sqlx::query(&sql);
+                bind_params_raw(q, &bound)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|e| format!("fetch_one_async: {e}"))
+            },
+            |py, row_opt| match row_opt {
+                Some(row) => Ok(row_to_dict(py, &row)?.into_any()),
+                None => Ok(py.None()),
+            },
+        )
     }
 
     #[pyo3(signature = (sql, *params))]
@@ -669,27 +667,30 @@ impl PgPool {
         sql: String,
         params: Vec<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        refuse_async_in_worker(py, "fetch_all")?;
         let pool = pool_ref()?;
         let bound = params
             .iter()
             .map(|p| extract_param(p.bind(py)))
             .collect::<PyResult<Vec<_>>>()?;
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let q = sqlx::query(&sql);
-            let rows = bind_params_raw(q, &bound)
-                .fetch_all(pool)
-                .await
-                .map_err(|e| PyRuntimeError::new_err(format!("fetch_all_async: {e}")))?;
-
-            Python::attach(|py| -> PyResult<Py<PyAny>> {
+        await_on_loop(
+            py,
+            async move {
+                let q = sqlx::query(&sql);
+                bind_params_raw(q, &bound)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|e| format!("fetch_all_async: {e}"))
+            },
+            |py, rows| {
                 let py_list = PyList::empty(py);
                 for row in &rows {
                     py_list.append(row_to_dict(py, row)?)?;
                 }
                 Ok(py_list.into_any().unbind())
-            })
-        })
+            },
+        )
     }
 
     #[pyo3(signature = (sql, *params))]
@@ -699,26 +700,29 @@ impl PgPool {
         sql: String,
         params: Vec<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        refuse_async_in_worker(py, "fetch_scalar")?;
         let pool = pool_ref()?;
         let bound = params
             .iter()
             .map(|p| extract_param(p.bind(py)))
             .collect::<PyResult<Vec<_>>>()?;
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let q = sqlx::query(&sql);
-            let row = bind_params_raw(q, &bound)
-                .fetch_one(pool)
-                .await
-                .map_err(|e| PyRuntimeError::new_err(format!("fetch_scalar_async: {e}")))?;
-
-            Python::attach(|py| -> PyResult<Py<PyAny>> {
+        await_on_loop(
+            py,
+            async move {
+                let q = sqlx::query(&sql);
+                bind_params_raw(q, &bound)
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|e| format!("fetch_scalar_async: {e}"))
+            },
+            |py, row| {
                 let raw = row.try_get_raw(0).map_err(|e| {
                     PyRuntimeError::new_err(format!("fetch_scalar_async col 0: {e}"))
                 })?;
                 column_to_py(py, raw)
-            })
-        })
+            },
+        )
     }
 
     #[pyo3(signature = (sql, *params))]
@@ -728,20 +732,30 @@ impl PgPool {
         sql: String,
         params: Vec<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        refuse_async_in_worker(py, "execute")?;
         let pool = pool_ref()?;
         let bound = params
             .iter()
             .map(|p| extract_param(p.bind(py)))
             .collect::<PyResult<Vec<_>>>()?;
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let q = sqlx::query(&sql);
-            let result = bind_params_raw(q, &bound)
-                .execute(pool)
-                .await
-                .map_err(|e| PyRuntimeError::new_err(format!("execute_async: {e}")))?;
-            Ok(result.rows_affected())
-        })
+        await_on_loop(
+            py,
+            async move {
+                let q = sqlx::query(&sql);
+                bind_params_raw(q, &bound)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| format!("execute_async: {e}"))
+            },
+            |py, result| {
+                Ok(result
+                    .rows_affected()
+                    .into_pyobject(py)?
+                    .into_any()
+                    .unbind())
+            },
+        )
     }
 
     /// Execute a statement that doesn't return rows. Returns the number of
@@ -786,6 +800,180 @@ fn deliver(
             Err(PyRuntimeError::new_err(e))
         }
         None => Err(PyStopIteration::new_err(py.None())),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Async results for any interpreter (Layer 2, C9)
+// ---------------------------------------------------------------------------
+
+/// `*_async` is main-interpreter only for now (Layer 2 design, FR-9). The message is the one
+/// the worker bootstrap already gives.
+fn refuse_async_in_worker(py: Python<'_>, name: &str) -> PyResult<()> {
+    if Interp::current(py).is_main() {
+        return Ok(());
+    }
+    Err(PyNotImplementedError::new_err(format!(
+        "{name}_async is not available in sub-interpreter workers; \
+         use {name} (sync) or route with gil=True"
+    )))
+}
+
+/// Runs `fut` on the `pyronova-db` runtime and returns an asyncio future, created on the
+/// caller's running loop, that completes with `convert(result)`.
+///
+/// The result is delivered by attaching to the interpreter captured here, never by a bare
+/// attach from a runtime thread: once more than one interpreter has executed the engine, the
+/// PyO3 fork refuses those (Layer 2 spike, R-3). `pyo3-async-runtimes` did exactly that.
+///
+/// - The asyncio future is set from its own loop, through `call_soon_threadsafe`, and only
+///   if it isn't done yet: a cancelled caller is left alone.
+/// - Cancelling the asyncio future aborts the DB task.
+/// - Every path completes the future or finds it done, including a panic in the query or in
+///   `convert`, and drops the captured loop and future while attached to their interpreter.
+/// - A closed loop can't be reached; the result is dropped and the failure is logged.
+///
+/// Concurrency: queries run on the 2-thread `pyronova-db` runtime (`runtime()`); results are
+/// delivered from its blocking pool, so a busy GIL never stalls a runtime thread.
+fn await_on_loop<'py, T, F, C>(py: Python<'py>, fut: F, convert: C) -> PyResult<Bound<'py, PyAny>>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = Result<T, String>> + Send + 'static,
+    C: for<'a> FnOnce(Python<'a>, T) -> PyResult<Py<PyAny>> + Send + 'static,
+{
+    let event_loop = py.import("asyncio")?.call_method0("get_running_loop")?;
+    let py_fut = event_loop.call_method0("create_future")?;
+    let delivery = Delivery {
+        interp: Interp::current(py),
+        target: Some((event_loop.unbind(), py_fut.clone().unbind())),
+    };
+
+    let task = runtime().spawn(async move {
+        let result = fut.await;
+        // A failure here only means the runtime is shutting down; `delivery` was moved into
+        // the closure, and its Drop completes the future either way.
+        let _ = tokio::task::spawn_blocking(move || {
+            delivery.complete(move |py| match result {
+                Ok(value) => convert(py, value),
+                Err(msg) => Err(PyRuntimeError::new_err(msg)),
+            });
+        })
+        .await;
+    });
+    py_fut.call_method1("add_done_callback", (AbortOnCancel(task.abort_handle()),))?;
+    Ok(py_fut)
+}
+
+/// The asyncio loop and future one `await_on_loop` call delivers to, and their interpreter.
+struct Delivery {
+    interp: Interp,
+    /// `(loop, future)`; taken by the first completion.
+    target: Option<(Py<PyAny>, Py<PyAny>)>,
+}
+
+impl Delivery {
+    /// Sets the future to `outcome` from its loop (unless it is already done) and releases
+    /// the loop and future, all while attached to their interpreter.
+    fn complete<O>(mut self, outcome: O)
+    where
+        O: for<'a> FnOnce(Python<'a>) -> PyResult<Py<PyAny>>,
+    {
+        self.complete_with(outcome);
+    }
+
+    fn complete_with<O>(&mut self, outcome: O)
+    where
+        O: for<'a> FnOnce(Python<'a>) -> PyResult<Py<PyAny>>,
+    {
+        let Some((event_loop, py_fut)) = self.target.take() else {
+            return;
+        };
+        // SAFETY: always safe to call.
+        if unsafe { pyo3::ffi::Py_IsInitialized() == 0 || pyo3::ffi::Py_IsFinalizing() != 0 } {
+            // Nothing left to deliver to, and no interpreter to release into.
+            std::mem::forget((event_loop, py_fut));
+            return;
+        }
+        let interp = self.interp;
+        let run = move |py: Python<'_>| {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| outcome(py)))
+                .unwrap_or_else(|_| {
+                    Err(PyRuntimeError::new_err(
+                        "converting the database result to Python panicked",
+                    ))
+                });
+            let (ok, value) = match outcome {
+                Ok(v) => (true, v),
+                Err(e) => (false, e.into_value(py).into_any()),
+            };
+            let sent = resolver(py).and_then(|resolve| {
+                event_loop
+                    .bind(py)
+                    .call_method1(
+                        "call_soon_threadsafe",
+                        (resolve, py_fut.bind(py), ok, value),
+                    )
+                    .map(drop)
+            });
+            if let Err(e) = sent {
+                tracing::warn!(
+                    target: "pyronova::server",
+                    "async database result dropped: the asyncio loop can't be reached: {e}"
+                );
+            }
+            drop(event_loop);
+            drop(py_fut);
+        };
+        if interp.is_main() {
+            main_attach(run);
+        } else {
+            attach_to(interp, run);
+        }
+    }
+}
+
+impl Drop for Delivery {
+    /// Reached without a completion only if the task ended early: the query panicked, the
+    /// task was aborted (the caller cancelled, and then the future is already done), or the
+    /// runtime shut down.
+    fn drop(&mut self) {
+        self.complete_with(|_py| {
+            Err(PyRuntimeError::new_err(
+                "pyronova-db task ended without a result (it panicked, or the runtime shut down)",
+            ))
+        });
+    }
+}
+
+/// `resolve(fut, ok, value)`: sets `fut` unless it is already done. Compiled once per
+/// interpreter (`PyOnceLock` is per interpreter with the PyO3 fork).
+static RESOLVE: pyo3::sync::PyOnceLock<Py<PyAny>> = pyo3::sync::PyOnceLock::new();
+
+fn resolver(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    RESOLVE
+        .get_or_try_init(py, || {
+            let module = pyo3::types::PyModule::from_code(
+                py,
+                c"def resolve(fut, ok, value):\n    if fut.done():\n        return\n    if ok:\n        fut.set_result(value)\n    else:\n        fut.set_exception(value)\n",
+                c"pyronova_db_async",
+                c"pyronova_db_async",
+            )?;
+            Ok::<_, PyErr>(module.getattr("resolve")?.unbind())
+        })
+        .map(|f| f.bind(py).clone())
+}
+
+/// Done-callback on the asyncio future: aborts the DB task if the future was cancelled.
+#[pyclass(frozen)]
+struct AbortOnCancel(tokio::task::AbortHandle);
+
+#[pymethods]
+impl AbortOnCancel {
+    fn __call__(&self, fut: &Bound<'_, PyAny>) -> PyResult<()> {
+        if fut.call_method0("cancelled")?.is_truthy()? {
+            self.0.abort();
+        }
+        Ok(())
     }
 }
 
