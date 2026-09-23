@@ -386,45 +386,62 @@ Graceful degradation under extreme concurrency — still 356k QPS with zero erro
 
 ### C Extension Compatibility
 
-Python C extensions (PyO3/Rust, C/C++) use global state that isn't compatible with sub-interpreters (PEP 684). This is a CPython ecosystem limitation, not a Pyronova limitation.
+Most C extensions (PyO3/Rust, C/C++) were not written for own-GIL sub-interpreters
+(PEP 684). They fail in one of two ways: a policy check (the module declares it doesn't
+support sub-interpreters), or process-global C state that can't be shared, which shows up
+as `cannot load module more than once per process`. Pyronova handles both without changes
+to your code:
 
-| Library | Sub-interp | gil=True | Why |
-|---------|-----------|----------|-----|
-| **pydantic** | ❌ | ✅ | pydantic-core is PyO3/Rust, global static state |
-| **numpy** | ❌ | ✅ | C extension hardcodes "load once per process" |
-| **pandas** | ❌ | ✅ | Depends on numpy |
-| **scipy** | ❌ | ✅ | Depends on numpy |
-| **orjson** | ❌ | ✅ | PyO3/Rust module |
-| **sqlalchemy** | ❌ | ✅ | C extensions (greenlet, cython) |
-| **pillow** | ❌ | ✅ | C extension with global state |
-| **httpx** | ✅ | ✅ | Pure Python |
-| **requests** | ✅ | ✅ | Pure Python |
-| **json, hashlib, math** | ✅ | ✅ | stdlib, multi-interp safe |
-| **asyncio, threading** | ✅ | ✅ | stdlib, per-interpreter loops |
-| **dataclasses, typing** | ✅ | ✅ | Pure Python |
-| **re, datetime, os** | ✅ | ✅ | stdlib |
-
-**Rule of thumb:** if `pip show <package>` shows a `.so`/`.pyd` file, it likely needs `gil=True`. Pure Python packages always work in sub-interpreters.
-
-**The fix is simple: add `gil=True` to routes that need C extensions.**
+- **Policy check:** every C extension a worker imports is loaded with CPython's
+  sub-interpreter override on, only for that load.
+- **Process-global state:** the worker gets its **own copy** of the library, cloned
+  copy-on-write (APFS `cp -c` / Linux `cp --reflink=auto`). This happens automatically the
+  first time an import fails that way (v2.7). You can also declare the libraries up front
+  with `app.isolate(...)` (v2.6). A copy costs memory: about 75 MB per worker for the
+  numpy + scipy + scikit-learn + orjson set.
 
 ```python
-# Fast route — sub-interpreter, 429k req/s, no C extensions needed
-@app.get("/fast")
-def fast(req):
-    return {"hello": "world"}
+app = Pyronova()
+app.isolate("numpy", "scipy", "sklearn")  # optional: declare up front; otherwise cloned on first import
 
-# Heavy route — GIL main interpreter, full C extension support
-@app.post("/analyze", model=AnalysisRequest, gil=True)
-def analyze(req, data):
+@app.get("/compute")                       # runs in the sub-interpreter workers, in parallel
+def compute(req):
     import numpy as np
-    import pandas as pd
-    return {"mean": float(np.mean(data.values))}
+    return {"s": float(np.linalg.svd(np.random.rand(160, 160), compute_uv=False).sum())}
 ```
 
-Pyronova auto-detects which routes need GIL and dispatches accordingly. Fast routes stay at 429k req/s; GIL routes get full ecosystem access. Both run concurrently in the same server.
+What has been measured (details and versions in
+[docs/subinterp-c-extension-status.en.md](docs/subinterp-c-extension-status.en.md) and
+[docs/subinterp-ecosystem-isolation.md](docs/subinterp-ecosystem-isolation.md)):
 
-> **When will this be fixed?** When PyO3 and numpy add PEP 684 multi-phase init support. Tracking: [PyO3#3451](https://github.com/PyO3/pyo3/issues/3451), [numpy#24003](https://github.com/numpy/numpy/issues/24003). When they do, these libraries will run at full speed in sub-interpreters — no `gil=True` needed.
+| Library | In sub-interpreter workers | How | Evidence |
+|---------|---------------------------|-----|----------|
+| **numpy / scipy / scikit-learn** | ✅ | per-worker copy | 16-worker grill soak (`examples/stress_grill.py`), macOS + Linux; Linux: 2.71M requests in 180 s, no errors |
+| **orjson** | ✅ | per-worker copy | same soak |
+| **polars** | ✅ | per-worker copy of **both** `polars` and `_polars_runtime_32` (~215 MB) | 1.29M requests, Linux |
+| **tokenizers** | ✅ | per-worker copy | 6.35M requests, Linux |
+| **msgpack, cryptography** | ✅ | override only, no copy | 4 of 4 sub-interpreters |
+| **pydantic** | ⚠️ import works, **no validation** | Pyronova substitutes a stub in workers | real validation runs on `gil=True` routes |
+| **pandas, lxml, pillow, sqlalchemy, others** | ❓ not tested | — | use `gil=True`, or test before relying on it |
+| **Pure Python, stdlib** (`json`, `re`, `asyncio`, `httpx`, …) | ✅ | nothing needed | |
+
+**`gil=True` is still the right tool** when a library is untested or rejects
+sub-interpreters, when you need real pydantic validation, or when N per-worker copies cost
+too much memory. Those routes run on the main interpreter, next to the sub-interpreter
+routes in the same server:
+
+```python
+@app.post("/analyze", model=AnalysisRequest, gil=True)  # main interpreter: full ecosystem
+def analyze(req, data):
+    import pandas as pd
+    return {"mean": float(pd.Series(data.values).mean())}
+```
+
+**Upstream status.** Pyronova builds against [leocaolab/pyo3](https://github.com/leocaolab/pyo3),
+a PyO3 fork with per-interpreter type objects, caches and decref pools; the proposal is on
+[PyO3#3451](https://github.com/PyO3/pyo3/issues/3451). numpy has closed sub-interpreter
+support as not planned ([numpy#27192](https://github.com/numpy/numpy/issues/27192)), so the
+per-worker copy is how numpy runs here.
 
 #### Known issues and solutions (C extensions on Linux)
 
@@ -717,11 +734,18 @@ val = app.state["key"]         # Read (nanosecond, no Redis)
 ### numpy / C Extensions
 
 ```python
-@app.get("/compute", gil=True)
+@app.get("/compute")          # each worker gets its own numpy copy automatically
 def compute(req):
     import numpy as np
     return {"mean": float(np.mean(np.random.randn(10000)))}
+
+@app.get("/legacy", gil=True)  # or run on the main interpreter
+def legacy(req):
+    import pandas as pd
+    return {"n": len(pd.DataFrame({"a": [1, 2, 3]}))}
 ```
+
+See [C Extension Compatibility](#c-extension-compatibility) for what is measured.
 
 ## Configuration
 
@@ -756,7 +780,7 @@ Pyronova (Rust core, 12 modules)
 ├── Sub-interpreter pool (N independent GILs)
 │   ├── Sync workers (def → 429k req/s)
 │   └── Async workers (async def → 133k req/s)
-├── Hybrid GIL dispatch (gil=True → numpy/C extensions)
+├── Hybrid GIL dispatch (gil=True → main interpreter)
 ├── SharedState (DashMap, cross-worker, nanosecond)
 ├── GIL Watchdog (contention + hold time + queue depth)
 └── Backpressure (bounded channels, 503 on overload)
@@ -764,9 +788,9 @@ Pyronova (Rust core, 12 modules)
 
 ## Sub-interpreter Safe Ecosystem
 
-Pyronova's sub-interpreters deliver 429k req/s, but C extensions (Pydantic, NumPy, Pandas) can't run in them. Instead of fighting the ecosystem, Pyronova offers a **Golden Path**: modern, pure-Python alternatives that are **not just safe — they're faster**.
+Pyronova's sub-interpreters deliver 429k req/s. C extensions such as NumPy run in them through a per-worker copy (see [C Extension Compatibility](#c-extension-compatibility)), which costs memory per worker; Pydantic runs only on `gil=True` routes. The **Golden Path** is the lighter option: alternatives that mostly need neither (Polars is the exception, see the note below), and are **not just safe — they're faster**.
 
-| Category | Traditional (needs `gil=True`) | Golden Path (sub-interp safe) |
+| Category | Traditional (per-worker copy or `gil=True`) | Golden Path (sub-interp safe) |
 |----------|-------------------------------|-------------------------------|
 | Validation | Pydantic V2 | `msgspec` / `mashumaro` |
 | Data | Pandas + NumPy | `Polars` |
@@ -774,7 +798,9 @@ Pyronova's sub-interpreters deliver 429k req/s, but C extensions (Pydantic, NumP
 | JSON | orjson | stdlib `json` / `msgspec` |
 | Database | psycopg2 | `psycopg` v3 (pure Python) |
 
-**The rule**: pure Python = sub-interp safe. C extensions = use `gil=True`.
+**The rule**: pure Python = sub-interp safe with no copy. C extensions = a per-worker copy (automatic) or `gil=True`.
+
+> Polars and msgspec are compiled extensions, not pure Python. Polars was measured to need a per-worker copy (see the table above); msgspec is not tested.
 
 ### Not just safe — faster
 
@@ -787,7 +813,7 @@ Same endpoints, same logic. Pyronova with sub-interp safe libs vs FastAPI with t
 | CPU-bound (10k moving avg) | 263 req/s | **599 req/s** | **2.3x** | 374ms → 165ms |
 | Validation | 7,345 req/s | **208,439 req/s** | **28.4x** | 13.8ms → 0.41ms |
 
-The traditional stack is single-threaded — the GIL serializes every request. Pyronova runs 10 sub-interpreters in parallel, each with its own GIL. The Golden Path libraries are pure Python, so they load cleanly in every interpreter. The result: **24-28x throughput, 29-34x lower latency**.
+The traditional stack is single-threaded — the GIL serializes every request. Pyronova runs 10 sub-interpreters in parallel, each with its own GIL. The Golden Path libraries load in every interpreter without a per-worker copy (Polars excepted, see above). The result: **24-28x throughput, 29-34x lower latency**.
 
 Run the benchmark yourself: `bash benchmarks/run_comparison.sh`
 
@@ -801,23 +827,36 @@ Pyronova's sub-interpreter architecture delivers extreme performance but comes w
 
 ### C extensions in sub-interpreters
 
-**What:** Libraries built with PyO3 (Rust) or C/C++ extensions cannot be imported inside sub-interpreters. This includes pydantic, numpy, pandas, orjson, and most compiled packages.
+**What:** Most C extensions (PyO3/Rust, C/C++) weren't written for sub-interpreters: they
+either declare no support or keep process-global C state.
 
-**Why:** CPython's PEP 684 requires extensions to declare multi-interpreter support via `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED`. Most libraries haven't done this yet. PyO3 uses global static state that conflicts with multiple interpreters.
+**How Pyronova handles it:** workers load C extensions with the sub-interpreter override,
+and give a library with process-global state (numpy, scipy, scikit-learn, orjson, polars)
+a per-worker copy, automatically or via `app.isolate(...)`. See
+[C Extension Compatibility](#c-extension-compatibility) for what is measured.
 
-**Workaround:** Add `gil=True` to routes that need these libraries. They run on the main interpreter with full ecosystem access while other routes run at 429k req/s on sub-interpreters.
+**What remains:**
+- **Memory:** one copy of each such library per worker (about 75 MB per worker for
+  numpy + scipy + scikit-learn + orjson).
+- **pydantic** is a stub in workers (imports work, no validation); validation runs on
+  `gil=True` routes.
+- **Untested libraries** (pandas, lxml, pillow, sqlalchemy, …): use `gil=True`, or test
+  them first.
 
 ```python
 @app.get("/fast")                    # Sub-interpreter: 429k req/s
 def fast(req): return "hello"
 
-@app.post("/analyze", gil=True)      # Main interpreter: numpy works
+@app.post("/analyze", gil=True)      # Main interpreter: full ecosystem, one shared instance
 def analyze(req):
-    import numpy as np
-    return {"result": float(np.mean([1,2,3]))}
+    import pandas as pd
+    return {"result": float(pd.Series([1, 2, 3]).mean())}
 ```
 
-**When fixed:** When PyO3 ([#3451](https://github.com/PyO3/pyo3/issues/3451)) and numpy ([#24003](https://github.com/numpy/numpy/issues/24003)) add PEP 684 support.
+**Upstream:** PyO3 per-interpreter state is proposed on
+[PyO3#3451](https://github.com/PyO3/pyo3/issues/3451) (Pyronova uses the
+[leocaolab/pyo3](https://github.com/leocaolab/pyo3) fork meanwhile); numpy closed
+sub-interpreter support as not planned ([numpy#27192](https://github.com/numpy/numpy/issues/27192)).
 
 ### Python 3.13+ required
 
