@@ -1353,7 +1353,7 @@ dependencies = [
 
 [[package]]
 name = "pyronova-engine"
-version = "2.7.1"
+version = "2.7.2"
 dependencies = [
  "brotli",
  "bytes",

@@ -436,9 +436,9 @@ Pyronova auto-detects which routes need GIL and dispatches accordingly. Fast rou
   yourself, set `OPENBLAS_NUM_THREADS` (or `OMP_NUM_THREADS` / `MKL_NUM_THREADS`) before
   starting; Pyronova then changes nothing.
 - **Isolated single-phase extensions (scipy's f2py modules etc.) crashed on startup**
-  (`free(): invalid size`): CPython ≥ 3.13 runs their init in the main interpreter. Fixed (unreleased): Pyronova runs the init of each worker's private copy inside that worker.
-- **SIGSEGV in OpenBLAS under load**: worker threads had a 2 MiB stack. Fixed (unreleased;
-  8 MiB, same as CPython's threads).
+  (`free(): invalid size`): CPython ≥ 3.13 runs their init in the main interpreter. Fixed in v2.7.2: Pyronova runs the init of each worker's private copy inside that worker.
+- **SIGSEGV in OpenBLAS under load**: worker threads had a 2 MiB stack. Fixed in v2.7.2
+  (8 MiB, same as CPython's threads).
 
 Details and measurements: [docs/subinterp-c-extension-status.en.md §10](docs/subinterp-c-extension-status.en.md#10-known-issues-and-fixes-linux).
 

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v2.7.2 (2026-09-23) — Linux grill crash fixes; BLAS threads per worker
 
 ### Fixed
 
