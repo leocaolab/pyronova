@@ -2,16 +2,11 @@
 
 Thin Python-side re-export of the Rust `PgPool` class. Initialize once at
 startup, then call `pool.fetch_one(...)`, `.fetch_all(...)`, `.fetch_scalar(...)`,
-`.execute(...)` from any handler. DB routes currently require
-`gil=True`: the sub-interp bridge (`src/bridge/db_bridge.rs`) exists but
-calls `rt.block_on(...)` inside the worker, which panics under TPC mode
-because the TPC worker thread is already driving a tokio current_thread
-runtime. Remove the pin once the bridge is refactored to channel work
-to the DB runtime without `block_on`.
-
-v1 is a sync API — handler threads block on `rt.block_on()` while the
-dedicated DB runtime drives the sqlx future. The GIL is released during
-the wait, so other workers make progress.
+`.execute(...)` from any handler, sub-interpreter workers included: every
+interpreter shares one connection pool. The query runs on a dedicated DB
+runtime while the calling thread waits with its GIL released, so other
+workers make progress. The `*_async` variants run on the main interpreter
+(`gil=True` routes); in a worker they raise `NotImplementedError`.
 
 Example::
 
@@ -37,9 +32,9 @@ families int2/int4/int8, float4/float8, text/varchar/char, bytea, bool,
 json/jsonb.
 
 For large result sets, use `pool.fetch_iter(sql, ...)` to get a
-streaming cursor — O(1) memory, rows yielded one at a time. Streaming
-cursors are currently main-interp only (sub-interp proxy is a mock),
-so export-style handlers still need `gil=True`:
+streaming cursor — O(1) memory, rows yielded one at a time; it works in any
+interpreter. Returning a streaming *response* (`Stream`) needs `gil=True`,
+so an export-style handler looks like this:
 
     @app.get("/export", gil=True)
     def export(req):

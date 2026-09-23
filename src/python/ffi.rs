@@ -11,7 +11,7 @@ use pyo3::ffi;
 use super::pool::*;
 
 // ---------------------------------------------------------------------------
-// Phase 7.2: Global worker state for async C-FFI bridge
+// Global worker state for the async engine (`worker_api.rs`)
 // ---------------------------------------------------------------------------
 
 /// Per-async-worker state, reached by `_worker_recv` / `_worker_send` through `WORKER_ID`.
@@ -400,11 +400,10 @@ mod tests {
     /// up its state. Without the `pool_id` guard it would silently receive
     /// from Pool B's channel — stealing a live request.
     ///
-    /// The guard: `pyronova_recv_cfunc` / `pyronova_send_cfunc` accept a pool_id
-    /// arg and short-circuit to None on mismatch. We exercise the guard
-    /// at the Rust level (the C-FFI wrappers just do PyArg_ParseTuple
-    /// then call this same path) to keep the test free of pyo3 test-rig
-    /// plumbing.
+    /// The guard: `_worker_recv` / `_worker_send` accept a pool_id
+    /// arg and short-circuit on mismatch. We exercise the guard
+    /// at the Rust level (the pyfunctions call this same lookup) to keep
+    /// the test free of pyo3 test-rig plumbing.
     #[test]
     fn zombie_worker_rejected_by_pool_id_mismatch() {
         let _guard = WORKER_STATES_TEST_LOCK.lock().unwrap();
@@ -420,7 +419,7 @@ mod tests {
         let live = get_worker_state(0).expect("slot 0 must exist");
         assert_eq!(live.pool_id, s_new.pool_id);
 
-        // Zombie's caller carries the OLD pool_id. The C-FFI bridge's
+        // Zombie's caller carries the OLD pool_id. The worker API's
         // filter `s.pool_id == pool_id` would reject it; simulate the
         // same check here.
         let zombie_sees = get_worker_state(0).filter(|s| s.pool_id == old_pool_id);

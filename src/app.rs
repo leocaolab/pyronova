@@ -852,8 +852,8 @@ impl PyronovaApp {
                 .unwrap_or(false);
 
         // Streaming constraints (v1): GIL-only, sync handlers only.
-        // Sub-interp streaming needs a C-FFI bridge; async streaming needs
-        // awaitable support. Both deferred to v2.
+        // Sub-interp streaming isn't supported (a worker handler returning a
+        // Stream gets a 500); async streaming needs awaitable support.
         if stream && !gil {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "stream=True requires gil=True (v1 limitation)",
@@ -1339,8 +1339,8 @@ impl PyronovaApp {
             pyo3::exceptions::PyRuntimeError::new_err(format!("read script '{script_path}': {e}"))
         })?;
 
-        // Allocate a pool_id for this TPC server — still used by the
-        // C-FFI bridge's zombie guard (cheap compatibility).
+        // Allocate a pool_id for this TPC server; each worker gets it as
+        // `POOL_ID` (the async engine's zombie guard; TPC doesn't use it).
         let pool_id = interp::next_pool_id();
 
         // Build N sub-interpreters on the MAIN thread (main tstate current).

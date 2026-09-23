@@ -261,8 +261,8 @@ impl InterpreterPool {
         };
 
         // Allocate a fresh pool_id for this InterpreterPool instance.
-        // All WorkerStates created below carry this id; the C-FFI bridge
-        // rejects recv/send from zombies whose pool_id mismatches.
+        // All WorkerStates created below carry this id; `_worker_recv` /
+        // `_worker_send` reject zombies whose pool_id mismatches.
         let pool_id = POOL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
 
         // Create sub-interpreters and spawn worker threads

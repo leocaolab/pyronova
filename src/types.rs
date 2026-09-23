@@ -12,7 +12,7 @@ use pyo3::prelude::*;
 
 /// Two ways to construct headers:
 /// - GIL path: store raw `hyper::HeaderMap`, convert lazily on first Python access.
-/// - Sub-interp path: pre-converted `HashMap` (needed for C-FFI bridge).
+/// - Sub-interp path: pre-converted `HashMap` (built off the worker thread's GIL).
 pub(crate) enum LazyHeaders {
     /// Raw hyper HeaderMap — O(1) construction, deferred conversion.
     Raw(hyper::HeaderMap),
@@ -108,12 +108,10 @@ impl PyronovaRequest {
 
 #[pymethods]
 impl PyronovaRequest {
-    /// Python-side constructor for the sub-interpreter async engine bridge
-    /// (`_async_engine.py`: `_Request(method, path, params, query,
-    /// body_bytes, headers, client_ip)`). The sync sub-interp worker path
-    /// (`worker.rs::build_request`) and the GIL route path
-    /// (`handlers/subinterp.rs`) construct this type directly from Rust and
-    /// never go through here.
+    /// Python-side constructor: `Request(method, path, params, query,
+    /// body_bytes, headers, client_ip)`. Pyronova itself builds requests in
+    /// Rust (the worker paths through `worker::new_request`, the GIL route path
+    /// in `handlers/subinterp.rs`) and never goes through here.
     ///
     /// `params` / `headers` arrive as already-built `dict[str, str]` (the
     /// FFI recv side builds them — see `python/ffi.rs`), `body_bytes` as

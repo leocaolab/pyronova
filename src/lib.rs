@@ -50,8 +50,8 @@ fn _forgotten_workers() -> Vec<String> {
 }
 
 /// Whether this code runs in a sub-interpreter worker, i.e. not in the main interpreter
-/// (Layer 2, FR-15). Replaces the process-wide `PYRONOVA_WORKER` env var, which leaked
-/// into child processes.
+/// (Layer 2, FR-15). Replaces a process-wide environment variable, which leaked into
+/// child processes.
 #[pyo3::pyfunction]
 fn _in_worker(py: Python<'_>) -> bool {
     !run_context::on_main(py)

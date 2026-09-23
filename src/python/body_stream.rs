@@ -18,8 +18,8 @@
 //! deliberately modest.
 //!
 //! Scope (v1):
-//!   * Only `gil=True` routes. Sub-interpreter streaming needs a C-FFI
-//!     bridge akin to `pyronova_recv`/`pyronova_send` and is deferred.
+//!   * Only `gil=True` routes. Sub-interpreter request streaming is
+//!     deferred.
 //!   * Sync iterator only. `async for chunk in req.stream()` is deferred.
 //!   * `max_body_size` still bounds total ingest even when streaming.
 //!

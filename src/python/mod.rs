@@ -13,8 +13,9 @@
 //! unsafe-heavy, so the audit-isolation rationale above still holds):
 //!
 //! - `ffi`: raw FFI primitives — `PyObjRef` RAII, `SubInterpGilGuard`,
-//!   tstate rebinding, the worker-state registry, and the C-FFI bridge
-//!   (`pyronova_recv`/`pyronova_send`/`pyronova_emit_log`).
+//!   tstate rebinding, and the async worker-state registry.
+//! - `worker_api`: the `#[pyfunction]`s the async engine calls
+//!   (`_worker_recv`/`_worker_send`/...).
 //! - `convert`: Python `str`/`dict` conversion helpers.
 //! - `worker`: `SubInterpreterWorker` — owns one sub-interpreter.
 //! - `pool`: `InterpreterPool`, `WorkRequest`, `SubInterpResponse`, and

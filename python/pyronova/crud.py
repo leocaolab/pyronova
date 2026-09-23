@@ -160,14 +160,10 @@ def register_crud(
         )
 
     # --- GET /prefix --------------------------------------------------------
-    # All routes pinned to gil=True. The sub-interp DB bridge
-    # (src/bridge/db_bridge.rs) looks ready on paper but uses
-    # `rt.block_on(...)` inside the sub-interp worker, which panics under
-    # TPC mode because the TPC worker thread is already driving a tokio
-    # current_thread runtime. Until the bridge is refactored to channel
-    # work to the DB runtime without block_on, CRUD stays on the main
-    # interp. Tracked as TODO: refactor db_bridge to channel-based
-    # dispatch (mirror src/bridge/main_bridge.rs).
+    # All routes pinned to gil=True. The original reason is gone: workers now
+    # run the real PgPool, which never nests `block_on` in a Tokio context
+    # (Layer 2). Moving CRUD into workers is a separate change (design
+    # docs/design/real-engine-in-workers.md, non-goals).
     list_sql = f"SELECT {col_list} FROM {table} ORDER BY {id_column} LIMIT $1 OFFSET $2"
 
     @app.get(prefix, gil=True)
