@@ -997,6 +997,52 @@ _iso_real_import = _builtins.__import__
 _iso_in_hook = False  # re-entrancy guard: only the OUTERMOST import self-heals
 
 
+def _iso_is_private_clone(path):
+    """True if `path` is inside this worker's private clone dir."""
+    wd = _ISO["worker_dir"]
+    if not wd or not path:
+        return False
+    wd = _os.path.realpath(wd)
+    return _os.path.realpath(path).startswith(wd + _os.sep)
+
+
+def _iso_init_here(spec):
+    """Run a single-phase extension's PyInit in THIS interpreter, or return None
+    for a multi-phase one (CPython already creates those here).
+
+    Since 3.13 CPython runs every single-phase init function in the MAIN
+    interpreter and hands the sub-interpreter a shallow copy of the resulting
+    module dict (import.c `switch_to_main_interpreter` /
+    `reload_singlephase_extension`). The module's objects then live on main's
+    obmalloc heap, and the first one the worker mutates frees main's memory into
+    its own allocator. Measured with scipy's f2py `_fblas` on 3.14: a setattr on a
+    fortran object resizes its dict -> `free(): invalid size`.
+
+    Only for a private clone: nothing else loads that file, so skipping CPython's
+    process-wide extension registry can't double-initialize its C statics."""
+    import ctypes, sys
+    short = spec.name.rpartition(".")[2]
+    lib = ctypes.PyDLL(spec.origin, mode=sys.getdlopenflags())
+    try:
+        init = getattr(lib, "PyInit_" + short)
+    except AttributeError:
+        return None
+    init.restype = ctypes.py_object
+    obj = init()
+    if not isinstance(obj, type(sys)):
+        return None  # a PyModuleDef: multi-phase
+    api = ctypes.pythonapi
+    api.PyModule_GetDef.restype = ctypes.c_void_p
+    api.PyModule_GetDef.argtypes = [ctypes.py_object]
+    api.PyState_AddModule.argtypes = [ctypes.py_object, ctypes.c_void_p]
+    moddef = api.PyModule_GetDef(obj)
+    # What CPython's fixup does: register it for PyState_FindModule.
+    if moddef and api.PyState_AddModule(obj, moddef) != 0:
+        raise ImportError(f"PyState_AddModule failed for {spec.name}")
+    obj.__file__ = spec.origin
+    return obj
+
+
 class _IsolatingExtensionLoader:
     """Wraps an ExtensionFileLoader so its dlopen+PyInit runs under a transient
     override. Delegates the rest of the loader protocol to the real loader."""
@@ -1011,6 +1057,10 @@ class _IsolatingExtensionLoader:
         # the override must wrap create_module.
         prev, _ok = _iso_transient_override()
         try:
+            if _ok and _iso_is_private_clone(spec.origin):
+                mod = _iso_init_here(spec)
+                if mod is not None:
+                    return mod
             return self._inner.create_module(spec)
         finally:
             _iso_restore_override(prev)
