@@ -41,6 +41,14 @@ fn workrequest_counts() -> (u64, u64) {
     )
 }
 
+/// Worker threads the last sub-interpreter pool shutdown abandoned, each with what it was
+/// running; taking the list clears it. `Pyronova.run()` exits non-zero when it is not
+/// empty, because finalizing with a live worker interpreter aborts (Layer 2, N8).
+#[pyo3::pyfunction]
+fn _forgotten_workers() -> Vec<String> {
+    python::pool::take_forgotten_workers()
+}
+
 /// Whether this code runs in a sub-interpreter worker, i.e. not in the main interpreter
 /// (Layer 2, FR-15). Replaces the process-wide `PYRONOVA_WORKER` env var, which leaked
 /// into child processes.
@@ -68,6 +76,7 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(logging::emit_python_log, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(workrequest_counts, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(_in_worker, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(_forgotten_workers, m)?)?;
     // Called by the async engine in sub-interpreter workers (Layer 2, C5).
     m.add_function(pyo3::wrap_pyfunction!(python::worker_api::_worker_recv, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(python::worker_api::_worker_send, m)?)?;

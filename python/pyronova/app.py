@@ -10,7 +10,7 @@ import json as _json_module
 
 import os
 
-from pyronova.engine import PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log, _in_worker
+from pyronova.engine import PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log, _in_worker, _forgotten_workers
 from pyronova.mcp import MCPServer
 import logging as _logging
 
@@ -1233,6 +1233,23 @@ class Pyronova:
                 _logging.getLogger("pyronova.app").exception(
                     "shutdown hook %s raised", getattr(hook, "__name__", repr(hook))
                 )
+
+        # A worker thread that outlived the shutdown grace period (a handler that ignores
+        # shutdown) still has a live interpreter, and finalizing with one aborts. Say which,
+        # and exit non-zero without finalizing (Layer 2, design §12).
+        forgotten = _forgotten_workers()
+        if forgotten:
+            _logging.getLogger("pyronova.app").error(
+                "exiting without finalization: worker(s) %s did not stop within the "
+                "shutdown grace period", ", ".join(forgotten)
+            )
+            print(
+                "pyronova: worker(s) " + ", ".join(forgotten) + " did not stop within the "
+                "shutdown grace period; exiting without finalization",
+                file=sys.stderr, flush=True,
+            )
+            sys.stdout.flush()
+            os._exit(1)
 
         # Not a graceful stop (real startup/run error): surface it normally.
         if run_error is not None:

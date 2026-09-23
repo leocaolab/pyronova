@@ -87,8 +87,33 @@ pub(crate) unsafe fn log_and_clear_py_exception(context: &str) {
         "<PyObject_Str failed>".to_string()
     };
 
+    let traceback = format_traceback(exc);
     ffi::Py_DECREF(exc);
-    tracing::error!(target: "pyronova::server", %context, error = %msg, "Python exception");
+    tracing::error!(target: "pyronova::server", %context, error = %msg, %traceback, "Python exception");
+}
+
+/// `traceback.format_exception(exc)`, joined; empty if formatting itself fails (its error
+/// is cleared). Only on the error path, so the import costs nothing on the hot path.
+unsafe fn format_traceback(exc: *mut ffi::PyObject) -> String {
+    let module = PyObjRef::from_owned(ffi::PyImport_ImportModule(c"traceback".as_ptr()));
+    let lines = module.and_then(|m| {
+        let f = PyObjRef::from_owned(ffi::PyObject_GetAttrString(
+            m.as_ptr(),
+            c"format_exception".as_ptr(),
+        ))?;
+        PyObjRef::from_owned(ffi::PyObject_CallOneArg(f.as_ptr(), exc))
+    });
+    let joined = lines.and_then(|l| {
+        let sep = py_str("")?;
+        PyObjRef::from_owned(ffi::PyUnicode_Join(sep.as_ptr(), l.as_ptr()))
+    });
+    match joined.and_then(|s| pyobj_to_string(s.as_ptr()).ok()) {
+        Some(tb) => tb,
+        None => {
+            ffi::PyErr_Clear();
+            String::new()
+        }
+    }
 }
 
 /// Same as `py_str_dict` but from a Vec of key-value pairs (for path params).

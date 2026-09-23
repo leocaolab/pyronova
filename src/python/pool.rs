@@ -4,7 +4,7 @@
 //! `SubInterpreterWorker`s.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use matchit::Router;
@@ -98,6 +98,20 @@ impl WorkRequest {
 // Channel-based Interpreter Pool
 // ---------------------------------------------------------------------------
 
+/// Worker threads a pool shutdown gave up on (still running after the grace period), each
+/// described with what it was running. Their interpreters are still alive, and finalizing
+/// with a live sub-interpreter aborts, so `Pyronova.run()` checks this and exits non-zero
+/// instead (Layer 2, design §12, M4 review N8).
+static FORGOTTEN_WORKERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Takes the list of workers the last pool shutdown abandoned.
+pub(crate) fn take_forgotten_workers() -> Vec<String> {
+    std::mem::take(&mut *FORGOTTEN_WORKERS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// `current_route` value of a sync worker that isn't running a handler.
+const IDLE: usize = usize::MAX;
+
 pub(crate) struct InterpreterPool {
     /// Dropping senders closes the channel, signaling workers to exit.
     sync_work_tx: crossbeam_channel::Sender<WorkRequest>,
@@ -112,6 +126,11 @@ pub(crate) struct InterpreterPool {
     pub(crate) submit_semaphore: Arc<tokio::sync::Semaphore>,
     /// Worker threads — joined on drop to ensure clean sub-interpreter shutdown.
     worker_threads: Option<Vec<std::thread::JoinHandle<()>>>,
+    /// Per worker thread (same order), the route index its sync worker is running, or
+    /// `IDLE`; async workers keep `IDLE`. Only read when a shutdown abandons a worker.
+    current_route: Vec<Arc<AtomicUsize>>,
+    /// `METHOD path` per route index, for naming an abandoned worker's route.
+    route_names: Vec<String>,
     routers: HashMap<String, Router<usize>>,
     pub(crate) requires_gil: Vec<bool>,
     pub(crate) is_async_handler: Vec<bool>,
@@ -144,7 +163,7 @@ impl Drop for InterpreterPool {
         // indefinitely.
         if let Some(threads) = self.worker_threads.take() {
             const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-            for t in threads {
+            for (i, t) in threads.into_iter().enumerate() {
                 // std::thread::JoinHandle has no timed join, so we spin a
                 // short poll loop by checking is_finished(). is_finished()
                 // is a cheap atomic read.
@@ -168,11 +187,26 @@ impl Drop for InterpreterPool {
                         );
                     }
                 } else {
-                    tracing::warn!(
+                    let name = t.thread().name().unwrap_or("worker").to_string();
+                    let route = self
+                        .current_route
+                        .get(i)
+                        .map(|c| c.load(Ordering::Relaxed))
+                        .filter(|&idx| idx != IDLE)
+                        .and_then(|idx| self.route_names.get(idx));
+                    let what = match route {
+                        Some(r) => format!("{name} (running {r})"),
+                        None => name,
+                    };
+                    tracing::error!(
                         target: "pyronova::server",
-                        "worker thread did not exit within {:?} — abandoning (process shutdown in progress)",
+                        "worker thread {what} did not exit within {:?}; abandoning it",
                         JOIN_TIMEOUT,
                     );
+                    FORGOTTEN_WORKERS
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(what);
                     // Leak the JoinHandle — OS will reclaim at process exit.
                     std::mem::forget(t);
                 }
@@ -275,11 +309,14 @@ impl InterpreterPool {
         }
 
         let logging_flag = Arc::new(AtomicBool::new(request_logging));
+        let current_route: Vec<Arc<AtomicUsize>> =
+            (0..n).map(|_| Arc::new(AtomicUsize::new(IDLE))).collect();
 
         // Spawn workers: first sync_count as sync, rest as async
         let mut pending = workers.into_iter().enumerate();
         while let Some((i, worker)) = pending.next() {
             let logging = Arc::clone(&logging_flag);
+            let current = Arc::clone(&current_route[i]);
 
             let spawned = if i >= sync_count && has_any_async {
                 // Async worker
@@ -297,7 +334,7 @@ impl InterpreterPool {
                     .name(format!("pyronova-worker-{i}"))
                     .stack_size(crate::python::PYTHON_THREAD_STACK)
                     .spawn(move || {
-                        worker_thread_loop(worker, rx, &logging);
+                        worker_thread_loop(worker, rx, &logging, &current);
                     })
                     .map_err(|e| format!("failed to spawn worker thread {i}: {e}"))
             };
@@ -327,6 +364,12 @@ impl InterpreterPool {
             sync_work_tx,
             async_work_tx,
             worker_threads: Some(threads),
+            current_route,
+            route_names: expected
+                .routes
+                .iter()
+                .map(|(method, path, _)| format!("{method} {path}"))
+                .collect(),
             routers,
             requires_gil,
             is_async_handler: is_async_handler.clone(),
@@ -397,6 +440,7 @@ fn worker_thread_loop(
     mut worker: SubInterpreterWorker,
     rx: crossbeam_channel::Receiver<WorkRequest>,
     request_logging: &AtomicBool,
+    current_route: &AtomicUsize,
 ) {
     // Rebind the sub-interp tstate to this OS thread (fixes the
     // cross-thread attach/detach leak). See
@@ -425,6 +469,7 @@ fn worker_thread_loop(
         // Deferred conversions: moved off Tokio thread.
         let headers_map = crate::types::extract_headers(&req.headers);
 
+        current_route.store(req.handler_idx, Ordering::Relaxed);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let _guard = SubInterpGilGuard::acquire(tstate_cell.get(), &tstate_cell);
 
@@ -443,6 +488,7 @@ fn worker_thread_loop(
 
         // Recover tstate (updated by guard's Drop, even after panic)
         worker.tstate = tstate_cell.get();
+        current_route.store(IDLE, Ordering::Relaxed);
 
         let response = match result {
             Ok(r) => r,
