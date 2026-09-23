@@ -431,7 +431,7 @@ def hit_counter(req):
 当前 PR 落地后的下一轮优化目标，按低分项倒序排列：
 
 - [ ] **CRUD (5.6 / 12k req/s)** — 见 [`docs/optimize-crud.md`](docs/optimize-crud.md)
-  - **前置**: SharedState C-FFI bridge（`src/bridge/state_bridge.rs`，~150 LOC Rust + ~30 LOC Python）—— 把 sub-interp 里的空 mock `SharedState` 换成 bridge-backed 实现，跟 `_PgPool` 同模式
+  - **前置**: ~~SharedState C-FFI bridge（`src/bridge/state_bridge.rs`）~~ —— 已被 Layer 2 取代：worker 加载真 engine，`SharedState` 直接连到主程序的同一个 map（`docs/design/real-engine-in-workers.md` C2，issue #5 / #6）
   - 关键 unlock: `_CRUD_CACHE` Python dict → `SharedState`，去掉所有 `/crud/*` 的 `gil=True`
   - 预期: 12k → 60–100k（5–10x，从 GIL-bridge 4 worker 池解放到 sub-interp 64 worker）
 - [ ] **Async DB (13.3 / 27k req/s)** — 见 [`docs/optimize-async-db.md`](docs/optimize-async-db.md)
