@@ -180,20 +180,13 @@ async def _pyronova_engine():
         _log.exception("worker=%s fetcher thread failed to start", WORKER_ID)
         return
     try:
-        # Bound shutdown duration. Without a timeout, a stuck fetcher
-        # thread (e.g. _pyronova_recv FFI hanging, zombie-worker guard
-        # failing, channel deadlock) would block shutdown indefinitely
-        # (arc finding async-engine-4). 30s aligns with Rust's gateway
-        # timeout — if the fetcher hasn't exited by then, it never will.
-        try:
-            await asyncio.wait_for(asyncio.to_thread(t.join), timeout=30.0)
-        except asyncio.TimeoutError:
-            _log.error(
-                "worker=%s fetcher thread did not exit within 30s — "
-                "proceeding with shutdown; thread will be killed by "
-                "Py_EndInterpreter",
-                WORKER_ID,
-            )
+        # The fetcher returns only when the request channel closes, i.e. at
+        # shutdown, so this waits for the worker's whole life. No timeout: one
+        # used to start counting at worker start, ended the engine after 30 s of
+        # normal serving, and Py_EndInterpreter then blocked forever joining the
+        # still-running (non-daemon; sub-interpreters forbid daemon threads)
+        # fetcher. A timeout can't bound shutdown anyway for the same reason.
+        await asyncio.to_thread(t.join)
     finally:
         # Graceful asyncio shutdown. Without this, Py_EndInterpreter
         # would tear the VM down while pending tasks (background
