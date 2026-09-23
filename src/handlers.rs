@@ -194,61 +194,70 @@ pub(crate) struct StreamInfo {
     headers: HashMap<String, String>,
 }
 
+/// A thread's persistent asyncio event loop, and the interpreter it was created in.
+///
+/// Calls `loop.close()` when the thread dies, so orphaned loops don't leak FDs or tasks.
+/// The close re-attaches to the loop's own interpreter explicitly: the thread may have no
+/// thread state by then, and once several interpreters have executed the engine a bare
+/// `Python::attach` there is refused (Layer 2, C4).
+///
+/// Safety: guards against the Py_Finalize race — if the interpreter is already finalized
+/// when the thread exits, the loop is leaked instead of touched.
+struct LoopGuard(Option<(Py<PyAny>, crate::run_context::Interp)>);
+
+impl Drop for LoopGuard {
+    /// [arc:intentional-handle] reason: we are in Drop with no error
+    /// channel to propagate to and no caller to defer to. A failed
+    /// close() can still leak FDs/tasks, so rather than silently dropping
+    /// the error we log it (with the error object) so the leak is
+    /// diagnosable.
+    fn drop(&mut self) {
+        if let Some((loop_obj, interp)) = self.0.take() {
+            // During process shutdown, Tokio's blocking thread pool may tear down
+            // threads after Py_Finalize has run; attaching then is a use-after-free.
+            if unsafe { pyo3::ffi::Py_IsInitialized() } != 0 {
+                crate::run_context::attach_to(interp, move |py| close_loop(py, loop_obj));
+            } else {
+                // Interp is gone. Py<PyAny>::Drop would Py_DECREF on a finalized
+                // interpreter → segfault. The process is exiting; leak it.
+                std::mem::forget(loop_obj);
+            }
+        }
+    }
+}
+
+fn close_loop(py: Python<'_>, loop_obj: Py<PyAny>) {
+    if let Err(e) = loop_obj.call_method0(py, "close") {
+        tracing::warn!(
+            target: "pyronova::server",
+            error = %e,
+            "event loop close() failed; loop FDs/tasks may have leaked"
+        );
+    }
+    // loop_obj drops here, attached.
+}
+
+thread_local! {
+    static LOOP: std::cell::RefCell<LoopGuard> =
+        const { std::cell::RefCell::new(LoopGuard(None)) };
+}
+
+/// Close this thread's event loop now, while attached, instead of at thread exit. For
+/// long-lived main-side threads that must drop every `Py<T>` they own before releasing
+/// their thread state.
+pub(crate) fn close_thread_event_loop(py: Python<'_>) {
+    let taken = LOOP.with(|tl| tl.borrow_mut().0.take());
+    if let Some((loop_obj, _interp)) = taken {
+        close_loop(py, loop_obj);
+    }
+}
+
 /// If `obj` is a coroutine (from `async def`), execute it via a thread-local
 /// persistent asyncio event loop. Otherwise return it unchanged.
 ///
 /// Uses thread_local to cache event loop per spawn_blocking thread —
 /// avoids asyncio.run() overhead of creating/destroying loop per request.
 fn resolve_coroutine(py: Python<'_>, obj: Py<PyAny>) -> Result<Py<PyAny>, String> {
-    use std::cell::RefCell;
-
-    /// RAII wrapper that calls `loop.close()` via GIL when the thread dies.
-    /// Prevents FD / task leaks from orphaned asyncio event loops.
-    ///
-    /// Safety: guards against Py_Finalize race — if the Python interpreter
-    /// is already shutting down when this thread exits, we skip the FFI call
-    /// (leak the loop object) rather than segfault on invalid thread state.
-    struct LoopGuard(Option<Py<PyAny>>);
-    impl Drop for LoopGuard {
-        /// [arc:intentional-handle] reason: we are in Drop with no error
-        /// channel to propagate to and no caller to defer to. A failed
-        /// close() can still leak FDs/tasks, so rather than silently dropping
-        /// the error we log it (with the error object) so the leak is
-        /// diagnosable.
-        fn drop(&mut self) {
-            if let Some(loop_obj) = self.0.take() {
-                // Check that the Python interpreter is still alive.
-                // During process shutdown, Tokio's blocking thread pool may
-                // tear down threads AFTER Py_Finalize has run, making
-                // Python::attach() UB (use-after-free on global interpreter).
-                if unsafe { pyo3::ffi::Py_IsInitialized() } != 0 {
-                    Python::attach(|py| {
-                        if let Err(e) = loop_obj.call_method0(py, "close") {
-                            tracing::warn!(
-                                target: "pyronova::server",
-                                error = %e,
-                                "event loop close() failed during LoopGuard \
-                                 drop; loop FDs/tasks may have leaked"
-                            );
-                        }
-                    });
-                    // loop_obj's Py<PyAny>::Drop fires here under a live
-                    // interp → benign refcount decrement.
-                } else {
-                    // Interp is gone. Py<PyAny>::Drop would try to
-                    // Py_DECREF on a finalized interpreter → segfault.
-                    // Physically leak the pointer — at this point the
-                    // whole process is exiting, so the OS reclaims it.
-                    std::mem::forget(loop_obj);
-                }
-            }
-        }
-    }
-
-    thread_local! {
-        static LOOP: RefCell<LoopGuard> = const { RefCell::new(LoopGuard(None)) };
-    }
-
     let bound = obj.bind(py);
     // Awaitable detection via C-level type slot probe.
     //
@@ -294,10 +303,18 @@ fn resolve_coroutine(py: Python<'_>, obj: Py<PyAny>) -> Result<Py<PyAny>, String
             asyncio
                 .call_method1("set_event_loop", (&new_loop,))
                 .map_err(|e| format!("set_event_loop: {e}"))?;
-            guard.0 = Some(new_loop.unbind());
+            guard.0 = Some((new_loop.unbind(), crate::run_context::Interp::current(py)));
         }
 
-        let event_loop = guard.0.as_ref().unwrap().bind(py);
+        let (loop_obj, loop_interp) = guard.0.as_ref().unwrap();
+        // R-4: the loop belongs to the interpreter that created it. Only main-side threads
+        // reach this path; one arriving from another interpreter is a bug.
+        debug_assert_eq!(
+            loop_interp.id(),
+            crate::run_context::Interp::current(py).id(),
+            "thread-local event loop reused from a different interpreter"
+        );
+        let event_loop = loop_obj.bind(py);
         let result = event_loop
             .call_method1("run_until_complete", (bound,))
             .map_err(|e| format!("run_until_complete error: {e}"))?;
@@ -533,7 +550,7 @@ pub(crate) fn call_handler_with_hooks(
     // measures real request latency instead of artificial contention.
     let gil_wait_start = std::time::Instant::now();
 
-    Python::attach(|py| {
+    crate::run_context::main_attach(|py| {
         crate::monitor::GIL_QUEUE_LENGTH.fetch_sub(1, Relaxed);
         crate::monitor::record_gil_wait(gil_wait_start.elapsed().as_micros() as u64);
         let hold_start = std::time::Instant::now();

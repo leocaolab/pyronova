@@ -77,11 +77,17 @@ def _boot(script: str, mode: str, port: int) -> subprocess.Popen:
     env = dict(os.environ)
     env["PYRONOVA_MODE"] = mode
     env["PYRONOVA_PORT"] = str(port)
-    proc = subprocess.Popen(
-        [sys.executable, path],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        preexec_fn=os.setsid, env=env,
-    )
+    # Output goes to a file, not a pipe: nobody drains a pipe while tests run, so a chatty
+    # server could block on a full one, and `_teardown` scans the whole log, shutdown
+    # included (Layer 2, FR-12).
+    log_path = f"/tmp/pyronova_test_{os.getpid()}_{port}.log"
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(
+            [sys.executable, path],
+            stdout=log, stderr=subprocess.STDOUT,
+            preexec_fn=os.setsid, env=env,
+        )
+    proc.pyronova_log = log_path  # type: ignore[attr-defined]
     # Poll until responsive
     deadline = time.time() + 10
     last_err = None
@@ -92,24 +98,34 @@ def _boot(script: str, mode: str, port: int) -> subprocess.Popen:
         except Exception as e:  # noqa: BLE001 — we only care it starts
             last_err = e
             time.sleep(0.1)
-    # Failed to start — harvest stderr for the error message
+    # Failed to start — harvest the output for the error message
     proc.kill()
-    out, _ = proc.communicate(timeout=5)
+    proc.wait(timeout=5)
+    with open(log_path, errors="replace") as f:
+        out = f.read()
     raise RuntimeError(
         f"Pyronova server ({mode} mode on port {port}) failed to start: "
-        f"{last_err}\nServer output:\n{out.decode(errors='replace')[:2000]}"
+        f"{last_err}\nServer output:\n{out[:2000]}"
     )
 
 
 def _teardown(proc: subprocess.Popen) -> None:
+    """Stop the server the way a user does (SIGINT → graceful shutdown), then fail if its
+    log, shutdown included, contains a PyO3 fork panic."""
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        proc.wait(timeout=5)
+        os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+        proc.wait(timeout=20)
     except Exception:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            proc.wait(timeout=5)
         except Exception:
             pass
+    log_path = getattr(proc, "pyronova_log", None)
+    if log_path and os.path.exists(log_path):
+        with open(log_path, errors="replace") as f:
+            panics = fork_panic_lines(f.read())
+        assert panics == [], "server log has PyO3 fork panics:\n" + "\n".join(panics)
 
 
 def feature_server_factory(script: str):
@@ -136,3 +152,24 @@ def feature_server_factory(script: str):
             _teardown(proc)
 
     return feature_server
+
+
+# ---------------------------------------------------------------------------
+# Layer 2 (FR-12): fork panic-text scan for E2E server logs
+# ---------------------------------------------------------------------------
+
+# The two refusals the PyO3 fork raises once more than one interpreter has executed the
+# engine and a thread with no thread state touches Python. A grep of src/ can't see
+# drops, so every Layer 2 E2E scans its server log for these instead.
+FORK_PANIC_TEXTS = (
+    "Python::attach was called on a thread that has no Python thread state",
+    "was dropped on a thread that has no Python thread state",
+)
+
+
+def fork_panic_lines(log_text: str) -> list[str]:
+    """Lines of `log_text` that contain a fork panic text."""
+    return [
+        line for line in log_text.splitlines()
+        if any(t in line for t in FORK_PANIC_TEXTS)
+    ]

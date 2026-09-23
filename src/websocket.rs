@@ -188,25 +188,26 @@ pub(crate) async fn handle_websocket(
 ) -> Result<Response<crate::handlers::BoxBody>, hyper::Error> {
     let path = req.uri().path().to_string();
 
-    // Look up PyronovaWebSocket handler (need GIL to clone Py<PyAny>)
-    let handler = Python::attach(|py| routes.ws_handlers.get(&path).map(|h| h.clone_ref(py)));
-
-    let handler = match handler {
-        Some(h) => h,
-        None => {
-            return Ok(crate::handlers::full_body(
-                Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Full::new(Bytes::from_static(b"no websocket handler")))
-                    .unwrap_or_else(|_| {
-                        // builder() only fails on invalid status/headers, which
-                        // cannot happen with these literal inputs — fall back to a
-                        // plain response instead of panicking on the impossible case.
-                        Response::new(Full::new(Bytes::from_static(b"no websocket handler")))
-                    }),
-            ));
-        }
-    };
+    // Only check that a handler exists here; no Python on this thread. In TPC mode this
+    // runs on a worker's thread, bound to that worker's interpreter: attaching here used to
+    // re-attach the WORKER's thread state and `clone_ref` a main-interpreter object under
+    // the worker's GIL. The handler is cloned on the connection thread instead, attached to
+    // main (Layer 2, C4).
+    if !routes.ws_handlers.contains_key(&path) {
+        return Ok(crate::handlers::full_body(
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Full::new(Bytes::from_static(b"no websocket handler")))
+                .unwrap_or_else(|_| {
+                    // builder() only fails on invalid status/headers, which
+                    // cannot happen with these literal inputs — fall back to a
+                    // plain response instead of panicking on the impossible case.
+                    Response::new(Full::new(Bytes::from_static(b"no websocket handler")))
+                }),
+        ));
+    }
+    // The route table belongs to the main interpreter.
+    let main = crate::run_context::main_interp();
 
     // Extract the key for the handshake
     let key = match req.headers().get("sec-websocket-key") {
@@ -235,7 +236,7 @@ pub(crate) async fn handle_websocket(
                 )
                 .await;
 
-                run_ws_connection(ws_stream, handler).await;
+                run_ws_connection(ws_stream, routes, path, main).await;
             }
             Err(e) => {
                 tracing::error!(target: "pyronova::server", error = %e, "PyronovaWebSocket upgrade error");
@@ -248,8 +249,12 @@ pub(crate) async fn handle_websocket(
 }
 
 /// Run a PyronovaWebSocket connection — bridges async Tokio with sync Python handler.
-async fn run_ws_connection<S>(ws_stream: WebSocketStream<S>, handler: Py<PyAny>)
-where
+async fn run_ws_connection<S>(
+    ws_stream: WebSocketStream<S>,
+    routes: FrozenRoutes,
+    path: String,
+    main: crate::run_context::Interp,
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (mut ws_sink, mut ws_source) = ws_stream.split();
@@ -274,12 +279,17 @@ where
     //
     // Contract: PyronovaWebSocket handlers live in the main interpreter (they
     // are registered via `@app.websocket(...)` at import time, which
-    // runs in the main interp). `Python::attach` on a fresh OS thread
-    // binds to the main interp's tstate, which matches. This is NOT a
-    // PEP 684 cross-interp boundary — sub-interpreters aren't involved
-    // for WS handlers in the current design.
+    // runs in the main interp). The thread has no thread state, so it attaches
+    // to main explicitly, with one thread state for the connection's life, and
+    // takes the handler from the route table there (Layer 2, C4). Not
+    // `main_attach`: this thread can outlive the server run whose context
+    // `main_attach` reads. The route table clone is dropped inside the attach.
     let py_handle = std::thread::spawn(move || {
-        Python::attach(|py| {
+        crate::run_context::attach_to(main, move |py| {
+            let handler = routes.ws_handlers.get(&path).map(|h| h.clone_ref(py));
+            drop(routes);
+            // Checked at handshake; the table is frozen.
+            let Some(handler) = handler else { return };
             let ws_obj = match Py::new(py, sky_ws) {
                 Ok(o) => o,
                 Err(e) => {

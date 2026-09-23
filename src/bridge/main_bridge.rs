@@ -93,9 +93,10 @@ pub(crate) struct GilWorkItem {
 /// threads.
 pub(crate) struct MainInterpBridge {
     tx: cbc::Sender<GilWorkItem>,
-    // Worker JoinHandles are deliberately dropped-detached. Workers
-    // exit when the crossbeam Sender count hits zero (server shutdown
-    // dropping Arcs). At that point main interp cleanup runs naturally.
+    /// Bridge threads exit when the Sender drops. `shutdown_join` drops it and joins them,
+    /// so a server run returns only after every thread has released its `Py<T>`s and its
+    /// main thread state (Layer 2, FR-6).
+    handles: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl MainInterpBridge {
@@ -129,7 +130,7 @@ impl MainInterpBridge {
         // (→ 500) already degrade gracefully when capacity is reduced or
         // zero, so the rest of the fleet (sub-interp routes) keeps
         // serving regardless.
-        let mut spawned = 0usize;
+        let mut handles = Vec::with_capacity(workers);
         for i in 0..workers {
             let rx = rx.clone();
             let routes = Arc::clone(&routes);
@@ -137,6 +138,9 @@ impl MainInterpBridge {
                 .name(format!("pyronova-main-bridge-{i}"))
                 .stack_size(crate::python::PYTHON_THREAD_STACK)
                 .spawn(move || {
+                    // Each request attaches through `main_attach`, which gives this
+                    // thread one main thread state for its life (released by a
+                    // thread-local destructor before `join` returns).
                     loop {
                         // crossbeam recv: blocks until item or all
                         // Senders drop. Disconnected → server shutdown
@@ -147,6 +151,12 @@ impl MainInterpBridge {
                         };
                         dispatch_one(&routes, item);
                     }
+                    // Everything this thread owns that holds Python objects goes while
+                    // attached, before the thread state does.
+                    crate::run_context::main_attach(move |py| {
+                        crate::handlers::close_thread_event_loop(py);
+                        drop(routes);
+                    });
                     tracing::info!(
                         target: "pyronova::server",
                         worker = i,
@@ -154,7 +164,7 @@ impl MainInterpBridge {
                     );
                 });
             match res {
-                Ok(_handle) => spawned += 1,
+                Ok(handle) => handles.push(handle),
                 Err(e) => {
                     tracing::error!(
                         target: "pyronova::server",
@@ -167,6 +177,7 @@ impl MainInterpBridge {
             }
         }
 
+        let spawned = handles.len();
         if spawned == 0 {
             tracing::error!(
                 target: "pyronova::server",
@@ -191,7 +202,36 @@ impl MainInterpBridge {
             "main-interp bridge spawned"
         );
 
-        Arc::new(MainInterpBridge { tx })
+        Arc::new(MainInterpBridge { tx, handles })
+    }
+
+    /// Close the channel and wait for every bridge thread to exit. Call it with the GIL
+    /// released (the threads attach to main on their way out), after every other clone of
+    /// the bridge is gone, i.e. after the TPC threads have been joined.
+    pub(crate) fn shutdown_join(bridge: Arc<Self>) {
+        match Arc::try_unwrap(bridge) {
+            Ok(MainInterpBridge { tx, handles }) => {
+                drop(tx);
+                for (i, h) in handles.into_iter().enumerate() {
+                    if h.join().is_err() {
+                        tracing::error!(
+                            target: "pyronova::server",
+                            worker = i,
+                            "main-interp bridge worker panicked"
+                        );
+                    }
+                }
+            }
+            Err(still_shared) => {
+                // Joining now would wait forever on a Sender someone else still holds.
+                tracing::error!(
+                    target: "pyronova::server",
+                    other_refs = Arc::strong_count(&still_shared) - 1,
+                    "main-interp bridge still referenced at shutdown; its threads are \
+                     left to exit when the last reference drops"
+                );
+            }
+        }
     }
 
     /// Non-blocking dispatch. Returns Err with the original work item

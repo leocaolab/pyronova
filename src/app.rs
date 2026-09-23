@@ -417,6 +417,11 @@ impl PyronovaApp {
             })
         };
 
+        // The route table holds main-interpreter `Py<T>`s. Worker, bridge and Tokio threads
+        // hold clones and may drop theirs anywhere, including at runtime shutdown; this one
+        // is the last, dropped when `run` returns, on the main thread, attached (FR-6).
+        let _routes_keepalive = Arc::clone(&frozen);
+
         // Build TLS acceptor once at startup if both paths are provided.
         // Either both or neither — single path is a configuration error.
         let tls_acceptor = match (tls_cert, tls_key) {
@@ -1247,7 +1252,8 @@ impl PyronovaApp {
         };
 
         py.detach(move || -> PyResult<()> {
-            crate::tpc::run_tpc_subinterp(
+            let bridge_to_join = main_bridge.clone();
+            let res = crate::tpc::run_tpc_subinterp(
                 addr,
                 n_threads,
                 num_cpus,
@@ -1256,8 +1262,13 @@ impl PyronovaApp {
                 tls_acceptor,
                 main_bridge,
                 extra_tls,
-            )
-            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+            );
+            // The TPC threads are joined, so this is the last bridge reference: close it and
+            // wait for its threads to release their Python objects (FR-6).
+            if let Some(bridge) = bridge_to_join {
+                crate::bridge::main_bridge::MainInterpBridge::shutdown_join(bridge);
+            }
+            res.map_err(pyo3::exceptions::PyRuntimeError::new_err)
         })
     }
 

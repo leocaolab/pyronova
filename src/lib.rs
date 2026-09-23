@@ -15,6 +15,7 @@ mod monitor;
 mod python;
 mod response;
 mod router;
+mod run_context;
 mod server;
 mod state;
 mod static_fs;
@@ -42,6 +43,9 @@ fn workrequest_counts() -> (u64, u64) {
 
 #[pymodule]
 fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Remembers the main interpreter (no-op elsewhere), for threads that must attach to
+    // it explicitly (Layer 2, C4).
+    run_context::capture_main(m.py());
     m.add_class::<app::PyronovaApp>()?;
     m.add_class::<types::PyronovaRequest>()?;
     m.add_class::<types::PyronovaResponse>()?;
