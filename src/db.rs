@@ -5,9 +5,12 @@
 //! pool's futures. All handlers (GIL or sub-interpreter) share the same
 //! connection pool — no per-interp duplication.
 //!
-//! v1 scope:
-//!   * sync API only (`pool.fetch_one(sql, *params)` blocks the worker
-//!     until the future completes). v2 adds async-awaitable wrappers.
+//! Scope:
+//!   * sync API (`pool.fetch_one(sql, *params)` blocks the calling thread
+//!     until the future completes, GIL released), usable from the main
+//!     interpreter and from sub-interpreter workers.
+//!   * `*_async` awaitables (`await_on_loop`), main interpreter only; a
+//!     worker gets `NotImplementedError`.
 //!   * supported param types: int, float, str, bool, bytes, None, dict
 //!     (JSON), list (JSON). datetime / uuid / decimal → v2.
 //!   * supported row types: same set, read back via PgValueRef type OIDs.

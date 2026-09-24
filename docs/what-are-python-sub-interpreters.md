@@ -228,9 +228,10 @@ steps.
    include the `interpreters` stdlib module (Python 3.13+), explicit
    `crossbeam-channel`-style queues built into a Rust extension,
    shared-memory primitives via `multiprocessing.shared_memory`, or
-   pure byte transfers. Pyronova uses a custom C-FFI bridge with
-   `tokio::sync::mpsc` channels for native async without crossing
-   GILs.
+   pure byte transfers. Pyronova's Rust engine hands each worker its
+   requests over channels, and its extension module loads in every
+   worker (one module object per interpreter), so a worker calls the
+   engine's functions directly without crossing GILs.
 
 4. **Plan for graceful degradation.** Some routes or operations will
    require the main interpreter (legacy C extensions, GIL-only
@@ -285,11 +286,13 @@ production deployments.
   request stays within one interpreter, and cross-interpreter
   communication happens at the bytes-and-channels level.
 
-- **Mock-module injection for incompatible libraries.** When a
-  sub-interpreter imports a module that holds GIL-required state, you
-  often need to inject a mock or stub. Pyronova does this for parts
-  of `pydantic` and its own submodules—the mock satisfies imports
-  without triggering the incompatible code path.
+- **A private copy for incompatible libraries.** A C extension that
+  keeps process-global state (numpy, orjson, pydantic-core, polars)
+  can't be shared between interpreters. Pyronova gives each worker its
+  own copy of such a library and initializes it inside that worker, so
+  the real library runs in every worker instead of a stand-in. Earlier
+  versions stubbed out parts of `pydantic` and Pyronova's own modules;
+  those stubs are gone.
 
 ## From sub-interpreters to multi-core Python
 
@@ -322,8 +325,9 @@ but with N parallel cores' worth of throughput.
 ## See sub-interpreters in production
 
 Pyronova is a Python web framework built from the ground up around
-sub-interpreters. It uses per-interpreter GIL for parallelism, a
-custom C-FFI bridge for native async without GIL crossing, and
+sub-interpreters. It uses per-interpreter GIL for parallelism, loads
+its Rust extension in every worker for native async without GIL
+crossing, and
 mimalloc as a global allocator to keep per-interpreter memory
 overhead low. Benchmarks on commodity hardware exceed 420,000
 requests per second on the plaintext baseline—numbers that

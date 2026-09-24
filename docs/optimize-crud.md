@@ -1,5 +1,8 @@
 # Optimize CRUD
 
+> **Superseded prerequisite (2026-09, Layer 2, `docs/design/real-engine-in-workers.md`):** the "SharedState C-FFI bridge" below (`src/bridge/state_bridge.rs`, a bridge-backed replacement for the `_bootstrap.py` mock) was never built. Workers now import the real `pyronova.engine`, and `SharedState()` / `app.state` in a worker is handed the running app's map (C2). The CRUD routes themselves are still `gil=True` (the stated `block_on` reason is stale since `run_on_db_rt`); moving them into workers is a separate follow-up.
+
+
 Plan to lift the `/crud/*` path past its current ceiling. Score:
 **CRUD 5.6 (12,432 req/s)** — the lowest in the suite.
 

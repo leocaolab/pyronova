@@ -1,5 +1,8 @@
 # TPC Re-architecture (v2.3)
 
+> **Superseded in part (2026-09, Layer 2, `docs/design/real-engine-in-workers.md`):** the C-FFI pieces this plan keeps — the DB bridge (`src/db_bridge.rs`, §"what stays") and the `_pyronova_recv` / `_pyronova_send` / `_pyronova_pool_id` registrations (the bootstrap step and "Delete" list below) — are gone. Workers import the real `pyronova.engine`; `PgPool` is used directly, and the async engine calls `pyronova.engine._worker_recv` / `_worker_send`. The TPC design itself is unchanged.
+
+
 Target: replace tokio multi-threaded + work-stealing + sharded channels with a pure Thread-Per-Core design. Goal is absolute linear scaling to 128+ core NUMA hosts with zero cross-core cache-line traffic on the hot path.
 
 ## The insight that forced this

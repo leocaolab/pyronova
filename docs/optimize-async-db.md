@@ -1,5 +1,8 @@
 # Optimize async-db
 
+> **Update (2026-09, Layer 2, `docs/design/real-engine-in-workers.md`):** the C-FFI DB bridge referenced below (`src/bridge/db_bridge.rs`, `_PgPool` in `_bootstrap.py`) is gone; workers use the real `PgPool`, whose sync methods run on the DB runtime via `run_on_db_rt` (`src/db.rs`). Async `*_async` methods are main-interpreter only and use `await_on_loop` (no `pyo3-async-runtimes`).
+
+
 Plan to lift the `/async-db` path past the post-bridge ceiling.
 
 ## Current state

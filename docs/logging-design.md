@@ -134,7 +134,7 @@ class PyronovaRustHandler(logging.Handler):
 ```python
 class _PyronovaRustHandler(logging.Handler):
     def emit(self, record):
-        _pyronova_emit_log(            # C-FFI → Rust（与 pyronova_recv/pyronova_send 同类注册方式）
+        _emit_python_log(              # 即 pyronova.engine.emit_python_log，与主解释器用的是同一个函数
             record.levelname,
             record.name,
             record.getMessage(),
@@ -167,7 +167,7 @@ class _PyronovaRustHandler(logging.Handler):
 | `src/lib.rs` | 注册 `logging` 模块 + 函数 |
 | `src/app.rs` | 启动/关闭 → `tracing::info!`，连接错误 → `tracing::warn!` |
 | `src/handlers.rs` | 访问日志：`latency_us`、`method`、`path`、`status`、`mode` |
-| `src/interp.rs` | `pyronova_emit_log_cfunc` C-FFI，注册到所有子解释器 |
+| `src/interp.rs` | *（历史）* 子解释器用的 `pyronova_emit_log_cfunc` C-FFI —— Layer 2 已删除；worker 现在导入真 engine，直接调用 `emit_python_log` |
 | `src/monitor.rs` | GIL 看门狗 → `tracing::warn!` |
 | `src/websocket.rs` | WebSocket 错误 → `tracing::error!`/`tracing::warn!` |
 
@@ -177,7 +177,7 @@ class _PyronovaRustHandler(logging.Handler):
 
 2. **独立的 `pyronova::access` 目标** — 允许用户关闭访问日志但保留服务器/应用日志，反之亦然。通过 `access_log` 配置映射为 `pyronova::access=off` 指令。
 
-3. **子解释器的 C-FFI 桥接** — 子解释器无法导入 PyO3 扩展模块。`_pyronova_emit_log` 作为 C-FFI 内建函数注册（类似 `pyronova_recv`/`pyronova_send`），在引导脚本运行前注入到 globals。
+3. **所有解释器用同一个函数** — 子解释器 worker 导入真正的 `pyronova.engine`（PyO3 fork 让模块按解释器各一份；Layer 2），worker 的日志 handler 带上自己的 worker id 调用 `pyronova.engine.emit_python_log`。*早期版本*当时无法在子解释器里导入 engine，所以注册了一个 C-FFI 内建函数 `_pyronova_emit_log`。
 
 4. **`init_logger` 延迟到 `run()`** — 允许 `enable_logging()` 在 tracing subscriber 锁定前修改日志配置。`tracing-subscriber` 每个进程只允许初始化一次。
 

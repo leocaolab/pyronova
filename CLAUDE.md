@@ -15,7 +15,8 @@ High-performance Python web framework powered by Rust. Per-Interpreter GIL (PEP 
   - `response.rs` — response builders (200/404/413/500/503/504)
   - `json.rs` — Rust-side `py_to_json_value` serializer
   - `static_fs.rs` — async static file serving + MIME detection + path traversal protection
-  - `interp.rs` — `PyObjRef` RAII, C-FFI bridge (`pyronova_recv`/`pyronova_send`), dual worker pool (sync+async), mock module injection
+  - `python/` — sub-interpreter workers: `worker.rs` (`SubInterpreterWorker`, runs the real `pyronova` package + engine), `pool.rs` (dual worker pool, sync+async), `worker_api.rs` (`_worker_recv`/`_worker_send` pyfunctions for the async engine), `ffi.rs` (`PyObjRef` RAII, tstate helpers)
+  - `run_context.rs` — explicit-interpreter attach (`main_attach`/`attach_to`) for every Rust thread that enters Python
   - `websocket.rs` — WebSocket upgrade, `WebSocket` pyclass, async↔sync bridge
   - `stream.rs` — `Stream` SSE with mpsc channel
   - `logging.rs` — `init_logger` (tracing-subscriber), `emit_python_log` (Python→Rust bridge)
@@ -65,15 +66,16 @@ bash benchmarks/run_bench.sh
 - `Pyronova` Python wrapper provides decorator syntax; `PyronovaApp` is the raw Rust engine
 - Sub-interpreter mode uses `crossbeam-channel` multi-consumer pool with `tokio::sync::oneshot` async responses
 - `PyObjRef` RAII wrapper for all raw FFI pointer operations — Drop auto-DECREFs
-- C-FFI bridge (`pyronova_recv`/`pyronova_send`) for native async in sub-interpreters — releases GIL during channel wait
+- Workers import the real `pyronova` package and engine (the fork makes the module per-interpreter); the async engine talks to Rust through `pyronova.engine._worker_recv`/`_worker_send`, which release the GIL during the channel wait
+- Every Rust thread that enters Python names its interpreter (`run_context::main_attach` / `attach_to`); a bare foreign-thread `Python::attach` is rejected by `tests/test_attach_allowlist.py`
 - Hybrid dispatch: `gil=True` routes go to main interpreter (for C extensions), others to sub-interpreters
 - Auto dual-pool: framework detects `async def` vs `def` handlers, routes to appropriate worker pool
-- Mock module injection in sub-interpreters for pydantic/pyronova submodules
+- C extensions in workers: extensions that CPython allows load shared; others are copied per worker and initialized inside that worker (`app.isolate(...)` or reactive auto-isolate in `_bootstrap.py`); `pyronova` itself is never isolated
 - Static files served via Tokio async fs — no GIL needed
 - Middleware: before_request/after_request hooks stored in RouteTable
 - WebSocket: tokio-tungstenite async ↔ Python sync via dual channels, one OS thread per connection
 - SSE: `Stream` with mpsc unbounded channel, returned from handler
-- Logging: Rust `tracing` with `EnvFilter` (zero-cost OFF), three targets (`pyronova::server`, `pyronova::access`, `pyronova::app`), Python logging hijacked via C-FFI bridge in sub-interpreters
+- Logging: Rust `tracing` with `EnvFilter` (zero-cost OFF), three targets (`pyronova::server`, `pyronova::access`, `pyronova::app`), Python logging routed to Rust via `pyronova.engine.emit_python_log` in every interpreter
 - mimalloc global allocator for high-concurrency allocation performance
 - 30s zombie request timeout in sub-interpreter mode (504 Gateway Timeout)
 - Graceful shutdown via `signal::ctrl_c()` + `tokio::select!`
@@ -91,7 +93,8 @@ src/
   response.rs         # Response builders, extract_response_data
   json.rs             # py_to_json_value
   static_fs.rs        # try_static_file, mime_from_ext
-  interp.rs           # PyObjRef RAII, C-FFI bridge, dual worker pool, mock injection
+  run_context.rs      # main_attach / attach_to: explicit-interpreter attach
+  python/             # worker.rs, pool.rs, worker_api.rs, ffi.rs: sub-interpreter workers
   websocket.rs        # WebSocket, upgrade handler, async↔sync bridge
   stream.rs           # Stream SSE
   monitor.rs          # GIL watchdog, memory RSS, atomic counters

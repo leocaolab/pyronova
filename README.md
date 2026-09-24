@@ -421,7 +421,7 @@ What has been measured (details and versions in
 | **polars** | ✅ | per-worker copy of **both** `polars` and `_polars_runtime_32` (~215 MB); `POLARS_MAX_THREADS=1` | 1.29M requests, Linux (measured with `PYTHONMALLOC=malloc`, before v2.7.2) |
 | **tokenizers** | ✅ | per-worker copy | 6.35M requests, Linux (measured with `PYTHONMALLOC=malloc`, before v2.7.2) |
 | **msgpack, cryptography** | ✅ | override only, no copy | loads in 4 of 4 sub-interpreters |
-| **pydantic** | ⚠️ by default a stub: imports work, **no validation** | declare `app.isolate("pydantic", "pydantic_core")` for the real library in workers | declared: 432k requests with validation, Linux (with `PYTHONMALLOC=malloc`, before v2.7.2); or validate on `gil=True` routes |
+| **pydantic** | ✅ real validation in workers (the stub is gone) | per-worker copy of `pydantic_core`, automatic on first import (only apps that use `model=` import it), or declared with `app.isolate("pydantic", "pydantic_core")` | automatic path: E2E on macOS + Linux; declared: 432k requests with validation, Linux (with `PYTHONMALLOC=malloc`, before v2.7.2) |
 | **pandas, lxml, pillow, sqlalchemy, others** | ❓ not tested | — | use `gil=True`, or test before relying on it |
 | **Pure Python, stdlib** (`json`, `re`, `asyncio`, `httpx`, …) | ✅ | nothing needed | |
 
@@ -843,9 +843,8 @@ a per-worker copy, automatically or via `app.isolate(...)`. See
 **What remains:**
 - **Memory:** one copy of each such library per worker (about 75 MB per worker for
   numpy + scipy + scikit-learn + orjson).
-- **pydantic** is a stub in workers by default (imports work, no validation). Declare
-  `app.isolate("pydantic", "pydantic_core")` for real validation in workers, or validate on
-  `gil=True` routes.
+- **pydantic** validates for real in workers, at the cost of one `pydantic_core` copy per
+  worker (only for apps that use `model=`).
 - **Untested libraries** (pandas, lxml, pillow, sqlalchemy, …): use `gil=True`, or test
   them first.
 

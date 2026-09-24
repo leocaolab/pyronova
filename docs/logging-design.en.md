@@ -134,7 +134,7 @@ class PyronovaRustHandler(logging.Handler):
 ```python
 class _PyronovaRustHandler(logging.Handler):
     def emit(self, record):
-        _pyronova_emit_log(            # C-FFI → Rust (registered like pyronova_recv/pyronova_send)
+        _emit_python_log(              # pyronova.engine.emit_python_log, the same function main uses
             record.levelname,
             record.name,
             record.getMessage(),
@@ -167,7 +167,7 @@ class _PyronovaRustHandler(logging.Handler):
 | `src/lib.rs` | Registered `logging` module + functions |
 | `src/app.rs` | Startup/shutdown → `tracing::info!`, conn errors → `tracing::warn!` |
 | `src/handlers.rs` | Access log with `latency_us`, `method`, `path`, `status`, `mode` |
-| `src/interp.rs` | `pyronova_emit_log_cfunc` C-FFI, registered in all sub-interpreters |
+| `src/interp.rs` | *(historical)* `pyronova_emit_log_cfunc` C-FFI for sub-interpreters — removed in Layer 2; workers now import the real engine and call `emit_python_log` |
 | `src/monitor.rs` | GIL watchdog → `tracing::warn!` |
 | `src/websocket.rs` | WS errors → `tracing::error!`/`tracing::warn!` |
 
@@ -177,7 +177,7 @@ class _PyronovaRustHandler(logging.Handler):
 
 2. **Separate `pyronova::access` target** — Allows users to disable access log while keeping server/app logs, or vice versa. Controlled by `access_log` config flag mapped to `pyronova::access=off` directive.
 
-3. **C-FFI bridge for sub-interpreters** — Sub-interpreters can't import PyO3 extension modules. `_pyronova_emit_log` is registered as a C-FFI built-in function (like `pyronova_recv`/`pyronova_send`), injected into globals before bootstrap runs.
+3. **Same function in every interpreter** — Sub-interpreter workers import the real `pyronova.engine` (the PyO3 fork makes the module per-interpreter; Layer 2), so the worker's logging handler calls `pyronova.engine.emit_python_log` with its worker id. *Earlier versions* registered a C-FFI built-in `_pyronova_emit_log` instead, because the engine could not then be imported in a sub-interpreter.
 
 4. **Deferred `init_logger` to `run()`** — Allows `enable_logging()` to modify log config before the tracing subscriber is locked in. `tracing-subscriber` only allows one initialization per process.
 

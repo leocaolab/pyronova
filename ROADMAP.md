@@ -394,8 +394,8 @@ def hit_counter(req):
 
 ### 当前限制 & 拓展路线
 
-- 当前：`app.state` 需要 `gil=True` 路由（PyO3 pyclass 不可在子解释器中直接使用）
-- 计划：通过 FFI 注入 `_state` 到子解释器 globals，实现原生 sub-interp 访问
+- ~~当前：`app.state` 需要 `gil=True` 路由（PyO3 pyclass 不可在子解释器中直接使用）~~
+- ~~计划：通过 FFI 注入 `_state` 到子解释器 globals，实现原生 sub-interp 访问~~ —— 已由 Layer 2 解决（未发布）：worker 导入真 engine，`app.state` / `SharedState()` 直接连到运行中 app 的同一个 map，不需要 `gil=True`
 - 拓展 1：`moka` Cache — 带 TTL 过期（Session 自动清理）
 - 拓展 2：`app.state.set_bytes()` 共享二进制数据（行情 Tensor）
 

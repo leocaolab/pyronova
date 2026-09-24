@@ -41,7 +41,7 @@ CPython 严格模式（`check_multi_interp_extensions = 1`，Pyronova 默认）�
 
 | 库 | 版本 | 结果 | 需要副本？ | 备注 |
 |----|------|------|-----------|------|
-| pydantic / pydantic-core | 2.13 / 2.46 | ✅ 4/4 | 否 | PyO3-based，override 够 |
+| pydantic / pydantic-core | 2.13 / 2.46 | ✅ 4/4 | 否（开 override 时） | PyO3-based，override 够。Pyronova 已不再为共享文件开 override（第十节），所以在 worker 里 `pydantic_core` 会按 worker 复制 |
 | msgpack | 1.2.1 | ✅ 4/4 | 否 | |
 | cryptography | 50.0.0 | ✅ 4/4 | 否 | OpenSSL bindings |
 | **numpy** | 2.5.1 | ❌ `cannot load more than once` | **是** | `_multiarray_umath` `m_size=0` + 全局态 |
@@ -226,6 +226,16 @@ worker 共用。每个线程池按全部核数开，N 个 worker 同时调用就
 
 三个修复之后的 grill，默认环境，每次 30 秒：4 worker 6,067 req/s，8 worker 10,666，16 worker
 11,058，无崩溃。16 worker、`wrk -c128` 跑 180 秒：271 万请求，15,063 req/s，无错误。
+
+## 十一、worker 运行真正的 `pyronova` engine（Layer 2，未发布）
+
+Layer 2 之前，worker 无法导入 Pyronova 自己的扩展，所以 `_bootstrap.py` 用假的 `pyronova`、
+`pyronova.engine`、`.db`、`.cookies` 等模块和一个 pydantic stub 顶替，Rust 再往 globals 里注入原始
+C 函数（`_pyronova_emit_log`、`_pyronova_recv`、`_pyronova_send`、`_pyronova_db_*`）。用上
+leocaolab/pyo3 fork 后 engine 模块按解释器各一份，worker 现在导入真正的包：假模块、这些 C 函数和
+`src/bridge/db_bridge.rs` 都已删除，每个 worker 里的 `SharedState`、`PgPool`、`model=` 校验和日志
+桥接都是真的。隔离机制永远不会复制或驱逐 `pyronova` 本身（每个进程只有一份 engine）。设计和用户
+可见的变化见 `docs/design/real-engine-in-workers.md` §8.7。
 
 ## 附：上游追踪（现状 2026-08）
 

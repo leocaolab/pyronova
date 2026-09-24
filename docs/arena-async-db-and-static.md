@@ -1,5 +1,8 @@
 # Arena bottleneck design: async-db and static
 
+> **Update (2026-09):** "Design B — make `pyronova.engine` sub-interp loadable" below was implemented as Layer 2 (`docs/design/real-engine-in-workers.md`): workers import the real engine, the mock `_mock_engine` and the C-FFI DB bridge (Design A, `db_bridge.rs`) are gone, and `PgPool` works in workers directly. The PyO3 0.28 blockers listed for Design B no longer apply (per-interpreter types come from the leocaolab/pyo3 fork).
+
+
 Targeted design doc for two underperforming profiles in HttpArena v1 results on pyronova v2.1.5. Scope is narrow on purpose — each section ends with a concrete patch outline, not a redesign.
 
 Benchmark target (Arena, TR 3995WX 64-core):

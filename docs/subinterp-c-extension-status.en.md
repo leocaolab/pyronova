@@ -50,7 +50,7 @@ would share the same C global). The only way around it: give each sub-interprete
 
 | Library | Version | Result | Needs copy? | Notes |
 |---------|---------|--------|-------------|-------|
-| pydantic / pydantic-core | 2.13 / 2.46 | ✅ 4/4 | No | PyO3-based; override suffices |
+| pydantic / pydantic-core | 2.13 / 2.46 | ✅ 4/4 | No (with override) | PyO3-based; override suffices. Pyronova no longer sets the override for shared files (§10), so in a worker `pydantic_core` is copied per worker |
 | msgpack | 1.2.1 | ✅ 4/4 | No | |
 | cryptography | 50.0.0 | ✅ 4/4 | No | OpenSSL bindings |
 | **numpy** | 2.5.1 | ❌ `cannot load more than once` | **Yes** | `_multiarray_umath` is `m_size=0` + global state |
@@ -271,6 +271,18 @@ The startup banner says which one happened (`BLAS: 1 thread per worker ...`).
 Grill after the three fixes, default environment, 30 s runs: 6,067 req/s at 4 workers,
 10,666 at 8, 11,058 at 16, no crashes. 180 s at 16 workers, `wrk -c128`: 2.71M requests,
 15,063 req/s, no errors.
+
+## 11. Workers run the real `pyronova` engine (Layer 2, unreleased)
+
+Until Layer 2, a worker could not import Pyronova's own extension, so `_bootstrap.py`
+stood in fake `pyronova`, `pyronova.engine`, `.db`, `.cookies`, … modules and a pydantic
+stub, and Rust injected raw C functions (`_pyronova_emit_log`, `_pyronova_recv`,
+`_pyronova_send`, `_pyronova_db_*`). With the leocaolab/pyo3 fork the engine module is
+per-interpreter, so workers now import the real package: the mocks, the C functions and
+`src/bridge/db_bridge.rs` are gone, and `SharedState`, `PgPool`, `model=` validation and
+the logging bridge are the real ones in every worker. `pyronova` itself is never cloned or
+evicted by the isolation machinery (one engine copy per process). Design and the list of
+user-visible changes: `docs/design/real-engine-in-workers.md` §8.7.
 
 ## Appendix: upstream tracking (as of Aug 2026)
 
