@@ -23,9 +23,76 @@
   its clone as the "original", deleted it and loaded the shared file (sklearn after
   scipy); it also retried only once and missed Cython's, scipy's and sklearn's wording of
   the collision.
+- **Async workers cancelled in-flight requests 30 s after they started.** The async engine
+  waited for its fetcher thread with a 30 s timeout counted from worker start. The fetcher
+  only returns at shutdown, so 30 s into normal serving the engine logged a false "fetcher
+  thread did not exit within 30s" error and cancelled every task on its loop; an async
+  request in flight at that moment never got a response. It now waits for the fetcher
+  without a timeout (the timeout couldn't bound shutdown anyway: `Py_EndInterpreter` joins
+  the fetcher regardless). Pre-existing since the shutdown hardening.
 
 ### Changed
 
+- **Workers run the real `pyronova` package and engine** ("Layer 2",
+  `docs/design/real-engine-in-workers.md`). A worker used to run the user's script against
+  hand-written stand-ins: fake `pyronova`, `pyronova.engine`, `.db`, `.cookies`, `.cache`,
+  `.uploads`, … modules, a pydantic stub, and raw C functions injected by Rust. With the
+  PyO3 fork the engine module is per-interpreter, so workers now import the real package;
+  the stand-ins, the C functions and `src/bridge/db_bridge.rs` are gone. Handlers are bound
+  by route index and checked against the main interpreter's route table at startup (a
+  mismatch fails startup with both lists). What changes for users:
+  - `model=` validates in workers (the stub returned an empty model). pydantic is imported
+    only by apps that use `model=`, and such an app pays one `pydantic_core` copy per
+    worker. A broken pydantic install now fails at route registration.
+  - `app.state` / `SharedState()` in a worker is the running app's shared map (it was a
+    fresh `{}` per access).
+  - `PgPool` in workers is the real class: sync methods and `fetch_iter` work; `*_async`
+    raise `NotImplementedError` in a worker (main interpreter only).
+  - `redirect()` in workers enforces the 3xx status check; `@app.options`, `@app.head`,
+    `@app.readiness_check` and other methods the stand-in turned into no-ops or `@None`
+    now work in workers; hooks registered on main as closures (request logging,
+    observability) now run in workers too, so `/metrics` counts worker-route traffic.
+  - The async worker path runs before/after hooks and returns response headers.
+  - Handler return values map the same on sync and async paths: `bytes` →
+    `application/octet-stream` (sync used to send `str(b'..')`), `None` → empty 200 (sync
+    used to send `"None"`).
+  - A route registered after `run()` begins (e.g. from an `on_startup` hook) must be
+    `gil=True`; a non-`gil` one raises at startup naming its method and path.
+  - A worker handler returning a `Stream` gets a 500 with an error log, instead of a
+    stringified body.
+  - `app.max_body_size = …` / compression settings executed in a worker are no-ops (main's
+    call sets the process-wide value); a differing value logs a warning.
+  - `PYRONOVA_WORKER` is no longer set in the process environment; use
+    `pyronova.engine._in_worker()`. Child processes no longer inherit it.
+  - A raw `PyronovaApp.run()` executed inside a worker raises instead of being ignored.
+  - User scripts may start with `from __future__ import annotations`; worker tracebacks
+    show the script's real path and line numbers.
+  - `pyronova run module:app` with sub-interpreters: workers now run the app module (they
+    used to run `cli.py` and silently had no handlers).
+  - `pyronova` itself is never cloned or evicted by per-worker isolation;
+    `app.isolate("pyronova")` raises.
+  - RPC helpers imported in a worker use msgpack's pure-Python fallback (its C module
+    refuses sub-interpreters); RPC routes are `gil=True`, so no hot path is affected.
+- **Every Rust thread that enters Python names its interpreter** (`run_context.rs`). Once
+  several interpreters have executed the engine, the PyO3 fork rejects a bare
+  `Python::attach` on a thread with no thread state; the GIL bridge, WebSocket,
+  `spawn_blocking` and event-loop-drop paths now attach to the main interpreter explicitly
+  (measured before the change: those threads panicked as soon as workers ran the engine).
+  A test rejects any new bare attach.
+- **`PgPool` is safe from any thread.** Sync methods hand the query to the DB runtime and
+  wait on a channel instead of `Runtime::block_on` (which panics inside a Tokio context,
+  i.e. on a TPC worker); `*_async` resolve through the caller's event loop without
+  `pyo3-async-runtimes`, which is no longer a dependency.
+- **PyO3 fork tag `subinterp-2026-09-23.2`** (97b2098): per-interpreter registry keys are
+  per extension copy (two fork-built extensions in one process, e.g. pyronova and a
+  fork-built polars, segfaulted), and `InterpreterHandle::attach` restores a detached
+  thread state instead of running without the GIL.
+- **CI runs the Postgres tests** (a `postgres:16` service); they were always skipped.
+- **Tests:** the timeout tests no longer hang when the server starts slowly (they read a
+  live server's stdout to EOF; now they kill it first), and the `Request` leak check in
+  `test_subinterp_memory_regression.py` measures something (it counted objects named
+  `_Request`, which never matched and aren't GC-tracked; it now reads the `Request` type's
+  refcount).
 - **`run()` no longer hard-exits after a graceful stop in sub-interpreter mode;** CPython
   finalizes normally. The teardown abort the `os._exit` avoided had the same root cause
   as the 2.7.2 import crash (objects owned by the main interpreter). Measured: macOS 13/13
