@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v2.8.0 (2026-09-24) — Real pyronova in every worker (Layer 2); shared-extension isolation
 
 ### Fixed
 

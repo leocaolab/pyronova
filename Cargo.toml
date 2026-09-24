@@ -1,6 +1,6 @@
 [package]
 name = "pyronova-engine"
-version = "2.7.3"
+version = "2.8.0"
 edition = "2021"
 
 [lib]
