@@ -1,9 +1,9 @@
 """Sub-interpreter DB bridge smoke test.
 
 Validates that a handler registered WITHOUT `gil=True` can execute
-queries via the C-FFI bridge injected into each sub-interp's globals
-(see src/db_bridge.rs). This is the regression test for the whole
-reason async-db / crud used to be pinned gil=True.
+queries from a sub-interpreter worker through the real `PgPool`
+(`src/db.rs`, sync methods via `run_on_db_rt`). This is the regression
+test for the whole reason async-db / crud used to be pinned gil=True.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ def ping(req):
     return "pong"
 
 # Critical: NO gil=True. The handler runs inside a sub-interpreter and
-# the PgPool proxy here goes through the C-FFI bridge.
+# uses the worker's own (real) PgPool.
 @app.get("/items")
 def items(req):
     rows = pool.fetch_all("SELECT id, label FROM bridge_test ORDER BY id")
