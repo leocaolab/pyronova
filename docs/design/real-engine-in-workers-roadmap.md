@@ -163,6 +163,27 @@
 - **Verification:** E2E-12 + the NFR thresholds (§4) + the release runbook's two-platform
   gate.
 - **Shippable:** yes (the release).
+- **Progress (2026-09-23, branch `layer2/m5-docs`, code at `b81ca40`):**
+  - Doc reconciliation: done (CLAUDE.md, logging design en/zh, README, C-extension status
+    en/zh §11 / 十一, the sub-interpreter explainer, ROADMAP app.state, superseded notes on
+    the TPC / CRUD / async-db / arena / phase-7.2 plans, `db.rs` module doc; polars design
+    line refs updated in the untracked copy). CHANGELOG "Unreleased" written.
+  - **E2E-12 correctness (done; perf numbers NOT taken — bluewhale load avg 17–33):**
+    - Linux (bluewhale, private checkout + venv, Python 3.14.4):
+      `test_subinterp_memory_regression.py` 9 passed.
+    - Linux grill W=16, `wrk -t8 -c128 -d180s`: 2,235,507 requests, no non-2xx line,
+      61 wrk socket timeouts (2 s default, loaded box); RSS 2,230,320 → 2,467,388 KB over
+      the run, then SIGINT rc=0 in ~4 s, 0 Fatal/panic lines.
+    - RSS check after warm-up (same app, fresh start): boot 2,083,776 KB → after 1 min load
+      2,328,080 KB → +1/+2/+3 min 2,328,912 / 2,329,648 / 2,329,652 KB. Flat after warm-up
+      (+1.5 MB over 3 min); the first-run growth is per-worker lazy imports (sklearn on the
+      first ml request), not a leak. SIGINT rc=0.
+    - Linux 20× graceful SIGINT, 16 workers, grill app with requests before each stop:
+      20/20 rc=0, stop in 2–3 s, 0 Fatal/panic/abort lines.
+    - macOS 5× graceful SIGINT, 4 workers, grill app, `MallocErrorAbort=1`: 5/5 rc=0, stop
+      in ~1 s, 0 Fatal/panic/"not allocated" lines.
+  - **Still open:** NFR-1…NFR-6 / NFR-2b/3b measurements on a quiet bluewhale
+    (`bench-compare` needs load avg < 3), then the release.
 
 **Removed or deferred by the gate (no milestone):**
 - R-3 as a "measure later" item was closed into C9 (M1).
