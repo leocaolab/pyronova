@@ -193,7 +193,7 @@ class _PyronovaRustHandler(logging.Handler):
 
 | Test | What it verifies |
 |---|---|
-| `test_gil_mode_logging` | Python hook output (`[INFO ] GET / → 200`) in GIL mode |
+| `test_gil_mode_logging` | `pyronova::access` line in GIL mode (the Rust access log is the only request log) |
 | `test_subinterp_rust_logging` | Rust tracing access log in subinterp mode |
 | `test_user_print_in_subinterp` | `print()` works in sub-interpreter handlers |
 | `test_user_logging_in_subinterp` | Python `logging.info()` bridges to Rust tracing |

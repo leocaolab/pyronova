@@ -124,10 +124,9 @@ app = Pyronova()
 app.enable_logging()  # 开启结构化日志
 ```
 
-输出格式：
+每个请求由 Rust 写一行 `pyronova::access`（所有模式一致，默认 JSON 格式）：
 ```
-GIL 模式:      2026-03-24 17:30:01 [INFO ] GET /api/trade → 200 (2.3ms)
-Sub-interp:    [INFO ] GET /api/trade → 200
+{"level":"INFO","fields":{"message":"Request handled","method":"GET","path":"/api/trade","status":200,"latency_us":2300,"mode":"gil"},"target":"pyronova::access"}
 ```
 
 ### 用户自定义日志

@@ -806,13 +806,16 @@ class Pyronova:
         sample: int = 1,
         always_log_status: int = 0,
     ) -> None:
-        """Enable structured request/response logging.
+        """Enable the per-request access log (``pyronova::access``).
 
-        This activates both:
-        - Rust-side access log (method, path, status, latency_us) via tracing
-        - Python-side formatted output for GIL mode (human-readable)
+        One line per request from the Rust side, in every mode and for every
+        response — including 404s, static files, fast-path routes and 5xx that
+        never reach a Python handler::
+
+            INFO  pyronova::access Request handled method=GET path=/ status=200 latency_us=198 mode="gil"
 
         :param level: minimum log level — "debug" / "info" / "warn" / "error".
+            An unknown level raises ``ValueError`` when the server starts.
         :param sample: log 1 in every ``sample`` requests. ``1`` (default)
             logs every request. ``100`` keeps roughly 1% — production knob
             to recover the 25-30% throughput tax of full access logging
@@ -822,80 +825,16 @@ class Pyronova:
             status is >= this value. ``400`` keeps full visibility of
             4xx/5xx errors while sampling 2xx success traffic. ``0``
             (default) applies sampling uniformly.
-
-        Output format (GIL mode, text format)::
-
-            2026-03-24 17:30:01 [INFO]  GET /api/trade → 200 (2.3ms)
-            2026-03-24 17:30:01 [ERROR] POST /rpc/add → 500 (0.4ms) TypeError: ...
-
-        Idempotent and thread-safe (matches the other ``enable_*`` helpers):
-        the before/after hooks below are *appended* to the engine, not
-        deduped, so a second call — e.g. a manual ``enable_logging()`` racing
-        the ``run()`` auto-enable, or two startup threads — would log every
-        request twice. Claim the right to initialize under ``_enable_lock``;
-        any subsequent call returns a no-op.
         """
-        with self._enable_lock:
-            if getattr(self, "_logging_enabled", False):
-                return
-            self._logging_enabled = True
-
-        from datetime import datetime
-
-        import threading as _threading
-
-        _timings: dict[int, float] = {}
-        _MAX_TIMINGS = 10000  # Cap to prevent memory leak from SSE/stream requests
-        # before/after hooks run concurrently across requests on multiple
-        # worker threads. The len()-then-clear() check-then-act and the
-        # set/pop interleave can race; serialize all _timings access so we
-        # never hit "dict changed size during iteration"/KeyError (arc app-40).
-        _timings_lock = _threading.Lock()
-        _min_level = {"debug": 0, "info": 1, "warn": 2, "error": 3}.get(level.lower(), 1)
-
-        def _log_before(req):
-            with _timings_lock:
-                if len(_timings) > _MAX_TIMINGS:
-                    _timings.clear()  # Emergency cleanup — stream requests skip after_hook
-                _timings[id(req)] = time.monotonic()
-            return None
-
-        def _log_after(req, resp):
-            with _timings_lock:
-                start = _timings.pop(id(req), None)
-            elapsed = (time.monotonic() - start) * 1000 if start else 0
-            status = getattr(resp, "status_code", 200)
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            # Determine log level by status code
-            if status >= 500:
-                tag, lvl = "ERROR", 3
-            elif status >= 400:
-                tag, lvl = "WARN ", 2
-            else:
-                tag, lvl = "INFO ", 1
-
-            if lvl >= _min_level:
-                err = _error_detail(getattr(resp, "body", "")) if status >= 500 else ""
-                print(f"  {ts} [{tag}] {req.method} {req.path} → {status} ({elapsed:.1f}ms){err}", flush=True)
-
-            return resp
-
-        self._engine.before_request(_log_before)
-        self._engine.after_request(_log_after)
-
-        # Also enable Rust-level logging for sub-interpreter mode (per-instance)
         self._engine.enable_request_logging(True)
         # Sampling / always-log knobs land on the Rust route table; the
         # decision happens inside each handler's logging path.
         if sample > 1 or always_log_status > 0:
             self._engine.set_request_log_sampling(sample, always_log_status)
 
-        # Upgrade log config so the deferred init_logger picks up access_log
-        level_map = {"debug": "DEBUG", "info": "INFO", "warn": "WARN", "error": "ERROR"}
-        rust_level = level_map.get(level.lower(), "INFO")
+        # The deferred init_logger picks these up (and validates the level).
         if self._log_config.get("level", "ERROR") in ("ERROR", "OFF"):
-            self._log_config["level"] = rust_level
+            self._log_config["level"] = level.upper()
         self._log_config["access_log"] = True
 
     # ------------------------------------------------------------------
@@ -1133,19 +1072,6 @@ class Pyronova:
         # Not a graceful stop (real startup/run error): surface it normally.
         if run_error is not None:
             raise run_error
-
-
-def _error_detail(body: object) -> str:
-    """The ``error`` field of a JSON 500 body, for the access-log line; "" when
-    the body has none (not a str, not JSON, or no string ``error`` field)."""
-    if not isinstance(body, str):
-        return ""
-    try:
-        parsed = _json_module.loads(body)
-    except ValueError:
-        return ""
-    detail = parsed.get("error") if isinstance(parsed, dict) else None
-    return f" {detail[:100]}" if isinstance(detail, str) else ""
 
 
 def _bind_handler(fn: Callable, path: str, model: type | None) -> Callable:

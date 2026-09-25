@@ -61,7 +61,7 @@ def run_server_and_check(script: str, label: str, expected_strings: list[str]):
 
 
 def test_gil_mode_logging():
-    """Framework logging in GIL mode — Python hooks + tracing access log."""
+    """Framework logging in GIL mode — the Rust access log (one line per request)."""
     script = '''
 from pyronova import Pyronova
 app = Pyronova()
@@ -73,9 +73,9 @@ def index(req): return "ok"
 app.run(host="127.0.0.1", port=9876)
 '''
     assert run_server_and_check(script, "gil_logging", [
-        "[INFO ]",
-        "GET /",
-        "200",
+        "pyronova::access",
+        "Request handled",
+        '"method":"GET"',
     ])
 
 

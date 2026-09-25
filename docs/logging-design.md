@@ -193,7 +193,7 @@ class _PyronovaRustHandler(logging.Handler):
 
 | 测试 | 验证内容 |
 |---|---|
-| `test_gil_mode_logging` | GIL 模式下 Python 钩子输出（`[INFO ] GET / → 200`） |
+| `test_gil_mode_logging` | GIL 模式下的 `pyronova::access` 行（请求日志只由 Rust access log 写一次） |
 | `test_subinterp_rust_logging` | 子解释器模式下 Rust tracing 访问日志 |
 | `test_user_print_in_subinterp` | 子解释器中 `print()` 正常工作 |
 | `test_user_logging_in_subinterp` | Python `logging.info()` 桥接到 Rust tracing |
