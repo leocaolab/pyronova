@@ -291,6 +291,12 @@ impl SubInterpreterWorker {
             .and_then(|s| s.parse().ok())
             .unwrap_or(100_000);
 
+        // The module references are released while this interpreter's thread state is
+        // still current: dropped after `PyEval_SaveThread` they would find none attached,
+        // and `PyObjRef` leaks rather than DECREFs (the modules stay in `sys.modules`).
+        drop(bootstrap);
+        drop(script_module);
+
         // Release this sub-interpreter's GIL. Outer `new()` swaps back to
         // the main interpreter after we return.
         let saved = ffi::PyEval_SaveThread();

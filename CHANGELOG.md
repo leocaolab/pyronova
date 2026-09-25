@@ -8,6 +8,13 @@
   3.13 is no longer supported: its own `_datetime` crashes under concurrent strict
   sub-interpreters with no Pyronova or isojson code involved (measured 2026-09-24).
 
+### Fixed
+
+- **Every worker leaked two module references at startup**, logged as
+  `PyObjRef dropped with no attached tstate — leaking pointer` (2 per worker, TPC and
+  pool). Worker init held its bootstrap and script module references until after it
+  released the worker's thread state; they are now released while it is current.
+
 ### Tests
 
 - **Per-worker numpy serialized by isojson 0.2** (`tests/test_isojson_numpy_workers.py`,
