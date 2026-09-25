@@ -490,3 +490,109 @@ def test_relative_import_failing_in_a_worker_says_why(tmp_path):
     assert proc.returncode != 0, out[-3000:]
     assert "attempted relative import" in out, out[-3000:]
     assert "outside any package, so a relative import" in out, out[-3000:]
+
+
+# ---------------------------------------------------------------------------
+# M4 gap: a streamed body's rejection is typed, and answers what a buffered body's does
+# ---------------------------------------------------------------------------
+
+STREAM_SCRIPT = """
+from pyronova import Pyronova
+from pyronova.engine import BodyRejected
+app = Pyronova()
+app.max_body_size = 1024
+
+@app.post("/buffered", gil=True)
+def buffered(req):
+    return {"bytes": len(req.body)}
+
+@app.post("/iterate", gil=True, stream=True)
+def iterate(req):
+    total = 0
+    for chunk in req.stream:
+        total += len(chunk)
+    return {"bytes": total}
+
+@app.post("/drain", gil=True, stream=True)
+def drain(req):
+    return {"bytes": req.stream.drain_count()}
+
+@app.post("/catch", gil=True, stream=True)
+def catch(req):
+    try:
+        req.stream.read()
+    except OSError as e:
+        return {"caught": type(e).__name__, "is_body_rejected": isinstance(e, BodyRejected),
+                "text": str(e)}
+    return "read it all"
+""" + RUN
+
+TOO_LARGE = {"error": "payload too large"}
+
+
+def _no_error_records(srv: Server) -> None:
+    errors = [r for r in srv.records() if r.get("level") == "ERROR"]
+    assert errors == [], errors
+
+
+@pytest.mark.parametrize("path", ["tpc", "pool", "gil"])
+def test_oversized_streamed_body_is_413_like_a_buffered_one(path):
+    with serve(STREAM_SCRIPT, path) as srv:
+        body = b"x" * 4096
+        buffered = srv.post("/buffered", body)
+        assert (buffered.status, buffered.json()) == (413, TOO_LARGE)
+        for route in ("/iterate", "/drain"):
+            r = srv.post(route, body)
+            assert (r.status, r.json()) == (buffered.status, buffered.json()), route
+        # A handler can still catch it, as the OSError it always was.
+        r = srv.post("/catch", body)
+        assert r.status == 200
+        assert r.json() == {
+            "caught": "BodyRejected",
+            "is_body_rejected": True,
+            "text": "request body is larger than max_body_size",
+        }
+        # Within the cap, streaming is unchanged.
+        assert srv.post("/iterate", b"y" * 100).json() == {"bytes": 100}
+        time.sleep(0.5)  # the log writer is non-blocking
+        _no_error_records(srv)
+
+
+def _send_partial_body(port: int, target: str) -> tuple[int, bytes]:
+    """Declares a 100-byte body, sends 10 bytes, then waits for the answer."""
+    with socket.create_connection((HOST, port), timeout=60) as s:
+        s.sendall(
+            f"POST {target} HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n".encode()
+            + b"z" * 10
+        )
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        head, _, rest = data.partition(b"\r\n\r\n")
+        status = int(head.split(b" ")[1])
+        return status, rest
+
+
+def test_slow_streamed_body_is_408_like_a_buffered_one():
+    # The 30 s body budget runs once per path, all paths at the same time.
+    import concurrent.futures
+
+    servers = {path: Server(STREAM_SCRIPT, path) for path in ("tpc", "gil")}
+    try:
+        with concurrent.futures.ThreadPoolExecutor(len(servers) * 2) as pool:
+            futures = {
+                (path, route): pool.submit(_send_partial_body, srv.port, route)
+                for path, srv in servers.items()
+                for route in ("/buffered", "/iterate")
+            }
+            results = {key: f.result() for key, f in futures.items()}
+        for (path, route), (status, _) in results.items():
+            assert status == 408, (path, route, status)
+        for srv in servers.values():
+            _no_error_records(srv)
+    finally:
+        for srv in servers.values():
+            srv.stop()

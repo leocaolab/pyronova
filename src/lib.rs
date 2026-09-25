@@ -93,6 +93,10 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<state::SharedState>()?;
     m.add_class::<python::stream::PyronovaStream>()?;
     m.add_class::<python::body_stream::PyronovaBodyStream>()?;
+    m.add(
+        "BodyRejected",
+        m.py().get_type::<python::body_stream::BodyRejected>(),
+    )?;
     db::register(m)?;
     m.add_class::<monitor::Metrics>()?;
     m.add_function(pyo3::wrap_pyfunction!(monitor::get_gil_metrics, m)?)?;

@@ -15,8 +15,8 @@ use crate::types::PyronovaRequest;
 
 use super::error::{HandlerError, RequestTag};
 use super::pipeline::{
-    await_reply, collect_body, fail, finish, preprocess, task_lost, Prepared, Preprocessed,
-    RequestLine, Served,
+    await_reply, await_streamed_reply, collect_body, fail, finish, preprocess, task_lost, Prepared,
+    Preprocessed, RequestLine, Served,
 };
 use super::{
     build_main_http_response, call_handler_with_hooks, max_body_size, stream_body_feeder, BoxBody,
@@ -67,12 +67,16 @@ pub(crate) async fn run_on_main(
     };
 
     let resp = match main_request(prepared, &method, &path, body, client_ip_addr).await {
-        Ok(sky_req) => {
+        Ok((sky_req, feeder)) => {
             let site_ref = Arc::clone(site);
             let task = tokio::task::spawn_blocking(move || {
                 call_handler_with_hooks(&site_ref, target, sky_req)
             });
-            match await_reply(task, task_lost).await {
+            let reply = match feeder {
+                Some(mut feeder) => await_streamed_reply(&mut feeder, task, task_lost).await,
+                None => await_reply(task, task_lost).await,
+            };
+            match reply {
                 Ok(result) => build_main_http_response(result, accept_encoding.as_str()),
                 Err(e) => fail(e, &tag),
             }
@@ -83,27 +87,32 @@ pub(crate) async fn run_on_main(
 }
 
 /// The `Request` a main-interpreter handler gets: the body collected, or fed through
-/// `req.stream` for a `stream=True` route.
+/// `req.stream` for a `stream=True` route (with the task feeding it).
 async fn main_request(
     prepared: Prepared,
     method: &Arc<str>,
     path: &Arc<str>,
     body: RequestBody,
     client_ip_addr: std::net::IpAddr,
-) -> Result<PyronovaRequest, HandlerError> {
+) -> Result<(PyronovaRequest, Option<tokio::task::JoinHandle<()>>), HandlerError> {
     let query = prepared.query().to_owned();
-    let (body_bytes, body_stream_rx) = match body {
+    let (body_bytes, body_stream_rx, feeder) = match body {
         RequestBody::Streamed => {
             let (tx, rx) = tokio::sync::mpsc::channel(crate::python::body_stream::CHANNEL_CAPACITY);
-            tokio::spawn(stream_body_feeder(prepared.body, tx, max_body_size()));
-            (Bytes::new(), Arc::new(std::sync::Mutex::new(Some(rx))))
+            let feeder = tokio::spawn(stream_body_feeder(prepared.body, tx, max_body_size()));
+            (
+                Bytes::new(),
+                Arc::new(std::sync::Mutex::new(Some(rx))),
+                Some(feeder),
+            )
         }
         RequestBody::Buffered => (
             collect_body(prepared.body, max_body_size()).await?,
             crate::python::body_stream::empty_body_stream_rx(),
+            None,
         ),
     };
-    Ok(PyronovaRequest {
+    let request = PyronovaRequest {
         method: Arc::clone(method),
         path: Arc::clone(path),
         params: prepared.params,
@@ -115,5 +124,6 @@ async fn main_request(
         body_stream_rx,
         query_cache: std::sync::OnceLock::new(),
         query_all_cache: std::sync::OnceLock::new(),
-    })
+    };
+    Ok((request, feeder))
 }

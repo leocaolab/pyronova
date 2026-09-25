@@ -216,7 +216,11 @@ pub(crate) fn build_main_http_response(
 /// time and pushes each data chunk into the `PyronovaBodyStream`'s mpsc channel.
 /// Enforces `max_size` as a running total (defense against malicious
 /// unbounded uploads) and a per-frame read deadline of [`pipeline::REQUEST_BUDGET`]
-/// (Slowloris defense, same budget as the buffered path).
+/// (Slowloris defense, same budget as the buffered path). A body it gives up on is sent as
+/// the same [`pipeline::BodyReject`] a buffered body gets, so it answers the same 413/408.
+/// Handing a chunk to the handler is bounded by the same budget: a handler that stops
+/// reading ends the stream without its end, which reading it then reports. The
+/// dispatcher's reply budget starts when this returns ([`pipeline::await_streamed_reply`]).
 pub(crate) async fn stream_body_feeder(
     body: Incoming,
     tx: tokio::sync::mpsc::Sender<crate::python::body_stream::ChunkMsg>,
@@ -224,56 +228,47 @@ pub(crate) async fn stream_body_feeder(
 ) {
     use crate::python::body_stream::ChunkMsg;
     use hyper::body::Body;
+    use pipeline::BodyReject;
     let mut body = body;
     let mut total: usize = 0;
-    loop {
-        let frame_res = match tokio::time::timeout(
+    let reject = loop {
+        let next = tokio::time::timeout(
             pipeline::REQUEST_BUDGET,
             std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)),
         )
-        .await
-        {
+        .await;
+        let frame = match next {
             Ok(Some(Ok(f))) => f,
-            Ok(Some(Err(e))) => {
-                let _ = tx.send(ChunkMsg::Err(format!("body read: {e}"))).await;
-                return;
-            }
+            Ok(Some(Err(e))) => break BodyReject::Read(Arc::new(e)),
             Ok(None) => {
+                // The handler may have stopped reading: nobody left to tell.
                 let _ = tx.send(ChunkMsg::Eof).await;
                 return;
             }
-            Err(_) => {
-                let _ = tx
-                    .send(ChunkMsg::Err(format!(
-                        "body read timeout ({:?})",
-                        pipeline::REQUEST_BUDGET
-                    )))
-                    .await;
-                return;
-            }
+            Err(_) => break BodyReject::TimedOut,
         };
-        if let Ok(chunk) = frame_res.into_data() {
-            total = total.saturating_add(chunk.len());
-            if total > max_size {
-                let _ = tx
-                    .send(ChunkMsg::Err(format!(
-                        "body exceeds max_body_size ({max_size} bytes)"
-                    )))
-                    .await;
-                return;
-            }
-            // `.send().await` propagates backpressure all the way back to
-            // hyper's poll_frame: a slow Python consumer blocks the feeder,
-            // which blocks the next poll, which closes the TCP receive
-            // window so the client slows down on the wire. See body_stream.rs
-            // module doc for the bound (CHANNEL_CAPACITY = 8 frames in flight).
-            if tx.send(ChunkMsg::Data(chunk)).await.is_err() {
-                // Handler dropped the stream — no one to receive further chunks.
-                return;
-            }
-        }
         // Trailer / metadata frames are ignored for body streaming.
-    }
+        let Ok(chunk) = frame.into_data() else {
+            continue;
+        };
+        total = total.saturating_add(chunk.len());
+        if total > max_size {
+            break BodyReject::TooLarge;
+        }
+        // `.send().await` propagates backpressure all the way back to
+        // hyper's poll_frame: a slow Python consumer blocks the feeder,
+        // which blocks the next poll, which closes the TCP receive
+        // window so the client slows down on the wire. See body_stream.rs
+        // module doc for the bound (CHANNEL_CAPACITY = 8 frames in flight).
+        let handed = async { tx.send(ChunkMsg::Data(chunk)).await };
+        match tokio::time::timeout(pipeline::REQUEST_BUDGET, handed).await {
+            Ok(Ok(())) => {}
+            // The handler dropped the stream, or stopped reading it for a whole budget.
+            Ok(Err(_)) | Err(_) => return,
+        }
+    };
+    // The handler may have stopped reading: nobody left to tell.
+    let _ = tx.send(ChunkMsg::Err(reject)).await;
 }
 
 // ---------------------------------------------------------------------------

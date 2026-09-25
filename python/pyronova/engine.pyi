@@ -398,6 +398,11 @@ def _in_worker() -> bool:
     """Whether this code runs in a sub-interpreter worker (not the main interpreter)."""
     ...
 
+class BodyRejected(OSError):
+    """A streamed request body (``req.stream``) was rejected as a buffered one would be:
+    larger than ``max_body_size``, too slow, or a failed read. Left uncaught, the request
+    gets the buffered body's 413 / 408 / 400."""
+
 def _route_params(path: str) -> List[str]:
     """The parameter names of a route path, in order (``{*rest}`` gives ``rest``).
     ``ValueError`` for a ``:name`` segment, which the router would take literally."""

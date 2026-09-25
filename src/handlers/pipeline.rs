@@ -241,15 +241,17 @@ async fn grpc_get_sum(
 
 // ─────────────────────────── body collection ───────────────────────────
 
-/// Why a request body was not collected: the client's doing (a 4xx).
-#[derive(Debug, thiserror::Error)]
+/// Why a request body was not read, buffered or streamed: the client's doing (a 4xx).
+/// `Clone` (the read error is shared) so a streamed body's rejection can travel through the
+/// handler as a Python exception and back (`python::body_stream::BodyRejected`).
+#[derive(Debug, Clone, thiserror::Error)]
 pub(crate) enum BodyReject {
     #[error("request body is larger than max_body_size")]
     TooLarge,
     #[error("request body did not arrive within {REQUEST_BUDGET:?}")]
     TimedOut,
     #[error("request body read failed: {0}")]
-    Read(#[source] hyper::Error),
+    Read(#[source] Arc<hyper::Error>),
 }
 
 /// The sub-interpreter pool's admission gate: a body past `skip_bytes` needs a permit.
@@ -271,8 +273,13 @@ pub(crate) struct Admitted {
 }
 
 /// The whole body, at most `max` bytes, within [`REQUEST_BUDGET`].
+pub(crate) async fn read_body(body: Incoming, max: usize) -> Result<Bytes, BodyReject> {
+    collect(body, max, &mut Ungated).await
+}
+
+/// [`read_body`], for a handler's request.
 pub(crate) async fn collect_body(body: Incoming, max: usize) -> Result<Bytes, HandlerError> {
-    collect(body, max, None).await.map(|admitted| admitted.body)
+    Ok(read_body(body, max).await?)
 }
 
 /// [`collect_body`], passing the pool's admission gate: a body that needs a permit when
@@ -280,50 +287,77 @@ pub(crate) async fn collect_body(body: Incoming, max: usize) -> Result<Bytes, Ha
 pub(crate) async fn collect_body_with_admission(
     body: Incoming,
     max: usize,
-    admission: Admission<'_>,
+    mut admission: Admission<'_>,
 ) -> Result<Admitted, HandlerError> {
-    collect(body, max, Some(admission)).await
+    let body = collect(body, max, &mut admission).await?;
+    Ok(Admitted {
+        body,
+        permit: admission.permit,
+    })
 }
 
 /// No admission permit was free.
 pub(crate) const OVERLOADED: HandlerError = HandlerError::Overloaded("admission permits");
 
-async fn collect(
+/// What a body must pass, besides the size cap, as it is buffered; its error type says
+/// what refusing it means.
+trait BodyGate {
+    type Error: From<BodyReject>;
+    /// Called with the bytes buffered so far, after each frame.
+    fn admit(&mut self, buffered: usize) -> Result<(), Self::Error>;
+}
+
+/// No gate: only the size cap and the budget.
+struct Ungated;
+
+impl BodyGate for Ungated {
+    type Error = BodyReject;
+    fn admit(&mut self, _buffered: usize) -> Result<(), BodyReject> {
+        Ok(())
+    }
+}
+
+impl BodyGate for Admission<'_> {
+    type Error = HandlerError;
+    fn admit(&mut self, buffered: usize) -> Result<(), HandlerError> {
+        if self.permit.is_none() && buffered as u64 > self.skip_bytes {
+            let permit = self
+                .semaphore
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| OVERLOADED)?;
+            self.permit = Some(permit);
+        }
+        Ok(())
+    }
+}
+
+async fn collect<G: BodyGate>(
     mut body: Incoming,
     max: usize,
-    mut admission: Option<Admission<'_>>,
-) -> Result<Admitted, HandlerError> {
+    gate: &mut G,
+) -> Result<Bytes, G::Error> {
     let read = async {
         let mut buf = BodyBuf::Empty;
         while let Some(frame) = body.frame().await {
             // Trailer frames carry no body bytes.
-            let Ok(data) = frame.map_err(BodyReject::Read)?.into_data() else {
+            let Ok(data) = frame
+                .map_err(|e| BodyReject::Read(Arc::new(e)))?
+                .into_data()
+            else {
                 continue;
             };
             if buf.len().saturating_add(data.len()) > max {
-                return Err(HandlerError::from(BodyReject::TooLarge));
+                return Err(BodyReject::TooLarge.into());
             }
             buf = buf.push(data);
-            if let Some(gate) = admission.as_mut() {
-                if gate.permit.is_none() && buf.len() as u64 > gate.skip_bytes {
-                    let permit = gate
-                        .semaphore
-                        .clone()
-                        .try_acquire_owned()
-                        .map_err(|_| OVERLOADED)?;
-                    gate.permit = Some(permit);
-                }
-            }
+            gate.admit(buf.len())?;
         }
-        Ok::<_, HandlerError>(buf.freeze())
+        Ok::<_, G::Error>(buf.freeze())
     };
-    let body = tokio::time::timeout(REQUEST_BUDGET, read)
+    tokio::time::timeout(REQUEST_BUDGET, read)
         .await
-        .map_err(|_| BodyReject::TimedOut)??;
-    Ok(Admitted {
-        body,
-        permit: admission.and_then(|gate| gate.permit),
-    })
+        .map_err(|_| BodyReject::TimedOut)?
 }
 
 /// Body bytes as they arrive. A one-frame body (the common case) is kept as hyper handed
@@ -387,6 +421,24 @@ pub(crate) async fn await_reply<T, E>(
         Ok(Err(e)) => Err(lost(e)),
         Err(_) => Err(HandlerError::Timeout),
     }
+}
+
+/// [`await_reply`] for a request whose body is streamed to its handler: the budget starts
+/// once the body has been read (`body_read`, the feeder, ends), as a buffered request's
+/// starts once its body is in. Until then the feeder's own per-step budget bounds the
+/// wait, so an upload that keeps moving is not cut off, and a client that stalls is
+/// answered 408 by the body's budget, not 504 by the handler's.
+pub(crate) async fn await_streamed_reply<T, E>(
+    body_read: &mut (impl std::future::Future + Unpin),
+    reply: impl std::future::Future<Output = Result<T, E>>,
+    lost: impl FnOnce(E) -> HandlerError,
+) -> Result<T, HandlerError> {
+    tokio::pin!(reply);
+    tokio::select! {
+        replied = &mut reply => return replied.map_err(lost),
+        _ = body_read => {}
+    }
+    await_reply(reply, lost).await
 }
 
 /// A blocking task that ended without a reply: its panic, with the payload.
