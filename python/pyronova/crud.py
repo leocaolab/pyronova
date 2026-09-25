@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from typing import Callable, TYPE_CHECKING
 
 from .app import Response
+from .db import IntegrityError
 
 _log = logging.getLogger("pyronova.crud")
 
@@ -89,6 +90,32 @@ def _json_object(req) -> "dict | _Rejected":
     if not isinstance(body, dict):
         return _Rejected(Response(body={"error": "body must be a JSON object"}, status_code=400))
     return body
+
+
+def _query(what: str, call: Callable, *args) -> object:
+    """Run one pool call. A failure the client caused is refused with the
+    database's reason; any other failure is logged and answered with a
+    generic 500 (4xx carry the reason, 5xx do not).
+
+    - ``IntegrityError`` (SQLSTATE class 23: duplicate key, NOT NULL, CHECK,
+      foreign key; ``UniqueViolation`` is a subclass) → 409.
+    - ``TypeError`` / ``ValueError``: the pool refused a body value the
+      column's type cannot take, before sending the query → 422.
+    - anything else (``DatabaseError``, pool timeout, a bug) → 500. It is
+      caught here rather than left to the framework so the client never sees
+      exception text.
+    """
+    try:
+        return call(*args)
+    except IntegrityError as e:
+        _log.info("%s: refused by a constraint: %s", what, e)
+        return _Rejected(Response(body={"error": str(e)}, status_code=409))
+    except (TypeError, ValueError) as e:
+        _log.info("%s: refused a value: %s", what, e)
+        return _Rejected(Response(body={"error": str(e)}, status_code=422))
+    except Exception:
+        _log.exception("%s failed", what)
+        return _Rejected(Response(body={"error": "database error"}, status_code=500))
 
 
 def register_crud(
@@ -221,16 +248,9 @@ def register_crud(
                 body={"error": "invalid limit/offset"},
                 status_code=400,
             )
-        try:
-            rows = pool.fetch_all(list_sql, limit, offset)
-        except Exception:
-            # PgPool raises RuntimeError for DB errors per its contract, but a
-            # contract violation (pool closed, internal bug, a future driver
-            # raising a different type) must still surface as a clean logged
-            # 500 here rather than escaping to the framework's top-level
-            # handler, which may leak a full traceback to the client.
-            _log.exception("list_rows: fetch_all failed")
-            return Response(body={"error": "database error"}, status_code=500)
+        rows = _query("list_rows", pool.fetch_all, list_sql, limit, offset)
+        if isinstance(rows, _Rejected):
+            return rows.response
         return rows
 
     # --- GET /prefix/{id} ---------------------------------------------------
@@ -241,11 +261,9 @@ def register_crud(
         id_val = parse_id(req)
         if isinstance(id_val, _Rejected):
             return id_val.response
-        try:
-            row = pool.fetch_one(get_sql, id_val)
-        except Exception:
-            _log.exception("get_row: fetch_one failed")
-            return Response(body={"error": "database error"}, status_code=500)
+        row = _query("get_row", pool.fetch_one, get_sql, id_val)
+        if isinstance(row, _Rejected):
+            return row.response
         if row is None:
             return Response(body={"error": "not found"}, status_code=404)
         return row
@@ -273,11 +291,9 @@ def register_crud(
             f"RETURNING {col_list}"
         )
         args = [body[c] for c in present]
-        try:
-            row = pool.fetch_one(insert_sql, *args)
-        except Exception:
-            _log.exception("create_row: DB error on INSERT into %s", table)
-            return Response(body={"error": "database error"}, status_code=500)
+        row = _query(f"create_row: INSERT into {table}", pool.fetch_one, insert_sql, *args)
+        if isinstance(row, _Rejected):
+            return row.response
         return Response(body=row, status_code=201)
 
     # --- PUT /prefix/{id} ---------------------------------------------------
@@ -304,11 +320,9 @@ def register_crud(
             f"RETURNING {col_list}"
         )
         args = [body[c] for c in present] + [id_val]
-        try:
-            row = pool.fetch_one(update_sql, *args)
-        except Exception:
-            _log.exception("update_row: DB error on UPDATE in %s", table)
-            return Response(body={"error": "database error"}, status_code=500)
+        row = _query(f"update_row: UPDATE in {table}", pool.fetch_one, update_sql, *args)
+        if isinstance(row, _Rejected):
+            return row.response
         if row is None:
             return Response(body={"error": "not found"}, status_code=404)
         return row
@@ -321,11 +335,9 @@ def register_crud(
         id_val = parse_id(req)
         if isinstance(id_val, _Rejected):
             return id_val.response
-        try:
-            affected = pool.execute(delete_sql, id_val)
-        except Exception:
-            _log.exception("delete_row: DB error on DELETE from %s", table)
-            return Response(body={"error": "database error"}, status_code=500)
+        affected = _query(f"delete_row: DELETE from {table}", pool.execute, delete_sql, id_val)
+        if isinstance(affected, _Rejected):
+            return affected.response
         if affected == 0:
             return Response(body={"error": "not found"}, status_code=404)
         return Response(body=b"", status_code=204)
