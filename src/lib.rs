@@ -66,6 +66,7 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<app::PyronovaApp>()?;
     m.add_class::<types::PyronovaRequest>()?;
     m.add_class::<types::PyronovaResponse>()?;
+    m.add_class::<types::PyronovaHeaders>()?;
     m.add_class::<websocket::PyronovaWebSocket>()?;
     m.add_class::<state::SharedState>()?;
     m.add_class::<python::stream::PyronovaStream>()?;

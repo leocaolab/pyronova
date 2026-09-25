@@ -18,8 +18,8 @@
 //!   (`_worker_recv`/`_worker_send`/...).
 //! - `convert`: Python `str`/`dict` conversion helpers.
 //! - `worker`: `SubInterpreterWorker` — owns one sub-interpreter.
-//! - `pool`: `InterpreterPool`, `WorkRequest`, `SubInterpResponse`, and
-//!   the per-OS-thread worker loops.
+//! - `pool`: `InterpreterPool`, `WorkRequest`, and the per-OS-thread worker
+//!   loops.
 //! - `interp`: thin facade re-exporting the four above so existing
 //!   `crate::python::interp::X` call sites keep compiling unchanged.
 //! - `body_stream`: hyper Request body → Python channel. Used by

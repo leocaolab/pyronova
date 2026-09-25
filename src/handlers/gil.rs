@@ -52,7 +52,7 @@ pub(crate) async fn run_on_main(
     // their own copies.
     let method: Arc<str> = Arc::from(prepared.parts.method.as_str());
     let path: Arc<str> = Arc::from(prepared.parts.uri.path());
-    let accept_encoding = prepared.accept_encoding().to_owned();
+    let accept_encoding = prepared.accept_encoding();
     let line = RequestLine {
         method: &method,
         path: &path,
@@ -66,7 +66,7 @@ pub(crate) async fn run_on_main(
                 call_handler_with_hooks(&site_ref, target, sky_req)
             });
             match await_reply(task, "main-interpreter handler thread panicked").await {
-                Ok(result) => build_main_http_response(result, &accept_encoding),
+                Ok(result) => build_main_http_response(result, accept_encoding.as_str()),
                 Err(refusal) => refuse(refusal),
             }
         }
@@ -101,8 +101,7 @@ async fn main_request(
         path: Arc::clone(path),
         params: prepared.params,
         query,
-        headers_source: crate::types::LazyHeaders::Raw(prepared.parts.headers),
-        headers_cache: std::sync::OnceLock::new(),
+        headers: prepared.parts.headers,
         client_ip_addr,
         body_bytes,
         body_stream_rx,

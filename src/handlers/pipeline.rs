@@ -111,17 +111,25 @@ impl Prepared {
         self.parts.uri.query().unwrap_or("")
     }
 
-    pub(crate) fn accept_encoding(&self) -> &str {
-        accept_encoding(&self.parts.headers)
+    pub(crate) fn accept_encoding(&self) -> AcceptEncoding {
+        AcceptEncoding::of(&self.parts.headers)
     }
 }
 
-/// The request's `Accept-Encoding`, or `""`.
-pub(crate) fn accept_encoding(headers: &hyper::HeaderMap) -> &str {
-    headers
-        .get(hyper::header::ACCEPT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
+/// The request's `Accept-Encoding`, kept for the response after the headers move into the
+/// handler's `Request`. A refcount copy of the field, no allocation.
+pub(crate) struct AcceptEncoding(Option<hyper::header::HeaderValue>);
+
+impl AcceptEncoding {
+    pub(crate) fn of(headers: &hyper::HeaderMap) -> Self {
+        Self(headers.get(hyper::header::ACCEPT_ENCODING).cloned())
+    }
+
+    /// The codings the client accepts; `""` (none) when it sent no `Accept-Encoding` or
+    /// one that isn't plain text.
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_ref().and_then(|v| v.to_str().ok()).unwrap_or("")
+    }
 }
 
 /// gRPC short-circuit, fast path, route resolution, then static file, fallback or 404.

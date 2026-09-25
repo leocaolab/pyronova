@@ -116,34 +116,6 @@ unsafe fn format_traceback(exc: *mut ffi::PyObject) -> String {
     }
 }
 
-/// Same as `py_str_dict` but from a Vec of key-value pairs (for path params).
-///
-/// Same exception-clearing discipline as `py_str_dict` — see doc there.
-pub(crate) unsafe fn py_str_dict_from_vec(pairs: &[(String, String)]) -> Option<PyObjRef> {
-    let dict = PyObjRef::from_owned(ffi::PyDict_New())?;
-    for (k, v) in pairs {
-        let pk = match py_str(k) {
-            Some(p) => p,
-            None => {
-                ffi::PyErr_Clear();
-                return None;
-            }
-        };
-        let pv = match py_str(v) {
-            Some(p) => p,
-            None => {
-                ffi::PyErr_Clear();
-                return None;
-            }
-        };
-        if ffi::PyDict_SetItem(dict.as_ptr(), pk.as_ptr(), pv.as_ptr()) < 0 {
-            ffi::PyErr_Clear();
-            return None;
-        }
-    }
-    Some(dict)
-}
-
 /// Extract a Rust String from a Python str object (raw FFI).
 pub(crate) unsafe fn pyobj_to_string(obj: *mut ffi::PyObject) -> Result<String, String> {
     let mut size: isize = 0;

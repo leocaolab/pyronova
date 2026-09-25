@@ -18,15 +18,13 @@ use crate::bridge::main_bridge::{GilWorkItem, MainInterpBridge, TryDispatchError
 use crate::python::interp::{self, SubInterpreterWorker};
 use crate::router::{Call, Params, RequestBody, RouteId, Target};
 use crate::site::Site;
-use crate::types::extract_headers;
 
 use super::pipeline::{
-    accept_encoding, await_reply, collect_body, finish, preprocess, refuse, Prepared, Preprocessed,
+    await_reply, collect_body, finish, preprocess, refuse, AcceptEncoding, Prepared, Preprocessed,
     Refusal, RequestLine, Served, REQUEST_BUDGET,
 };
 use super::{
-    build_main_http_response, build_subinterp_http_response, full_body, max_body_size,
-    stream_body_feeder, BoxBody,
+    build_main_http_response, full_body, http_response, max_body_size, stream_body_feeder, BoxBody,
 };
 
 pub(crate) async fn handle_request_tpc_inline(
@@ -63,35 +61,58 @@ async fn run_inline(
     client_ip_addr: std::net::IpAddr,
 ) -> Response<BoxBody> {
     let Prepared {
-        parts,
+        mut parts,
         body,
         params,
         start,
         ..
     } = prepared;
+    let headers = std::mem::take(&mut parts.headers);
     let line = RequestLine {
         method: parts.method.as_str(),
         path: parts.uri.path(),
         start,
     };
     let resp = match collect_body(body, max_body_size()).await {
-        Ok(body) => call_inline(site, worker, &parts, route, &params, body, client_ip_addr),
+        Ok(body) => {
+            let request = InlineRequest {
+                parts: &parts,
+                headers,
+                params: &params,
+                body,
+                client_ip: client_ip_addr,
+            };
+            call_inline(site, worker, route, request)
+        }
         Err(reject) => reject.into_response(),
     };
     finish(resp, site, &line, Served::Inline)
 }
 
+/// What an inline handler's `Request` is made of; the headers are moved out of `parts`.
+struct InlineRequest<'a> {
+    parts: &'a Parts,
+    headers: hyper::HeaderMap,
+    params: &'a Params,
+    body: Bytes,
+    client_ip: std::net::IpAddr,
+}
+
 fn call_inline(
     site: &Site,
     worker: &Rc<RefCell<SubInterpreterWorker>>,
-    parts: &Parts,
     route: RouteId,
-    params: &Params,
-    body: Bytes,
-    client_ip_addr: std::net::IpAddr,
+    request: InlineRequest<'_>,
 ) -> Response<BoxBody> {
     let name = &site.routes.route(route).name;
-    let headers = extract_headers(&parts.headers);
+    let accept_encoding = AcceptEncoding::of(&request.headers);
+    let InlineRequest {
+        parts,
+        headers,
+        params,
+        body,
+        client_ip,
+    } = request;
     let called = Instant::now();
 
     // Acquire the TPC thread's sub-interp GIL, run the handler, release. Non-Send because
@@ -108,8 +129,8 @@ fn call_inline(
                 params,
                 parts.uri.query().unwrap_or(""),
                 body,
-                &headers,
-                client_ip_addr,
+                headers,
+                client_ip,
             )
         }));
         worker_ref.tstate = tstate_cell.get();
@@ -135,7 +156,7 @@ fn call_inline(
         );
         return refuse(Refusal::TimedOut);
     }
-    build_subinterp_http_response(result, accept_encoding(&parts.headers), name)
+    http_response(result, accept_encoding.as_str())
 }
 
 /// Runs a main-interpreter call (a `gil=True` route or the fallback) through the bridge.
@@ -148,12 +169,13 @@ async fn run_on_bridge(
     client_ip_addr: std::net::IpAddr,
 ) -> Response<BoxBody> {
     let Prepared {
-        parts,
+        mut parts,
         body: incoming,
         params,
         start,
         ..
     } = prepared;
+    let headers = std::mem::take(&mut parts.headers);
     let line = RequestLine {
         method: parts.method.as_str(),
         path: parts.uri.path(),
@@ -165,6 +187,7 @@ async fn run_on_bridge(
                 target,
                 body,
                 params,
+                headers,
                 client_ip: client_ip_addr,
             };
             dispatch_to_bridge(&bridge, &parts, incoming, call).await
@@ -181,6 +204,7 @@ struct BridgeCall {
     target: Target,
     body: RequestBody,
     params: Params,
+    headers: hyper::HeaderMap,
     client_ip: std::net::IpAddr,
 }
 
@@ -214,6 +238,7 @@ async fn dispatch_to_bridge(
         },
     };
 
+    let accept_encoding = AcceptEncoding::of(&call.headers);
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
     let item = GilWorkItem {
         method: Arc::from(parts.method.as_str()),
@@ -221,7 +246,7 @@ async fn dispatch_to_bridge(
         params: call.params,
         query: parts.uri.query().unwrap_or("").to_string(),
         body: body_bytes,
-        headers: extract_headers(&parts.headers),
+        headers: call.headers,
         client_ip: call.client_ip,
         target: call.target,
         body_stream_rx,
@@ -239,7 +264,7 @@ async fn dispatch_to_bridge(
     }
 
     match await_reply(response_rx, "gil=True bridge dropped the request").await {
-        Ok(result) => build_main_http_response(result, accept_encoding(&parts.headers)),
+        Ok(result) => build_main_http_response(result, accept_encoding.as_str()),
         Err(refusal) => refuse(refusal),
     }
 }

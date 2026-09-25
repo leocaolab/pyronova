@@ -45,7 +45,6 @@
 //! → handler → after hooks → response extraction. Coroutines and
 //! streams fall through the same logic.
 
-use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -57,7 +56,7 @@ use tokio::sync::oneshot;
 use crate::handlers::{call_handler_with_hooks, HandlerResult};
 use crate::router::Target;
 use crate::site::SharedSite;
-use crate::types::{LazyHeaders, PyronovaRequest};
+use crate::types::PyronovaRequest;
 
 /// Work request for the main-interp bridge. Carries everything a GIL
 /// handler needs plus the oneshot reply channel. The reply is a buffered response or a
@@ -69,7 +68,7 @@ pub(crate) struct GilWorkItem {
     pub params: Vec<(String, String)>,
     pub query: String,
     pub body: Bytes,
-    pub headers: HashMap<String, String>,
+    pub headers: hyper::HeaderMap,
     pub client_ip: IpAddr,
     pub target: Target,
     /// Body-stream receiver for `stream=True` routes. The feeder task
@@ -278,8 +277,7 @@ fn dispatch_one(site: &SharedSite, item: GilWorkItem) {
         path,
         params,
         query,
-        headers_source: LazyHeaders::Converted(headers),
-        headers_cache: OnceLock::new(),
+        headers,
         query_cache: OnceLock::new(),
         query_all_cache: OnceLock::new(),
         client_ip_addr: client_ip,

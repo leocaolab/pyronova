@@ -13,8 +13,8 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 use super::ffi::{get_worker_state, PyObjRef};
-use super::pool::SubInterpResponse;
-use super::worker::{build_response, new_request, parse_result};
+use super::worker::{new_request, worker_response};
+use crate::types::ResponseData;
 
 /// Runs `f`, turning a Rust panic into a `RuntimeError` naming `context`.
 fn no_panic<T>(context: &'static str, f: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
@@ -55,7 +55,6 @@ pub(crate) fn _worker_recv(
             return Ok(None);
         };
         let req_id = state.next_req_id.fetch_add(1, Ordering::Relaxed);
-        let headers = crate::types::extract_headers(&req.headers);
         let request = Py::new(
             py,
             new_request(
@@ -64,7 +63,7 @@ pub(crate) fn _worker_recv(
                 req.params,
                 &req.query,
                 req.body,
-                headers,
+                req.headers,
                 req.client_ip,
             ),
         )?;
@@ -91,8 +90,8 @@ pub(crate) fn _worker_send(
 ) -> PyResult<()> {
     no_panic("_worker_send", || {
         // SAFETY: attached to `response`'s interpreter (this is a pymethod call).
-        let parsed: Result<SubInterpResponse, String> = unsafe {
-            parse_result(
+        let parsed: Result<ResponseData, String> = unsafe {
+            worker_response(
                 py,
                 PyObjRef::from_borrowed(response.as_ptr())
                     .ok_or_else(|| PyRuntimeError::new_err("_worker_send: null response"))?,
@@ -124,9 +123,9 @@ pub(crate) fn _worker_send(
     })
 }
 
-/// A handler's (or hook's) return value as a `Response`, with the same mapping as the sync
-/// worker path (M4 review N1a/N1b), so after-request hooks see a `Response` on both paths.
-/// A `Stream` raises: streaming responses need `gil=True, stream=True` (FR-16).
+/// A handler's (or hook's) return value as a `Response`, with the one mapping every
+/// interpreter uses, so after-request hooks see a `Response` on every path. A `Stream`
+/// raises: streaming responses need `gil=True, stream=True` (FR-16).
 #[pyfunction]
 pub(crate) fn _worker_to_response(py: Python<'_>, value: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
     no_panic("_worker_to_response", || {
@@ -134,13 +133,12 @@ pub(crate) fn _worker_to_response(py: Python<'_>, value: Bound<'_, PyAny>) -> Py
             return Ok(value.unbind());
         }
         // SAFETY: attached to `value`'s interpreter (this is a pymethod call).
-        unsafe {
+        let data = unsafe {
             let obj = PyObjRef::from_borrowed(value.as_ptr())
                 .ok_or_else(|| PyRuntimeError::new_err("_worker_to_response: null value"))?;
-            let parsed = parse_result(py, obj).map_err(PyRuntimeError::new_err)?;
-            let resp = build_response(py, &parsed).map_err(PyRuntimeError::new_err)?;
-            Ok(Bound::from_owned_ptr(py, resp.into_raw()).unbind())
-        }
+            worker_response(py, obj).map_err(PyRuntimeError::new_err)?
+        };
+        Ok(data.to_py(py)?.into_any().unbind())
     })
 }
 

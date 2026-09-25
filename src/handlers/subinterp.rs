@@ -16,7 +16,7 @@ use super::pipeline::{
     await_reply, collect_body_with_admission, finish, preprocess, refuse, Admission, Prepared,
     Preprocessed, Refusal, RequestLine, Served,
 };
-use super::{build_subinterp_http_response, max_body_size, BoxBody, SharedPool};
+use super::{http_response, max_body_size, BoxBody, SharedPool};
 
 /// Bodies up to this size skip the admission gate. HTTP/2 multiplexes hundreds of streams
 /// per connection, so tens of thousands of small requests can be in flight at once: a
@@ -50,7 +50,7 @@ pub(crate) async fn handle_request_subinterp(
                 path: Arc::clone(&path),
                 client_ip: client_ip_addr,
             };
-            let resp = run_on_pool(&pool, &site, prepared, work).await;
+            let resp = run_on_pool(&pool, prepared, work).await;
             let line = RequestLine {
                 method: &method,
                 path: &path,
@@ -71,12 +71,7 @@ struct PoolWork {
     client_ip: std::net::IpAddr,
 }
 
-async fn run_on_pool(
-    pool: &SharedPool,
-    site: &SharedSite,
-    prepared: Prepared,
-    work: PoolWork,
-) -> Response<BoxBody> {
+async fn run_on_pool(pool: &SharedPool, prepared: Prepared, work: PoolWork) -> Response<BoxBody> {
     // An honestly declared large body takes its permit before a byte is read, so it can be
     // rejected upfront. One that under-declares is caught by the collector.
     let content_length = prepared
@@ -99,7 +94,7 @@ async fn run_on_pool(
         skip_bytes: ADMISSION_SKIP_BYTES,
         permit: upfront,
     };
-    let accept_encoding = prepared.accept_encoding().to_owned();
+    let accept_encoding = prepared.accept_encoding();
     let query = prepared.query().to_owned();
     let admitted =
         match collect_body_with_admission(prepared.body, max_body_size(), admission).await {
@@ -131,11 +126,7 @@ async fn run_on_pool(
     interp::WorkRequest::inc_created();
 
     match await_reply(response_rx, "sub-interpreter worker dropped the request").await {
-        Ok(result) => build_subinterp_http_response(
-            result,
-            &accept_encoding,
-            &site.routes.route(work.route).name,
-        ),
+        Ok(result) => http_response(result, accept_encoding.as_str()),
         Err(refusal) => refuse(refusal),
     }
 }

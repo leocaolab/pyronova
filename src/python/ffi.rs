@@ -17,8 +17,9 @@ use super::pool::*;
 /// Per-async-worker state, reached by `_worker_recv` / `_worker_send` through `WORKER_ID`.
 pub(crate) struct WorkerState {
     pub(crate) rx: crossbeam_channel::Receiver<WorkRequest>,
-    pub(crate) response_map:
-        Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Result<SubInterpResponse, String>>>>,
+    pub(crate) response_map: Mutex<
+        HashMap<u64, tokio::sync::oneshot::Sender<Result<crate::types::ResponseData, String>>>,
+    >,
     pub(crate) next_req_id: AtomicU64,
     /// Identifier for the `InterpreterPool` instance that created this
     /// state. A zombie worker from a prior pool (test / hot-reload)
