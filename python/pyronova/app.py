@@ -842,18 +842,7 @@ class Pyronova:
                 tag, lvl = "INFO ", 1
 
             if lvl >= _min_level:
-                # Extract error message from body if 500
-                err = ""
-                if status >= 500:
-                    body = getattr(resp, "body", "")
-                    if isinstance(body, str) and "error" in body:
-                        # Try to extract error from JSON response
-                        try:
-                            import json
-                            err = " " + json.loads(body).get("error", "")[:100]
-                        except Exception:
-                            pass
-
+                err = _error_detail(getattr(resp, "body", "")) if status >= 500 else ""
                 print(f"  {ts} [{tag}] {req.method} {req.path} → {status} ({elapsed:.1f}ms){err}", flush=True)
 
             return resp
@@ -959,12 +948,6 @@ class Pyronova:
 
         if port is None:
             port = _env_int("PYRONOVA_PORT", "8000")
-        # Guarantee an int reaches the Rust FFI boundary. _env_int already
-        # has a "8000" default, but pin the invariant explicitly so a None
-        # can never flow into self._engine.run(port=...) and produce an
-        # opaque type error deep in Rust (arc finding app-39).
-        if port is None:
-            port = 8000
         if workers is None:
             workers = _env_int("PYRONOVA_WORKERS")
         if io_workers is None:
@@ -1116,6 +1099,19 @@ class Pyronova:
         # Not a graceful stop (real startup/run error): surface it normally.
         if run_error is not None:
             raise run_error
+
+
+def _error_detail(body: object) -> str:
+    """The ``error`` field of a JSON 500 body, for the access-log line; "" when
+    the body has none (not a str, not JSON, or no string ``error`` field)."""
+    if not isinstance(body, str):
+        return ""
+    try:
+        parsed = _json_module.loads(body)
+    except ValueError:
+        return ""
+    detail = parsed.get("error") if isinstance(parsed, dict) else None
+    return f" {detail[:100]}" if isinstance(detail, str) else ""
 
 
 def _bind_handler(fn: Callable, path: str, model: type | None) -> Callable:

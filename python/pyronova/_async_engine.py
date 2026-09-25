@@ -104,35 +104,16 @@ def _fetcher_thread(loop):
             req_id, handler_idx, req = req_data
             asyncio.run_coroutine_threadsafe(_process_request(req_id, handler_idx, req), loop)
             consecutive_errors = 0
-        except RuntimeError:
-            # run_coroutine_threadsafe raises RuntimeError once the event loop
-            # is closed (interpreter teardown / shutdown race). This is fatal
-            # and non-recoverable — retrying only spins the CPU and spams logs.
-            if loop.is_closed():
-                _log.info(
-                    "worker=%s fetcher: event loop closed — exiting", WORKER_ID
-                )
-                break
-            # A RuntimeError while the loop is still alive is unexpected but
-            # potentially transient (a Rust panic in the engine call surfaces as
-            # one too); fall through to the retriable path.
-            consecutive_errors += 1
-            _log.exception("worker=%s fetcher error — continuing", WORKER_ID)
-            time.sleep(min(0.05 * consecutive_errors, 1.0))
         except Exception:
-            # Retriable error (e.g. transient scheduling failure). Back off
-            # proportionally so a persistent error does not pin a core or
-            # flood the log.
-            #
-            # A closed loop is fatal here too: if the loop is torn down while
-            # this path keeps firing (e.g. OOM during shutdown), the back-off
-            # would never exit and the worker would burn CPU until killed.
-            # Mirror the RuntimeError branch and exit on a closed loop.
+            # A closed loop (interpreter teardown; run_coroutine_threadsafe then
+            # raises RuntimeError) is fatal: retrying would only spin the CPU.
             if loop.is_closed():
                 _log.info(
                     "worker=%s fetcher: event loop closed — exiting", WORKER_ID
                 )
                 break
+            # Otherwise possibly transient: back off proportionally so a
+            # persistent error does not pin a core or flood the log.
             consecutive_errors += 1
             _log.exception("worker=%s fetcher error — continuing", WORKER_ID)
             time.sleep(min(0.05 * consecutive_errors, 1.0))
