@@ -225,13 +225,13 @@ impl PyronovaApp {
         &self,
         py: Python<'_>,
         enabled: bool,
-        min_size: usize,
+        min_size: u32,
         gzip: bool,
         brotli: bool,
         gzip_level: u32,
         brotli_quality: u32,
     ) {
-        let wanted = crate::compression::Settings::new(
+        let wanted = crate::compression::requested(
             enabled,
             min_size,
             gzip,
