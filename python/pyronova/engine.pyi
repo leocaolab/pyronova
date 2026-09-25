@@ -262,9 +262,15 @@ class PyronovaApp:
     def put(self, path: str, handler: Callable[..., Any], gil: bool = False) -> None: ...
     def delete(self, path: str, handler: Callable[..., Any], gil: bool = False) -> None: ...
     def route(self, method: str, path: str, handler: Callable[..., Any], gil: bool = False) -> None: ...
-    def before_request(self, handler: Callable[..., Any]) -> None: ...
-    def after_request(self, handler: Callable[..., Any]) -> None: ...
-    def fallback(self, handler: Callable[..., Any]) -> None: ...
+    def before_request(self, handler: Callable[..., Any]) -> None:
+        """:raises RegistrationSealed: registered after the first server started."""
+        ...
+    def after_request(self, handler: Callable[..., Any]) -> None:
+        """:raises RegistrationSealed: registered after the first server started."""
+        ...
+    def fallback(self, handler: Callable[..., Any]) -> None:
+        """:raises RegistrationSealed: registered after the first server started."""
+        ...
     def websocket(self, path: str, handler: Callable[..., Any]) -> None:
         """:raises ValueError: a handler is already registered for ``path``."""
         ...
@@ -334,6 +340,33 @@ class PyronovaApp:
         """The script sub-interpreter workers execute, when it isn't
         ``__main__.__file__`` (the CLI sets it to the app's module)."""
         ...
+    def start(
+        self,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+        workers: Optional[int] = None,
+        mode: Union[Mode, str, None] = None,
+        io_workers: Optional[int] = None,
+        tls_cert: Optional[str] = None,
+        tls_key: Optional[str] = None,
+        extra_tls_ports: Optional[List[int]] = None,
+    ) -> Server:
+        """Prepare one server of this app and bind its listeners; ``Server.serve()`` runs
+        it. ``mode`` defaults to ``Mode.Gil``.
+
+        ``host`` is an IP address (``"127.0.0.1"``, ``"::1"``, ``"[::1]"``); anything
+        else raises ``ValueError`` naming it. ``workers`` / ``io_workers`` of 0 raise
+        ``ValueError``. The engine's environment variables (``PYRONOVA_TPC``,
+        ``PYRONOVA_GC_*``, ``PYRONOVA_GIL_BRIDGE_*``, ``PYRONOVA_METRICS``,
+        ``PYRONOVA_TPC_DARWIN``) are parsed once here; an invalid mode or value raises
+        ``ValueError`` before anything starts.
+
+        With ``extra_tls_ports``, ``port`` serves plain HTTP and each extra port serves
+        TLS (``tls_cert``/``tls_key`` required); without them ``port`` serves TLS when a
+        certificate is given. Every listener is bound here, before any thread or worker
+        starts: a port another server listens on (in this process or another, with or
+        without ``SO_REUSEPORT``) raises ``OSError`` (``errno.EADDRINUSE``)."""
+        ...
     def run(
         self,
         host: Optional[str] = None,
@@ -345,27 +378,7 @@ class PyronovaApp:
         tls_key: Optional[str] = None,
         extra_tls_ports: Optional[List[int]] = None,
     ) -> None:
-        """Serve until SIGINT or ``shutdown()``. ``mode`` defaults to ``Mode.Gil``.
-
-        The engine's environment variables (``PYRONOVA_TPC``, ``PYRONOVA_GC_*``,
-        ``PYRONOVA_GIL_BRIDGE_*``, ``PYRONOVA_METRICS``, ``PYRONOVA_TPC_DARWIN``) are
-        parsed once here; an invalid mode or value raises ``ValueError`` before
-        anything starts.
-
-        With ``extra_tls_ports``, ``port`` serves plain HTTP and each extra port serves
-        TLS (``tls_cert``/``tls_key`` required); without them ``port`` serves TLS when a
-        certificate is given. Every listener is bound before any thread or worker
-        starts: a port in use raises ``OSError`` (``errno.EADDRINUSE``)."""
-        ...
-    def bound_port(self) -> Optional[int]:
-        """The port ``run()``'s server listens on (its first listener; a ``port=0``
-        resolved to the kernel's pick). ``None`` until its listeners are bound, and
-        after it stopped."""
-        ...
-    def shutdown(self) -> None:
-        """Stop the server ``run()`` is serving, as SIGINT does: stop accepting, drain the
-        in-flight connections, return from ``run()``. Callable from any thread; a no-op
-        while nothing is serving."""
+        """``start(...).serve()``: bind, then serve until SIGINT."""
         ...
     # Feature-gated: present only in an engine built with
     # `maturin develop --release --features bench` (absent from the default build and
@@ -452,6 +465,29 @@ class PgPool:
 def _in_worker() -> bool:
     """Whether this code runs in a sub-interpreter worker (not the main interpreter)."""
     ...
+
+class Server:
+    """One server of an app, bound by ``PyronovaApp.start()``."""
+
+    @property
+    def port(self) -> int:
+        """The port it listens on (its first listener; a ``port=0`` resolved to the
+        kernel's pick)."""
+        ...
+    def serve(self) -> None:
+        """Serve until SIGINT or ``shutdown()``, blocking this thread; then drain the
+        in-flight connections and return. A server stopped before it served returns at
+        once. :raises RuntimeError: it has already served."""
+        ...
+    def shutdown(self) -> None:
+        """Stop this server as SIGINT does. Callable from any thread, before or during
+        ``serve()``; idempotent. Other servers of the same app keep serving."""
+        ...
+
+class RegistrationSealed(ValueError):
+    """A route (other than ``gil=True``), hook or fallback registered after the app's
+    registrations were sealed (the first server's start). Workers rebuild the app by
+    running its script, so they would never see it."""
 
 class BodyRejected(OSError):
     """A streamed request body (``req.stream``) was rejected as a buffered one would be:

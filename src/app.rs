@@ -5,15 +5,17 @@ use hyper::service::service_fn;
 use hyper::Request;
 use pyo3::prelude::*;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{ConfigError, EnvConfig, Mode};
+use crate::config::{ConfigError, EnvConfig, Mode, Sizing, Topology};
 use crate::handlers::{handle_request, handle_request_subinterp};
 use crate::python::interp;
 use crate::router::{Dispatch, HandlerKind, MutableRoutes, RequestBody, RouteTable, Sealed};
+use crate::server::cpu::Cpus;
 use crate::server::listener::{AcceptSource, Accepted, BoundListeners, Listener, ListenerSpec};
 use crate::site::{AccessLog, Cors, CorsSpec, Limits, SharedSite, Site, SiteConfig};
 use crate::state::SharedState;
@@ -40,17 +42,17 @@ pub(crate) struct PyronovaApp {
     request_id_header: Option<hyper::header::HeaderName>,
     /// This app's request-body and WebSocket limits, served by its runs.
     limits: Limits,
-    /// The server `run` is serving; `None` while nothing is serving.
-    serving: parking_lot::Mutex<Option<Serving>>,
 }
 
-/// The server one `run()` call is serving.
-struct Serving {
-    /// Cancelled to stop it (`shutdown()`, or SIGINT through `until_stopped`).
-    stop: CancellationToken,
-    /// Where it listens; empty until its listeners are bound.
-    bound: Vec<crate::server::listener::Bound>,
-}
+pyo3::create_exception!(
+    pyronova.engine,
+    RegistrationSealed,
+    pyo3::exceptions::PyValueError,
+    "A route or hook registered after the app's registrations were sealed (the first \
+     server's start). Workers rebuild the app by running its script, so they only have \
+     what the script registered: a late hook would silently skip every worker route. A \
+     ValueError."
+);
 
 #[pymethods]
 impl PyronovaApp {
@@ -65,7 +67,6 @@ impl PyronovaApp {
             grpc_benchmark: false,
             request_id_header: None,
             limits: Limits::DEFAULT,
-            serving: parking_lot::Mutex::new(None),
         }
     }
 
@@ -383,19 +384,28 @@ impl PyronovaApp {
 
     fn before_request(slf: &Bound<'_, Self>, handler: Py<PyAny>) -> PyResult<()> {
         Self::serve_in_worker(slf)?;
-        slf.borrow().routes.write().before_hooks.push(handler);
+        let app = slf.borrow();
+        let mut routes = app.routes.write();
+        refuse_sealed_hook(&routes, "a before_request hook")?;
+        routes.before_hooks.push(handler);
         Ok(())
     }
 
     fn after_request(slf: &Bound<'_, Self>, handler: Py<PyAny>) -> PyResult<()> {
         Self::serve_in_worker(slf)?;
-        slf.borrow().routes.write().after_hooks.push(handler);
+        let app = slf.borrow();
+        let mut routes = app.routes.write();
+        refuse_sealed_hook(&routes, "an after_request hook")?;
+        routes.after_hooks.push(handler);
         Ok(())
     }
 
     fn fallback(slf: &Bound<'_, Self>, handler: Py<PyAny>) -> PyResult<()> {
         Self::serve_in_worker(slf)?;
-        slf.borrow().routes.write().set_fallback(handler);
+        let app = slf.borrow();
+        let mut routes = app.routes.write();
+        refuse_sealed_hook(&routes, "a fallback handler")?;
+        routes.set_fallback(handler);
         Ok(())
     }
 
@@ -423,12 +433,16 @@ impl PyronovaApp {
         Ok(())
     }
 
+    /// Prepares one server of this app: resolves its configuration, freezes what it serves
+    /// and binds its listeners (a port in use is `OSError(EADDRINUSE)` here). Nothing
+    /// serves until the returned `Server`'s `serve()`; its `shutdown()` stops that one
+    /// server, so several servers of one app stop independently.
     #[pyo3(signature = (
         host=None, port=None, workers=None, mode=None, io_workers=None,
         tls_cert=None, tls_key=None, extra_tls_ports=None,
     ))]
     #[allow(clippy::too_many_arguments)]
-    fn run(
+    fn start(
         &self,
         py: Python<'_>,
         host: Option<&str>,
@@ -439,7 +453,7 @@ impl PyronovaApp {
         tls_cert: Option<&str>,
         tls_key: Option<&str>,
         extra_tls_ports: Option<Vec<u16>>,
-    ) -> PyResult<()> {
+    ) -> PyResult<Server> {
         // A worker executes the whole script, so an unguarded `app.run()` in a raw-engine
         // script reaches here inside the worker's init. Serving from there would start a
         // server inside a worker (Layer 2, N10); `Pyronova.run()` returns before this.
@@ -453,52 +467,17 @@ impl PyronovaApp {
         }
         // isojson is a hard dependency: without it the server doesn't start.
         crate::response::require_json(py)?;
-        // Everything this run takes from the environment, parsed once; a bad value stops
-        // it here, before anything is built.
+        // Everything this run takes from its arguments and the environment, parsed once; a
+        // bad value stops it here, before anything is built.
+        let sizing = Sizing {
+            workers: positive("workers", workers)?,
+            io_workers: positive("io_workers", io_workers)?,
+        };
+        let addr = socket_addr(host.unwrap_or("127.0.0.1"), port.unwrap_or(8000))?;
         let env = EnvConfig::from_env()?;
         let mode = mode.map(Mode::from_arg).transpose()?.unwrap_or(Mode::Gil);
-        // Process-level, refreshed every run: tests / hot-reload may flip PYRONOVA_METRICS
-        // between runs, and each new server honours the latest value.
-        crate::monitor::init_metrics_flag(env.metrics);
-        if env.metrics {
-            // The RSS sampler is a real OS thread; spawning it twice would leak one.
-            static RSS_SAMPLER_INIT: std::sync::Once = std::sync::Once::new();
-            RSS_SAMPLER_INIT.call_once(|| {
-                crate::monitor::spawn_rss_sampler();
-                tracing::info!(target: "pyronova::server", "Metrics enabled (PYRONOVA_METRICS=1): passive GIL monitor + RSS sampler");
-            });
-        }
-
-        let host = host.unwrap_or("127.0.0.1");
-        let port = port.unwrap_or(8000);
-        let addr: SocketAddr =
-            format!("{host}:{port}")
-                .parse()
-                .map_err(|e: std::net::AddrParseError| {
-                    pyo3::exceptions::PyValueError::new_err(e.to_string())
-                })?;
-
-        let num_cpus = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        // workers = TPC thread count (TPC mode) or sub-interpreter count (non-TPC).
-        // Default: physical_core_count() in TPC mode (avoids SMT thrash), num_cpus otherwise.
-        let workers_explicit = workers.is_some();
-        let workers = workers.unwrap_or(num_cpus);
-        // io_workers = Tokio async thread count + accept loop count (non-TPC mode).
-        let io_workers = io_workers.unwrap_or(num_cpus);
-
-        // A raw-engine script never calls `_seal_registrations`; seal here so every served
-        // table has the script's boundary that workers compare against (Layer 2, FR-2).
-        self.seal_if_unsealed();
-        // Freeze route table: extract from RwLock into read-only Arc.
-        // After this point, no more route registration — zero-lock reads.
-        let frozen: SharedSite = Arc::new(self.snapshot(py));
-
-        // The route table holds main-interpreter `Py<T>`s. Worker, bridge and Tokio threads
-        // hold clones and may drop theirs anywhere, including at runtime shutdown; this one
-        // is the last, dropped when `run` returns, on the main thread, attached (FR-6).
-        let _routes_keepalive = Arc::clone(&frozen);
+        let cpus = Cpus::detect();
+        let topology = Topology::resolve(mode, &env, sizing, cpus).map_err(ConfigError::from)?;
 
         // Build TLS acceptor once at startup if both paths are provided.
         // Either both or neither — single path is a configuration error.
@@ -520,107 +499,73 @@ impl PyronovaApp {
         let specs = ListenerSpec::set(addr, tls_acceptor, &extra_tls_ports.unwrap_or_default())
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
-        // Thread-per-core serves every route shape (gil=True and response streams through
-        // the main-interpreter bridge, async def on the worker's own loop, stream=True
-        // bodies fed from the TPC thread) and measured +7% throughput and ~10× better P99
-        // than the multi-thread pool, so it is the default. `PYRONOVA_TPC=0` keeps the
-        // pool path as an escape hatch for niche C-extension loading issues.
-        let tpc_enabled = env.tpc;
+        // Process-level, refreshed every start: tests / hot-reload may flip PYRONOVA_METRICS
+        // between runs, and each new server honours the latest value.
+        crate::monitor::init_metrics_flag(env.metrics);
 
-        // TPC defaults to PHYSICAL core count, not logical. On SMT
-        // systems, pinning 2 TPC threads to sibling hyperthreads
-        // thrashes shared L1i/L1d and kills per-thread throughput
-        // (measured -50% on 7840HS baseline). Work-stealing on
-        // non-TPC can exploit SMT because one sibling does IO while
-        // the other does Python bytecode — different cache footprints.
-        // TPC runs the SAME codepath on every thread, so SMT siblings
-        // step on each other. Explicit override via PYRONOVA_WORKERS still honored.
-        let workers = if tpc_enabled && !workers_explicit {
-            crate::tpc::physical_core_count()
-        } else {
-            workers
-        };
+        // A raw-engine script never calls `_seal_registrations`; seal here so every served
+        // table has the script's boundary that workers compare against (Layer 2, FR-2).
+        self.seal_if_unsealed();
+        // Freeze route table: extract from RwLock into read-only Arc.
+        // After this point, no more route registration — zero-lock reads.
+        let site: SharedSite = Arc::new(self.snapshot(py));
 
-        // The GC modes a path can't run are refused now, before anything is bound or built.
-        let fanout = env.darwin_topology == crate::config::DarwinTopology::Fanout;
-        match (mode, tpc_enabled) {
-            (Mode::Subinterp, false) => {
-                env.gc
-                    .mode
-                    .supported_by(crate::tpc::GcServer::SubInterpreterPool)
-                    .map_err(ConfigError::from)?;
-            }
-            #[cfg(target_os = "macos")]
-            (Mode::Subinterp, true) if fanout => {
-                env.gc
-                    .mode
-                    .supported_by(crate::tpc::GcServer::DarwinFanout)
-                    .map_err(ConfigError::from)?;
-            }
-            _ => {}
-        }
-
-        // One socket per listener for each accept loop: every TPC thread, the fanout
-        // acceptor, or the multi-thread runtime's accept tasks.
-        let accept_loops = match (mode, tpc_enabled) {
-            (Mode::Subinterp, true) if fanout => 1,
-            (_, true) => workers,
-            (_, false) => multi_thread_accept_loops(io_workers, num_cpus),
-        };
-
-        let stop = CancellationToken::new();
-        *self.serving.lock() = Some(Serving {
-            stop: stop.clone(),
-            bound: Vec::new(),
-        });
-        let served = (|| -> PyResult<()> {
-            // Every listener is bound before any thread or worker exists: a port in use is
-            // this call's `OSError(EADDRINUSE)`, not a log line from a serving thread.
-            let listeners = BoundListeners::bind(&specs, accept_loops)?;
-            if let Some(serving) = self.serving.lock().as_mut() {
-                serving.bound = listeners.bound.clone();
-            }
-            let run = ServerRun {
-                listeners,
-                site: frozen,
-                stop,
-                workers,
-                io_workers,
-                num_cpus,
-            };
-            match (mode, tpc_enabled) {
-                (Mode::Subinterp, true) => self.run_tpc_subinterp(py, run, &env),
-                (Mode::Subinterp, false) => self.run_subinterp(py, run, &env),
-                (Mode::Gil, true) => py
-                    .detach(move || {
-                        crate::tpc::run_tpc_gil(run.listeners, run.num_cpus, run.site, run.stop)
-                    })
-                    .map_err(PyErr::from),
-                (Mode::Gil, false) => run_gil(py, run),
-            }
-        })();
-        *self.serving.lock() = None;
-        served
-    }
-
-    /// The port the server `run()` is serving listens on (its first listener's; a
-    /// `port=0` resolved to the one the kernel picked). `None` until the listeners are
-    /// bound, and after the server stopped.
-    fn bound_port(&self) -> Option<u16> {
-        self.serving
-            .lock()
-            .as_ref()
-            .and_then(|serving| serving.bound.first())
+        // Every listener is bound before any thread or worker exists: a port in use is
+        // this call's `OSError(EADDRINUSE)`, not a log line from a serving thread.
+        let listeners = BoundListeners::bind(&specs, topology.accept_loops().get())?;
+        let port = listeners
+            .bound
+            .first()
             .map(|bound| bound.addr.port())
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("the server has no listener")
+            })?;
+        let stop = CancellationToken::new();
+        Ok(Server {
+            stop: stop.clone(),
+            port,
+            run: parking_lot::Mutex::new(Some(ServerRun {
+                listeners,
+                site,
+                stop,
+                topology,
+                env,
+                cpus,
+                app: self.app_source(),
+            })),
+        })
     }
 
-    /// Stops the server `run()` is serving, the way SIGINT does: stop accepting, drain the
-    /// in-flight connections, return from `run()`. Callable from any thread; a no-op while
-    /// nothing is serving.
-    fn shutdown(&self) {
-        if let Some(serving) = self.serving.lock().as_ref() {
-            serving.stop.cancel();
-        }
+    /// `start()` then `serve()`: binds, then serves until SIGINT; for raw-engine scripts.
+    #[pyo3(signature = (
+        host=None, port=None, workers=None, mode=None, io_workers=None,
+        tls_cert=None, tls_key=None, extra_tls_ports=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        py: Python<'_>,
+        host: Option<&str>,
+        port: Option<u16>,
+        workers: Option<usize>,
+        mode: Option<&Bound<'_, PyAny>>,
+        io_workers: Option<usize>,
+        tls_cert: Option<&str>,
+        tls_key: Option<&str>,
+        extra_tls_ports: Option<Vec<u16>>,
+    ) -> PyResult<()> {
+        self.start(
+            py,
+            host,
+            port,
+            workers,
+            mode,
+            io_workers,
+            tls_cert,
+            tls_key,
+            extra_tls_ports,
+        )?
+        .serve(py)
     }
 
     /// In-memory benchmark (`--features bench` builds only): N TPC sub-interpreter
@@ -645,7 +590,14 @@ impl PyronovaApp {
             .collect::<PyResult<_>>()?;
         let env = EnvConfig::from_env()?;
         crate::monitor::init_metrics_flag(env.metrics);
-        let workers = self.build_workers(py, n, &sites[0], env.gc.count_trigger())?;
+        let workers = build_workers(
+            py,
+            n,
+            &sites[0],
+            env.gc.count_trigger(),
+            &self.app_source().program(py)?,
+            &self.shared_state,
+        )?;
 
         // The sites hold main-interpreter `Py<T>`s: the last reference to each is this
         // one, dropped here, attached, after the bench threads are joined (FR-6).
@@ -678,7 +630,14 @@ impl PyronovaApp {
         let site: SharedSite = Arc::new(self.bench_site(py)?);
         let env = EnvConfig::from_env()?;
         crate::monitor::init_metrics_flag(env.metrics);
-        let workers = self.build_workers(py, n, &site, env.gc.count_trigger())?;
+        let workers = build_workers(
+            py,
+            n,
+            &site,
+            env.gc.count_trigger(),
+            &self.app_source().program(py)?,
+            &self.shared_state,
+        )?;
 
         // As in `bench_inmem`: the site's last reference is dropped here, attached.
         let site_keepalive = Arc::clone(&site);
@@ -697,7 +656,7 @@ impl PyronovaApp {
 #[cfg(feature = "bench")]
 fn bench_worker_count(workers: Option<usize>) -> PyResult<usize> {
     match workers {
-        None => Ok(crate::tpc::physical_core_count()),
+        None => Ok(crate::server::cpu::physical_core_count().get()),
         Some(0) => Err(pyo3::exceptions::PyValueError::new_err(
             "bench workers must be at least 1",
         )),
@@ -705,20 +664,63 @@ fn bench_worker_count(workers: Option<usize>) -> PyResult<usize> {
     }
 }
 
+/// A count argument of `run()`: `None` takes the default, 0 is a `ValueError` (a server
+/// with no worker or no IO thread serves nothing).
+fn positive(name: &str, value: Option<usize>) -> PyResult<Option<std::num::NonZeroUsize>> {
+    value
+        .map(|n| {
+            std::num::NonZeroUsize::new(n).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "{name} must be at least 1, got 0 (leave it unset for the default)"
+                ))
+            })
+        })
+        .transpose()
+}
+
+/// The address `run(host=…, port=…)` names. The host is an IP address, v4 or v6 (bare or
+/// in brackets); a name such as `localhost` is not resolved.
+fn socket_addr(host: &str, port: u16) -> Result<SocketAddr, BadHost> {
+    let ip = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    ip.parse::<std::net::IpAddr>()
+        .map(|ip| SocketAddr::new(ip, port))
+        .map_err(|source| BadHost {
+            host: host.to_string(),
+            source,
+        })
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "host {host:?} is not an IP address ({source}); use e.g. \"127.0.0.1\", \"0.0.0.0\" or \
+     \"::1\" (host names such as \"localhost\" are not resolved)"
+)]
+struct BadHost {
+    host: String,
+    source: std::net::AddrParseError,
+}
+
+impl From<BadHost> for PyErr {
+    fn from(e: BadHost) -> Self {
+        pyo3::exceptions::PyValueError::new_err(e.to_string())
+    }
+}
+
 /// Resolves once the server should stop, then cancels `stop` so every accept loop and
-/// connection sees it: on SIGINT, or when `PyronovaApp.shutdown()` cancelled `stop`. If the
+/// connection sees it: on SIGINT, or when `Server.shutdown()` cancelled `stop`. If the
 /// SIGINT handler cannot be installed, the server keeps serving until `shutdown()`.
 pub(crate) async fn until_stopped(stop: CancellationToken) {
     tokio::select! {
-        signalled = signal::ctrl_c() => match signalled {
-            // SIGINT ends the process, so the process-wide RSS sampler stops with it.
-            Ok(()) => crate::monitor::stop_rss_sampler(),
-            Err(e) => {
+        signalled = signal::ctrl_c() => {
+            if let Err(e) = signalled {
                 tracing::error!(
                     target: "pyronova::server",
                     error = %e,
                     "ctrl_c signal handler registration failed; cannot receive SIGINT. \
-                     Serving until PyronovaApp.shutdown(), SIGTERM or SIGKILL."
+                     Serving until Server.shutdown(), SIGTERM or SIGKILL."
                 );
                 stop.cancelled().await;
             }
@@ -730,30 +732,124 @@ pub(crate) async fn until_stopped(stop: CancellationToken) {
     stop.cancel();
 }
 
-/// One server run as `run()` resolved it: what each serving path starts from.
+/// One server of an app, bound by `PyronovaApp.start()`. `serve()` runs it until SIGINT
+/// or this server's `shutdown()`; its listeners are released when it returns.
+#[pyclass(module = "pyronova.engine", frozen)]
+pub(crate) struct Server {
+    /// Cancelled by `shutdown()` or SIGINT; shared with the run.
+    stop: CancellationToken,
+    /// The first listener's port (a `port=0` resolved to the kernel's pick).
+    port: u16,
+    /// What `serve()` runs; taken by it, so a server serves once.
+    run: parking_lot::Mutex<Option<ServerRun>>,
+}
+
+#[pymethods]
+impl Server {
+    /// Serves until SIGINT or `shutdown()`, blocking this thread; then drains the in-flight
+    /// connections and returns. A server stopped before it served returns at once. Serving
+    /// a server a second time raises `RuntimeError`.
+    pub(crate) fn serve(&self, py: Python<'_>) -> PyResult<()> {
+        let run = self.run.lock().take().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "this server has already served; start() another",
+            )
+        })?;
+        run.serve(py)
+    }
+
+    /// Stops this server the way SIGINT does: stop accepting, drain the in-flight
+    /// connections, return from `serve()`. Callable from any thread, before or during
+    /// `serve()`; idempotent. Other servers of the same app keep serving.
+    fn shutdown(&self) {
+        self.stop.cancel();
+    }
+
+    /// The port this server listens on (its first listener's).
+    #[getter]
+    fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+/// The app a server's workers rebuild by executing its script.
+struct AppSource {
+    /// `set_script_path`'s script, else `__main__.__file__` (read when the workers are
+    /// built).
+    script_path: Option<String>,
+    shared_state: Arc<dashmap::DashMap<String, bytes::Bytes>>,
+}
+
+impl AppSource {
+    /// The program workers run: the script, with main's `sys.path` as it is now.
+    fn program(&self, py: Python<'_>) -> PyResult<interp::WorkerProgram> {
+        let script_path = match &self.script_path {
+            Some(path) => path.clone(),
+            None => py.import("__main__")?.getattr("__file__")?.extract()?,
+        };
+        interp::WorkerProgram::read(py, script_path)
+    }
+}
+
+/// One server as `start()` resolved it: what `serve()` runs.
 struct ServerRun {
-    /// Bound before the path starts; one group per accept loop.
+    /// One group per accept loop (`Topology::accept_loops`).
     listeners: BoundListeners,
     site: SharedSite,
     /// Cancelled by `shutdown()` or SIGINT.
     stop: CancellationToken,
-    /// TPC threads, or the pool's sub-interpreters.
-    workers: usize,
-    /// Tokio threads of the multi-thread paths.
-    io_workers: usize,
-    num_cpus: usize,
+    topology: Topology,
+    env: EnvConfig,
+    cpus: Cpus,
+    app: AppSource,
 }
 
-/// Accept loops of the multi-thread (`PYRONOVA_TPC=0`) server. Linux's `SO_REUSEPORT`
-/// load-balances connections across several loops; macOS's doesn't, so it gets one.
-#[cfg(target_os = "linux")]
-fn multi_thread_accept_loops(io_workers: usize, num_cpus: usize) -> usize {
-    io_workers.min(num_cpus)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn multi_thread_accept_loops(_io_workers: usize, _num_cpus: usize) -> usize {
-    1
+impl ServerRun {
+    fn serve(self, py: Python<'_>) -> PyResult<()> {
+        // The route table holds main-interpreter `Py<T>`s. Worker, bridge and Tokio
+        // threads hold clones and may drop theirs anywhere, including at runtime shutdown;
+        // this one is the last, dropped when `serve` returns, on this thread, attached
+        // (FR-6).
+        let _site_keepalive = Arc::clone(&self.site);
+        if self.stop.is_cancelled() {
+            // Stopped before it served (e.g. `TestClient.close()` during its start):
+            // nothing to build, the listeners are released here.
+            return Ok(());
+        }
+        // Sampled while this server serves; stopped on every way out of here.
+        let _rss = self.env.metrics.then(|| {
+            tracing::info!(target: "pyronova::server", "Metrics enabled (PYRONOVA_METRICS=1): passive GIL monitor + RSS sampler");
+            crate::monitor::RssSampling::start()
+        });
+        match self.topology {
+            Topology::TpcGil { .. } => {
+                let ServerRun {
+                    listeners,
+                    site,
+                    stop,
+                    cpus,
+                    ..
+                } = self;
+                py.detach(move || {
+                    crate::tpc::run_tpc_gil(listeners, cpus.logical.get(), site, stop)
+                })
+                .map_err(PyErr::from)
+            }
+            Topology::TpcWorkers { threads } => {
+                serve_tpc_workers(py, self, threads, crate::tpc::run_per_thread_listener)
+            }
+            #[cfg(target_os = "macos")]
+            Topology::TpcFanout { threads } => {
+                serve_tpc_workers(py, self, threads, crate::tpc::run_fanout)
+            }
+            Topology::MultiThreadGil { io_threads, .. } => run_gil(py, self, io_threads),
+            Topology::Pool {
+                workers,
+                io_threads,
+                ..
+            } => run_subinterp(py, self, workers, io_threads),
+        }
+    }
 }
 
 /// How long the multi-thread server's in-flight connections get to finish after a stop.
@@ -818,15 +914,15 @@ where
 
 /// The multi-thread GIL-mode server (`PYRONOVA_TPC=0`): every handler on the main
 /// interpreter.
-fn run_gil(py: Python<'_>, run: ServerRun) -> PyResult<()> {
+fn run_gil(py: Python<'_>, run: ServerRun, io_threads: NonZeroUsize) -> PyResult<()> {
     let ServerRun {
         listeners,
         site,
         stop,
-        io_workers,
-        num_cpus,
+        cpus,
         ..
     } = run;
+    let (io_workers, num_cpus) = (io_threads.get(), cpus.logical.get());
     tracing::info!(
         target: "pyronova::server",
         version = env!("CARGO_PKG_VERSION"),
@@ -953,6 +1049,13 @@ impl PyronovaApp {
             .add_route(method, path, handler, name, gil, stream, py)
     }
 
+    fn app_source(&self) -> AppSource {
+        AppSource {
+            script_path: self.script_path.clone(),
+            shared_state: Arc::clone(&self.shared_state),
+        }
+    }
+
     /// Records the script's registration boundary unless one is already set; idempotent
     /// (Layer 2, FR-2).
     fn seal_if_unsealed(&self) {
@@ -1009,248 +1112,294 @@ impl PyronovaApp {
                 Err(e) => return Err(e),
             };
 
-        // Streaming constraints (v1): GIL-only, sync handlers only.
-        // Sub-interp streaming isn't supported (a worker handler returning a
-        // Stream gets a 500); async streaming needs awaitable support.
-        if stream && !gil {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "stream=True requires gil=True (v1 limitation)",
-            ));
-        }
-        if stream && is_async {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "stream=True is not yet supported on async def handlers (v1 limitation)",
-            ));
-        }
+        let dispatch = route_dispatch(gil, stream, is_async).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "{} {path}: {e}",
+                method.to_uppercase()
+            ))
+        })?;
 
         let mut routes = self.routes.write();
         // Workers only know the routes the script registered (Layer 2, FR-2). A route added
         // after `run()` began, e.g. from an `on_startup` hook, exists only on main.
         if routes.sealed.is_some() && !gil {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            return Err(RegistrationSealed::new_err(format!(
                 "{} {path} is registered after app.run() started (for example from an on_startup \
                  hook). Such a route exists only in the main interpreter, so it needs gil=True.",
                 method.to_uppercase()
             )));
         }
-        let dispatch = match (gil, stream, is_async) {
-            (true, true, _) => Dispatch::Main(RequestBody::Streamed),
-            (true, false, _) => Dispatch::Main(RequestBody::Buffered),
-            (false, _, false) => Dispatch::Worker(HandlerKind::Sync),
-            (false, _, true) => Dispatch::Worker(HandlerKind::Async),
-        };
         routes
             .insert(method, path, handler, handler_name, dispatch)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("route error: {e}")))?;
         Ok(())
     }
+}
 
-    /// The multi-thread sub-interpreter server (`PYRONOVA_TPC=0`): a channel pool of
-    /// workers behind Tokio accept loops.
-    fn run_subinterp(&self, py: Python<'_>, run: ServerRun, env: &EnvConfig) -> PyResult<()> {
-        let ServerRun {
-            listeners,
-            site: routes,
-            stop,
-            workers,
+/// The multi-thread sub-interpreter server (`PYRONOVA_TPC=0`): a channel pool of
+/// workers behind Tokio accept loops.
+fn run_subinterp(
+    py: Python<'_>,
+    run: ServerRun,
+    workers: NonZeroUsize,
+    io_threads: NonZeroUsize,
+) -> PyResult<()> {
+    let ServerRun {
+        listeners,
+        site: routes,
+        stop,
+        env,
+        cpus,
+        app,
+        ..
+    } = run;
+    let (workers, io_workers, num_cpus) = (workers.get(), io_threads.get(), cpus.logical.get());
+    let program = app.program(py)?;
+
+    let shape = crate::router::RouteShape::of(&routes.routes);
+    let split = interp::split_workers_for_routes(workers, &shape.gil, &shape.is_async)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+    let gil_count = shape.gil_count();
+    let async_count_routes = shape.async_count();
+    let subinterp_count = shape.gil.len() - gil_count;
+    let has_async = async_count_routes > 0;
+    let mode_label = if has_async { "hybrid-async" } else { "hybrid" };
+    tracing::info!(
+        target: "pyronova::server",
+        version = env!("CARGO_PKG_VERSION"),
+        mode = mode_label,
+        listening = ?listeners.bound,
+        workers,
+        cpus = num_cpus,
+        subinterp_routes = subinterp_count,
+        gil_routes = gil_count,
+        async_routes = async_count_routes,
+        "Pyronova started"
+    );
+    println!(
+        "\n  Pyronova v{} [{mode_label} mode]",
+        env!("CARGO_PKG_VERSION")
+    );
+    for listener in &listeners.bound {
+        println!("  Listening on {listener}");
+    }
+    println!("  Sub-interpreters: {workers} | IO threads: {io_workers} (CPUs: {num_cpus})");
+    if split.async_workers > 0 {
+        println!(
+            "  Workers: {} sync + {} async",
+            split.sync_workers, split.async_workers
+        );
+    }
+    println!(
+        "  Routes: {subinterp_count} sub-interp + {gil_count} GIL + {async_count_routes} async"
+    );
+    println!("  Script: {}\n", program.script_path);
+
+    let pool = Arc::new(build_pool(
+        py,
+        split,
+        &routes,
+        env.gc.threshold,
+        &program,
+        &app,
+    )?);
+
+    py.detach(move || {
+        serve_multi_thread(
+            listeners.groups,
             io_workers,
-            num_cpus,
-        } = run;
-        let program = self.worker_program(py)?;
-
-        // What every worker's script must register (Layer 2, C3), as plain values.
-        let expected = crate::router::RouteSignature::of(&routes.routes);
-        let shape = crate::router::RouteShape::of(&routes.routes);
-        let split = interp::split_workers_for_routes(workers, &shape.gil, &shape.is_async)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-
-        let gil_count = shape.gil_count();
-        let async_count_routes = shape.async_count();
-        let subinterp_count = shape.gil.len() - gil_count;
-        let has_async = async_count_routes > 0;
-        let mode_label = if has_async { "hybrid-async" } else { "hybrid" };
-        tracing::info!(
-            target: "pyronova::server",
-            version = env!("CARGO_PKG_VERSION"),
-            mode = mode_label,
-            listening = ?listeners.bound,
-            workers,
-            cpus = num_cpus,
-            subinterp_routes = subinterp_count,
-            gil_routes = gil_count,
-            async_routes = async_count_routes,
-            "Pyronova started"
-        );
-        println!(
-            "\n  Pyronova v{} [{mode_label} mode]",
-            env!("CARGO_PKG_VERSION")
-        );
-        for listener in &listeners.bound {
-            println!("  Listening on {listener}");
-        }
-        println!("  Sub-interpreters: {workers} | IO threads: {io_workers} (CPUs: {num_cpus})");
-        if split.async_workers > 0 {
-            println!(
-                "  Workers: {} sync + {} async",
-                split.sync_workers, split.async_workers
-            );
-        }
-        println!(
-            "  Routes: {subinterp_count} sub-interp + {gil_count} GIL + {async_count_routes} async"
-        );
-        println!("  Script: {}\n", program.script_path);
-
-        let spec = interp::WorkerSpec {
-            program: &program,
-            expected: &expected,
-            pool_id: interp::next_pool_id(),
-            shared_state: &self.shared_state,
-            gc_threshold: env.gc.threshold,
-            limits: routes.config.limits,
-        };
-        let pool = unsafe {
-            interp::InterpreterPool::new(split, py, &spec).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "sub-interpreter pool error: {e}"
-                ))
-            })?
-        };
-        let pool = Arc::new(pool);
-
-        py.detach(move || {
-            serve_multi_thread(
-                listeners.groups,
-                io_workers,
-                stop,
-                move |accepted, token| {
-                    let (pool, site) = (Arc::clone(&pool), Arc::clone(&routes));
-                    async move {
-                        let client_ip = accepted.remote.ip();
-                        let Some(stream) =
-                            crate::tls::wrap(accepted.stream, accepted.tls.as_deref()).await
-                        else {
-                            return;
-                        };
-                        let svc = service_fn(move |req: Request<Incoming>| {
-                            let (pool, site) = (Arc::clone(&pool), Arc::clone(&site));
-                            async move {
-                                if websocket::is_websocket_upgrade(&req) {
-                                    websocket::handle_websocket(req, site, client_ip).await
-                                } else {
-                                    handle_request_subinterp(req, pool, site, client_ip).await
-                                }
-                            }
-                        });
-                        drive_connection(stream, svc, TokioExecutor::new(), token).await;
-                    }
-                },
-            )
-        })
-    }
-
-    /// TPC sub-interp inline mode — each TPC thread owns its
-    /// own sub-interp and runs handlers synchronously on the accept
-    /// thread. No pool, no channel, no oneshot wake.
-    fn run_tpc_subinterp(&self, py: Python<'_>, run: ServerRun, env: &EnvConfig) -> PyResult<()> {
-        let ServerRun {
-            listeners,
-            site: routes,
             stop,
-            workers: n_threads,
-            num_cpus,
-            ..
-        } = run;
-        // gil=True routes and response streams: main-interp bridge.
-        // async def: the worker drives the coroutine on its own persistent asyncio loop.
-        //   This is "blocking async": the TPC thread is blocked for the coroutine's
-        //   entire execution. Awaits inside the coroutine still run on that loop, so
-        //   `await asyncio.sleep()` or `await client.get()` work; they just don't yield
-        //   to OTHER requests on the same TPC thread. SO_REUSEPORT spreads connections
-        //   across threads, so a slow async handler only blocks its one thread.
-        // stream=True: gated by gil=True at registration, so it flows through the bridge.
-        let workers = self.build_workers(py, n_threads, &routes, env.gc.count_trigger())?;
-
-        // The main-interp bridge serves `gil=True` routes and the fallback with the main
-        // GIL, while TPC threads handle the rest inline. See src/bridge/main_bridge.rs.
-        let bridge = routes.routes.uses_main().then(|| {
-            crate::bridge::main_bridge::MainInterpBridge::spawn(Arc::clone(&routes), env.bridge)
-        });
-        let server = crate::tpc::TpcServer {
-            workers,
-            site: routes,
-            bridge: bridge.clone(),
-            gc: env.gc,
-            topology: env.darwin_topology,
-        };
-
-        py.detach(move || {
-            let served = crate::tpc::run_tpc_subinterp(listeners, num_cpus, server, stop);
-            // The TPC threads are joined, so this is the last bridge reference: close it and
-            // wait for its threads to release their Python objects (FR-6).
-            if let Some(bridge) = bridge {
-                crate::bridge::main_bridge::MainInterpBridge::shutdown_join(bridge);
-            }
-            served
-        })
-        .map_err(PyErr::from)
-    }
-
-    /// The program workers run: the script `set_script_path` named, else
-    /// `__main__.__file__`, with main's `sys.path` as it is now.
-    fn worker_program(&self, py: Python<'_>) -> PyResult<interp::WorkerProgram> {
-        let script_path = match &self.script_path {
-            Some(path) => path.clone(),
-            None => py.import("__main__")?.getattr("__file__")?.extract()?,
-        };
-        interp::WorkerProgram::read(py, script_path)
-    }
-
-    /// Builds `n` TPC sub-interpreter workers, in order, on the main thread: each runs the
-    /// app's script and must register `site`'s routes. If worker `i` fails, the workers already
-    /// built are ended here, on the thread that created them (FR-19), before the error is
-    /// raised. The workers come back with their thread state saved; the thread that
-    /// serves one rebinds it first.
-    fn build_workers(
-        &self,
-        py: Python<'_>,
-        n: usize,
-        site: &Site,
-        gc_threshold: u64,
-    ) -> PyResult<Vec<interp::SubInterpreterWorker>> {
-        if !crate::run_context::on_main(py) {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "sub-interpreter workers are built on the main interpreter only",
-            ));
-        }
-        let program = self.worker_program(py)?;
-
-        let expected = crate::router::RouteSignature::of(&site.routes);
-        let spec = interp::WorkerSpec {
-            program: &program,
-            expected: &expected,
-            // Each worker gets it as `POOL_ID` (the async engine's zombie guard).
-            pool_id: interp::next_pool_id(),
-            shared_state: &self.shared_state,
-            gc_threshold,
-            limits: site.config.limits,
-        };
-        let mut built = Vec::with_capacity(n);
-        for i in 0..n {
-            // SAFETY: on the main thread with main's thread state current (checked above).
-            let worker = unsafe { interp::SubInterpreterWorker::new(i, &spec) };
-            match worker {
-                Ok(w) => built.push(w),
-                Err(e) => {
-                    // SAFETY: as above; none of `built` was rebound to another thread.
-                    unsafe { interp::SubInterpreterWorker::end_all(built) };
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "sub-interp {i} init: {e}"
-                    )));
+            move |accepted, token| {
+                let (pool, site) = (Arc::clone(&pool), Arc::clone(&routes));
+                async move {
+                    let client_ip = accepted.remote.ip();
+                    let Some(stream) =
+                        crate::tls::wrap(accepted.stream, accepted.tls.as_deref()).await
+                    else {
+                        return;
+                    };
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let (pool, site) = (Arc::clone(&pool), Arc::clone(&site));
+                        async move {
+                            if websocket::is_websocket_upgrade(&req) {
+                                websocket::handle_websocket(req, site, client_ip).await
+                            } else {
+                                handle_request_subinterp(req, pool, site, client_ip).await
+                            }
+                        }
+                    });
+                    drive_connection(stream, svc, TokioExecutor::new(), token).await;
                 }
+            },
+        )
+    })
+}
+
+/// A TPC sub-interpreter server: how it takes connections (`Topology`).
+type TpcServe = fn(
+    BoundListeners,
+    usize,
+    crate::tpc::TpcServer,
+    CancellationToken,
+) -> Result<(), crate::tpc::ServeError>;
+
+/// The TPC sub-interpreter server: `threads` TPC threads, each owning a worker that runs
+/// the `def` routes inline; `async def` routes on an async pool (decision Q1), so their
+/// awaits overlap and their 504 is sent on time; `gil=True` routes and the fallback on the
+/// main-interpreter bridge.
+fn serve_tpc_workers(
+    py: Python<'_>,
+    run: ServerRun,
+    threads: NonZeroUsize,
+    serve: TpcServe,
+) -> PyResult<()> {
+    let ServerRun {
+        listeners,
+        site: routes,
+        stop,
+        env,
+        cpus,
+        app,
+        ..
+    } = run;
+    let program = app.program(py)?;
+
+    let shape = crate::router::RouteShape::of(&routes.routes);
+    let async_routes = shape.async_count();
+    let sync_routes = shape.gil.len() - shape.gil_count() - async_routes;
+    let async_workers = if async_routes > 0 {
+        crate::config::tpc_async_workers(threads, sync_routes > 0).get()
+    } else {
+        0
+    };
+    // Built first: if the TPC workers then fail, dropping the pool ends its workers on
+    // their own threads.
+    let async_pool = if async_workers > 0 {
+        let split = interp::WorkerSplit {
+            sync_workers: 0,
+            async_workers,
+        };
+        let pool = build_pool(py, split, &routes, env.gc.count_trigger(), &program, &app)?;
+        Some(Arc::new(pool))
+    } else {
+        None
+    };
+    let workers = match build_workers(
+        py,
+        threads.get(),
+        &routes,
+        env.gc.count_trigger(),
+        &program,
+        &app.shared_state,
+    ) {
+        Ok(workers) => workers,
+        Err(e) => {
+            py.detach(move || drop(async_pool));
+            return Err(e);
+        }
+    };
+
+    // The main-interp bridge serves `gil=True` routes and the fallback with the main
+    // GIL, while TPC threads handle the rest. See src/bridge/main_bridge.rs.
+    let bridge = routes.routes.uses_main().then(|| {
+        crate::bridge::main_bridge::MainInterpBridge::spawn(Arc::clone(&routes), env.bridge)
+    });
+    let server = crate::tpc::TpcServer {
+        workers,
+        site: routes,
+        bridge: bridge.clone(),
+        async_pool: async_pool.clone(),
+        async_workers,
+        gc: env.gc,
+    };
+
+    py.detach(move || {
+        let served = serve(listeners, cpus.logical.get(), server, stop);
+        // The TPC threads are joined, so these are the last references: the async pool
+        // joins its workers, the bridge its threads (FR-6).
+        drop(async_pool);
+        if let Some(bridge) = bridge {
+            crate::bridge::main_bridge::MainInterpBridge::shutdown_join(bridge);
+        }
+        served
+    })
+    .map_err(PyErr::from)
+}
+
+/// What every worker of a server is built from: the app's program, the routes it must
+/// register (`site`'s, up to the seal), the shared state and the served limits.
+fn worker_spec<'a>(
+    program: &'a interp::WorkerProgram,
+    expected: &'a crate::router::RouteSignature,
+    site: &Site,
+    gc_threshold: u64,
+    shared_state: &'a crate::state::SharedMap,
+) -> interp::WorkerSpec<'a> {
+    interp::WorkerSpec {
+        program,
+        expected,
+        // Each worker gets it as `POOL_ID` (the async engine's zombie guard).
+        pool_id: interp::next_pool_id(),
+        shared_state,
+        gc_threshold,
+        limits: site.config.limits,
+    }
+}
+
+/// A channel pool of `split` workers, each on its own thread, serving `site`.
+fn build_pool(
+    py: Python<'_>,
+    split: interp::WorkerSplit,
+    site: &Site,
+    gc_threshold: u64,
+    program: &interp::WorkerProgram,
+    app: &AppSource,
+) -> PyResult<interp::InterpreterPool> {
+    let expected = crate::router::RouteSignature::of(&site.routes);
+    let spec = worker_spec(program, &expected, site, gc_threshold, &app.shared_state);
+    // SAFETY: called with the main interpreter attached (`py`), before `py.detach`.
+    unsafe { interp::InterpreterPool::new(split, py, &spec) }.map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("sub-interpreter pool error: {e}"))
+    })
+}
+
+/// Builds `n` TPC sub-interpreter workers, in order, on the main thread: each runs the
+/// app's script and must register `site`'s routes. If worker `i` fails, the workers already
+/// built are ended here, on the thread that created them (FR-19), before the error is
+/// raised. The workers come back with their thread state saved; the thread that
+/// serves one rebinds it first.
+fn build_workers(
+    py: Python<'_>,
+    n: usize,
+    site: &Site,
+    gc_threshold: u64,
+    program: &interp::WorkerProgram,
+    shared_state: &crate::state::SharedMap,
+) -> PyResult<Vec<interp::SubInterpreterWorker>> {
+    if !crate::run_context::on_main(py) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "sub-interpreter workers are built on the main interpreter only",
+        ));
+    }
+    let expected = crate::router::RouteSignature::of(&site.routes);
+    let spec = worker_spec(program, &expected, site, gc_threshold, shared_state);
+    let mut built = Vec::with_capacity(n);
+    for i in 0..n {
+        // SAFETY: on the main thread with main's thread state current (checked above).
+        let worker = unsafe { interp::SubInterpreterWorker::new(i, &spec) };
+        match worker {
+            Ok(w) => built.push(w),
+            Err(e) => {
+                // SAFETY: as above; none of `built` was rebound to another thread.
+                unsafe { interp::SubInterpreterWorker::end_all(built) };
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "sub-interp {i} init: {e}"
+                )));
             }
         }
-        Ok(built)
     }
+    Ok(built)
 }
 
 #[cfg(feature = "bench")]
@@ -1269,6 +1418,98 @@ impl PyronovaApp {
     }
 }
 
+/// A route's `gil` / `stream` / handler-kind combination that no serving path runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+enum UnservableRoute {
+    /// A streamed body is fed from the connection's thread to a handler on the main
+    /// interpreter; a worker handler has no such feed and would find `req.stream` empty.
+    #[error("stream=True needs gil=True: a streamed request body is only fed to handlers on the main interpreter")]
+    StreamOffMain,
+    #[error("stream=True is not supported on `async def` handlers; use a `def` handler")]
+    StreamAsync,
+}
+
+/// Where a route with these registration flags runs, or why none can run it.
+fn route_dispatch(gil: bool, stream: bool, is_async: bool) -> Result<Dispatch, UnservableRoute> {
+    match (gil, stream, is_async) {
+        (_, true, true) => Err(UnservableRoute::StreamAsync),
+        (false, true, false) => Err(UnservableRoute::StreamOffMain),
+        (true, true, false) => Ok(Dispatch::Main(RequestBody::Streamed)),
+        (true, false, _) => Ok(Dispatch::Main(RequestBody::Buffered)),
+        (false, false, false) => Ok(Dispatch::Worker(HandlerKind::Sync)),
+        (false, false, true) => Ok(Dispatch::Worker(HandlerKind::Async)),
+    }
+}
+
+/// A hook (or the fallback) registered once the registrations are sealed would exist
+/// only on main, so every worker route would skip it — e.g. an auth `before_request` added
+/// by an `on_startup` hook. Refused with the error a late worker route gets.
+fn refuse_sealed_hook(routes: &RouteTable, what: &str) -> PyResult<()> {
+    match routes.sealed {
+        None => Ok(()),
+        Some(_) => Err(RegistrationSealed::new_err(format!(
+            "{what} is registered after app.run() started (for example from an on_startup \
+             hook, or enable_cors() there). Workers only run what the script registered, so \
+             every worker route would skip it; register it at module level."
+        ))),
+    }
+}
+
 fn parse_cors(spec: &CorsSpec<'_>) -> PyResult<Cors> {
     Cors::parse(spec).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_streamed_body_needs_a_sync_main_interpreter_handler() {
+        use Dispatch::{Main, Worker};
+        assert_eq!(
+            route_dispatch(true, true, false),
+            Ok(Main(RequestBody::Streamed))
+        );
+        assert_eq!(
+            route_dispatch(false, true, false),
+            Err(UnservableRoute::StreamOffMain)
+        );
+        assert_eq!(
+            route_dispatch(false, true, true),
+            Err(UnservableRoute::StreamAsync)
+        );
+        assert_eq!(
+            route_dispatch(true, true, true),
+            Err(UnservableRoute::StreamAsync)
+        );
+        assert_eq!(
+            route_dispatch(true, false, true),
+            Ok(Main(RequestBody::Buffered))
+        );
+        assert_eq!(
+            route_dispatch(false, false, false),
+            Ok(Worker(HandlerKind::Sync))
+        );
+        assert_eq!(
+            route_dispatch(false, false, true),
+            Ok(Worker(HandlerKind::Async))
+        );
+    }
+
+    #[test]
+    fn a_host_is_an_ip_address_and_its_error_names_it() {
+        assert_eq!(
+            socket_addr("127.0.0.1", 80).unwrap(),
+            "127.0.0.1:80".parse().unwrap()
+        );
+        assert_eq!(socket_addr("::1", 80).unwrap(), "[::1]:80".parse().unwrap());
+        assert_eq!(
+            socket_addr("[::1]", 80).unwrap(),
+            "[::1]:80".parse().unwrap()
+        );
+        for host in ["localhost", "", "1.2.3", "[127.0.0.1"] {
+            let text = socket_addr(host, 80).unwrap_err().to_string();
+            assert!(text.starts_with(&format!("host {host:?} ")), "{text}");
+        }
+    }
 }

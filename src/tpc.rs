@@ -4,8 +4,9 @@
 //! `tokio::runtime::Builder::new_current_thread()` runtime, a
 //! `LocalSet` for spawn_local tasks, and its own `SO_REUSEPORT`
 //! listeners (bound before any thread exists); in sub-interpreter mode it
-//! also owns one worker and runs its handlers inline. `PYRONOVA_TPC=0`
-//! serves through the multi-thread pool instead (`app.rs`).
+//! also owns one worker and runs its `def` handlers inline, while `async def`
+//! handlers go to the async worker pool. `PYRONOVA_TPC=0` serves through the
+//! multi-thread pool instead (`app.rs`).
 //!
 //! Why no `Send` bounds on the per-connection future? Because
 //! `LocalSet::spawn_local` runs the task on the same OS thread that
@@ -28,10 +29,11 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::bridge::main_bridge::MainInterpBridge;
-use crate::config::{DarwinTopology, GcConfig, GC_MODE_ENV};
+use crate::config::{GcConfig, GcMode};
 use crate::handlers::error::panic_message;
-use crate::handlers::handle_request;
+use crate::handlers::{handle_request, SharedPool};
 use crate::python::interp::SubInterpreterWorker;
+use crate::server::cpu::{elevate_thread_qos_macos, try_pin_current};
 use crate::server::listener::{
     AcceptSource, Accepted, Bound, BoundListeners, Listener, ListenerError,
 };
@@ -42,65 +44,19 @@ use crate::worker::{drive_connection, drive_tcp_conn, LocalExec, TpcContext};
 /// How long a TPC thread's in-flight connections get to finish after a stop.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Pin the current OS thread to a specific CPU core if one is
-/// available. Silently no-ops on platforms where `core_affinity`
-/// can't enumerate (e.g. restricted containers with no CPU mask
-/// visibility); in that case the OS scheduler still gets us
-/// statistically-close-to-core-local execution on the per-thread
-/// runtime because the runtime never migrates tasks, only the
-/// kernel can move the thread.
-pub(crate) fn try_pin_current(core_id: Option<core_affinity::CoreId>) {
-    if let Some(c) = core_id {
-        let _ = core_affinity::set_for_current(c);
-    }
-}
-
-/// macOS-only: bump the calling thread's QoS class to
-/// USER_INTERACTIVE. core_affinity::set_for_current is a silent
-/// no-op on Darwin (no public CPU-pinning API), so without this
-/// the scheduler is free to park TPC threads on E-cores for
-/// power savings — fatal under TPC because there is no work-
-/// stealing across threads. USER_INTERACTIVE tells the scheduler
-/// to keep us on P-cores and ignore power hints, at the cost of
-/// giving up energy-efficiency on idle machines. Acceptable
-/// tradeoff for a throughput-first server.
-#[cfg(target_os = "macos")]
-pub(crate) fn elevate_thread_qos_macos() {
-    use std::os::raw::c_int;
-    // Opaque qos_class_t. 0x21 == QOS_CLASS_USER_INTERACTIVE per
-    // <sys/qos.h>. Keeping the constant inline avoids pulling in
-    // the whole qos.h shim; the value has been stable since 10.10.
-    const QOS_CLASS_USER_INTERACTIVE: c_int = 0x21;
-    extern "C" {
-        fn pthread_set_qos_class_self_np(qos_class: c_int, relative_priority: c_int) -> c_int;
-    }
-    unsafe {
-        let rc = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-        // Silent failure here can park TPC threads on E-cores — fatal
-        // for throughput per the doc comment above ("no work-stealing
-        // across threads"). Log so the perf regression is visible
-        // before it shows up as a benchmark drop (arc finding tpc-1).
-        if rc != 0 {
-            tracing::warn!(
-                target: "pyronova::server",
-                rc,
-                "pthread_set_qos_class_self_np failed; TPC thread may be \
-                 scheduled on E-cores — expect throughput collapse"
-            );
-        }
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-#[inline(always)]
-pub(crate) fn elevate_thread_qos_macos() {}
-
 /// Log line emitted once on startup so operators can see the TPC topology.
 ///
 /// `site` is used to surface the gil / async / sub-interp split so the
 /// operator knows up front how many routes will go through the
 /// main_bridge versus the per-thread TPC fleet.
-fn log_startup(mode: &str, bound: &[Bound], n_threads: usize, n_cpus: usize, site: &Site) {
+fn log_startup(
+    mode: &str,
+    bound: &[Bound],
+    n_threads: usize,
+    n_cpus: usize,
+    site: &Site,
+    async_workers: usize,
+) {
     let shape = crate::router::RouteShape::of(&site.routes);
     let gil_count = shape.gil_count();
     let async_count = shape.async_count();
@@ -114,6 +70,7 @@ fn log_startup(mode: &str, bound: &[Bound], n_threads: usize, n_cpus: usize, sit
         tpc = true,
         listening = ?bound,
         tpc_threads = n_threads,
+        async_workers,
         cpus = n_cpus,
         routes_total = total,
         routes_subinterp = subinterp_count,
@@ -130,6 +87,9 @@ fn log_startup(mode: &str, bound: &[Bound], n_threads: usize, n_cpus: usize, sit
         println!("  Listening on {listener}");
     }
     println!("  TPC threads: {n_threads} (CPUs: {n_cpus}, pinned)");
+    if async_workers > 0 {
+        println!("  Async workers: {async_workers} (async def routes)");
+    }
     println!(
         "  Routes: {subinterp_count} sub-interp + {gil_count} GIL + {async_count} async{stream_suffix}\n",
         stream_suffix = if stream_count > 0 {
@@ -205,8 +165,6 @@ pub(crate) enum ServeError {
     },
     #[error("thread {thread} panicked: {payload}")]
     Panicked { thread: String, payload: String },
-    #[error("{workers} TPC workers for {groups} listener groups")]
-    WorkerCount { workers: usize, groups: usize },
 }
 
 impl From<ServeError> for pyo3::PyErr {
@@ -293,7 +251,7 @@ pub(crate) fn run_tpc_gil(
     shutdown: CancellationToken,
 ) -> Result<(), ServeError> {
     let n_threads = listeners.groups.len();
-    log_startup("gil", &listeners.bound, n_threads, n_cpus, &site);
+    log_startup("gil", &listeners.bound, n_threads, n_cpus, &site, 0);
 
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
     let _watcher = spawn_stop_watcher(shutdown.clone())?;
@@ -368,10 +326,11 @@ async fn serve_main_conn(accepted: Accepted, site: SharedSite, conn_token: Cance
 }
 
 // ---------------------------------------------------------------------------
-// Sub-interpreter mode — each TPC thread owns a worker and runs its handlers inline
+// Sub-interpreter mode — each TPC thread owns a worker and runs its `def` handlers inline
 // ---------------------------------------------------------------------------
 
-/// A TPC sub-interpreter server: what `run_tpc_subinterp` serves with.
+/// A TPC sub-interpreter server: what [`run_per_thread_listener`] and `run_fanout` serve
+/// with.
 pub(crate) struct TpcServer {
     /// One per TPC thread, built on the main thread.
     pub(crate) workers: Vec<SubInterpreterWorker>,
@@ -379,46 +338,12 @@ pub(crate) struct TpcServer {
     /// Runs `gil=True` routes and the fallback on the main interpreter; `None` when the
     /// table has none.
     pub(crate) bridge: Option<Arc<MainInterpBridge>>,
+    /// Runs the `async def` routes on async-engine workers, off the TPC threads; `None`
+    /// when the table has none.
+    pub(crate) async_pool: Option<SharedPool>,
+    /// The async pool's worker count, for the banner.
+    pub(crate) async_workers: usize,
     pub(crate) gc: GcConfig,
-    pub(crate) topology: DarwinTopology,
-}
-
-/// Each TPC thread owns one worker and executes handlers synchronously on the accept
-/// thread: no shared pool, no channel, no oneshot wake. Every worker ends on the thread
-/// that served it, or here if it was never handed to one.
-pub(crate) fn run_tpc_subinterp(
-    listeners: BoundListeners,
-    n_cpus: usize,
-    server: TpcServer,
-    shutdown: CancellationToken,
-) -> Result<(), ServeError> {
-    // Darwin: kqueue-backed SO_REUSEPORT routes ~all traffic to one
-    // listener (last-socket-wins). We keep the per-thread-listener
-    // default anyway because localhost benchmarking shows it still
-    // wins: fanout's cross-thread wake cost + client/server CPU
-    // contention on a single machine outweighs the distribution
-    // benefit. The fanout topology stays behind an env opt-in for
-    // real-NIC testing and hardware where the loopback isn't the
-    // bottleneck. Set `PYRONOVA_TPC_DARWIN=fanout` to opt in.
-    let groups = match server.topology {
-        DarwinTopology::PerThreadListener => server.workers.len(),
-        DarwinTopology::Fanout => 1,
-    };
-    if listeners.groups.len() != groups {
-        let err = ServeError::WorkerCount {
-            workers: server.workers.len(),
-            groups: listeners.groups.len(),
-        };
-        // SAFETY: on the main thread inside `py.detach` (no thread state current); none of
-        // the workers was rebound.
-        unsafe { SubInterpreterWorker::end_all(server.workers) };
-        return Err(err);
-    }
-    match server.topology {
-        #[cfg(target_os = "macos")]
-        DarwinTopology::Fanout => run_fanout(listeners, n_cpus, server, shutdown),
-        _ => run_per_thread_listener(listeners, n_cpus, server, shutdown),
-    }
 }
 
 /// The stop watcher, or the run's end: a server that can't watch for SIGINT doesn't
@@ -433,7 +358,9 @@ fn watch_or_end(
     })
 }
 
-fn run_per_thread_listener(
+/// Serves `server` with one TPC thread per worker, each accepting on its own listener
+/// group: `listeners` has one group per worker (`Topology::accept_loops`).
+pub(crate) fn run_per_thread_listener(
     listeners: BoundListeners,
     n_cpus: usize,
     mut server: TpcServer,
@@ -446,20 +373,48 @@ fn run_per_thread_listener(
         n_threads,
         n_cpus,
         &server.site,
+        server.async_workers,
     );
     let _watcher = watch_or_end(&shutdown, &mut server.workers)?;
 
     let gc = server.gc;
+    let shared = Shared::of(&server);
     let handoffs = server.workers.into_iter().zip(listeners.groups).collect();
     let handles = spawn_worker_threads(
         "tpc",
         handoffs,
-        &server.site,
-        &server.bridge,
+        &shared,
         &shutdown,
         move |context, group, stop| tpc_accept_loop_inline(group, context, stop, gc),
     )?;
     join_all(handles)
+}
+
+/// What every TPC thread's [`TpcContext`] shares besides its own worker.
+#[derive(Clone)]
+struct Shared {
+    site: SharedSite,
+    bridge: Option<Arc<MainInterpBridge>>,
+    async_pool: Option<SharedPool>,
+}
+
+impl Shared {
+    fn of(server: &TpcServer) -> Self {
+        Shared {
+            site: Arc::clone(&server.site),
+            bridge: server.bridge.clone(),
+            async_pool: server.async_pool.clone(),
+        }
+    }
+
+    fn with_worker(self, worker: SubInterpreterWorker) -> TpcContext {
+        TpcContext {
+            worker: std::cell::RefCell::new(worker),
+            site: self.site,
+            bridge: self.bridge,
+            async_pool: self.async_pool,
+        }
+    }
 }
 
 /// One pinned thread per `(worker, payload)`. A worker is handed over only after its
@@ -471,8 +426,7 @@ fn run_per_thread_listener(
 fn spawn_worker_threads<T, F, Fut>(
     name: &str,
     handoffs: Vec<(SubInterpreterWorker, T)>,
-    site: &SharedSite,
-    bridge: &Option<Arc<MainInterpBridge>>,
+    shared: &Shared,
     shutdown: &CancellationToken,
     serve: F,
 ) -> Result<Vec<ThreadHandle>, ServeError>
@@ -489,7 +443,7 @@ where
         let core = core_ids.get(i).copied();
         let (tx, rx) = mpsc::sync_channel::<(SubInterpreterWorker, T)>(1);
         let serve = serve.clone();
-        let (site, bridge, stop) = (Arc::clone(site), bridge.clone(), shutdown.clone());
+        let (shared, stop) = (shared.clone(), shutdown.clone());
         let label = thread.clone();
         let spawned = std::thread::Builder::new()
             .name(thread.clone())
@@ -503,11 +457,7 @@ where
                 worker.tstate = unsafe {
                     crate::python::interp::rebind_tstate_to_current_thread(worker.tstate)
                 };
-                let context = Rc::new(TpcContext {
-                    worker: std::cell::RefCell::new(worker),
-                    site,
-                    bridge,
-                });
+                let context = Rc::new(shared.with_worker(worker));
                 let served = serve_on_this_thread(&label, core, || {
                     serve(Rc::clone(&context), payload, stop.clone())
                 });
@@ -611,9 +561,15 @@ type FannedOut = (
 /// only change is where the TcpStream comes from. Pays one cross-thread
 /// wake per TCP connection, which is amortized to ~0 under HTTP keep-
 /// alive (one wake serves the connection's full request lifetime).
-/// Count or off GC only (`GcServer::DarwinFanout`): there is no idle tick here.
+/// Count or off GC only (`Topology::supports`): there is no idle tick here.
+///
+/// Darwin's kqueue-backed `SO_REUSEPORT` routes ~all traffic to one listener
+/// (last-socket-wins). The per-thread-listener topology stays the default anyway because
+/// localhost benchmarking shows it still wins: fanout's cross-thread wake cost plus
+/// client/server CPU contention on one machine outweighs the distribution benefit. This
+/// one is an opt-in (`PYRONOVA_TPC_DARWIN=fanout`) for real-NIC testing.
 #[cfg(target_os = "macos")]
-fn run_fanout(
+pub(crate) fn run_fanout(
     listeners: BoundListeners,
     n_cpus: usize,
     mut server: TpcServer,
@@ -634,30 +590,25 @@ fn run_fanout(
         n_threads,
         n_cpus,
         &server.site,
+        server.async_workers,
     );
     let _watcher = watch_or_end(&shutdown, &mut server.workers)?;
 
     let (txs, rxs): (Vec<_>, Vec<_>) = (0..n_threads)
         .map(|_| tokio::sync::mpsc::channel::<FannedOut>(WORKER_INBOX_CAP))
         .unzip();
+    let shared = Shared::of(&server);
     let handoffs = server.workers.into_iter().zip(rxs).collect();
-    let mut handles = spawn_worker_threads(
-        "tpc",
-        handoffs,
-        &server.site,
-        &server.bridge,
-        &shutdown,
-        |context, rx, stop| fanout_worker_loop(rx, context, stop),
-    )?;
+    let mut handles =
+        spawn_worker_threads("tpc", handoffs, &shared, &shutdown, |context, rx, stop| {
+            fanout_worker_loop(rx, context, stop)
+        })?;
 
     // Acceptor — dedicated OS thread with its own current_thread runtime so accept()
     // polling doesn't contend with any worker. Pinned to the core after the workers'
     // so TCP work doesn't fight handler execution for the same L1/L2.
-    let group = listeners
-        .groups
-        .into_iter()
-        .next()
-        .expect("run_tpc_subinterp checked: one listener group");
+    // `Topology::TpcFanout` binds one group: the acceptor's.
+    let group: Vec<Listener> = listeners.groups.into_iter().flatten().collect();
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
     let core = (!core_ids.is_empty()).then(|| core_ids[n_threads % core_ids.len()]);
     let stop = shutdown.clone();
@@ -770,103 +721,6 @@ async fn fanout_worker_loop(
     Ok(())
 }
 
-/// GC scheduling mode, parsed once at startup from `PYRONOVA_GC_MODE` (unset = count):
-///   - `count` — the count trigger inside `SubInterpreterWorker::call_handler` fires
-///     `gc.collect()` every `PYRONOVA_GC_THRESHOLD` requests per worker. Simple,
-///     predictable, can collide with bursty traffic.
-///   - `idle` — the TPC accept loop collects once a worker has run requests and then
-///     none for a full `PYRONOVA_GC_IDLE_MS` tick (default 100ms), so the pause lands in
-///     a lull. The worker's count trigger becomes the OOM failsafe at
-///     `PYRONOVA_GC_OOM_FAILSAFE` requests (default 50_000), so sustained traffic can't
-///     starve the collector. Needs the per-thread-listener TPC topology.
-///   - `off` — no framework-level triggers at all. `gc.disable()` still runs at sub-interp
-///     init; users must call `gc.collect()` themselves or accept ref-count-only cleanup.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum GcMode {
-    Count,
-    Idle,
-    Off,
-}
-
-impl std::fmt::Display for GcMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            GcMode::Count => "count",
-            GcMode::Idle => "idle",
-            GcMode::Off => "off",
-        })
-    }
-}
-
-impl std::str::FromStr for GcMode {
-    type Err = GcModeError;
-
-    fn from_str(raw: &str) -> Result<Self, GcModeError> {
-        match raw {
-            "count" => Ok(GcMode::Count),
-            "idle" => Ok(GcMode::Idle),
-            "off" => Ok(GcMode::Off),
-            _ => Err(GcModeError::Unknown(raw.to_string())),
-        }
-    }
-}
-
-impl GcMode {
-    /// This mode, if `server` can run it.
-    pub(crate) fn supported_by(self, server: GcServer) -> Result<Self, GcModeError> {
-        let supported = match server {
-            #[cfg(target_os = "macos")]
-            GcServer::DarwinFanout => matches!(self, GcMode::Count | GcMode::Off),
-            GcServer::SubInterpreterPool => self == GcMode::Count,
-        };
-        if supported {
-            Ok(self)
-        } else {
-            Err(GcModeError::Unsupported { mode: self, server })
-        }
-    }
-}
-
-/// A server shape that runs only some GC modes (the TPC per-thread-listener one runs all).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum GcServer {
-    #[cfg(target_os = "macos")]
-    DarwinFanout,
-    SubInterpreterPool,
-}
-
-impl std::fmt::Display for GcServer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            #[cfg(target_os = "macos")]
-            GcServer::DarwinFanout => "the Darwin fanout TPC topology (PYRONOVA_TPC_DARWIN=fanout)",
-            GcServer::SubInterpreterPool => "the sub-interpreter pool (PYRONOVA_TPC=0)",
-        })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum GcModeError {
-    Unknown(String),
-    Unsupported { mode: GcMode, server: GcServer },
-}
-
-impl std::fmt::Display for GcModeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            GcModeError::Unknown(raw) => write!(
-                f,
-                "{GC_MODE_ENV}={raw:?} is not a GC mode; expected \"count\", \"idle\" or \"off\""
-            ),
-            GcModeError::Unsupported { mode, server } => {
-                write!(f, "{GC_MODE_ENV}={mode} is not supported by {server}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for GcModeError {}
-
 /// The idle-mode trigger: collect at a tick when the worker ran requests since its last
 /// collect and none since the previous tick.
 #[derive(Default)]
@@ -883,133 +737,9 @@ impl IdleGc {
     }
 }
 
-/// Count physical CPU cores to size the TPC pool.
-///
-/// Linux: parses /sys/devices/system/cpu/cpu*/topology/thread_siblings_list —
-/// the number of unique sibling groups equals the physical core count,
-/// stripping SMT.
-///
-/// macOS: queries `hw.perflevel0.physicalcpu` via sysctl. On Apple
-/// Silicon perflevel0 is the performance-core cluster; the efficiency
-/// cores at perflevel1 are deliberately excluded. Running a TPC
-/// thread on an E-core tanks single-connection throughput to ~1/3,
-/// and with no work-stealing that request is stuck — so the whole
-/// tail latency collapses. Sizing to P-core count keeps every TPC
-/// thread on a fast cluster.
-///
-/// Other platforms: falls back to logical core count.
-#[cfg(target_os = "linux")]
-pub(crate) fn physical_core_count() -> usize {
-    use std::collections::HashSet;
-    use std::fs;
-
-    let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") else {
-        return std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-    };
-
-    let mut sibling_groups: HashSet<String> = HashSet::new();
-    for e in entries.flatten() {
-        let name = e.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with("cpu") || !name[3..].chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        let path = e.path().join("topology/thread_siblings_list");
-        if let Ok(s) = fs::read_to_string(&path) {
-            sibling_groups.insert(s.trim().to_string());
-        }
-    }
-    if sibling_groups.is_empty() {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-    } else {
-        sibling_groups.len()
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn physical_core_count() -> usize {
-    use std::ffi::CString;
-    use std::ptr;
-    let name = CString::new("hw.perflevel0.physicalcpu").unwrap();
-    let mut count: i32 = 0;
-    let mut size = std::mem::size_of::<i32>();
-    let rc = unsafe {
-        libc::sysctlbyname(
-            name.as_ptr(),
-            &mut count as *mut _ as *mut libc::c_void,
-            &mut size,
-            ptr::null_mut(),
-            0,
-        )
-    };
-    if rc == 0 && count > 0 {
-        return count as usize;
-    }
-    // Pre-Apple-Silicon macOS (no perf levels) or older kernels:
-    // fall back to logical count.
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn physical_core_count() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-}
-
 #[cfg(test)]
 mod gc_tests {
     use super::*;
-
-    #[test]
-    fn gc_mode_parses_the_three_modes_and_nothing_else() {
-        assert_eq!("count".parse(), Ok(GcMode::Count));
-        assert_eq!("idle".parse(), Ok(GcMode::Idle));
-        assert_eq!("off".parse(), Ok(GcMode::Off));
-        for raw in ["idel", "", "IDLE", " idle"] {
-            assert_eq!(
-                raw.parse::<GcMode>(),
-                Err(GcModeError::Unknown(raw.to_string()))
-            );
-        }
-        let message = "idel".parse::<GcMode>().unwrap_err().to_string();
-        assert!(message.contains("PYRONOVA_GC_MODE") && message.contains("\"idel\""));
-    }
-
-    #[test]
-    fn pool_runs_count_mode_only() {
-        let pool = GcServer::SubInterpreterPool;
-        assert_eq!(GcMode::Count.supported_by(pool), Ok(GcMode::Count));
-        for mode in [GcMode::Idle, GcMode::Off] {
-            assert_eq!(
-                mode.supported_by(pool),
-                Err(GcModeError::Unsupported { mode, server: pool })
-            );
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn darwin_fanout_has_no_idle_mode() {
-        let fanout = GcServer::DarwinFanout;
-        assert_eq!(GcMode::Count.supported_by(fanout), Ok(GcMode::Count));
-        assert_eq!(GcMode::Off.supported_by(fanout), Ok(GcMode::Off));
-        let err = GcMode::Idle.supported_by(fanout).unwrap_err();
-        assert_eq!(
-            err,
-            GcModeError::Unsupported {
-                mode: GcMode::Idle,
-                server: fanout
-            }
-        );
-        assert!(err.to_string().contains("idle") && err.to_string().contains("fanout"));
-    }
 
     #[test]
     fn idle_gc_collects_after_a_quiet_tick() {

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import sys
+import threading
 from dataclasses import dataclass
 from typing import Callable, TypedDict
 import inspect
@@ -240,15 +241,20 @@ class Pyronova:
             }
         # Whether enable_logging(level=...) chose the level (it then keeps it).
         self._log_level_pinned = False
-        # Set by the first server's _prepare(); later servers reuse it.
+        # _prepare()'s state, under its lock: two servers of one app may start at once
+        # (nested TestClients), and each must find the app prepared exactly once.
+        self._prepare_lock = threading.Lock()
         self._prepared = False
+        self._mcp_route_registered = False
+        # The servers this app is serving (engine `Server`s), for `_stop()`.
+        self._servers_lock = threading.Lock()
+        self._servers: set = set()
         self._defined_in = _defining_module_file(self)
         # Guards the idempotency check-then-set in the enable_* helpers so
         # concurrent startup hooks/threads can't both pass the "already
         # enabled?" check and double-register routes/hooks (arc findings
         # app-36/37/38).
-        import threading as _threading
-        self._enable_lock = _threading.Lock()
+        self._enable_lock = threading.Lock()
 
     @property
     def mcp(self) -> MCPServer:
@@ -958,7 +964,14 @@ class Pyronova:
             _reload.run_with_reload(_reload.ReloadTarget.of_this_process(self._app_file()))
             return
 
-        self._serve(settings, self._start)
+        try:
+            self._serve(settings, self._start)
+        except WorkersAbandoned as e:
+            # A live sub-interpreter makes finalization abort: this process can only
+            # exit, non-zero, without finalizing (Layer 2, design §12).
+            print(f"pyronova: {e}; exiting without finalization", file=sys.stderr, flush=True)
+            sys.stdout.flush()
+            os._exit(1)
 
     def _serve(self, settings: _ServeSettings, start: Callable[[_ServeSettings], None]) -> None:
         """One server's lifetime: prepare the app (once), run the startup hooks, ``start``
@@ -1018,64 +1031,67 @@ class Pyronova:
             _signal.signal(_signal.SIGINT, previous_sigint)
 
         # A worker thread that outlived the shutdown grace period (a handler that ignores
-        # shutdown) still has a live interpreter, and finalizing with one aborts. Say which,
-        # and exit non-zero without finalizing (Layer 2, design §12).
+        # shutdown) still has a live interpreter, and finalizing with one aborts. Say which;
+        # the caller decides what the process does (`run()` exits, a TestClient raises).
         forgotten = _forgotten_workers()
         if forgotten:
             _logging.getLogger("pyronova.app").error(
-                "exiting without finalization: worker(s) %s did not stop within the "
-                "shutdown grace period", ", ".join(forgotten)
+                "worker(s) %s did not stop within the shutdown grace period",
+                ", ".join(forgotten),
             )
-            print(
-                "pyronova: worker(s) " + ", ".join(forgotten) + " did not stop within the "
-                "shutdown grace period; exiting without finalization",
-                file=sys.stderr, flush=True,
-            )
-            sys.stdout.flush()
-            os._exit(1)
+            raise WorkersAbandoned(forgotten)
 
         # Not a graceful stop (real startup/run error): surface it normally.
         if run_error is not None:
             raise run_error
 
     def _prepare(self, settings: _ServeSettings) -> None:
-        """What every server of this app shares, done by the first one: seal the script's
-        registrations, then set up logging, the ``/mcp`` route and the BLAS thread limit.
-        Everything registered here exists only on main."""
-        if self._prepared:
-            return
-        self._engine._seal_registrations()
+        """Get the app ready for this server. Once per app, by its first server: seal the
+        script's registrations and set up logging. Per server, as that server needs it:
+        the ``/mcp`` route once there are MCP tools (a later server still gets it when the
+        first had none), and the process's BLAS thread limit when this server runs workers
+        (whatever the first server's mode was). Everything registered here exists only on
+        main. Locked: two servers of one app may start at once."""
+        with self._prepare_lock:
+            if not self._prepared:
+                self._engine._seal_registrations()
 
-        if os.environ.get("PYRONOVA_LOG") == "1" or self.debug:
-            self.enable_logging()
-        # Deferred from __init__ so enable_logging() can adjust the config first.
-        # Workers take the level the engine parsed here (`_python_log_level`).
-        init_logger(
-            self._log_config["level"],
-            self._log_config["access_log"],
-            self._log_config["format"],
-        )
-        _setup_python_logging_bridge(self._log_config["level"])
-
-        if not self._mcp.is_empty():
-            mcp = self._mcp
-
-            def _mcp_handler(req):
-                return Response(
-                    body=mcp.handle_request(req.body, request_id=req.request_id),
-                    content_type="application/json",
+                if os.environ.get("PYRONOVA_LOG") == "1" or self.debug:
+                    self.enable_logging()
+                # Deferred from __init__ so enable_logging() can adjust the config first.
+                # Workers take the level the engine parsed here (`_python_log_level`).
+                init_logger(
+                    self._log_config["level"],
+                    self._log_config["access_log"],
+                    self._log_config["format"],
                 )
+                _setup_python_logging_bridge(self._log_config["level"])
+                self._prepared = True
 
-            self._route("POST", "/mcp", _mcp_handler, gil=True)
-            print(f"  MCP: {len(mcp._tools)} tools, {len(mcp._resources)} resources, {len(mcp._prompts)} prompts → POST /mcp")
+            if not self._mcp_route_registered and not self._mcp.is_empty():
+                mcp = self._mcp
+
+                def _mcp_handler(req):
+                    return Response(
+                        body=mcp.handle_request(req.body, request_id=req.request_id),
+                        content_type="application/json",
+                    )
+
+                self._route("POST", "/mcp", _mcp_handler, gil=True)
+                self._mcp_route_registered = True
+                print(f"  MCP: {len(mcp._tools)} tools, {len(mcp._resources)} resources, {len(mcp._prompts)} prompts → POST /mcp")
 
         if settings.mode.uses_workers and settings.workers != 1:
-            print(f"  BLAS: {_limit_blas_threads()} (override: set OPENBLAS_NUM_THREADS)", flush=True)
-        self._prepared = True
+            print(f"  BLAS: {_blas_threads_limited()} (override: set OPENBLAS_NUM_THREADS)", flush=True)
 
-    def _start(self, settings: _ServeSettings) -> None:
-        """Bind and serve until the server stops (SIGINT or ``_stop()``)."""
-        self._engine.run(
+    def _start(
+        self,
+        settings: _ServeSettings,
+        on_bound: Callable[[object], None] | None = None,
+    ) -> None:
+        """Bind a server (an ``OSError`` if its port is taken), hand it to ``on_bound``,
+        then serve until it stops: SIGINT, its ``shutdown()``, or ``_stop()``."""
+        server = self._engine.start(
             host=settings.host,
             port=settings.port,
             workers=settings.workers,
@@ -1085,11 +1101,53 @@ class Pyronova:
             tls_key=settings.tls_key,
             extra_tls_ports=settings.extra_tls_ports,
         )
+        with self._servers_lock:
+            self._servers.add(server)
+        try:
+            if on_bound is not None:
+                on_bound(server)
+            server.serve()
+        finally:
+            with self._servers_lock:
+                self._servers.discard(server)
 
     def _stop(self) -> None:
-        """Stop the server this app is serving, as SIGINT does: ``_start`` drains and
-        returns. A no-op while nothing is serving."""
-        self._engine.shutdown()
+        """Stop every server this app is serving, as SIGINT does: each ``_start`` drains
+        and returns. A no-op while nothing is serving. To stop one server of several,
+        call that server's ``shutdown()``."""
+        with self._servers_lock:
+            servers = list(self._servers)
+        for server in servers:
+            server.shutdown()
+
+
+class WorkersAbandoned(RuntimeError):
+    """Worker threads outlived the shutdown grace period (a handler that ignores the
+    stop). Their interpreters are still alive, and finalizing the process with a live
+    sub-interpreter aborts, so the process must exit without finalizing
+    (``os._exit``): ``Pyronova.run()`` does; a ``TestClient`` raises this instead, and
+    the test process will abort at exit."""
+
+    def __init__(self, workers: list[str]):
+        self.workers = list(workers)
+        super().__init__(
+            "worker(s) " + ", ".join(self.workers) + " did not stop within the "
+            "shutdown grace period"
+        )
+
+
+# What `_limit_blas_threads` did, once per process: BLAS is process-wide, so the first
+# server that runs workers limits it and later ones report the same outcome.
+_BLAS_LOCK = threading.Lock()
+_blas_outcome: str | None = None
+
+
+def _blas_threads_limited() -> str:
+    global _blas_outcome
+    with _BLAS_LOCK:
+        if _blas_outcome is None:
+            _blas_outcome = _limit_blas_threads()
+        return _blas_outcome
 
 
 @dataclass(frozen=True)

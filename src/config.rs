@@ -10,7 +10,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 
 use pyo3::prelude::*;
 
-use crate::tpc::{GcMode, GcModeError};
+use crate::server::cpu::Cpus;
 
 /// Where non-`gil=True` handlers run.
 #[pyclass(module = "pyronova.engine", eq, eq_int, frozen, hash)]
@@ -146,7 +146,208 @@ pub(crate) enum DarwinTopology {
     /// One `SO_REUSEPORT` listener per TPC thread (the default).
     PerThreadListener,
     /// One acceptor thread fans connections out to the TPC threads.
+    #[cfg(target_os = "macos")]
     Fanout,
+}
+
+/// GC scheduling mode, parsed once at startup from `PYRONOVA_GC_MODE` (unset = count):
+///   - `count` — the count trigger inside `SubInterpreterWorker::call_handler` fires
+///     `gc.collect()` every `PYRONOVA_GC_THRESHOLD` requests per worker. Simple,
+///     predictable, can collide with bursty traffic.
+///   - `idle` — the TPC accept loop collects once a worker has run requests and then
+///     none for a full `PYRONOVA_GC_IDLE_MS` tick (default 100ms), so the pause lands in
+///     a lull. The worker's count trigger becomes the OOM failsafe at
+///     `PYRONOVA_GC_OOM_FAILSAFE` requests (default 50_000), so sustained traffic can't
+///     starve the collector. Needs the per-thread-listener TPC topology.
+///   - `off` — no framework-level triggers at all. `gc.disable()` still runs at sub-interp
+///     init; users must call `gc.collect()` themselves or accept ref-count-only cleanup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GcMode {
+    Count,
+    Idle,
+    Off,
+}
+
+impl std::fmt::Display for GcMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            GcMode::Count => "count",
+            GcMode::Idle => "idle",
+            GcMode::Off => "off",
+        })
+    }
+}
+
+impl std::str::FromStr for GcMode {
+    type Err = GcModeError;
+
+    fn from_str(raw: &str) -> Result<Self, GcModeError> {
+        match raw {
+            "count" => Ok(GcMode::Count),
+            "idle" => Ok(GcMode::Idle),
+            "off" => Ok(GcMode::Off),
+            _ => Err(GcModeError::Unknown(raw.to_string())),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum GcModeError {
+    #[error("{GC_MODE_ENV}={0:?} is not a GC mode; expected \"count\", \"idle\" or \"off\"")]
+    Unknown(String),
+    #[error("{GC_MODE_ENV}={mode} is not supported by {topology}")]
+    Unsupported { mode: GcMode, topology: Topology },
+}
+
+/// The sizes `run()` was given; `None` takes the topology's default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Sizing {
+    /// TPC threads, or the pool's sub-interpreters.
+    pub(crate) workers: Option<NonZeroUsize>,
+    /// Tokio threads of the multi-thread (`PYRONOVA_TPC=0`) server.
+    pub(crate) io_workers: Option<NonZeroUsize>,
+}
+
+/// How one server serves, resolved once in `run()` from the mode, the environment and
+/// the sizes. Every serving decision (accept loops, worker count, GC support, which
+/// server runs) reads it; nothing re-derives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Topology {
+    /// Thread-per-core; every handler on the main interpreter.
+    TpcGil { threads: NonZeroUsize },
+    /// Thread-per-core with one sub-interpreter per thread, each thread accepting on its
+    /// own `SO_REUSEPORT` listeners.
+    TpcWorkers { threads: NonZeroUsize },
+    /// macOS opt-in (`PYRONOVA_TPC_DARWIN=fanout`): one acceptor thread fans connections
+    /// out to the TPC worker threads.
+    #[cfg(target_os = "macos")]
+    TpcFanout { threads: NonZeroUsize },
+    /// `PYRONOVA_TPC=0` in GIL mode: a multi-thread Tokio runtime.
+    MultiThreadGil {
+        io_threads: NonZeroUsize,
+        accept_loops: NonZeroUsize,
+    },
+    /// `PYRONOVA_TPC=0` in sub-interpreter mode: a channel pool of workers behind a
+    /// multi-thread Tokio runtime.
+    Pool {
+        workers: NonZeroUsize,
+        io_threads: NonZeroUsize,
+        accept_loops: NonZeroUsize,
+    },
+}
+
+impl Topology {
+    /// The topology `mode` and `env` select, sized from `sizing` or else `cpus`; a GC mode
+    /// it can't run is an error here, before anything is bound or built.
+    ///
+    /// TPC defaults to one thread per PHYSICAL core: pinning two TPC threads to SMT
+    /// siblings thrashes their shared L1 (measured -50% on a 7840HS), since every thread
+    /// runs the same code path. The multi-thread server defaults to the logical count:
+    /// work-stealing puts IO and bytecode on siblings, which have different footprints.
+    pub(crate) fn resolve(
+        mode: Mode,
+        env: &EnvConfig,
+        sizing: Sizing,
+        cpus: Cpus,
+    ) -> Result<Self, GcModeError> {
+        let topology = if env.tpc {
+            let threads = sizing.workers.unwrap_or(cpus.physical);
+            match (mode, env.darwin_topology) {
+                (Mode::Gil, _) => Topology::TpcGil { threads },
+                (Mode::Subinterp, DarwinTopology::PerThreadListener) => {
+                    Topology::TpcWorkers { threads }
+                }
+                #[cfg(target_os = "macos")]
+                (Mode::Subinterp, DarwinTopology::Fanout) => Topology::TpcFanout { threads },
+            }
+        } else {
+            let io_threads = sizing.io_workers.unwrap_or(cpus.logical);
+            let accept_loops = multi_thread_accept_loops(io_threads, cpus.logical);
+            match mode {
+                Mode::Gil => Topology::MultiThreadGil {
+                    io_threads,
+                    accept_loops,
+                },
+                Mode::Subinterp => Topology::Pool {
+                    workers: sizing.workers.unwrap_or(cpus.logical),
+                    io_threads,
+                    accept_loops,
+                },
+            }
+        };
+        if topology.supports(env.gc.mode) {
+            Ok(topology)
+        } else {
+            Err(GcModeError::Unsupported {
+                mode: env.gc.mode,
+                topology,
+            })
+        }
+    }
+
+    /// One socket per listener for each of these: every TPC thread, the fanout acceptor,
+    /// or the multi-thread runtime's accept tasks.
+    pub(crate) fn accept_loops(self) -> NonZeroUsize {
+        match self {
+            Topology::TpcGil { threads } | Topology::TpcWorkers { threads } => threads,
+            #[cfg(target_os = "macos")]
+            Topology::TpcFanout { .. } => NonZeroUsize::MIN,
+            Topology::MultiThreadGil { accept_loops, .. } | Topology::Pool { accept_loops, .. } => {
+                accept_loops
+            }
+        }
+    }
+
+    /// Whether this topology can schedule `mode`'s collections. Only the per-thread TPC
+    /// listener has the idle tick; the pool's workers count requests only. The GIL
+    /// topologies run no workers, so every mode is moot, and accepted, there.
+    pub(crate) fn supports(self, mode: GcMode) -> bool {
+        match self {
+            Topology::TpcGil { .. } | Topology::TpcWorkers { .. } => true,
+            Topology::MultiThreadGil { .. } => true,
+            #[cfg(target_os = "macos")]
+            Topology::TpcFanout { .. } => matches!(mode, GcMode::Count | GcMode::Off),
+            Topology::Pool { .. } => mode == GcMode::Count,
+        }
+    }
+}
+
+impl std::fmt::Display for Topology {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Topology::TpcGil { .. } => "the thread-per-core GIL server",
+            Topology::TpcWorkers { .. } => "the thread-per-core sub-interpreter server",
+            #[cfg(target_os = "macos")]
+            Topology::TpcFanout { .. } => {
+                "the Darwin fanout TPC topology (PYRONOVA_TPC_DARWIN=fanout)"
+            }
+            Topology::MultiThreadGil { .. } => "the multi-thread GIL server (PYRONOVA_TPC=0)",
+            Topology::Pool { .. } => "the sub-interpreter pool (PYRONOVA_TPC=0)",
+        })
+    }
+}
+
+/// Accept loops of the multi-thread (`PYRONOVA_TPC=0`) server. Linux's `SO_REUSEPORT`
+/// load-balances connections across several loops; macOS's doesn't, so it gets one.
+#[cfg(target_os = "linux")]
+fn multi_thread_accept_loops(io_threads: NonZeroUsize, logical: NonZeroUsize) -> NonZeroUsize {
+    io_threads.min(logical)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn multi_thread_accept_loops(_io_threads: NonZeroUsize, _logical: NonZeroUsize) -> NonZeroUsize {
+    NonZeroUsize::MIN
+}
+
+/// Async-engine workers a TPC sub-interpreter server runs its `async def` routes on (the
+/// TPC threads keep the `def` routes inline): one per TPC thread when no `def` route
+/// needs the cores, half of them (at least one) when `def` routes share the cores.
+pub(crate) fn tpc_async_workers(threads: NonZeroUsize, has_sync: bool) -> NonZeroUsize {
+    if has_sync {
+        NonZeroUsize::new(threads.get() / 2).unwrap_or(NonZeroUsize::MIN)
+    } else {
+        threads
+    }
 }
 
 /// GC scheduling for sub-interpreter workers (see `GcMode`).
@@ -230,7 +431,9 @@ impl EnvConfig {
         const TOPOLOGY: &str = "expected \"fanout\" or \"listener\"";
         let darwin_topology = match get(TPC_DARWIN_ENV, TOPOLOGY)?.as_deref() {
             None | Some("listener") => DarwinTopology::PerThreadListener,
-            Some("fanout") if cfg!(target_os = "macos") => DarwinTopology::Fanout,
+            #[cfg(target_os = "macos")]
+            Some("fanout") => DarwinTopology::Fanout,
+            #[cfg(not(target_os = "macos"))]
             Some("fanout") => {
                 return Err(invalid(
                     TPC_DARWIN_ENV,
@@ -446,11 +649,169 @@ mod tests {
             "PYRONOVA_TPC_DARWIN"
         );
         let fanout = parse(&[("PYRONOVA_TPC_DARWIN", "fanout")]);
-        if cfg!(target_os = "macos") {
-            assert_eq!(fanout.unwrap().darwin_topology, DarwinTopology::Fanout);
-        } else {
-            assert!(fanout.is_err());
+        #[cfg(target_os = "macos")]
+        assert_eq!(fanout.unwrap().darwin_topology, DarwinTopology::Fanout);
+        #[cfg(not(target_os = "macos"))]
+        assert!(fanout.is_err());
+    }
+
+    #[test]
+    fn gc_mode_parses_the_three_modes_and_nothing_else() {
+        assert_eq!("count".parse(), Ok(GcMode::Count));
+        assert_eq!("idle".parse(), Ok(GcMode::Idle));
+        assert_eq!("off".parse(), Ok(GcMode::Off));
+        for raw in ["idel", "", "IDLE", " idle"] {
+            assert_eq!(
+                raw.parse::<GcMode>(),
+                Err(GcModeError::Unknown(raw.to_string()))
+            );
         }
+        let message = "idel".parse::<GcMode>().unwrap_err().to_string();
+        assert!(message.contains("PYRONOVA_GC_MODE") && message.contains("\"idel\""));
+    }
+
+    fn n(value: usize) -> NonZeroUsize {
+        NonZeroUsize::new(value).unwrap()
+    }
+
+    const CPUS: Cpus = Cpus {
+        logical: NonZeroUsize::new(16).unwrap(),
+        physical: NonZeroUsize::new(8).unwrap(),
+    };
+
+    fn resolve(
+        mode: Mode,
+        vars: &[(&'static str, &str)],
+        sizing: Sizing,
+    ) -> Result<Topology, GcModeError> {
+        Topology::resolve(mode, &parse(vars).unwrap(), sizing, CPUS)
+    }
+
+    #[test]
+    fn tpc_defaults_to_one_thread_per_physical_core() {
+        let t = resolve(Mode::Subinterp, &[], Sizing::default()).unwrap();
+        assert_eq!(t, Topology::TpcWorkers { threads: n(8) });
+        assert_eq!(t.accept_loops(), n(8));
+        let t = resolve(Mode::Gil, &[], Sizing::default()).unwrap();
+        assert_eq!(t, Topology::TpcGil { threads: n(8) });
+        let sized = Sizing {
+            workers: Some(n(3)),
+            io_workers: Some(n(99)),
+        };
+        let t = resolve(Mode::Subinterp, &[], sized).unwrap();
+        assert_eq!(t, Topology::TpcWorkers { threads: n(3) });
+        assert_eq!(t.accept_loops(), n(3));
+    }
+
+    #[test]
+    fn tpc_off_sizes_from_the_logical_count() {
+        let off = [("PYRONOVA_TPC", "0")];
+        let t = resolve(Mode::Subinterp, &off, Sizing::default()).unwrap();
+        let loops = if cfg!(target_os = "linux") { 16 } else { 1 };
+        assert_eq!(
+            t,
+            Topology::Pool {
+                workers: n(16),
+                io_threads: n(16),
+                accept_loops: n(loops),
+            }
+        );
+        assert_eq!(t.accept_loops(), n(loops));
+        let sized = Sizing {
+            workers: Some(n(2)),
+            io_workers: Some(n(4)),
+        };
+        let t = resolve(Mode::Gil, &off, sized).unwrap();
+        let loops = if cfg!(target_os = "linux") { 4 } else { 1 };
+        assert_eq!(
+            t,
+            Topology::MultiThreadGil {
+                io_threads: n(4),
+                accept_loops: n(loops),
+            }
+        );
+    }
+
+    #[test]
+    fn the_pool_runs_count_mode_only() {
+        let off = ("PYRONOVA_TPC", "0");
+        assert!(resolve(
+            Mode::Subinterp,
+            &[off, ("PYRONOVA_GC_MODE", "count")],
+            Sizing::default()
+        )
+        .is_ok());
+        for mode in ["idle", "off"] {
+            let err = resolve(
+                Mode::Subinterp,
+                &[off, ("PYRONOVA_GC_MODE", mode)],
+                Sizing::default(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    GcModeError::Unsupported {
+                        topology: Topology::Pool { .. },
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+            let text = err.to_string();
+            assert!(
+                text.contains(mode) && text.contains("PYRONOVA_TPC=0"),
+                "{text}"
+            );
+        }
+        // GIL mode runs no workers: every GC mode is accepted.
+        assert!(resolve(
+            Mode::Gil,
+            &[off, ("PYRONOVA_GC_MODE", "idle")],
+            Sizing::default()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn per_thread_tpc_runs_every_gc_mode() {
+        for mode in ["count", "idle", "off"] {
+            assert!(resolve(
+                Mode::Subinterp,
+                &[("PYRONOVA_GC_MODE", mode)],
+                Sizing::default()
+            )
+            .is_ok());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_fanout_has_one_accept_loop_and_no_idle_mode() {
+        let fanout = ("PYRONOVA_TPC_DARWIN", "fanout");
+        let t = resolve(Mode::Subinterp, &[fanout], Sizing::default()).unwrap();
+        assert_eq!(t, Topology::TpcFanout { threads: n(8) });
+        assert_eq!(t.accept_loops(), NonZeroUsize::MIN);
+        assert!(t.supports(GcMode::Off));
+        let err = resolve(
+            Mode::Subinterp,
+            &[fanout, ("PYRONOVA_GC_MODE", "idle")],
+            Sizing::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("idle") && err.to_string().contains("fanout"));
+        // The fanout choice is a sub-interpreter topology; GIL mode stays per-thread.
+        let t = resolve(Mode::Gil, &[fanout], Sizing::default()).unwrap();
+        assert_eq!(t, Topology::TpcGil { threads: n(8) });
+    }
+
+    #[test]
+    fn tpc_async_pool_shares_the_cores_with_sync_routes() {
+        assert_eq!(tpc_async_workers(n(8), false), n(8));
+        assert_eq!(tpc_async_workers(n(8), true), n(4));
+        assert_eq!(tpc_async_workers(n(3), true), n(1));
+        assert_eq!(tpc_async_workers(n(1), true), n(1));
+        assert_eq!(tpc_async_workers(n(1), false), n(1));
     }
 
     #[test]

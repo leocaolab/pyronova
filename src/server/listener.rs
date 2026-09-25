@@ -1,13 +1,7 @@
-//! TCP listener configuration: SO_REUSEPORT + TCP_DEFER_ACCEPT +
-//! TCP_QUICKACK + accept-error backoff.
-//!
-//! Extracted out of `app.rs` so the 1500-line pymethods block doesn't
-//! carry 120 lines of socket-layer config that has nothing to do with
-//! the Python-facing app surface. Every TPC spawn path (production
-//! `run_tpc_subinterp`, both bench harnesses) calls these helpers;
-//! centralizing them here also makes platform-specific tuning easy
-//! to find — `#[cfg(target_os = "linux")]` for the two Linux-only
-//! knobs (TCP_QUICKACK, TCP_DEFER_ACCEPT) lives in one file now.
+//! TCP listener configuration: the free-port probe, SO_REUSEPORT + TCP_DEFER_ACCEPT +
+//! TCP_QUICKACK + accept-error backoff. Every serving path and both bench harnesses bind
+//! through [`BoundListeners::bind`]; the Linux-only knobs (TCP_QUICKACK,
+//! TCP_DEFER_ACCEPT) live here.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -227,25 +221,46 @@ pub(crate) struct BoundListeners {
     pub(crate) bound: Vec<Bound>,
 }
 
+/// Proves `addr` free before the `SO_REUSEPORT` set joins it: a socket without
+/// `SO_REUSEPORT` can't bind a port any other socket listens on, whether or not that one
+/// set `SO_REUSEPORT`, so a port held by another server (in this process or another) is
+/// `AddrInUse` here instead of silently shared. `SO_REUSEADDR` is set, as on the set, so a
+/// port left in TIME_WAIT by an earlier server still counts as free. Returns the bound
+/// address (a port 0 resolved to the kernel's pick); the probe is released on return.
+fn probe_free(addr: SocketAddr) -> Result<SocketAddr, ListenerError> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let failed = |step: &'static str| move |source| ListenerError { step, addr, source };
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
+        .map_err(failed("socket creation"))?;
+    socket
+        .set_reuse_address(true)
+        .map_err(failed("set_reuse_address"))?;
+    socket.bind(&addr.into()).map_err(failed("bind"))?;
+    socket
+        .local_addr()
+        .ok()
+        .and_then(|local| local.as_socket())
+        .ok_or_else(|| ListenerError {
+            step: "local_addr",
+            addr,
+            source: std::io::Error::other("the probe socket has no IP address"),
+        })
+}
+
 impl BoundListeners {
     /// Binds `copies` `SO_REUSEPORT` sockets for each spec: one group per accept loop, so
-    /// the kernel spreads connections over the loops. A port 0 is bound once and its
-    /// copies join the port the kernel picked. Any failure (e.g. `AddrInUse`) is returned
-    /// here, before a thread or worker exists.
+    /// the kernel spreads connections over the loops. Each port is first proven free
+    /// ([`probe_free`], decision G4); a port 0 is resolved by that probe and every copy
+    /// joins the port the kernel picked. Any failure (e.g. `AddrInUse`) is returned here,
+    /// before a thread or worker exists.
     pub(crate) fn bind(specs: &[ListenerSpec], copies: usize) -> Result<Self, ListenerError> {
         let mut groups: Vec<Vec<Listener>> = (0..copies).map(|_| Vec::new()).collect();
         let mut bound = Vec::with_capacity(specs.len());
         for spec in specs {
-            let mut addr = spec.addr;
+            let addr = probe_free(spec.addr)?;
             for group in &mut groups {
                 let socket = create_reuseport_listener(addr)?;
-                if addr.port() == 0 {
-                    addr = socket.local_addr().map_err(|source| ListenerError {
-                        step: "local_addr",
-                        addr,
-                        source,
-                    })?;
-                }
                 group.push(Listener {
                     socket,
                     addr,
@@ -433,6 +448,38 @@ mod tests {
         assert_eq!(err.step, "bind");
         assert_eq!(err.source.kind(), std::io::ErrorKind::AddrInUse);
         assert_eq!(err.errno(), Some(libc::EADDRINUSE));
+    }
+
+    #[test]
+    fn a_port_another_reuseport_server_listens_on_is_in_use() {
+        // Another server's SO_REUSEPORT socket: without the probe, ours would join it and
+        // the kernel would split the traffic between the two servers.
+        let other = create_reuseport_listener(loopback(0)).unwrap();
+        let addr = other.local_addr().unwrap();
+        let spec = ListenerSpec { addr, tls: None };
+        let err = BoundListeners::bind(&[spec], 2)
+            .err()
+            .expect("the port is another server's");
+        assert_eq!(err.step, "bind");
+        assert_eq!(err.errno(), Some(libc::EADDRINUSE));
+        assert_eq!(err.addr, addr);
+    }
+
+    #[test]
+    fn a_released_port_binds_again() {
+        let first = BoundListeners::bind(
+            &[ListenerSpec {
+                addr: loopback(0),
+                tls: None,
+            }],
+            2,
+        )
+        .unwrap();
+        let addr = first.bound[0].addr;
+        drop(first);
+        let again = BoundListeners::bind(&[ListenerSpec { addr, tls: None }], 2)
+            .expect("a port its last server released is free");
+        assert_eq!(again.bound[0].addr, addr);
     }
 
     #[test]

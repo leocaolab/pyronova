@@ -9,7 +9,7 @@ use hyper::{Request, Response};
 
 use crate::python::interp;
 use crate::router::{Call, HandlerKind, RouteId};
-use crate::site::SharedSite;
+use crate::site::{SharedSite, Site};
 
 use super::error::{HandlerError, RequestTag};
 use super::gil::run_on_main;
@@ -41,33 +41,46 @@ pub(crate) async fn handle_request_subinterp(
             run_on_main(&site, prepared, target, body, client_ip_addr, Served::Main).await
         }
         Call::Worker(route, kind) => {
-            let method: Arc<str> = Arc::from(prepared.parts.method.as_str());
-            let path: Arc<str> = Arc::from(prepared.parts.uri.path());
-            let line_start = prepared.start;
-            let id = prepared.request_id.clone();
-            let tag = RequestTag {
-                id: &id,
-                method: &method,
-                path: &path,
-            };
-            let work = PoolWork {
-                route,
-                kind,
-                method: Arc::clone(&method),
-                path: Arc::clone(&path),
-                client_ip: client_ip_addr,
-                max_body: site.config.limits.max_body_bytes,
-            };
-            let resp = run_on_pool(&pool, prepared, work, &tag).await;
-            let line = RequestLine {
-                method: &method,
-                path: &path,
-                start: line_start,
-            };
-            finish(resp, &site, &line, Served::Pool)
+            serve_on_pool(&pool, &site, prepared, route, kind, client_ip_addr).await
         }
     };
     Ok(resp)
+}
+
+/// Runs a worker route on `pool` and finishes its response. A TPC thread serves its
+/// `async def` routes this way too, on the async pool.
+pub(crate) async fn serve_on_pool(
+    pool: &SharedPool,
+    site: &Site,
+    prepared: Prepared,
+    route: RouteId,
+    kind: HandlerKind,
+    client_ip_addr: std::net::IpAddr,
+) -> Response<BoxBody> {
+    let method: Arc<str> = Arc::from(prepared.parts.method.as_str());
+    let path: Arc<str> = Arc::from(prepared.parts.uri.path());
+    let line_start = prepared.start;
+    let id = prepared.request_id.clone();
+    let tag = RequestTag {
+        id: &id,
+        method: &method,
+        path: &path,
+    };
+    let work = PoolWork {
+        route,
+        kind,
+        method: Arc::clone(&method),
+        path: Arc::clone(&path),
+        client_ip: client_ip_addr,
+        max_body: site.config.limits.max_body_bytes,
+    };
+    let resp = run_on_pool(pool, prepared, work, &tag).await;
+    let line = RequestLine {
+        method: &method,
+        path: &path,
+        start: line_start,
+    };
+    finish(resp, site, &line, Served::Pool)
 }
 
 /// What the pool runs, besides the request itself.

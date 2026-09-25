@@ -30,9 +30,10 @@ use tokio_util::sync::CancellationToken;
 use crate::config::GcConfig;
 use crate::handlers::error::panic_message;
 use crate::python::interp::SubInterpreterWorker;
+use crate::server::cpu::{elevate_thread_qos_macos, try_pin_current};
 use crate::server::listener::{BoundListeners, ListenerSpec};
 use crate::site::SharedSite;
-use crate::tpc::{elevate_thread_qos_macos, tpc_accept_loop_inline, try_pin_current};
+use crate::tpc::tpc_accept_loop_inline;
 use crate::worker::{TpcContext, Upgrades};
 
 /// The request every client connection sends, pipelined [`PIPELINE_DEPTH`] deep.
@@ -540,6 +541,7 @@ fn serve_worker<Fut: Future<Output = Vec<Failure>>>(
         worker: RefCell::new(worker),
         site,
         bridge: None,
+        async_pool: None,
     });
     let failures = match RuntimeBuilder::new_current_thread().enable_all().build() {
         Ok(rt) => {
