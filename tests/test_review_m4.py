@@ -473,7 +473,9 @@ def test_crud_database_failure_is_generic_with_request_id(caplog):
     pool.execute(f"DROP TABLE IF EXISTS {table}")
     app = Pyronova()
     register_crud(app, pool, prefix="/gone", table=table, columns=["id", "name"])
-    with TestClient(app, port=None) as c:
+    # Main interpreter: the app is built here, the pool is this process's,
+    # and caplog only sees main-interpreter records.
+    with TestClient(app, port=None, mode="gil") as c:
         r = c.get("/gone")
     assert r.status_code == 500
     assert b"does not exist" not in r.body
