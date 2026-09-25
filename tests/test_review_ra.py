@@ -885,3 +885,116 @@ def test_upload_media_type_is_case_insensitive_and_boundary_may_quote_a_semicolo
     assert form["t"].data == b"hello"
     with pytest.raises(MultipartError, match="Expected multipart/form-data"):
         parse_multipart(_MultipartRequest('multipart/mixed; boundary="a;b"', body))
+
+
+# ---------------------------------------------------------------------------
+# DB: typed parameter errors, NUMERIC limits, big ints, float4 range (Postgres)
+# ---------------------------------------------------------------------------
+
+PG_DSN = os.environ.get("PYRONOVA_TEST_PG_DSN")
+needs_pg = pytest.mark.skipif(PG_DSN is None, reason="PYRONOVA_TEST_PG_DSN not set")
+
+
+@pytest.fixture(scope="module")
+def ra_pool():
+    from pyronova.db import PgPool
+
+    pool = PgPool.connect(PG_DSN)
+    pool.execute("DROP TABLE IF EXISTS ra_values")
+    pool.execute("CREATE TABLE ra_values (n NUMERIC, b BIGINT, r REAL, d DOUBLE PRECISION)")
+    yield pool
+    pool.execute("DROP TABLE IF EXISTS ra_values")
+
+
+@needs_pg
+def test_big_int_reaches_a_numeric_column(ra_pool):
+    import decimal
+
+    big = 10**30 + 7
+    ra_pool.execute("INSERT INTO ra_values (n) VALUES ($1)", big)
+    assert ra_pool.fetch_scalar("SELECT n FROM ra_values WHERE n = $1", big) == decimal.Decimal(big)
+    assert ra_pool.fetch_scalar("SELECT $1::numeric * 2", -big) == decimal.Decimal(-2 * big)
+
+
+@needs_pg
+def test_big_int_for_an_integer_column_is_a_param_error(ra_pool):
+    from pyronova.db import ParamError
+
+    with pytest.raises(ParamError, match=r"\$1: 9223372036854775808 is out of range for int8") as e:
+        ra_pool.execute("INSERT INTO ra_values (b) VALUES ($1)", 2**63)
+    # Both bases, so `except TypeError` / `except ValueError` still catch it.
+    assert isinstance(e.value, TypeError) and isinstance(e.value, ValueError)
+
+
+@needs_pg
+def test_float_past_real_is_out_of_range_not_infinity(ra_pool):
+    from pyronova.db import ParamError
+
+    with pytest.raises(ParamError, match="out of range for float4"):
+        ra_pool.execute("INSERT INTO ra_values (r) VALUES ($1)", 1e300)
+    ra_pool.execute("INSERT INTO ra_values (r, d) VALUES ($1, $2)", 1.5, 1e300)
+    assert ra_pool.fetch_one("SELECT r, d FROM ra_values WHERE r = 1.5") == {"r": 1.5, "d": 1e300}
+
+
+@needs_pg
+def test_numeric_scale_past_0x3fff_is_refused_before_sending(ra_pool):
+    import decimal
+
+    from pyronova.db import ParamError
+
+    at_max = decimal.Decimal("0." + "1" * 0x3FFF)
+    assert ra_pool.fetch_scalar("SELECT $1::numeric", at_max) == at_max
+    past = decimal.Decimal("0." + "1" * (0x3FFF + 1))
+    with pytest.raises(ParamError, match="decimal places"):
+        ra_pool.fetch_scalar("SELECT $1::numeric", past)
+
+
+@needs_pg
+def test_type_mismatch_is_a_param_error(ra_pool):
+    from pyronova.db import ParamError
+
+    with pytest.raises(ParamError, match=r"parameter \$1 is int8"):
+        ra_pool.execute("INSERT INTO ra_values (b) VALUES ($1)", "not a number")
+
+
+class _RaisingPool:
+    """A pool whose calls raise `exc`."""
+
+    def __init__(self, exc: BaseException):
+        self.exc = exc
+
+    def _raise(self, *args):
+        raise self.exc
+
+    fetch_one = fetch_all = execute = _raise
+
+
+@pytest.mark.parametrize(
+    "exc,status",
+    [
+        (TypeError("a bug in the app: unhashable type"), 500),
+        (ValueError("a bug in the app: bad literal"), 500),
+    ],
+    ids=["TypeError", "ValueError"],
+)
+def test_crud_maps_only_param_errors_to_422(exc, status):
+    from pyronova import Pyronova
+    from pyronova.crud import register_crud
+    from pyronova.db import ParamError
+    from pyronova.testing import TestClient
+
+    for raised, expected in ((exc, status), (ParamError("parameter $1 is int8"), 422)):
+        app = Pyronova()
+        register_crud(app, _RaisingPool(raised), prefix="/items", table="items",
+                      columns=["id", "name"])
+
+        @app.get("/")
+        def index(req):
+            return "ok"
+
+        with TestClient(app, mode="gil") as c:
+            r = c.post("/items", body=b'{"name": "x"}',
+                       headers={"Content-Type": "application/json"})
+        assert r.status_code == expected, (raised, r.status_code, r.text)
+        if expected == 500:
+            assert "a bug in the app" not in r.text

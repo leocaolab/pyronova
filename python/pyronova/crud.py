@@ -45,7 +45,7 @@ from typing import Callable, TYPE_CHECKING
 
 from .app import Response
 from ._errors import log_server_error, server_error_body
-from .db import IntegrityError
+from .db import IntegrityError, ParamError
 
 _log = logging.getLogger("pyronova.crud")
 
@@ -100,18 +100,18 @@ def _query(req, what: str, call: Callable, *args) -> object:
 
     - ``IntegrityError`` (SQLSTATE class 23: duplicate key, NOT NULL, CHECK,
       foreign key; ``UniqueViolation`` is a subclass) → 409.
-    - ``TypeError`` / ``ValueError``: the pool refused a body value the
-      column's type cannot take, before sending the query → 422.
-    - anything else (``DatabaseError``, pool timeout, a bug) → 500. It is
-      caught here rather than left to the framework so the client never sees
-      exception text.
+    - ``ParamError``: the pool refused a body value the column's type cannot
+      take, before sending the query → 422.
+    - anything else (``DatabaseError``, pool timeout, a bug — including a
+      ``TypeError`` / ``ValueError`` of our own) → 500. It is caught here rather
+      than left to the framework so the client never sees exception text.
     """
     try:
         return call(*args)
     except IntegrityError as e:
         _log.info("%s: refused by a constraint: %s", what, e)
         return _Rejected(Response(body={"error": str(e)}, status_code=409))
-    except (TypeError, ValueError) as e:
+    except ParamError as e:
         _log.info("%s: refused a value: %s", what, e)
         return _Rejected(Response(body={"error": str(e)}, status_code=422))
     except Exception:

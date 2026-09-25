@@ -2,8 +2,9 @@
 //!
 //! One process, one pool. `PgPool.connect(dsn)` populates a global `OnceLock` + a
 //! dedicated tokio runtime that drives the pool's futures. All handlers (GIL or
-//! sub-interpreter) share the same connection pool — no per-interp duplication. A second
-//! `connect()` to another DSN is an error; other pool settings are logged and ignored.
+//! sub-interpreter) share the same connection pool — no per-interp duplication. A later
+//! `connect()` reuses it when every setting it names matches; one asking for another DSN,
+//! `max_connections` or `acquire_timeout_secs` raises `ValueError`.
 //!
 //! Scope:
 //!   * sync API (`pool.fetch_one(sql, *params)` blocks the calling thread
@@ -231,11 +232,14 @@ fn connect_pool(py: Python<'_>, request: PoolRequest) -> Result<(), DbError> {
         .map_err(DbError::Connect)?;
 
     // Two first calls can race; the loser closes its pool and is checked against the winner.
-    if let Err(lost) = PG_POOL.set(Connected { settings, pool }) {
-        runtime().spawn(async move { lost.pool.close().await });
+    // The winner's settings came from its own request, so it needs no check.
+    match PG_POOL.set(Connected { settings, pool }) {
+        Ok(()) => Ok(()),
+        Err(lost) => {
+            runtime().spawn(async move { lost.pool.close().await });
+            Ok(reuse(&request, &PG_POOL.wait().settings)?)
+        }
     }
-    let winner = PG_POOL.get().ok_or(DbError::NotConnected)?;
-    Ok(reuse(&request, &winner.settings)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -250,10 +254,11 @@ struct Statement {
 
 impl Statement {
     fn from_py(py: Python<'_>, sql: String, params: &[Py<PyAny>]) -> PyResult<Self> {
-        let params = params
-            .iter()
-            .map(|p| PyParam::extract(p.bind(py)))
-            .collect::<PyResult<_>>()?;
+        let params = (1..)
+            .zip(params)
+            .map(|(index, p)| PyParam::extract(p.bind(py), index))
+            .collect::<Result<_, _>>()
+            .map_err(|e| DbError::from(e).into_pyerr(py))?;
         Ok(Self { sql, params })
     }
 }

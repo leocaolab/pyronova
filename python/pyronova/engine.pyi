@@ -362,6 +362,10 @@ class IntegrityError(DatabaseError):
 class UniqueViolation(IntegrityError):
     """A unique or primary-key constraint was violated (SQLSTATE 23505)."""
 
+class ParamError(TypeError, ValueError):
+    """A value a statement parameter can't take (wrong type, out of range, not
+    encodable), refused before the query is sent."""
+
 class PgCursor:
     """Streaming result set from ``PgPool.fetch_iter``; yields one dict per row."""
 
