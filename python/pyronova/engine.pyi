@@ -178,11 +178,14 @@ class PyronovaApp:
     def static_dir(self, prefix: str, directory: str) -> None:
         """Serve files under ``directory`` at URL ``prefix``.
 
-        Requested paths are canonicalized and confirmed to stay within
-        ``directory`` (path-traversal / symlink-escape attempts are
-        rejected with 404, not served). A non-existent or unreadable
-        ``directory`` does not raise here; matching requests simply 404 at
-        serve time.
+        :raises ValueError: ``prefix`` does not start with ``/``, or
+            ``directory`` does not resolve to a directory.
+
+        The request path is percent-decoded, then refused with 403 if it
+        climbs out with ``..`` (literal or encoded) or resolves outside
+        ``directory`` through a symlink. A missing file falls through to
+        routing (404); an unreadable one is 403; any other IO error is
+        logged and answered 500.
         """
         ...
     def set_cors_origin(self, origin: str) -> None: ...
