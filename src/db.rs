@@ -205,20 +205,14 @@ impl PoolRequest {
     }
 }
 
-/// Whether this call may use the process's pool. Another DSN is another database: refused.
-/// Other settings leave the pool as it is, with a warning: each module of an app may call
-/// `connect()` with its own sizing, and they all share the first one's pool.
+/// Whether this call may use the process's pool: only if every setting it names matches.
+/// A process has one pool, so a call asking for another DSN or another sizing cannot get
+/// what it asked for and is refused. Settings left out (`None`) match any pool.
 fn reuse(request: &PoolRequest, existing: &PoolSettings) -> Result<(), Reconfigured> {
-    for difference in request.differences(existing) {
-        match difference {
-            Reconfigured::Dsn => return Err(difference),
-            setting => tracing::warn!(
-                target: "pyronova::server",
-                "{setting}; keeping the existing pool"
-            ),
-        }
+    match request.differences(existing).into_iter().next() {
+        Some(difference) => Err(difference),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Opens the process's pool, or checks that the one already open can serve `request`.
@@ -603,9 +597,9 @@ pub(crate) struct PgPool;
 #[pymethods]
 impl PgPool {
     /// Open the process's pool, or return a handle to the one already open. A later call
-    /// with another DSN raises ValueError. `max_connections` / `acquire_timeout_secs`
-    /// default to 10 / 30 on the first call; on a later one they may be left out, and
-    /// values that differ from the open pool are logged as a warning, the pool unchanged.
+    /// with another DSN, `max_connections` or `acquire_timeout_secs` raises ValueError.
+    /// `max_connections` / `acquire_timeout_secs` default to 10 / 30 on the first call;
+    /// on a later one they may be left out, and then match whatever the pool has.
     #[classmethod]
     #[pyo3(signature = (dsn, max_connections = None, acquire_timeout_secs = None))]
     fn connect(
@@ -1041,12 +1035,29 @@ mod review_m1c_tests {
     }
 
     #[test]
-    fn only_another_dsn_is_refused() {
+    fn any_difference_is_refused() {
         let existing = request("postgres://a", Some(4), None).settings();
         assert!(matches!(
             reuse(&request("postgres://b", None, None), &existing),
             Err(Reconfigured::Dsn)
         ));
-        assert!(reuse(&request("postgres://a", Some(5), Some(5)), &existing).is_ok());
+        assert!(matches!(
+            reuse(&request("postgres://a", Some(5), None), &existing),
+            Err(Reconfigured::MaxConnections {
+                existing: 4,
+                asked: 5
+            })
+        ));
+        assert!(matches!(
+            reuse(&request("postgres://a", None, Some(5)), &existing),
+            Err(Reconfigured::AcquireTimeout { .. })
+        ));
+    }
+
+    #[test]
+    fn settings_left_out_or_equal_are_reused() {
+        let existing = request("postgres://a", Some(4), None).settings();
+        assert!(reuse(&request("postgres://a", None, None), &existing).is_ok());
+        assert!(reuse(&request("postgres://a", Some(4), Some(30)), &existing).is_ok());
     }
 }

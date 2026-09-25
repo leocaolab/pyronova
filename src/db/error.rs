@@ -113,9 +113,8 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-/// How a later `PgPool.connect()` differs from the pool the process has. `Dsn` refuses the
-/// call; the settings are reported and the pool kept. The DSN is never echoed: it may
-/// carry a password.
+/// How a later `PgPool.connect()` differs from the pool the process has; any difference
+/// refuses the call. The DSN is never echoed: it may carry a password.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Reconfigured {
     #[error("PgPool is already connected to a different DSN; a process has one pool")]

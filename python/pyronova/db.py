@@ -9,8 +9,8 @@ workers make progress. The `*_async` variants run on the main interpreter
 (`gil=True` routes); in a worker they raise `NotImplementedError`.
 
 A process has one pool: a later `PgPool.connect()` returns the same pool, and
-raises `ValueError` if it asks for a different DSN. Different pool settings
-(`max_connections`, `acquire_timeout_secs`) keep the open pool and log a warning.
+raises `ValueError` if it asks for a different DSN or different pool settings
+(`max_connections`, `acquire_timeout_secs`). Settings left out match the open pool.
 
 Example::
 

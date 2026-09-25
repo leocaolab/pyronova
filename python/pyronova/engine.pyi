@@ -282,8 +282,8 @@ class PgPool:
         acquire_timeout_secs: Optional[int] = None,
     ) -> "PgPool":
         """Open the pool, or return the open one. Raises ``ValueError`` if it is open
-        with another DSN; settings that differ from the open pool are logged as a
-        warning and the pool is kept. Defaults on the first call: 10 connections, 30 s."""
+        with another DSN or with settings that differ from the ones asked for; settings
+        left out match the open pool. Defaults on the first call: 10 connections, 30 s."""
         ...
     def fetch_one(self, sql: str, *params: Any) -> Optional[Dict[str, Any]]: ...
     def fetch_all(self, sql: str, *params: Any) -> List[Dict[str, Any]]: ...

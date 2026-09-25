@@ -40,7 +40,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture(scope="module")
 def pool():
     # Rust-side PgPool is a process global; connect() is idempotent.
-    p = PgPool.connect(PG_DSN, max_connections=4)
+    p = PgPool.connect(PG_DSN)
     # Fresh schema per test module.
     p.execute("DROP TABLE IF EXISTS pyronova_test_rows")
     p.execute("""
