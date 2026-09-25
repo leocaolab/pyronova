@@ -313,6 +313,17 @@ def _iso_ensure_on_path(worker_dir):
         _ISO["path_inserted"] = True
 
 
+def _iso_remove(path):
+    """Remove a clone, a partial copy or a lost race's copy as what it is: `rmtree` for a
+    real directory, `os.remove` for a file (a single-file extension) or a symlink (never
+    followed into what it points at)."""
+    import os, shutil
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    else:
+        os.remove(path)
+
+
 def _iso_clone_lib(lib, worker_dir, pkg2dist):
     """Clone `lib` (and its vendored `.libs`) into `worker_dir`. Returns the
     cloned destination path (dir or file), or None if the lib can't be resolved.
@@ -322,7 +333,7 @@ def _iso_clone_lib(lib, worker_dir, pkg2dist):
     (mtime/size change) forces a re-clone. This covers reactively-added libs the
     bucket signature can't see, and makes declared-lib upgrades safe regardless of
     the bucket keying."""
-    import os, subprocess, shutil, platform
+    import os, subprocess, platform
     src = _iso_resolve_src(lib)
     if src is None:
         return None
@@ -331,7 +342,7 @@ def _iso_clone_lib(lib, worker_dir, pkg2dist):
     clone = ["cp", "-c", "-R"] if platform.system() == "Darwin" else ["cp", "--reflink=auto", "-R"]
 
     def _clone(s, d, sig_path=None):
-        if os.path.exists(d):
+        if os.path.lexists(d):
             if sig_path is None:
                 return  # vendored .libs: no manifest, reuse as-is
             try:
@@ -340,14 +351,15 @@ def _iso_clone_lib(lib, worker_dir, pkg2dist):
                         return  # up-to-date clone, inodes already verified
             except FileNotFoundError:
                 pass  # no manifest yet: treat the clone as stale
-            shutil.rmtree(d)  # stale (lib upgraded) — re-clone
+            _iso_remove(d)  # stale (lib upgraded) — re-clone
         # Clone into a temp dir and atomically rename it into place, so a
         # first-ever concurrent boot never observes a half-written copy.
         tmp = "%s.tmp-%d" % (d, os.getpid())
         done = subprocess.run(clone + [s, tmp], stdout=subprocess.DEVNULL,
                               stderr=subprocess.PIPE, text=True)
         if done.returncode != 0:
-            shutil.rmtree(tmp, ignore_errors=True)  # cp may leave a partial copy
+            if os.path.lexists(tmp):
+                _iso_remove(tmp)  # cp may leave a partial copy
             raise _IsoError(
                 f"cloning {s} into {tmp} failed ({' '.join(clone)} exited "
                 f"{done.returncode}): {done.stderr.strip()}"
@@ -355,9 +367,9 @@ def _iso_clone_lib(lib, worker_dir, pkg2dist):
         try:
             os.replace(tmp, d)
         except OSError:
-            if not os.path.exists(d):
+            if not os.path.lexists(d):
                 raise
-            shutil.rmtree(tmp)  # lost the race to another boot — use theirs
+            _iso_remove(tmp)  # lost the race to another boot — use theirs
         if sig_path is not None:
             with open(sig_path, "w") as f:
                 f.write(cur_sig)
@@ -412,11 +424,18 @@ def _iso_evict(lib):
 
 
 def _iso_pkg2dist():
+    """Import name -> distribution names, for finding a package's vendored `<dist>.libs`.
+    Reading it fails only on broken install metadata; a clone made without it could miss
+    the libraries the package loads, so that is an error, with its cause."""
     import importlib.metadata as _md
     try:
         return _md.packages_distributions()
-    except Exception:
-        return {}
+    except Exception as exc:
+        raise _IsoError(
+            "reading the installed distributions (importlib.metadata."
+            f"packages_distributions) failed: {exc!r}; a per-worker copy could miss the "
+            "shared libraries its package vendors, so none is made"
+        ) from exc
 
 
 def _iso_report(lib, dst):
@@ -525,10 +544,14 @@ def _pyronova_isolate_libs():
 # clone: a different file, so a different key. Declared libs (pre-staged clones
 # already on sys.path) load isolated on the first try.
 
+import _thread
 import builtins as _builtins
 import importlib.machinery as _machinery
 _iso_real_import = _builtins.__import__
-_iso_in_hook = False  # re-entrancy guard: only the OUTERMOST import self-heals
+# Per thread: whether an import on this thread is already inside `_iso_import`. Only the
+# OUTERMOST import of a thread self-heals; threads importing concurrently each have their
+# own outermost import.
+_iso_hook = _thread._local()
 
 
 def _iso_is_private_clone(path):
@@ -843,13 +866,12 @@ def _iso_offending_module(exc):
 
 
 def _iso_import(name, globals=None, locals=None, fromlist=(), level=0):
-    global _iso_in_hook
-    if _iso_in_hook:
+    if getattr(_iso_hook, "active", False):
         # Nested import (e.g. numpy/__init__ importing its own .so): let it raise
         # so the failure propagates to the outermost call, which owns the
         # isolate-and-restart of the whole top-level statement.
         return _iso_real_import(name, globals, locals, fromlist, level)
-    _iso_in_hook = True
+    _iso_hook.active = True
     try:
         outer = (name or "").split(".")[0] if level == 0 else ""
         cloned = set()
@@ -874,7 +896,7 @@ def _iso_import(name, globals=None, locals=None, fromlist=(), level=0):
                 if outer and outer != "pyronova":
                     _iso_evict(outer)
     finally:
-        _iso_in_hook = False
+        _iso_hook.active = False
 
 
 _pyronova_isolate_libs()
