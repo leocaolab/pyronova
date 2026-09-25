@@ -812,7 +812,7 @@ pub(crate) async fn preprocess_request(
     req: hyper::Request<Incoming>,
     routes: &FrozenRoutes,
     cors: Option<&crate::router::CorsConfig>,
-    static_dirs: &[(String, String)],
+    static_dirs: &[crate::static_fs::StaticMount],
     lookup: impl FnOnce(&str, &str) -> Option<(usize, Vec<(String, String)>)>,
 ) -> Result<Preprocessed, hyper::Error> {
     // gRPC short-circuit: gRPC needs HTTP/2 trailers (`grpc-status`) the

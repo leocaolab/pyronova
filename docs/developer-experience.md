@@ -226,9 +226,17 @@ def echo(ws):
 data = ws.recv_bytes()
 ws.send_bytes(data)
 
-# 混合
-msg_type, data = ws.recv_message()  # ("text", "hello") or ("binary", b"\x00")
+# 混合：文本返回 str，二进制返回 bytes
+msg = ws.recv_message()  # "hello" 或 b"\x00"
 ```
+
+`recv()` 遇到二进制消息（或 `recv_bytes()` 遇到文本消息）会抛 `TypeError`，
+这条消息仍留在队列里，可用 `recv_message()` 读出，不会被静默丢弃。
+
+限制（进程级）：`app.max_websocket_message_size`（默认 1 MiB，双向；超限的
+客户端消息以 1009 关闭连接，超限的 `ws.send` 抛 `ValueError`）、
+`app.max_websocket_connections`（默认 1024，每个连接一个处理线程；满了升级请求返回 503）。
+每个方向的缓冲按字节计，约为一条最大消息的大小；`ws.send` 在缓冲满时抛 `BlockingIOError`。
 
 ## SSE 流式传输
 
@@ -270,8 +278,12 @@ del app.state["key"]
 # 启用 (环境变量)
 # PYRONOVA_METRICS=1 python app.py
 
-from pyronova import get_gil_metrics
-last, peak, probes, total, rss, queue, hold, dropped, total_req = get_gil_metrics()
+from pyronova import get_gil_metrics, reset_peaks
+m = get_gil_metrics()          # Metrics 快照；读取不会清零
+m.gil_wait_peak_us, m.gil_hold_peak_us, m.gil_queue_length
+m.rss_bytes                    # 采样器还没读到时为 None
+m.dropped_requests, m.total_requests
+reset_peaks()                  # 显式开始新的峰值窗口
 ```
 
 ## IDE 支持

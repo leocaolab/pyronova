@@ -94,7 +94,7 @@ class _PyronovaRustHandler(_logging.Handler):
                 exc_text = record.exc_text or self.formatException(record.exc_info)
                 msg = f"{msg}\n{exc_text}"
             emit_python_log(
-                level=record.levelname,
+                levelno=record.levelno,
                 name=record.name,
                 message=msg,
                 pathname=record.pathname or "",
@@ -115,6 +115,12 @@ _LOGGING_LEVEL_MAP = {
     "CRITICAL": _logging.CRITICAL,
     "OFF": _logging.CRITICAL + 10,  # above CRITICAL — blocks everything
 }
+
+
+def _require_int(name: str, value: object) -> None:
+    """``bool`` is an ``int`` subclass; a limit set to ``True`` is a bug, not 1."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{name} must be int, got {type(value).__name__}")
 
 
 def _setup_python_logging_bridge(rust_level: str = "DEBUG") -> None:
@@ -247,6 +253,34 @@ class Pyronova:
             raise ValueError(f"max_body_size must be non-negative, got {size}")
         self._max_body_size = size
         self._engine.set_max_body_size(size)
+
+    @property
+    def max_websocket_message_size(self) -> int:
+        """Largest WebSocket message, in bytes, in either direction. Default: 1 MiB.
+
+        A bigger client message closes the connection with 1009 (Message Too Big);
+        a bigger ``ws.send`` raises ``ValueError``. Each connection also buffers at
+        most about this many bytes per direction.
+        """
+        return self._engine.max_websocket_message_size()
+
+    @max_websocket_message_size.setter
+    def max_websocket_message_size(self, size: int) -> None:
+        _require_int("max_websocket_message_size", size)
+        self._engine.set_max_websocket_message_size(size)
+
+    @property
+    def max_websocket_connections(self) -> int:
+        """Concurrent WebSocket connections (one handler thread each). Default: 1024.
+
+        An upgrade beyond the cap is answered ``503 Service Unavailable``.
+        """
+        return self._engine.max_websocket_connections()
+
+    @max_websocket_connections.setter
+    def max_websocket_connections(self, count: int) -> None:
+        _require_int("max_websocket_connections", count)
+        self._engine.set_max_websocket_connections(count)
 
     def enable_compression(
         self,

@@ -3,28 +3,58 @@
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 def init_logger(level: str, access_log: bool, format: str) -> None:
-    """Initialize the Rust tracing engine. Call once at startup.
+    """Install the Rust tracing engine, or reconfigure it if already installed.
 
-    :param level: one of ``"TRACE" | "DEBUG" | "INFO" | "WARN" |
-        "ERROR" | "OFF"`` (case-insensitive). An unrecognized value is
-        treated as ``"INFO"``.
-    :param format: ``"json"`` for structured logs, anything else for the
-        human-readable text formatter.
-    Calling more than once is a no-op after the first successful init
-    (the global subscriber can only be installed once); the later call
-    does not raise but also does not re-configure the level/format.
+    :param level: ``"OFF" | "ERROR" | "WARN" | "WARNING" | "INFO" | "DEBUG" |
+        "TRACE"`` (case-insensitive).
+    :param format: ``"text"`` (human-readable) or ``"json"`` (structured).
+    :raises ValueError: on an unknown level or format.
+    :raises RuntimeError: if the subscriber cannot be installed because a
+        foreign global tracing subscriber already holds the slot.
+
+    tracing allows one global subscriber per process; a later call applies its
+    level, access-log switch and format to that subscriber.
     """
     ...
 
 def emit_python_log(
-    level: str,
+    levelno: int,
     name: str,
     message: str,
     pathname: str,
     lineno: int,
     worker_id: Optional[int] = None,
 ) -> None:
-    """Route a Python log record through Rust tracing."""
+    """Route a Python log record through Rust tracing.
+
+    ``levelno`` is the record's numeric level; it maps to the highest standard
+    threshold it reaches, so a custom level 25 logs at INFO.
+    """
+    ...
+
+class Metrics:
+    """Snapshot of the engine counters. Times are in microseconds."""
+
+    gil_wait_last_us: int
+    gil_wait_peak_us: int
+    """Longest GIL acquisition wait since the last ``reset_peaks()``."""
+    gil_wait_count: int
+    gil_wait_total_us: int
+    gil_queue_length: int
+    gil_hold_peak_us: int
+    """Longest handler GIL hold since the last ``reset_peaks()``."""
+    rss_bytes: Optional[int]
+    """Process RSS; ``None`` until the sampler (``PYRONOVA_METRICS=1``) reads one."""
+    dropped_requests: int
+    total_requests: int
+    """Counted only while ``PYRONOVA_METRICS=1``."""
+
+def get_gil_metrics() -> Metrics:
+    """Read every counter. Has no side effect."""
+    ...
+
+def reset_peaks() -> None:
+    """Clear ``gil_wait_peak_us`` and ``gil_hold_peak_us``."""
     ...
 
 class Request:
@@ -76,16 +106,41 @@ class Response:
     ) -> None: ...
 
 class WebSocket:
+    """One WebSocket connection, handed to an ``@app.websocket`` handler.
+
+    Every receive returns ``None`` once the connection has ended (the peer
+    closed it, or it was dropped after a read error, which the server logs).
+    """
+
+    def recv_message(self) -> Optional[str | bytes]:
+        """Receive the next message: ``str`` for text, ``bytes`` for binary."""
+        ...
     def recv(self) -> Optional[str]:
         """Receive the next text message.
 
-        Returns ``None`` when the peer has closed the connection (no more
-        messages). Protocol errors, transport failures, and non-UTF-8
-        frames surface as exceptions, not as ``None`` — distinguish a clean
-        close (``None``) from an error (raised) accordingly.
+        :raises TypeError: if the next message is binary; it stays queued for
+            ``recv_bytes()`` / ``recv_message()``.
         """
         ...
-    def send(self, msg: str) -> None: ...
+    def recv_bytes(self) -> Optional[bytes]:
+        """Receive the next binary message.
+
+        :raises TypeError: if the next message is text; it stays queued for
+            ``recv()`` / ``recv_message()``.
+        """
+        ...
+    def send(self, msg: str) -> None:
+        """Queue a text message. Never blocks.
+
+        :raises ValueError: the message exceeds ``max_websocket_message_size``.
+        :raises BlockingIOError: the send buffer is full (the client reads
+            slowly); retry after a pause.
+        :raises ConnectionError: the connection is closed.
+        """
+        ...
+    def send_bytes(self, data: bytes) -> None:
+        """Queue a binary message. Same errors as ``send``."""
+        ...
     def close(self) -> None: ...
 
 class SharedState:
@@ -145,14 +200,25 @@ class PyronovaApp:
     def after_request(self, handler: Callable[..., Any]) -> None: ...
     def fallback(self, handler: Callable[..., Any]) -> None: ...
     def websocket(self, path: str, handler: Callable[..., Any]) -> None: ...
+    def set_max_websocket_message_size(self, size: int) -> None:
+        """Process-wide; raises ``ValueError`` outside ``1..=2**32-65``."""
+        ...
+    def max_websocket_message_size(self) -> int: ...
+    def set_max_websocket_connections(self, count: int) -> None:
+        """Process-wide; raises ``ValueError`` below 1."""
+        ...
+    def max_websocket_connections(self) -> int: ...
     def static_dir(self, prefix: str, directory: str) -> None:
         """Serve files under ``directory`` at URL ``prefix``.
 
-        Requested paths are canonicalized and confirmed to stay within
-        ``directory`` (path-traversal / symlink-escape attempts are
-        rejected with 404, not served). A non-existent or unreadable
-        ``directory`` does not raise here; matching requests simply 404 at
-        serve time.
+        :raises ValueError: ``prefix`` does not start with ``/``, or
+            ``directory`` does not resolve to a directory.
+
+        The request path is percent-decoded, then refused with 403 if it
+        climbs out with ``..`` (literal or encoded) or resolves outside
+        ``directory`` through a symlink. A missing file falls through to
+        routing (404); an unreadable one is 403; any other IO error is
+        logged and answered 500.
         """
         ...
     def set_cors_origin(self, origin: str) -> None: ...

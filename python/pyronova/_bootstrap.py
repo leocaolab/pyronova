@@ -47,7 +47,7 @@ class _PyronovaRustHandler(_logging.Handler):
                 sys.stderr.write(f"{record.levelname} {record.name}: {msg}\n")
                 return
             _emit_python_log(
-                record.levelname,
+                record.levelno,
                 record.name,
                 msg,
                 record.pathname or "",

@@ -20,8 +20,8 @@
 //! ---------------
 //! * Unary gRPC over HTTP/2 (`application/grpc+proto`). Body is a
 //!   single length-prefixed frame: `[0x00][u32 BE len][proto bytes]`.
-//! * Response carries status via HTTP/2 **trailers** — `grpc-status: 0`
-//!   for success, `13` for internal error, `12` for unimplemented.
+//! * Response carries status via HTTP/2 **trailers** — `grpc-status`
+//!   plus, on failure, a percent-encoded `grpc-message` with the real cause.
 //! * ALPN `h2` is negotiated for the TLS variant; our rustls acceptor
 //!   already advertises h2. For the cleartext `unary-grpc` profile the
 //!   client (h2load) starts with the HTTP/2 preface which hyper's
@@ -31,20 +31,75 @@ use bytes::{BufMut, Bytes, BytesMut};
 use futures_util::stream;
 use http_body_util::{BodyExt, LengthLimitError, Limited, StreamBody};
 use hyper::body::{Frame, Incoming};
-use hyper::header::HeaderValue;
+use hyper::header::{HeaderValue, InvalidHeaderValue};
 use hyper::{HeaderMap, Request, Response};
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 
 use crate::handlers::BoxBody;
 
-/// Canonical gRPC status codes. We only need the handful the server
-/// actually emits — the full list is at
-/// https://grpc.github.io/grpc/core/md_doc_statuscodes.html.
-mod status {
-    pub const OK: &str = "0";
-    pub const UNIMPLEMENTED: &str = "12";
-    pub const INTERNAL: &str = "13";
-    pub const UNAVAILABLE: &str = "14";
-    pub const RESOURCE_EXHAUSTED: &str = "8";
+/// The canonical gRPC status codes this server emits
+/// (https://grpc.github.io/grpc/core/md_doc_statuscodes.html).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrpcStatus {
+    Ok,
+    ResourceExhausted,
+    Unimplemented,
+    Internal,
+    Unavailable,
+}
+
+impl GrpcStatus {
+    fn header_value(self) -> HeaderValue {
+        HeaderValue::from_static(match self {
+            Self::Ok => "0",
+            Self::ResourceExhausted => "8",
+            Self::Unimplemented => "12",
+            Self::Internal => "13",
+            Self::Unavailable => "14",
+        })
+    }
+}
+
+/// Why a unary call failed. The `Display` text is sent as `grpc-message`.
+#[derive(Debug, thiserror::Error)]
+enum GrpcError {
+    #[error("request body exceeds max_body_size ({limit} bytes)")]
+    BodyTooLarge { limit: usize },
+    #[error("request body read failed: {0}")]
+    BodyRead(Box<dyn std::error::Error + Send + Sync>),
+    #[error("request is {len} bytes, shorter than the 5-byte gRPC frame header")]
+    ShortFrame { len: usize },
+    #[error("message is compressed (flag {flag}); no grpc-encoding is supported")]
+    Compressed { flag: u8 },
+    #[error("frame declares a {declared}-byte message but carries {actual} bytes")]
+    TruncatedFrame { declared: usize, actual: usize },
+    #[error("method {0} is not implemented")]
+    Unimplemented(String),
+    #[error("malformed SumRequest: {0}")]
+    Decode(#[from] DecodeError),
+}
+
+impl GrpcError {
+    fn status(&self) -> GrpcStatus {
+        match self {
+            Self::BodyTooLarge { .. } => GrpcStatus::ResourceExhausted,
+            Self::BodyRead(_) => GrpcStatus::Unavailable,
+            Self::Compressed { .. } | Self::Unimplemented(_) => GrpcStatus::Unimplemented,
+            Self::ShortFrame { .. } | Self::TruncatedFrame { .. } | Self::Decode(_) => {
+                GrpcStatus::Internal
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+enum DecodeError {
+    #[error("truncated or over-long varint")]
+    Varint,
+    #[error("field {field} runs past the end of the message")]
+    Truncated { field: u64 },
+    #[error("field {field} uses wire type {wire_type}, which proto3 does not allow")]
+    WireType { field: u64, wire_type: u8 },
 }
 
 /// Is this a gRPC call? Matches POST with an `application/grpc*`
@@ -64,126 +119,157 @@ pub(crate) fn is_grpc_request(req: &Request<Incoming>) -> bool {
 
 pub(crate) async fn handle_grpc(req: Request<Incoming>) -> Result<Response<BoxBody>, hyper::Error> {
     let path = req.uri().path().to_string();
-    // Guard body read with the same size cap the rest of the server
-    // uses. gRPC is normally small messages (< 4 KB for the Arena
-    // GetSum proto) but we're serving on the same ports as HTTP — a
-    // malicious client pushing a multi-GB body through an
-    // `application/grpc` content-type would OOM the process without
-    // this cap. `Limited::collect` yields an Error once the cap is
-    // crossed, and we fold that into `RESOURCE_EXHAUSTED` (gRPC
-    // status 8) for the caller.
-    let limited = Limited::new(req.into_body(), crate::handlers::max_body_size());
-    let collected = match limited.collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(e) => {
-            // Distinguish "client exceeded our size cap" from a transport
-            // drop so the grpc-status on the wire actually matches what
-            // happened. Downcasting the boxed error is the documented way
-            // to interrogate `Limited` (see its rustdoc example).
-            return Ok(if e.downcast_ref::<LengthLimitError>().is_some() {
-                grpc_reply_trailers(None, status::RESOURCE_EXHAUSTED, "body too large")
-            // RESOURCE_EXHAUSTED
+    let reply = read_message(req.into_body())
+        .await
+        .and_then(|message| dispatch(&path, &message));
+    Ok(match reply {
+        Ok(reply) => grpc_reply(Some(frame(&reply)), GrpcStatus::Ok, None),
+        Err(e) => grpc_reply(None, e.status(), Some(&e.to_string())),
+    })
+}
+
+/// Collect the body under the server's size cap (a multi-GB body behind an
+/// `application/grpc` content-type must not OOM the process) and unframe it.
+async fn read_message(body: Incoming) -> Result<Bytes, GrpcError> {
+    let limit = crate::handlers::max_body_size();
+    let collected = Limited::new(body, limit)
+        .collect()
+        .await
+        .map_err(|e| {
+            if e.downcast_ref::<LengthLimitError>().is_some() {
+                GrpcError::BodyTooLarge { limit }
             } else {
-                grpc_reply_trailers(None, status::UNAVAILABLE, "body read failed")
-                // UNAVAILABLE
-            });
-        }
-    };
+                GrpcError::BodyRead(e)
+            }
+        })?
+        .to_bytes();
+    unframe(collected)
+}
 
-    if collected.len() < 5 {
-        return Ok(grpc_reply_trailers(None, status::INTERNAL, "short frame"));
+/// `[compressed flag: u8][length: u32 BE][message]` → message.
+fn unframe(framed: Bytes) -> Result<Bytes, GrpcError> {
+    const HEADER_LEN: usize = 5;
+    if framed.len() < HEADER_LEN {
+        return Err(GrpcError::ShortFrame { len: framed.len() });
     }
-    if collected[0] != 0 {
-        // Non-zero = compressed. We don't advertise or understand any
-        // codec beyond identity; tell the caller.
-        return Ok(grpc_reply_trailers(
-            None,
-            status::UNIMPLEMENTED,
-            "compression unsupported",
-        ));
+    if framed[0] != 0 {
+        return Err(GrpcError::Compressed { flag: framed[0] });
     }
-    let payload_len =
-        u32::from_be_bytes([collected[1], collected[2], collected[3], collected[4]]) as usize;
-    if collected.len() < 5 + payload_len {
-        return Ok(grpc_reply_trailers(
-            None,
-            status::INTERNAL,
-            "truncated frame",
-        ));
+    let declared = u32::from_be_bytes([framed[1], framed[2], framed[3], framed[4]]) as usize;
+    let actual = framed.len() - HEADER_LEN;
+    if actual < declared {
+        return Err(GrpcError::TruncatedFrame { declared, actual });
     }
-    let payload = &collected[5..5 + payload_len];
+    Ok(framed.slice(HEADER_LEN..HEADER_LEN + declared))
+}
 
-    match path.as_str() {
-        "/benchmark.BenchmarkService/GetSum" => get_sum(payload),
-        _ => Ok(grpc_reply_trailers(
-            None,
-            status::UNIMPLEMENTED,
-            "unimplemented",
-        )),
+fn dispatch(path: &str, message: &[u8]) -> Result<Bytes, GrpcError> {
+    match path {
+        "/benchmark.BenchmarkService/GetSum" => get_sum(message),
+        _ => Err(GrpcError::Unimplemented(path.to_string())),
     }
 }
 
-fn get_sum(payload: &[u8]) -> Result<Response<BoxBody>, hyper::Error> {
-    let (mut a, mut b) = (0i64, 0i64);
-    let mut cursor = payload;
-    while !cursor.is_empty() {
-        let tag = cursor[0];
-        cursor = &cursor[1..];
-        let wire_type = tag & 0x07;
-        let field_no = tag >> 3;
-        let Some((val, rest)) = read_varint(cursor) else {
-            return Ok(grpc_reply_trailers(None, status::INTERNAL, "bad varint"));
-        };
-        match (field_no, wire_type) {
-            (1, 0) => a = val as i64,
-            (2, 0) => b = val as i64,
-            _ => {
-                // Unknown / non-varint field — proto3 says skip.
-                if wire_type != 0 {
-                    return Ok(grpc_reply_trailers(
-                        None,
-                        status::INTERNAL,
-                        "unsupported wire type",
-                    ));
-                }
-            }
-        }
-        cursor = rest;
-    }
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SumRequest {
+    a: i32,
+    b: i32,
+}
 
-    let sum = (a as i32).wrapping_add(b as i32) as i64;
-
+fn get_sum(message: &[u8]) -> Result<Bytes, GrpcError> {
+    let SumRequest { a, b } = decode_sum_request(message)?;
     // SumReply { int32 result = 1; }  →  0x08 (field 1, varint) + varint.
     // proto3 int32 serializes negatives as 10-byte sign-extended varints,
     // matching what tonic / grpc-go emit.
     let mut reply = BytesMut::with_capacity(16);
     reply.put_u8(0x08);
-    write_varint_i32(&mut reply, sum as i32);
-    let reply_bytes = reply.freeze();
-
-    // Prefix with the 5-byte gRPC frame header.
-    let mut framed = BytesMut::with_capacity(5 + reply_bytes.len());
-    framed.put_u8(0);
-    framed.put_u32(reply_bytes.len() as u32);
-    framed.extend_from_slice(&reply_bytes);
-
-    Ok(grpc_reply_trailers(Some(framed.freeze()), status::OK, ""))
+    write_varint_i32(&mut reply, a.wrapping_add(b));
+    Ok(reply.freeze())
 }
 
-fn grpc_reply_trailers(
-    data: Option<Bytes>,
-    grpc_status: &str,
-    grpc_message: &str,
-) -> Response<BoxBody> {
-    let mut trailers = HeaderMap::new();
-    trailers.insert(
-        "grpc-status",
-        HeaderValue::from_str(grpc_status).unwrap_or(HeaderValue::from_static("0")),
-    );
-    if !grpc_message.is_empty() {
-        if let Ok(msg) = HeaderValue::from_str(grpc_message) {
-            trailers.insert("grpc-message", msg);
+/// proto3 wire types (https://protobuf.dev/programming-guides/encoding/#structure).
+mod wire {
+    pub const VARINT: u8 = 0;
+    pub const I64: u8 = 1;
+    pub const LEN: u8 = 2;
+    pub const I32: u8 = 5;
+}
+
+/// Decode `SumRequest`. Unknown fields of any proto3 wire type are skipped, as the
+/// proto3 spec requires; the deprecated group types (3, 4) and invalid ones are errors.
+fn decode_sum_request(mut cursor: &[u8]) -> Result<SumRequest, DecodeError> {
+    let mut request = SumRequest::default();
+    while !cursor.is_empty() {
+        let (tag, rest) = read_varint(cursor).ok_or(DecodeError::Varint)?;
+        let (field, wire_type) = (tag >> 3, (tag & 0x07) as u8);
+        cursor = match (field, wire_type) {
+            (1 | 2, wire::VARINT) => {
+                let (value, rest) = read_varint(rest).ok_or(DecodeError::Varint)?;
+                // int32 on the wire: the low 32 bits of a sign-extended varint.
+                let value = value as i32;
+                if field == 1 {
+                    request.a = value;
+                } else {
+                    request.b = value;
+                }
+                rest
+            }
+            _ => skip_field(field, wire_type, rest)?,
+        };
+    }
+    Ok(request)
+}
+
+fn skip_field(field: u64, wire_type: u8, input: &[u8]) -> Result<&[u8], DecodeError> {
+    let len = match wire_type {
+        wire::VARINT => {
+            return read_varint(input)
+                .map(|(_, rest)| rest)
+                .ok_or(DecodeError::Varint)
         }
+        wire::I64 => 8,
+        wire::I32 => 4,
+        wire::LEN => {
+            let (len, rest) = read_varint(input).ok_or(DecodeError::Varint)?;
+            let len = usize::try_from(len).map_err(|_| DecodeError::Truncated { field })?;
+            return rest.get(len..).ok_or(DecodeError::Truncated { field });
+        }
+        _ => return Err(DecodeError::WireType { field, wire_type }),
+    };
+    input.get(len..).ok_or(DecodeError::Truncated { field })
+}
+
+/// Prefix a message with the 5-byte gRPC frame header.
+fn frame(message: &[u8]) -> Bytes {
+    let mut framed = BytesMut::with_capacity(5 + message.len());
+    framed.put_u8(0);
+    framed.put_u32(message.len() as u32);
+    framed.extend_from_slice(message);
+    framed.freeze()
+}
+
+/// `grpc-message` is percent-encoded UTF-8: everything outside printable ASCII, plus
+/// `%` itself (gRPC over HTTP/2 spec, "Responses").
+const GRPC_MESSAGE_ENCODE: &AsciiSet = &CONTROLS.add(b'%');
+
+fn grpc_message_value(message: &str) -> Result<HeaderValue, InvalidHeaderValue> {
+    HeaderValue::try_from(utf8_percent_encode(message, GRPC_MESSAGE_ENCODE).to_string())
+}
+
+fn grpc_reply(data: Option<Bytes>, status: GrpcStatus, message: Option<&str>) -> Response<BoxBody> {
+    let mut trailers = HeaderMap::new();
+    trailers.insert("grpc-status", status.header_value());
+    // Percent-encoding leaves only printable ASCII, so the Err arm is unreachable in
+    // practice; if it ever fires, the real message still reaches the log.
+    match message.map(|m| (m, grpc_message_value(m))) {
+        Some((_, Ok(value))) => {
+            trailers.insert("grpc-message", value);
+        }
+        Some((message, Err(e))) => {
+            tracing::error!(target: "pyronova::server", error = %e, message,
+                "grpc-message not header-safe after percent-encoding");
+        }
+        None => {}
     }
 
     let data_frame = data.map(Frame::data);
@@ -267,5 +353,113 @@ mod tests {
         // 11 bytes, all continuation set — should bail rather than UB.
         let bad = vec![0xFF; 11];
         assert!(read_varint(&bad).is_none());
+    }
+
+    async fn trailers(resp: Response<BoxBody>) -> HeaderMap {
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .trailers()
+            .cloned()
+            .unwrap()
+    }
+
+    #[test]
+    fn unknown_fields_of_every_proto3_wire_type_are_skipped() {
+        let message = [
+            0x08, 0x02, // a = 2
+            0x1a, 0x02, b'h', b'i', // field 3, LEN "hi"
+            0x21, 1, 2, 3, 4, 5, 6, 7, 8, // field 4, I64
+            0x2d, 1, 2, 3, 4, // field 5, I32
+            0x30, 0x7f, // field 6, VARINT
+            0x80, 0x01, 0x00, // field 16 (two-byte tag), VARINT 0
+            0x10, 0x03, // b = 3
+        ];
+        assert_eq!(decode_sum_request(&message), Ok(SumRequest { a: 2, b: 3 }));
+    }
+
+    #[test]
+    fn group_and_invalid_wire_types_are_errors() {
+        assert_eq!(
+            decode_sum_request(&[0x1b]),
+            Err(DecodeError::WireType {
+                field: 3,
+                wire_type: 3
+            })
+        );
+        assert_eq!(
+            decode_sum_request(&[0x1e]),
+            Err(DecodeError::WireType {
+                field: 3,
+                wire_type: 6
+            })
+        );
+    }
+
+    #[test]
+    fn truncated_unknown_field_is_an_error() {
+        assert_eq!(
+            decode_sum_request(&[0x1a, 0x05, b'h']),
+            Err(DecodeError::Truncated { field: 3 })
+        );
+        assert_eq!(
+            decode_sum_request(&[0x21, 1, 2]),
+            Err(DecodeError::Truncated { field: 4 })
+        );
+    }
+
+    #[test]
+    fn negative_int32_sums_wrap() {
+        let mut message = BytesMut::new();
+        message.put_u8(0x08);
+        write_varint_i32(&mut message, i32::MAX);
+        message.put_u8(0x10);
+        write_varint_i32(&mut message, 1);
+        let reply = get_sum(&message).unwrap();
+        let (value, _) = read_varint(&reply[1..]).unwrap();
+        assert_eq!(value as i32, i32::MIN);
+    }
+
+    #[test]
+    fn body_read_error_carries_the_real_cause() {
+        let cause: Box<dyn std::error::Error + Send + Sync> = "connection reset by peer".into();
+        let e = GrpcError::BodyRead(cause);
+        assert_eq!(e.status(), GrpcStatus::Unavailable);
+        assert!(e.to_string().contains("connection reset by peer"), "{e}");
+    }
+
+    #[test]
+    fn frame_errors_say_what_was_wrong() {
+        let e = unframe(Bytes::from_static(&[0, 0, 0, 0, 9, 1])).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "frame declares a 9-byte message but carries 1 bytes"
+        );
+        assert_eq!(e.status(), GrpcStatus::Internal);
+        let e = unframe(Bytes::from_static(&[1, 0, 0, 0, 0])).unwrap_err();
+        assert_eq!(e.status(), GrpcStatus::Unimplemented);
+    }
+
+    #[tokio::test]
+    async fn multiline_non_ascii_message_is_percent_encoded_not_dropped() {
+        let resp = grpc_reply(
+            None,
+            GrpcStatus::Internal,
+            Some("line one\nline two: é 100%"),
+        );
+        let t = trailers(resp).await;
+        assert_eq!(t.get("grpc-status").unwrap(), "13");
+        assert_eq!(
+            t.get("grpc-message").unwrap(),
+            "line one%0Aline two: %C3%A9 100%25"
+        );
+    }
+
+    #[tokio::test]
+    async fn ok_reply_has_no_message() {
+        let t = trailers(grpc_reply(None, GrpcStatus::Ok, None)).await;
+        assert_eq!(t.get("grpc-status").unwrap(), "0");
+        assert!(t.get("grpc-message").is_none());
     }
 }

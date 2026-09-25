@@ -1,18 +1,175 @@
 //! PyronovaWebSocket support — async Tokio ↔ sync Python bridge via channels.
+//!
+//! Every resource a client can make the server hold is bounded: connections (each
+//! holds one OS thread for its Python handler) by `max_connections`, message and frame
+//! size by `max_message_bytes`, and the bytes queued in each direction of a connection
+//! by a per-connection byte budget.
+
+use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
+use parking_lot::{Mutex, RwLock};
+use pyo3::exceptions::{PyBlockingIOError, PyConnectionError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyString};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::WebSocketStream;
+use tungstenite::protocol::frame::coding::CloseCode;
+use tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tungstenite::Message;
 
 use crate::router::FrozenRoutes;
 
 // ---------------------------------------------------------------------------
-// Channel message type
+// Limits (process-wide, like max_body_size)
+// ---------------------------------------------------------------------------
+
+/// Largest message (and frame) accepted from a client or queued by a handler, in bytes.
+/// tungstenite's own default is 64 MiB per message; 1 MiB matches the `websockets` library.
+const DEFAULT_MAX_MESSAGE_BYTES: u32 = 1024 * 1024;
+/// Concurrent WebSocket connections. Each holds one OS thread for its Python handler.
+const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+/// Bytes charged per queued message on top of its payload, for the allocation and
+/// queue slot it occupies, so a flood of empty messages is bounded too.
+const MESSAGE_OVERHEAD_BYTES: u32 = 64;
+/// A budget of `max_message_bytes + MESSAGE_OVERHEAD_BYTES` must fit the `u32` permit
+/// count a semaphore acquire takes.
+const MAX_MESSAGE_BYTES_LIMIT: u32 = u32::MAX - MESSAGE_OVERHEAD_BYTES;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WsLimits {
+    pub(crate) max_message_bytes: u32,
+    pub(crate) max_connections: usize,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum WsLimitError {
+    #[error(
+        "max_websocket_message_size must be between 1 and {MAX_MESSAGE_BYTES_LIMIT} bytes, got {0}"
+    )]
+    MessageSize(i64),
+    #[error("max_websocket_connections must be at least 1, got {0}")]
+    Connections(i64),
+}
+
+impl From<WsLimitError> for PyErr {
+    fn from(e: WsLimitError) -> Self {
+        PyValueError::new_err(e.to_string())
+    }
+}
+
+impl WsLimits {
+    const DEFAULT: Self = Self {
+        max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
+        max_connections: DEFAULT_MAX_CONNECTIONS,
+    };
+
+    pub(crate) fn with_max_message_bytes(self, bytes: i64) -> Result<Self, WsLimitError> {
+        let max_message_bytes = u32::try_from(bytes)
+            .ok()
+            .filter(|b| (1..=MAX_MESSAGE_BYTES_LIMIT).contains(b))
+            .ok_or(WsLimitError::MessageSize(bytes))?;
+        Ok(Self {
+            max_message_bytes,
+            ..self
+        })
+    }
+
+    pub(crate) fn with_max_connections(self, connections: i64) -> Result<Self, WsLimitError> {
+        let max_connections = usize::try_from(connections)
+            .ok()
+            .filter(|c| *c >= 1)
+            .ok_or(WsLimitError::Connections(connections))?;
+        Ok(Self {
+            max_connections,
+            ..self
+        })
+    }
+
+    fn tungstenite_config(self) -> WebSocketConfig {
+        let max = Some(self.max_message_bytes as usize);
+        WebSocketConfig::default()
+            .max_message_size(max)
+            .max_frame_size(max)
+    }
+}
+
+static LIMITS: RwLock<WsLimits> = RwLock::new(WsLimits::DEFAULT);
+
+pub(crate) fn limits() -> WsLimits {
+    *LIMITS.read()
+}
+
+pub(crate) fn set_limits(limits: WsLimits) {
+    *LIMITS.write() = limits;
+}
+
+static OPEN_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// One of the `max_connections` slots, held for the connection's whole life (until its
+/// Python handler thread has been joined) and released on drop.
+struct ConnectionSlot(());
+
+impl ConnectionSlot {
+    fn try_acquire(max_connections: usize) -> Option<Self> {
+        OPEN_CONNECTIONS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |open| {
+                (open < max_connections).then_some(open + 1)
+            })
+            .ok()
+            .map(|_| Self(()))
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        OPEN_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Bytes queued in one direction of one connection. A message holds its share until it
+/// leaves the queue. The budget fits one maximum-size message, so every allowed
+/// message can always be queued once the queue drains.
+#[derive(Clone)]
+struct ByteBudget(Arc<Semaphore>);
+
+impl ByteBudget {
+    fn new(max_message_bytes: u32) -> Self {
+        let permits = max_message_bytes + MESSAGE_OVERHEAD_BYTES;
+        Self(Arc::new(Semaphore::new(permits as usize)))
+    }
+
+    /// `len` never exceeds `max_message_bytes`: tungstenite enforces it on input and
+    /// `send` checks it on output, so the sum cannot overflow `MAX_MESSAGE_BYTES_LIMIT`.
+    fn cost(len: usize) -> u32 {
+        len as u32 + MESSAGE_OVERHEAD_BYTES
+    }
+
+    async fn reserve(&self, len: usize) -> Option<OwnedSemaphorePermit> {
+        self.0
+            .clone()
+            .acquire_many_owned(Self::cost(len))
+            .await
+            .ok()
+    }
+
+    fn try_reserve(&self, len: usize) -> Option<OwnedSemaphorePermit> {
+        self.0.clone().try_acquire_many_owned(Self::cost(len)).ok()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Messages
 // ---------------------------------------------------------------------------
 
 enum WsMsg {
@@ -20,142 +177,200 @@ enum WsMsg {
     Binary(Vec<u8>),
 }
 
+impl WsMsg {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Text(_) => "text",
+            Self::Binary(_) => "binary",
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Text(s) => s.len(),
+            Self::Binary(b) => b.len(),
+        }
+    }
+
+    fn into_text(self) -> Result<String, Self> {
+        match self {
+            Self::Text(s) => Ok(s),
+            other => Err(other),
+        }
+    }
+
+    fn into_binary(self) -> Result<Vec<u8>, Self> {
+        match self {
+            Self::Binary(b) => Ok(b),
+            other => Err(other),
+        }
+    }
+
+    fn into_message(self) -> Message {
+        match self {
+            Self::Text(s) => Message::Text(s.into()),
+            Self::Binary(b) => Message::Binary(b.into()),
+        }
+    }
+}
+
+/// A message in a connection queue, holding its share of that direction's byte budget.
+struct Queued {
+    msg: WsMsg,
+    _budget: OwnedSemaphorePermit,
+}
+
+/// `recv()` / `recv_bytes()` found the other kind of message at the head of the queue.
+/// The message stays queued; the error says how to read it.
+struct KindMismatch {
+    method: &'static str,
+    got: &'static str,
+    len: usize,
+}
+
+impl From<KindMismatch> for PyErr {
+    fn from(m: KindMismatch) -> Self {
+        PyTypeError::new_err(format!(
+            "{}() found a {} message ({} bytes) next; it is still queued: read it with \
+             recv_message(), which returns str or bytes",
+            m.method, m.got, m.len
+        ))
+    }
+}
+
+struct Inbox {
+    rx: UnboundedReceiver<Queued>,
+    /// A message a typed receive refused, returned first by the next receive.
+    held: Option<WsMsg>,
+}
+
+impl Inbox {
+    /// The next message converted by `extract`, or `None` once the peer has closed. A
+    /// message `extract` hands back stays at the head of the queue.
+    fn next_as<T>(
+        &mut self,
+        method: &'static str,
+        extract: impl FnOnce(WsMsg) -> Result<T, WsMsg>,
+    ) -> Result<Option<T>, KindMismatch> {
+        let Some(msg) = self
+            .held
+            .take()
+            .or_else(|| self.rx.blocking_recv().map(|q| q.msg))
+        else {
+            return Ok(None);
+        };
+        extract(msg).map(Some).map_err(|msg| {
+            let mismatch = KindMismatch {
+                method,
+                got: msg.kind(),
+                len: msg.len(),
+            };
+            self.held = Some(msg);
+            mismatch
+        })
+    }
+}
+
+struct Outbox {
+    tx: UnboundedSender<Queued>,
+    budget: ByteBudget,
+    max_message_bytes: u32,
+}
+
+impl Outbox {
+    fn push(&self, msg: WsMsg) -> PyResult<()> {
+        if msg.len() > self.max_message_bytes as usize {
+            return Err(PyValueError::new_err(format!(
+                "{} message of {} bytes exceeds max_websocket_message_size ({} bytes)",
+                msg.kind(),
+                msg.len(),
+                self.max_message_bytes
+            )));
+        }
+        let budget = self.budget.try_reserve(msg.len()).ok_or_else(|| {
+            PyBlockingIOError::new_err(
+                "WebSocket send buffer full (client is slow); retry after a brief pause",
+            )
+        })?;
+        self.tx
+            .send(Queued {
+                msg,
+                _budget: budget,
+            })
+            .map_err(|_| PyConnectionError::new_err("WebSocket closed"))
+    }
+}
+
 // ---------------------------------------------------------------------------
-// PyronovaWebSocket — Python-facing PyronovaWebSocket connection object
+// PyronovaWebSocket — the Python-facing connection object
 // ---------------------------------------------------------------------------
 
 #[pyclass(name = "WebSocket", module = "pyronova.engine")]
 pub(crate) struct PyronovaWebSocket {
-    // Bounded tokio channel so the hyper → Python path has TCP-level
-    // backpressure: if the Python handler falls behind, the tokio
-    // reader's `send().await` suspends, hyper stops reading the
-    // socket, the kernel closes the receive window, the client slows
-    // down. The previous `std::sync::mpsc::channel()` was unbounded
-    // and turned that backpressure chain into an unbounded memory
-    // sink — a single fast client could drive a multi-GB queue while
-    // the Python handler ran a slow computation. 256 slots matches
-    // OUTGOING_CAP order of magnitude and is small enough that a
-    // stuck consumer notices immediately.
-    incoming_rx: std::sync::Mutex<tokio::sync::mpsc::Receiver<WsMsg>>,
-    outgoing_tx: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<WsMsg>>>,
+    inbox: Mutex<Inbox>,
+    outbox: Mutex<Option<Outbox>>,
 }
 
 #[pymethods]
 impl PyronovaWebSocket {
-    /// Receive next text message. Returns None if connection closed.
+    /// Receive the next message as `str` (text) or `bytes` (binary); `None` once the
+    /// connection is closed.
     ///
-    /// Releases the GIL while blocking on the channel so other Python
-    /// threads (e.g. a second task reading from another ws, or the
-    /// application's worker threads) are not frozen. Holding the GIL
-    /// across a potentially unbounded channel wait is a single-threaded
-    /// Python server in disguise.
-    fn recv(&self, py: Python<'_>) -> Option<String> {
-        py.detach(|| {
-            // Recover from poisoning (a previous holder panicked) — channel
-            // data is intact, only the poison flag is set. Panicking across
-            // FFI into Python is UB per PyO3 (arc websocket-1).
-            let mut rx = self.incoming_rx.lock().unwrap_or_else(|e| e.into_inner());
-            loop {
-                match rx.blocking_recv()? {
-                    WsMsg::Text(s) => return Some(s),
-                    WsMsg::Binary(_) => continue,
-                }
-            }
-        })
+    /// Releases the GIL while blocking on the queue so other Python threads are not
+    /// frozen for an unbounded wait.
+    fn recv_message<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let msg = py.detach(|| self.inbox.lock().next_as("recv_message", Ok))?;
+        Ok(msg.map(|msg| match msg {
+            WsMsg::Text(s) => PyString::new(py, &s).into_any(),
+            WsMsg::Binary(b) => PyBytes::new(py, &b).into_any(),
+        }))
     }
 
-    /// Receive next binary message. Returns None if connection closed.
-    /// Releases the GIL while waiting — see `recv` for rationale.
-    fn recv_bytes(&self, py: Python<'_>) -> Option<Vec<u8>> {
-        py.detach(|| {
-            // Recover from poisoning (a previous holder panicked) — channel
-            // data is intact, only the poison flag is set. Panicking across
-            // FFI into Python is UB per PyO3 (arc websocket-1).
-            let mut rx = self.incoming_rx.lock().unwrap_or_else(|e| e.into_inner());
-            loop {
-                match rx.blocking_recv()? {
-                    WsMsg::Binary(b) => return Some(b),
-                    WsMsg::Text(_) => continue,
-                }
-            }
-        })
+    /// Receive the next text message; `None` once the connection is closed. Raises
+    /// `TypeError` if the next message is binary, leaving it queued.
+    fn recv(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        Ok(py.detach(|| self.inbox.lock().next_as("recv", WsMsg::into_text))?)
     }
 
-    /// Receive next message as (type, data). type is "text" or "binary".
-    /// Returns None if connection closed.
-    fn recv_message<'py>(&self, py: Python<'py>) -> Option<(String, Py<PyAny>)> {
-        // Release the GIL across the blocking recv; re-acquire to build the
-        // Python-typed return value.
-        let msg = py.detach(|| {
-            // Recover from poisoning (a previous holder panicked) — channel
-            // data is intact, only the poison flag is set. Panicking across
-            // FFI into Python is UB per PyO3 (arc websocket-1).
-            let mut rx = self.incoming_rx.lock().unwrap_or_else(|e| e.into_inner());
-            rx.blocking_recv()
-        })?;
-        match msg {
-            WsMsg::Text(s) => Some((
-                "text".to_string(),
-                s.into_pyobject(py).unwrap().into_any().unbind(),
-            )),
-            WsMsg::Binary(b) => Some((
-                "binary".to_string(),
-                pyo3::types::PyBytes::new(py, &b).into_any().unbind(),
-            )),
-        }
+    /// Receive the next binary message; `None` once the connection is closed. Raises
+    /// `TypeError` if the next message is text, leaving it queued.
+    fn recv_bytes<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        let data = py.detach(|| self.inbox.lock().next_as("recv_bytes", WsMsg::into_binary))?;
+        Ok(data.map(|b| PyBytes::new(py, &b)))
     }
 
     /// Send a text message to the client.
     ///
-    /// Uses try_send to stay sync — the outgoing channel is bounded, so a
-    /// slow or disconnected client surfaces as BlockingIOError (buffer
-    /// full) or ConnectionError (channel closed). Callers typically either
-    /// pause / drop events or abort the connection.
+    /// Non-blocking: a message over `max_websocket_message_size` raises `ValueError`;
+    /// a full send buffer (slow client) raises `BlockingIOError`; a closed connection
+    /// raises `ConnectionError`.
     fn send(&self, msg: &str) -> PyResult<()> {
-        self.try_send_outgoing(WsMsg::Text(msg.to_string()))
+        self.push(WsMsg::Text(msg.to_string()))
     }
 
     /// Send a binary message to the client. See `send` for semantics.
     fn send_bytes(&self, data: Vec<u8>) -> PyResult<()> {
-        self.try_send_outgoing(WsMsg::Binary(data))
+        self.push(WsMsg::Binary(data))
     }
 
-    /// Close the PyronovaWebSocket connection.
+    /// Close the connection.
     fn close(&self) {
-        // Recover from poisoning — see recv() rationale (arc websocket-1).
-        let mut tx = self.outgoing_tx.lock().unwrap_or_else(|e| e.into_inner());
-        *tx = None;
+        *self.outbox.lock() = None;
     }
 }
 
 impl PyronovaWebSocket {
-    fn try_send_outgoing(&self, msg: WsMsg) -> PyResult<()> {
-        use tokio::sync::mpsc::error::TrySendError;
-        // Convert poisoning to PyConnectionError — this method already
-        // returns PyResult, so failure can flow back to Python normally
-        // (arc websocket-1). Panicking across FFI is UB per PyO3.
-        let guard = self.outgoing_tx.lock().map_err(|e| {
-            pyo3::exceptions::PyConnectionError::new_err(format!(
-                "PyronovaWebSocket outgoing mutex poisoned: {e}"
-            ))
-        })?;
-        let tx = guard.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyConnectionError::new_err("PyronovaWebSocket closed")
-        })?;
-        match tx.try_send(msg) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(pyo3::exceptions::PyBlockingIOError::new_err(
-                "PyronovaWebSocket send buffer full (client is slow); retry after a brief pause",
-            )),
-            Err(TrySendError::Closed(_)) => Err(pyo3::exceptions::PyConnectionError::new_err(
-                "PyronovaWebSocket closed",
-            )),
-        }
+    fn push(&self, msg: WsMsg) -> PyResult<()> {
+        self.outbox
+            .lock()
+            .as_ref()
+            .ok_or_else(|| PyConnectionError::new_err("WebSocket closed"))?
+            .push(msg)
     }
 }
 
 // ---------------------------------------------------------------------------
-// PyronovaWebSocket upgrade detection
+// Upgrade
 // ---------------------------------------------------------------------------
 
 pub(crate) fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
@@ -165,7 +380,7 @@ pub(crate) fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
         .unwrap_or(false)
 }
 
-/// Build the 101 Switching Protocols response for PyronovaWebSocket upgrade.
+/// Build the 101 Switching Protocols response for a WebSocket upgrade.
 fn ws_upgrade_response(key: &[u8]) -> Response<Full<Bytes>> {
     let accept = tungstenite::handshake::derive_accept_key(key);
 
@@ -178,9 +393,11 @@ fn ws_upgrade_response(key: &[u8]) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
-// ---------------------------------------------------------------------------
-// Handle PyronovaWebSocket upgrade + message pump
-// ---------------------------------------------------------------------------
+fn refusal(status: StatusCode, body: &'static str) -> Response<crate::handlers::BoxBody> {
+    let mut response = Response::new(Full::new(Bytes::from_static(body.as_bytes())));
+    *response.status_mut() = status;
+    crate::handlers::full_body(response)
+}
 
 pub(crate) async fn handle_websocket(
     mut req: Request<Incoming>,
@@ -194,250 +411,414 @@ pub(crate) async fn handle_websocket(
     // the worker's GIL. The handler is cloned on the connection thread instead, attached to
     // main (Layer 2, C4).
     if !routes.ws_handlers.contains_key(&path) {
-        return Ok(crate::handlers::full_body(
-            Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Full::new(Bytes::from_static(b"no websocket handler")))
-                .unwrap_or_else(|_| {
-                    // builder() only fails on invalid status/headers, which
-                    // cannot happen with these literal inputs — fall back to a
-                    // plain response instead of panicking on the impossible case.
-                    Response::new(Full::new(Bytes::from_static(b"no websocket handler")))
-                }),
-        ));
+        return Ok(refusal(StatusCode::NOT_FOUND, "no websocket handler"));
     }
-    // The route table belongs to the main interpreter.
-    let main = crate::run_context::main_interp();
-
-    // Extract the key for the handshake
-    let key = match req.headers().get("sec-websocket-key") {
-        Some(k) => k.as_bytes().to_vec(),
-        None => {
-            return Ok(crate::handlers::full_body(
-                Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(Full::new(Bytes::from_static(b"missing sec-websocket-key")))
-                    .unwrap(),
-            ));
-        }
+    let Some(key) = req
+        .headers()
+        .get("sec-websocket-key")
+        .map(|k| k.as_bytes().to_vec())
+    else {
+        return Ok(refusal(
+            StatusCode::BAD_REQUEST,
+            "missing sec-websocket-key",
+        ));
+    };
+    let limits = limits();
+    let Some(slot) = ConnectionSlot::try_acquire(limits.max_connections) else {
+        crate::monitor::DROPPED_REQUESTS.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(target: "pyronova::server", path, max_connections = limits.max_connections,
+            "WebSocket connection limit reached; answered 503");
+        return Ok(refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "websocket connection limit reached",
+        ));
     };
 
-    // Set up the upgrade
+    // The route table belongs to the main interpreter.
+    let main = crate::run_context::main_interp();
     let upgrade = hyper::upgrade::on(&mut req);
-
-    // Spawn the PyronovaWebSocket handler task
     tokio::spawn(async move {
+        let _slot = slot;
         match upgrade.await {
             Ok(upgraded) => {
                 let ws_stream = WebSocketStream::from_raw_socket(
                     hyper_util::rt::TokioIo::new(upgraded),
                     tungstenite::protocol::Role::Server,
-                    None,
+                    Some(limits.tungstenite_config()),
                 )
                 .await;
-
-                run_ws_connection(ws_stream, routes, path, main).await;
+                run_ws_connection(ws_stream, routes, path, main, limits).await;
             }
             Err(e) => {
-                tracing::error!(target: "pyronova::server", error = %e, "PyronovaWebSocket upgrade error");
+                tracing::error!(target: "pyronova::server", error = %e, "WebSocket upgrade error");
             }
         }
     });
 
-    // Return the 101 response
     Ok(crate::handlers::full_body(ws_upgrade_response(&key)))
 }
 
-/// Run a PyronovaWebSocket connection — bridges async Tokio with sync Python handler.
+// ---------------------------------------------------------------------------
+// Connection: Python handler thread + message pump
+// ---------------------------------------------------------------------------
+
+/// Run the handler registered for `path` on its own OS thread, attached to main.
+///
+/// Contract: WebSocket handlers live in the main interpreter (they are registered via
+/// `@app.websocket(...)` at import time, which runs in the main interp). The thread has
+/// no thread state, so it attaches to main explicitly, with one thread state for the
+/// connection's life, and takes the handler from the route table there (Layer 2, C4).
+/// Not `main_attach`: this thread can outlive the server run whose context
+/// `main_attach` reads. The route table clone is dropped inside the attach.
+fn spawn_handler_thread(
+    ws: PyronovaWebSocket,
+    routes: FrozenRoutes,
+    path: String,
+    main: crate::run_context::Interp,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("pyronova-ws".to_string())
+        .spawn(move || {
+            crate::run_context::attach_to(main, move |py| {
+                let handler = routes.ws_handlers.get(&path).map(|h| h.clone_ref(py));
+                drop(routes);
+                // Checked at handshake; the table is frozen.
+                let Some(handler) = handler else { return };
+                run_handler(py, &handler, ws);
+                // Drop the handler under the GIL, not via PyO3's pending-drop path.
+                drop(handler);
+            });
+        })
+}
+
+fn run_handler(py: Python<'_>, handler: &Py<PyAny>, ws: PyronovaWebSocket) {
+    let ws_obj = match Py::new(py, ws) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::error!(target: "pyronova::server", error = %e, "WebSocket alloc failed");
+            return;
+        }
+    };
+    let result = match handler.call1(py, (ws_obj,)) {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::error!(target: "pyronova::server", error = %e, "WebSocket handler error");
+            return;
+        }
+    };
+    // An `async def` handler returns a coroutine that must be driven on a fresh loop.
+    let driven = py.import("asyncio").and_then(|asyncio| {
+        let is_coro = asyncio
+            .getattr("iscoroutine")?
+            .call1((&result,))?
+            .extract::<bool>()?;
+        if is_coro {
+            asyncio.getattr("run")?.call1((&result,))?;
+        }
+        Ok(())
+    });
+    if let Err(e) = driven {
+        tracing::error!(target: "pyronova::server", error = %e,
+            "WebSocket handler: running the returned coroutine failed");
+    }
+}
+
 async fn run_ws_connection<S>(
     ws_stream: WebSocketStream<S>,
     routes: FrozenRoutes,
     path: String,
     main: crate::run_context::Interp,
+    limits: WsLimits,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut ws_sink, mut ws_source) = ws_stream.split();
+    let (ws_sink, ws_source) = ws_stream.split();
 
-    // Bounded — see PyronovaWebSocket::incoming_rx docstring for why.
-    const INCOMING_CAP: usize = 256;
-    let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel::<WsMsg>(INCOMING_CAP);
-    // Bounded outgoing: if the Python handler produces faster than the
-    // client reads (TCP backpressure builds in ws_sink), we must stop
-    // accepting new messages rather than buffer to OOM. `try_send` on
-    // full raises ConnectionError to the Python sender, which can back
-    // off or abort. 1024 matches the SSE stream default.
-    const OUTGOING_CAP: usize = 1024;
-    let (outgoing_tx, mut outgoing_rx) = tokio::sync::mpsc::channel::<WsMsg>(OUTGOING_CAP);
-
-    let sky_ws = PyronovaWebSocket {
-        incoming_rx: std::sync::Mutex::new(incoming_rx),
-        outgoing_tx: std::sync::Mutex::new(Some(outgoing_tx)),
+    let (incoming_tx, incoming_rx) = unbounded_channel::<Queued>();
+    let (outgoing_tx, outgoing_rx) = unbounded_channel::<Queued>();
+    let ws = PyronovaWebSocket {
+        inbox: Mutex::new(Inbox {
+            rx: incoming_rx,
+            held: None,
+        }),
+        outbox: Mutex::new(Some(Outbox {
+            tx: outgoing_tx,
+            budget: ByteBudget::new(limits.max_message_bytes),
+            max_message_bytes: limits.max_message_bytes,
+        })),
     };
 
-    // Spawn a thread for the Python handler (blocks on ws.recv()).
-    //
-    // Contract: PyronovaWebSocket handlers live in the main interpreter (they
-    // are registered via `@app.websocket(...)` at import time, which
-    // runs in the main interp). The thread has no thread state, so it attaches
-    // to main explicitly, with one thread state for the connection's life, and
-    // takes the handler from the route table there (Layer 2, C4). Not
-    // `main_attach`: this thread can outlive the server run whose context
-    // `main_attach` reads. The route table clone is dropped inside the attach.
-    let py_handle = std::thread::spawn(move || {
-        crate::run_context::attach_to(main, move |py| {
-            let handler = routes.ws_handlers.get(&path).map(|h| h.clone_ref(py));
-            drop(routes);
-            // Checked at handshake; the table is frozen.
-            let Some(handler) = handler else { return };
-            let ws_obj = match Py::new(py, sky_ws) {
-                Ok(o) => o,
-                Err(e) => {
-                    tracing::error!(target: "pyronova::server", error = %e, "PyronovaWebSocket alloc failed");
-                    // Drop handler under GIL before returning.
-                    drop(handler);
-                    return;
-                }
-            };
-            match handler.call1(py, (ws_obj,)) {
-                Ok(result) => {
-                    // If the handler is `async def`, call1 returns a
-                    // coroutine that must be driven. Detect via
-                    // `asyncio.iscoroutine`; if so, run it on a fresh
-                    // event loop. Otherwise drop the result.
-                    // If the iscoroutine check fails (asyncio import,
-                    // attribute lookup, or call), pre-fix this silently
-                    // returned `false` and the coroutine was dropped
-                    // un-awaited — handler appears to succeed but does
-                    // nothing (arc finding websocket-3). Log so the
-                    // silent no-op is observable.
-                    let is_coro = match py
-                        .import("asyncio")
-                        .and_then(|m| m.getattr("iscoroutine"))
-                        .and_then(|f| f.call1((&result,)))
-                        .and_then(|r| r.extract::<bool>())
-                    {
-                        Ok(b) => b,
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "pyronova::app",
-                                error = %e,
-                                "websocket handler: asyncio.iscoroutine check \
-                                 failed; treating result as non-coroutine — \
-                                 if the handler is async def its body will \
-                                 not have run"
-                            );
-                            false
-                        }
-                    };
-                    if is_coro {
-                        if let Err(e) = py
-                            .import("asyncio")
-                            .and_then(|m| m.getattr("run"))
-                            .and_then(|f| f.call1((&result,)))
-                        {
-                            tracing::error!(
-                                target: "pyronova::server",
-                                error = %e,
-                                "PyronovaWebSocket async handler error",
-                            );
-                        }
-                    }
-                    // `result` drops here under GIL — safe.
-                    drop(result);
-                }
-                Err(e) => {
-                    tracing::error!(target: "pyronova::server", error = %e, "PyronovaWebSocket handler error");
-                }
-            }
-            // Drop handler explicitly under GIL. Without this, the
-            // Py<PyAny> would be dropped after the `attach` scope
-            // closes, triggering PyO3's GIL-less pending-drop path —
-            // harmless for ref counting but avoids the indirection.
-            drop(handler);
-        });
-    });
+    let py_handle = match spawn_handler_thread(ws, routes, path, main) {
+        Ok(handle) => handle,
+        Err(e) => {
+            tracing::error!(target: "pyronova::server", error = %e,
+                "WebSocket handler thread could not be spawned; closing the connection");
+            close_connection(ws_sink, ws_source, None).await;
+            return;
+        }
+    };
 
-    // Message pump: forward between PyronovaWebSocket and Python channels
+    let mut ends = PumpEnds {
+        sink: ws_sink,
+        source: ws_source,
+        incoming: incoming_tx,
+        incoming_budget: ByteBudget::new(limits.max_message_bytes),
+        outgoing: outgoing_rx,
+    };
+    let close_frame = pump(&mut ends, limits).await;
+
+    let PumpEnds {
+        sink,
+        source,
+        incoming,
+        ..
+    } = ends;
+    // Dropping the sender makes Python's pending recv return None.
+    drop(incoming);
+    close_connection(sink, source, close_frame).await;
+    join_handler_thread(py_handle).await;
+}
+
+type WsSink<S> = SplitSink<WebSocketStream<S>, Message>;
+type WsSource<S> = SplitStream<WebSocketStream<S>>;
+
+struct PumpEnds<S> {
+    sink: WsSink<S>,
+    source: WsSource<S>,
+    incoming: UnboundedSender<Queued>,
+    incoming_budget: ByteBudget,
+    outgoing: UnboundedReceiver<Queued>,
+}
+
+/// Move messages between the socket and Python until either side ends. Returns the
+/// close frame the server owes the client, if the server is the one closing.
+///
+/// The channels are unbounded in count but every queued message holds its bytes from
+/// a `ByteBudget`, so each direction is bounded in memory.
+async fn pump<S>(ends: &mut PumpEnds<S>, limits: WsLimits) -> Option<CloseFrame>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     loop {
         tokio::select! {
-            // Client → Python (via incoming_tx). `send().await` applies
-            // backpressure: if Python's handler is slow and the channel
-            // fills, the await suspends, which stops this select arm
-            // from re-polling ws_source, which lets hyper's receive
-            // buffer fill, which closes the TCP window — flow control
-            // reaches all the way to the wire.
-            msg = ws_source.next() => {
-                match msg {
-                    // clippy::collapsible_match (added in Rust 1.95) wants
-                    // the inner `if .is_err() { break }` rewritten as a
-                    // match guard. That works but requires duplicating the
-                    // arm pattern (one with the side-effect-bearing guard,
-                    // one bare to swallow the success case) — uglier than
-                    // the original nested if. Keep the readable form.
-                    #[allow(clippy::collapsible_match)]
-                    Some(Ok(Message::Text(text))) => {
-                        if incoming_tx.send(WsMsg::Text(text.to_string())).await.is_err() {
-                            break;
-                        }
-                    }
-                    #[allow(clippy::collapsible_match)]
-                    Some(Ok(Message::Binary(data))) => {
-                        if incoming_tx.send(WsMsg::Binary(data.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(Ok(Message::Close(_))) | None => {
-                        break;
-                    }
-                    // clippy::collapsible_match wants this folded into a match
-                    // guard (`Ping(data) if ws_sink.send(Pong(data)).await.is_err()`),
-                    // but that moves `data` into the guard → E0507 (can't move a
-                    // pattern binding out in a guard). Keep the explicit `if`.
-                    #[allow(clippy::collapsible_match)]
+            msg = ends.source.next() => {
+                let queued = match msg {
+                    Some(Ok(Message::Text(text))) => WsMsg::Text(text.to_string()),
+                    Some(Ok(Message::Binary(data))) => WsMsg::Binary(data.into()),
                     Some(Ok(Message::Ping(data))) => {
-                        if ws_sink.send(Message::Pong(data)).await.is_err() {
-                            break;
+                        if let Err(e) = ends.sink.send(Message::Pong(data)).await {
+                            tracing::debug!(target: "pyronova::server", error = %e, "WebSocket pong failed");
+                            return None;
                         }
+                        continue;
+                    }
+                    Some(Ok(Message::Pong(_) | Message::Frame(_))) => continue,
+                    Some(Ok(Message::Close(_))) | None => return None,
+                    Some(Err(tungstenite::Error::Capacity(e))) => {
+                        tracing::warn!(target: "pyronova::server", error = %e,
+                            max_message_bytes = limits.max_message_bytes,
+                            "WebSocket message over max_websocket_message_size; closing with 1009");
+                        return Some(CloseFrame { code: CloseCode::Size, reason: e.to_string().into() });
                     }
                     Some(Err(e)) => {
-                        tracing::warn!(target: "pyronova::server", error = %e, "PyronovaWebSocket read error");
-                        break;
+                        tracing::warn!(target: "pyronova::server", error = %e, "WebSocket read error");
+                        return None;
                     }
-                    _ => {} // Pong
+                };
+                if forward(&ends.incoming, &ends.incoming_budget, queued).await.is_break() {
+                    return None;
                 }
             }
-            // Python → Client (via outgoing_rx)
-            msg = outgoing_rx.recv() => {
-                match msg {
-                    Some(WsMsg::Text(text)) => {
-                        if ws_sink.send(Message::Text(text.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(WsMsg::Binary(data)) => {
-                        if ws_sink.send(Message::Binary(data.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    None => {
-                        break;
-                    }
+            queued = ends.outgoing.recv() => {
+                // The queue slot's budget is released once the message is on the wire.
+                let Queued { msg, _budget } = queued?;
+                if let Err(e) = ends.sink.send(msg.into_message()).await {
+                    tracing::debug!(target: "pyronova::server", error = %e, "WebSocket send failed");
+                    return None;
                 }
             }
         }
     }
+}
 
-    // Drop incoming_tx to unblock Python's ws.recv() → returns None
-    drop(incoming_tx);
+/// Queue a client message for Python. While the byte budget is spent this waits,
+/// which stops this select arm from reading the socket: flow control reaches the
+/// client through the TCP window.
+async fn forward(tx: &UnboundedSender<Queued>, budget: &ByteBudget, msg: WsMsg) -> ControlFlow<()> {
+    let Some(permit) = budget.reserve(msg.len()).await else {
+        return ControlFlow::Break(());
+    };
+    match tx.send(Queued {
+        msg,
+        _budget: permit,
+    }) {
+        Ok(()) => ControlFlow::Continue(()),
+        // The Python side is gone.
+        Err(_) => ControlFlow::Break(()),
+    }
+}
 
-    // Close PyronovaWebSocket
-    let _ = ws_sink.close().await;
+/// How long a closing connection waits for the peer to close its side.
+const CLOSE_LINGER: Duration = Duration::from_secs(2);
+/// Scratch buffer for discarding input while lingering.
+const LINGER_CHUNK_BYTES: usize = 8 * 1024;
 
-    // Wait for Python handler thread. `JoinHandle::join()` blocks, so
-    // calling it directly from this async fn would pin a Tokio worker
-    // thread until the Python handler finishes — a trivial DoS vector
-    // when a handler hangs. Dispatch to the blocking-thread pool so
-    // async workers stay free.
-    let _ = tokio::task::spawn_blocking(move || py_handle.join()).await;
+/// Close so the client reliably sees the close frame: send it, flush, shut down our
+/// write side, then read and discard until the peer closes (at most `CLOSE_LINGER`).
+/// Dropping a socket that still has unread input — such as the rest of a message just
+/// refused as too big — makes the kernel send RST, which can destroy the close frame
+/// before the client reads it.
+///
+/// Failures here mean the peer is already gone, the normal end of many connections,
+/// so they log at debug.
+async fn close_connection<S>(mut sink: WsSink<S>, source: WsSource<S>, frame: Option<CloseFrame>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    if let Some(frame) = frame {
+        if let Err(e) = sink.send(Message::Close(Some(frame))).await {
+            tracing::debug!(target: "pyronova::server", error = %e, "WebSocket close frame not sent");
+        }
+    }
+    if let Err(e) = sink.close().await {
+        tracing::debug!(target: "pyronova::server", error = %e, "WebSocket close failed");
+    }
+
+    let mut stream = match sink.reunite(source) {
+        Ok(stream) => stream,
+        Err(e) => {
+            tracing::debug!(target: "pyronova::server", error = %e, "WebSocket halves did not reunite");
+            return;
+        }
+    };
+    let io = stream.get_mut();
+    if let Err(e) = io.shutdown().await {
+        tracing::debug!(target: "pyronova::server", error = %e, "WebSocket write shutdown failed");
+    }
+    if tokio::time::timeout(CLOSE_LINGER, discard_until_eof(io))
+        .await
+        .is_err()
+    {
+        tracing::debug!(target: "pyronova::server", linger = ?CLOSE_LINGER,
+            "WebSocket peer did not close in time; dropping the connection");
+    }
+}
+
+async fn discard_until_eof<R: tokio::io::AsyncRead + Unpin>(io: &mut R) {
+    let mut scratch = [0u8; LINGER_CHUNK_BYTES];
+    loop {
+        // EOF or a read error both mean the peer has gone, which is what we wait for.
+        match io.read(&mut scratch).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
+}
+
+/// `JoinHandle::join()` blocks, so it runs on the blocking pool: a hung handler must
+/// not pin a Tokio worker thread.
+async fn join_handler_thread(handle: std::thread::JoinHandle<()>) {
+    match tokio::task::spawn_blocking(move || handle.join()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(payload)) => {
+            tracing::error!(target: "pyronova::server", panic = panic_message(&*payload),
+                "WebSocket handler thread panicked");
+        }
+        Err(e) => {
+            tracing::error!(target: "pyronova::server", error = %e,
+                "WebSocket handler thread join failed");
+        }
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("non-string panic payload")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limits_reject_out_of_range_values() {
+        let l = WsLimits::DEFAULT;
+        assert!(l.with_max_message_bytes(0).is_err());
+        assert!(l.with_max_message_bytes(-1).is_err());
+        assert!(l
+            .with_max_message_bytes(MAX_MESSAGE_BYTES_LIMIT as i64 + 1)
+            .is_err());
+        assert_eq!(
+            l.with_max_message_bytes(4096).unwrap().max_message_bytes,
+            4096
+        );
+        assert!(l.with_max_connections(0).is_err());
+        assert_eq!(l.with_max_connections(3).unwrap().max_connections, 3);
+    }
+
+    #[tokio::test]
+    async fn byte_budget_counts_bytes_not_messages() {
+        let budget = ByteBudget::new(1000);
+        let big = budget.try_reserve(900).expect("fits");
+        // 900 + 64 of 1064 used: a 100-byte message (164) no longer fits, a 0-byte one does.
+        assert!(budget.try_reserve(100).is_none());
+        let small = budget.try_reserve(0).expect("fits");
+        drop(big);
+        assert!(budget.try_reserve(900).is_some());
+        drop(small);
+    }
+
+    #[test]
+    fn a_max_size_message_always_fits_an_empty_budget() {
+        let budget = ByteBudget::new(1000);
+        assert!(budget.try_reserve(1000).is_some());
+    }
+
+    #[test]
+    fn connection_slots_are_bounded_and_released() {
+        // Other tests do not open WebSocket connections, so the counter starts at 0.
+        let first = ConnectionSlot::try_acquire(2).expect("slot 1");
+        let second = ConnectionSlot::try_acquire(2).expect("slot 2");
+        assert!(ConnectionSlot::try_acquire(2).is_none());
+        drop(first);
+        let third = ConnectionSlot::try_acquire(2).expect("released slot");
+        drop((second, third));
+    }
+
+    #[test]
+    fn typed_receive_keeps_the_other_kind_queued() {
+        let (tx, rx) = unbounded_channel();
+        let budget = ByteBudget::new(1000);
+        for msg in [WsMsg::Binary(vec![1, 2, 3]), WsMsg::Text("hi".into())] {
+            let permit = budget.try_reserve(msg.len()).unwrap();
+            tx.send(Queued {
+                msg,
+                _budget: permit,
+            })
+            .unwrap();
+        }
+        let mut inbox = Inbox { rx, held: None };
+        let mismatch = inbox.next_as("recv", WsMsg::into_text).err().unwrap();
+        assert_eq!((mismatch.got, mismatch.len), ("binary", 3));
+        assert_eq!(
+            inbox
+                .next_as("recv_bytes", WsMsg::into_binary)
+                .ok()
+                .flatten(),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(
+            inbox.next_as("recv", WsMsg::into_text).ok().flatten(),
+            Some("hi".to_string())
+        );
+        drop(tx);
+        assert!(inbox
+            .next_as("recv", WsMsg::into_text)
+            .ok()
+            .unwrap()
+            .is_none());
+    }
 }

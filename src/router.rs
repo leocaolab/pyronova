@@ -47,7 +47,7 @@ pub(crate) struct RouteTable {
     pub(crate) after_hook_names: Vec<String>,
     pub(crate) fallback_handler: Option<Py<PyAny>>,
     pub(crate) fallback_handler_name: Option<String>,
-    pub(crate) static_dirs: Vec<(String, String)>,
+    pub(crate) static_dirs: Vec<crate::static_fs::StaticMount>,
     pub(crate) cors_config: Option<CorsConfig>,
     pub(crate) request_logging: bool,
     /// Sample 1-in-N requests when access logging is enabled. `1` (the

@@ -150,6 +150,28 @@ impl PyronovaApp {
         }
     }
 
+    /// Largest WebSocket message (and frame), in bytes, in either direction. Default 1 MiB.
+    fn set_max_websocket_message_size(&self, py: Python<'_>, size: i64) -> PyResult<()> {
+        let wanted = crate::websocket::limits().with_max_message_bytes(size)?;
+        set_websocket_limits(py, wanted);
+        Ok(())
+    }
+
+    fn max_websocket_message_size(&self) -> u32 {
+        crate::websocket::limits().max_message_bytes
+    }
+
+    /// Concurrent WebSocket connections; an upgrade beyond it is answered 503. Default 1024.
+    fn set_max_websocket_connections(&self, py: Python<'_>, count: i64) -> PyResult<()> {
+        let wanted = crate::websocket::limits().with_max_connections(count)?;
+        set_websocket_limits(py, wanted);
+        Ok(())
+    }
+
+    fn max_websocket_connections(&self) -> usize {
+        crate::websocket::limits().max_connections
+    }
+
     /// Register a fast-path route — a response that never enters Python.
     ///
     /// For routes with a constant body (health checks, `/robots.txt`,
@@ -372,22 +394,9 @@ impl PyronovaApp {
     }
 
     fn static_dir(&mut self, prefix: &str, directory: &str) -> PyResult<()> {
-        let prefix = if prefix.ends_with('/') {
-            prefix.to_string()
-        } else {
-            format!("{prefix}/")
-        };
-        let dir = std::path::Path::new(directory)
-            .canonicalize()
-            .map_err(|e| {
-                pyo3::exceptions::PyValueError::new_err(format!(
-                    "static directory '{directory}' not found: {e}"
-                ))
-            })?
-            .to_string_lossy()
-            .to_string();
-        let mut routes = self.routes.write();
-        routes.static_dirs.push((prefix, dir));
+        let mount = crate::static_fs::StaticMount::new(prefix, directory)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.routes.write().static_dirs.push(mount);
         Ok(())
     }
 
@@ -714,6 +723,23 @@ async fn serve_connection<S>(
                 graceful_sent = true;
             }
         }
+    }
+}
+
+/// WebSocket limits are process-wide, like `set_max_body_size`: main sets them; a worker
+/// replaying the script only warns if its value differs (FR-17).
+fn set_websocket_limits(py: Python<'_>, wanted: crate::websocket::WsLimits) {
+    if crate::run_context::on_main(py) {
+        crate::websocket::set_limits(wanted);
+        return;
+    }
+    let current = crate::websocket::limits();
+    if wanted != current {
+        tracing::warn!(
+            target: "pyronova::server",
+            "WebSocket limits {wanted:?} set in a worker are ignored: they are process-wide, \
+             and the main interpreter set {current:?}"
+        );
     }
 }
 
