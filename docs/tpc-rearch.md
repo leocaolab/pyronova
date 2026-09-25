@@ -60,7 +60,7 @@ Every line of code listed below stops being used.
 | Admission | `submit_semaphore: Arc<tokio::sync::Semaphore>` — replaced by per-thread local `Cell<u32>` counter |
 | Zombie / cross-pool theft | Pool-id stamping (`_pyronova_pool_id`), cross-pool guards in `_pyronova_recv` / `_pyronova_send`, zombie timeout watchdog — physically impossible in TPC because work cannot leave its thread |
 | tstate rebinding | `rebind_tstate_to_current_thread` — stays put forever, no rebind needed |
-| Dual pool | Separate sync + async worker pools (`async_work_txs`, async engine script injection) — an `async def` handler becomes a normal `LocalSet::spawn_local` call inside the sub-interp's current-thread runtime |
+| Dual pool | Separate sync + async worker pools (`async_work_txs`, async engine script injection) — an `async def` handler becomes a normal `LocalSet::spawn_local` call inside the sub-interp's current-thread runtime. *Not done: TPC keeps the async pool for `async def` routes (decision Q1, see Line 3).* |
 
 Estimated line count to delete: ~2,000 lines (primarily `src/interp.rs`).
 
@@ -76,7 +76,7 @@ Estimated line count to delete: ~2,000 lines (primarily `src/interp.rs`).
 
 - `PyronovaApp::run_subinterp` / `run_gil`: completely rewritten around per-core thread spawn instead of one multi_thread tokio runtime with shared worker pool.
 - `handle_request_subinterp` in `handlers.rs`: instead of `pool.submit(work)` + cross-thread channel + worker dequeues, it becomes a direct call into the current thread's sub-interpreter via the existing `_pyronova_recv` / `_pyronova_send` FFI (now in-thread instead of cross-thread). The FFI contract stays; the caller and callee just run on the same thread.
-- Async handlers (`async def`): today they run on a separate "async pool" with a tokio-on-sub-interp bridge. In TPC they run as `spawn_local` tasks on the same per-thread tokio runtime that's running the accept loop, sharing the same sub-interp. Much simpler — LocalSet handles the single-thread scheduling naturally.
+- Async handlers (`async def`): today they run on a separate "async pool" with a tokio-on-sub-interp bridge. In TPC they run as `spawn_local` tasks on the same per-thread tokio runtime that's running the accept loop, sharing the same sub-interp. Much simpler — LocalSet handles the single-thread scheduling naturally. *Superseded (decision Q1): the TPC server sends `async def` routes to the async worker pool; see Line 3.*
 - Graceful shutdown: one `CancellationToken`, but fanned to N threads instead of one runtime. Each thread drains its own accept loop + in-flight handlers, then joins.
 
 ## Phase plan
@@ -191,7 +191,9 @@ match resp {
 }
 ```
 
-**Inline sub-interp handlers are the exception (decided 2026-09-25).** A `def` route served inline on the TPC thread runs the Python call on the current_thread runtime's only thread, so no timer can fire until the call returns — `tokio::time::timeout` cannot preempt it. The implemented behaviour: when the call returns past `REQUEST_BUDGET`, the response is a 504, counted in `DROPPED_REQUESTS`, with an error log naming the handler; the client still waits for the handler. Preemption was rejected: `PyThreadState_SetAsyncExc` can land inside C extensions or `finally` blocks, and moving the call off-thread costs a cross-thread wake on every request. Slow handlers belong on `async def` or `gil=True`, where the timeout is enforced on time.
+**Inline sync handlers are the exception (decided 2026-09-25).** Only a sync `def` route runs inline on the TPC thread: the Python call runs on the current_thread runtime's only thread, so no timer can fire until the call returns — `tokio::time::timeout` cannot preempt it. The implemented behaviour: when the call returns past `REQUEST_BUDGET`, the response is a 504, counted in `DROPPED_REQUESTS`, with an error log naming the handler; the client still waits for the handler. Preemption was rejected: `PyThreadState_SetAsyncExc` can land inside C extensions or `finally` blocks, and moving the call off-thread costs a cross-thread wake on every request.
+
+**`async def` routes run on the async worker pool, not inline (decision Q1, 2026-09-25).** Earlier the TPC thread drove an `async def` handler on its worker's own loop and blocked for the coroutine's whole run, so its awaits overlapped nothing and its timeout was as late as a sync handler's. Now, when the table has `async def` routes, the TPC server also builds the dual-engine async pool (`split` of zero sync workers and N async-engine workers: one per TPC thread when there are no sync worker routes, half of them otherwise) and a TPC thread sends each `async def` request there, awaiting the reply under `REQUEST_BUDGET` on its own loop. Cost per `async def` request: one crossbeam send, one oneshot wake back to the TPC thread, and two `Arc<str>` plus the query `String`; the sync inline path is unchanged (the dispatch already matched on the route's call, now also on its handler kind). So the on-time 504 applies to `async def` and `gil=True` routes; only a sync `def` on TPC cannot be preempted. Slow work belongs on `async def` or `gil=True`.
 
 ## gil=True / blocking=True bridge — concrete design
 

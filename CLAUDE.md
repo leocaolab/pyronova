@@ -80,9 +80,10 @@ bash benchmarks/run_bench.sh
 - Logging: Rust `tracing` with `EnvFilter` (zero-cost OFF), three targets (`pyronova::server`, `pyronova::access`, `pyronova::app`), Python logging routed to Rust via `pyronova.engine.emit_python_log` in every interpreter
 - mimalloc global allocator for high-concurrency allocation performance
 - 30s zombie request timeout in sub-interpreter mode (504 Gateway Timeout)
-- Graceful shutdown via `signal::ctrl_c()` or `PyronovaApp.shutdown()` (a per-run `CancellationToken`, `app::until_stopped`); `TestClient.close()` uses the latter
+- One server = one `Server` from `PyronovaApp.start()` (binds; `serve()` runs it; `run()` = both): graceful shutdown via `signal::ctrl_c()` or that server's `shutdown()` (its own `CancellationToken`, `app::until_stopped`), so several servers of one app (nested `TestClient`s) stop independently; `Pyronova._stop()` stops all of the app's servers
+- Topology: `config::Topology` is resolved once per start from `(Mode, EnvConfig, sizes)` and drives accept loops, GC support and which server runs; on TPC, `def` routes run inline, `async def` routes on the async worker pool (on-time 504), `gil=True` on the main bridge
 - Config parsed once at the edge: `config::EnvConfig` reads every engine env var in `run()` and a bad value (or a `mode` typo) is a startup error; limits (`max_body_size`, WebSocket caps) are per app in `SiteConfig`
-- Listeners: `ListenerSpec::set` (port + extra TLS ports) is bound by `BoundListeners::bind` before any thread or worker starts, on every run path; a port in use is `OSError(EADDRINUSE)` from `run()`, and `bound_port()` reports the bound port (TestClient binds port 0)
+- Listeners: `ListenerSpec::set` (port + extra TLS ports) is bound by `BoundListeners::bind` before any thread or worker starts, on every run path, after a probe bind without `SO_REUSEPORT`; a port in use (also by another server's reuseport set) is `OSError(EADDRINUSE)` from `start()`, and `Server.port` reports the bound port (TestClient binds port 0)
 
 ## Project Structure
 
