@@ -98,3 +98,14 @@ Implementers run Rust checks only (`fmt`, `clippy` for default / `bench` / `faul
 ## Plan
 
 One fix wave, then a single full-suite run (human decision): these findings + R-b (Q1, R2, R5, reconcile §2/§4 leftovers) + M7 + M9 + §7 (no fixed test ports) + the macOS `cargo test` link failure after R-a. Grouped by file ownership so parallel implementers do not collide; implementers run only targeted tests, serialized; the supervisor runs the full suite once at the end.
+
+## Approved existing-test edits for W5 (human, 2026-09-25)
+
+1. `tests/test_stream_backpressure.py::test_feeder_uses_bounded_async_channel` — delete (source grep; behaviour covered by `test_streaming_handler_receives_all_chunks` and `test_final_w2`'s F4/G2 test).
+2. `tests/test_layer2_m4.py` `_ENGINE_NAMES` — drop `"_forgotten_workers"`.
+3. `tests/test_review_ra.py::test_async_engine_death_at_run_time_is_reported_as_such` — delete (superseded by `test_final_w3`'s engine-death tests; `SystemExit` in a handler is now a 500).
+4. `tests/test_worker_no_leaked_refs.py` — assert on the fork's "a Py<T> was dropped on a thread that has no Python thread state" text instead of the deleted `PyObjRef` log line.
+5. `tests/test_attach_allowlist.py`, `tests/test_assume_attached_allowlist.py` — reason strings name `with_gil` / `with_current_tstate`.
+6. Docstrings mentioning `interp.rs` / `PyObjRef` in `tests/test_subinterp_memory_regression.py`, `tests/test_capi_hygiene.py`.
+
+Also from the wave-A reports (edits to tests added in this effort): `test_review_m5.py:378,381` (`bound_port()` removed → `c._server.port`, port refused after close); `test_review_ra.py` logging/readiness tests (`LogLevel`, `ReadinessCheck.of`); `test_review_m1d.py` logging bridge call; `test_layer2_m3.py:304` `/mcp` POST needs `Content-Type: application/json`; `test_review_m1a.py:396`, `test_review_m8.py:201` route records (`r.method`, `r.path`); stale comment `test_review_ra.py:318`.
