@@ -18,9 +18,7 @@ use super::pipeline::{
     await_reply, collect_body, fail, finish, preprocess, task_lost, Prepared, Preprocessed,
     RequestLine, Served,
 };
-use super::{
-    build_main_http_response, call_handler_with_hooks, max_body_size, stream_body_feeder, BoxBody,
-};
+use super::{build_main_http_response, call_handler_with_hooks, stream_body_feeder, BoxBody};
 
 pub(crate) async fn handle_request(
     req: Request<Incoming>,
@@ -66,7 +64,8 @@ pub(crate) async fn run_on_main(
         path: &path,
     };
 
-    let resp = match main_request(prepared, &method, &path, body, client_ip_addr).await {
+    let max_body = site.config.limits.max_body_bytes;
+    let resp = match main_request(prepared, &method, &path, body, client_ip_addr, max_body).await {
         Ok(sky_req) => {
             let site_ref = Arc::clone(site);
             let task = tokio::task::spawn_blocking(move || {
@@ -90,16 +89,17 @@ async fn main_request(
     path: &Arc<str>,
     body: RequestBody,
     client_ip_addr: std::net::IpAddr,
+    max_body: usize,
 ) -> Result<PyronovaRequest, HandlerError> {
     let query = prepared.query().to_owned();
     let (body_bytes, body_stream_rx) = match body {
         RequestBody::Streamed => {
             let (tx, rx) = tokio::sync::mpsc::channel(crate::python::body_stream::CHANNEL_CAPACITY);
-            tokio::spawn(stream_body_feeder(prepared.body, tx, max_body_size()));
+            tokio::spawn(stream_body_feeder(prepared.body, tx, max_body));
             (Bytes::new(), Arc::new(std::sync::Mutex::new(Some(rx))))
         }
         RequestBody::Buffered => (
-            collect_body(prepared.body, max_body_size()).await?,
+            collect_body(prepared.body, max_body).await?,
             crate::python::body_stream::empty_body_stream_rx(),
         ),
     };

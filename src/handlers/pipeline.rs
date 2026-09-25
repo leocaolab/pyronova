@@ -230,7 +230,7 @@ async fn grpc_get_sum(
     site: &Site,
 ) -> Result<Response<BoxBody>, hyper::Error> {
     let start = Instant::now();
-    let resp = crate::grpc::handle_get_sum(req).await?;
+    let resp = crate::grpc::handle_get_sum(req, site.config.limits.max_body_bytes).await?;
     let line = RequestLine {
         method: "POST",
         path: crate::grpc::GET_SUM_PATH,

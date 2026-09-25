@@ -56,6 +56,24 @@ impl AsyncWrite for MaybeTlsStream {
             MaybeTlsProj::Tls { inner } => inner.poll_write(cx, buf),
         }
     }
+    /// Forwarded so hyper's vectored writes (response head + body in one `writev`) reach
+    /// the socket as one syscall; the trait default would write only the first buffer.
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.project() {
+            MaybeTlsProj::Plain { inner } => inner.poll_write_vectored(cx, bufs),
+            MaybeTlsProj::Tls { inner } => inner.poll_write_vectored(cx, bufs),
+        }
+    }
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            MaybeTlsStream::Plain { inner } => inner.is_write_vectored(),
+            MaybeTlsStream::Tls { inner } => inner.is_write_vectored(),
+        }
+    }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.project() {
             MaybeTlsProj::Plain { inner } => inner.poll_flush(cx),
@@ -170,13 +188,13 @@ pub(crate) fn build_acceptor(
 
 /// Perform the TLS handshake and wrap the result in `MaybeTlsStream::Tls`.
 ///
-/// Bounded by a hard 10 s handshake timeout — defense against TLS
+/// Bounded by [`HANDSHAKE_TIMEOUT`] — defense against TLS
 /// Slowloris attacks where a peer opens a TCP connection then dribbles
 /// ClientHello bytes one per 30 s, pinning a file descriptor and an
 /// async task indefinitely. With 65k half-open connections a single
 /// laptop can exhaust the server's fd budget without ever finishing
 /// a handshake; the timeout closes the loop.
-pub(crate) async fn wrap_tls(
+async fn wrap_tls(
     acceptor: &TlsAcceptor,
     stream: TcpStream,
 ) -> Result<MaybeTlsStream, HandshakeError> {
@@ -187,13 +205,50 @@ pub(crate) async fn wrap_tls(
     }
 }
 
-pub(crate) fn wrap_plain(stream: TcpStream) -> MaybeTlsStream {
-    MaybeTlsStream::Plain { inner: stream }
+/// An accepted connection as the stream to serve: TLS-handshaken when its listener has
+/// an acceptor, plain otherwise. A failed handshake is logged here and gives `None` (the
+/// connection is dropped).
+pub(crate) async fn wrap(stream: TcpStream, tls: Option<&TlsAcceptor>) -> Option<MaybeTlsStream> {
+    match tls {
+        None => Some(MaybeTlsStream::Plain { inner: stream }),
+        Some(acceptor) => match wrap_tls(acceptor, stream).await {
+            Ok(stream) => Some(stream),
+            Err(e) => {
+                tracing::warn!(target: "pyronova::server", error = %e, "TLS handshake failed");
+                None
+            }
+        },
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_plain_stream_keeps_the_sockets_vectored_writes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let mut client = client.unwrap();
+        let mut stream = wrap(accepted.unwrap().0, None)
+            .await
+            .expect("plain needs no handshake");
+        assert!(stream.is_write_vectored());
+
+        // Both buffers go out through the forwarded `poll_write_vectored`.
+        let bufs = [
+            std::io::IoSlice::new(b"head "),
+            std::io::IoSlice::new(b"body"),
+        ];
+        let written = stream.write_vectored(&bufs).await.unwrap();
+        assert_eq!(written, 9);
+        let mut got = [0u8; 9];
+        client.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"head body");
+    }
 
     #[test]
     fn a_missing_cert_is_a_typed_open_error_naming_the_file() {

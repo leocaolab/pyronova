@@ -6,6 +6,7 @@ mod app;
 mod bench;
 mod bridge;
 mod compression;
+mod config;
 mod db;
 mod grpc;
 mod handlers;
@@ -66,6 +67,7 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // it explicitly (Layer 2, C4).
     run_context::capture_main(m.py());
     m.add_class::<app::PyronovaApp>()?;
+    m.add_class::<config::Mode>()?;
     m.add_class::<types::PyronovaRequest>()?;
     m.add_class::<types::PyronovaResponse>()?;
     m.add_class::<types::PyronovaHeaders>()?;
@@ -79,6 +81,7 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(monitor::reset_peaks, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(logging::init_logger, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(logging::emit_python_log, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(logging::_python_log_level, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(workrequest_counts, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(_in_worker, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(_forgotten_workers, m)?)?;

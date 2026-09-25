@@ -22,6 +22,7 @@ High-performance Python web framework powered by Rust. Per-Interpreter GIL (PEP 
   - `logging.rs` — `init_logger` (tracing-subscriber), `emit_python_log` (Python→Rust bridge)
   - `monitor.rs` — GIL watchdog, memory RSS, atomic counters
   - `state.rs` — `SharedState` backed by `Arc<DashMap>`
+  - `config.rs` — `Mode` and `EnvConfig`: the engine's env vars, parsed once in `run()`
 - **Python interface** (`python/pyronova/`):
   - `engine` (Rust): `PyronovaApp`, `Request`, `Response`, `WebSocket`, `SharedState`, `Stream`
   - `app.py`: `Pyronova` class — decorators, CORS, logging, Pydantic model=, env var config, hot reload, dual pool auto-detection
@@ -80,6 +81,8 @@ bash benchmarks/run_bench.sh
 - mimalloc global allocator for high-concurrency allocation performance
 - 30s zombie request timeout in sub-interpreter mode (504 Gateway Timeout)
 - Graceful shutdown via `signal::ctrl_c()` or `PyronovaApp.shutdown()` (a per-run `CancellationToken`, `app::until_stopped`); `TestClient.close()` uses the latter
+- Config parsed once at the edge: `config::EnvConfig` reads every engine env var in `run()` and a bad value (or a `mode` typo) is a startup error; limits (`max_body_size`, WebSocket caps) are per app in `SiteConfig`
+- Listeners: `ListenerSpec::set` (port + extra TLS ports) is bound by `BoundListeners::bind` before any thread or worker starts, on every run path; a port in use is `OSError(EADDRINUSE)` from `run()`, and `bound_port()` reports the bound port (TestClient binds port 0)
 
 ## Project Structure
 
@@ -101,6 +104,7 @@ src/
   stream.rs           # Stream SSE
   monitor.rs          # GIL watchdog, memory RSS, atomic counters
   state.rs            # SharedState (DashMap)
+  config.rs           # Mode + EnvConfig: every engine env var, parsed once in run()
 python/pyronova/
   __init__.py         # Re-exports all public APIs
   app.py              # Pyronova class (decorators, CORS, logging, config)

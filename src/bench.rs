@@ -27,9 +27,13 @@ use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::task::{JoinHandle, LocalSet};
 use tokio_util::sync::CancellationToken;
 
+use crate::config::GcConfig;
+use crate::handlers::error::panic_message;
 use crate::python::interp::SubInterpreterWorker;
-use crate::site::{SharedSite, Site};
-use crate::tpc::{elevate_thread_qos_macos, tpc_accept_loop_inline, try_pin_current, GcMode};
+use crate::server::listener::{BoundListeners, ListenerSpec};
+use crate::site::SharedSite;
+use crate::tpc::{elevate_thread_qos_macos, tpc_accept_loop_inline, try_pin_current};
+use crate::worker::{TpcContext, Upgrades};
 
 /// The request every client connection sends, pipelined [`PIPELINE_DEPTH`] deep.
 const BENCH_REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: bench\r\nConnection: keep-alive\r\n\r\n";
@@ -63,8 +67,6 @@ pub(crate) enum BenchError {
     },
     #[error("bind a loopback port: {0}")]
     Bind(#[source] crate::server::listener::ListenerError),
-    #[error("read the bound loopback port: {0}")]
-    LocalAddr(#[source] io::Error),
     #[error("the bench failed: {}", join_failures(.0))]
     Failed(Vec<Failure>),
 }
@@ -91,6 +93,8 @@ pub(crate) enum Failure {
     },
     #[error("client connection {conn} panicked: {payload}")]
     ClientPanicked { conn: usize, payload: String },
+    #[error(transparent)]
+    Serve(crate::tpc::ServeError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -145,21 +149,13 @@ pub(crate) fn run_inmem_bench(
     let counter = Arc::new(AtomicU64::new(0));
 
     let mut threads = Threads::new();
-    let lent: Vec<(SubInterpreterWorker, &'static Site)> = workers
+    let handoffs = workers
         .into_iter()
-        // SAFETY: each reference goes only into the closure `spawn_workers` runs on a
-        // thread of `threads`.
-        .map(|(worker, site)| (worker, unsafe { threads.lend(site) }))
+        .map(|(worker, site)| (worker, site, ()))
         .collect();
     let serve_counter = Arc::clone(&counter);
-    spawn_workers(&mut threads, "inmem", lent, move |worker, site, stop| {
-        serve_inmem(
-            worker,
-            site,
-            conns_per_worker,
-            Arc::clone(&serve_counter),
-            stop,
-        )
+    spawn_workers(&mut threads, "inmem", handoffs, move |context, (), stop| {
+        serve_inmem(context, conns_per_worker, Arc::clone(&serve_counter), stop)
     })?;
 
     let measured = measure(&counter, duration);
@@ -175,9 +171,16 @@ pub(crate) fn run_loopback_bench(
     duration: Duration,
     workers: Vec<SubInterpreterWorker>,
     site: SharedSite,
-    gc_mode: GcMode,
+    gc: GcConfig,
 ) -> Result<(Measured, u16), BenchError> {
-    let addr = free_loopback_addr()?;
+    // One SO_REUSEPORT socket per worker on one ephemeral port, all bound before any
+    // server thread starts.
+    let spec = ListenerSpec {
+        addr: (Ipv4Addr::LOCALHOST, 0).into(),
+        tls: None,
+    };
+    let listeners = BoundListeners::bind(&[spec], workers.len()).map_err(BenchError::Bind)?;
+    let addr = listeners.bound[0].addr;
     println!(
         "\n  Pyronova v{} [loopback bench] — {} workers, {client_conns} client conns, port {}, {}s",
         env!("CARGO_PKG_VERSION"),
@@ -189,30 +192,19 @@ pub(crate) fn run_loopback_bench(
 
     // Declared before `clients`, so on an early return the clients stop first.
     let mut servers = Threads::new();
-    // SAFETY: the reference goes only into the closure `spawn_workers` runs on threads of
-    // `servers`.
-    let site_ref = unsafe { servers.lend(Arc::clone(&site)) };
-    let workers = workers.into_iter().map(|w| (w, site_ref)).collect();
+    let handoffs = workers
+        .into_iter()
+        .zip(listeners.groups)
+        .map(|(worker, group)| (worker, Arc::clone(&site), group))
+        .collect();
     spawn_workers(
         &mut servers,
         "lb-srv",
-        workers,
-        move |worker, site_ref, stop| {
-            let site = Arc::clone(&site);
-            async move {
-                tpc_accept_loop_inline(
-                    addr,
-                    vec![],
-                    worker,
-                    site_ref,
-                    site,
-                    stop,
-                    None,
-                    None,
-                    gc_mode,
-                )
-                .await;
-                Vec::new()
+        handoffs,
+        move |context, group, stop| async move {
+            match tpc_accept_loop_inline(group, context, stop, gc).await {
+                Ok(()) => Vec::new(),
+                Err(e) => vec![Failure::Serve(e)],
             }
         },
     )?;
@@ -252,18 +244,10 @@ fn measure(counter: &AtomicU64, duration: Duration) -> Measured {
     }
 }
 
-fn free_loopback_addr() -> Result<SocketAddr, BenchError> {
-    // Bound with SO_REUSEPORT and dropped: the server threads then bind the same port.
-    let probe = crate::server::listener::create_reuseport_listener((Ipv4Addr::LOCALHOST, 0).into())
-        .map_err(BenchError::Bind)?;
-    probe.local_addr().map_err(BenchError::LocalAddr)
-}
-
 /// One worker's LocalSet: `conns` server connections, each with its client task. Ends
 /// when every client has stopped; the server side is dropped with the LocalSet.
 async fn serve_inmem(
-    worker: Rc<RefCell<SubInterpreterWorker>>,
-    site: &'static Site,
+    context: Rc<TpcContext>,
     conns: usize,
     counter: Arc<AtomicU64>,
     stop: CancellationToken,
@@ -276,11 +260,9 @@ async fn serve_inmem(
             tokio::task::spawn_local(crate::worker::drive_conn(
                 server_io,
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
-                Rc::clone(&worker),
-                site,
-                None,
+                Rc::clone(&context),
+                Upgrades::Off,
                 server_stop.clone(),
-                None,
             ));
             let (counter, stop) = (Arc::clone(&counter), stop.clone());
             tokio::task::spawn_local(async move { drive_client(client_io, &counter, &stop).await })
@@ -428,12 +410,10 @@ async fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
 // ---------------------------------------------------------------------------
 
 /// A group of bench threads sharing one stop token. Finishing or dropping the group stops
-/// and joins every thread, and only then releases what was lent to them.
+/// and joins every thread.
 struct Threads {
     stop: CancellationToken,
     running: Vec<(String, std::thread::JoinHandle<Vec<Failure>>)>,
-    /// Dropped after `Drop for Threads` has joined `running`.
-    lent: Vec<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl Threads {
@@ -441,23 +421,7 @@ impl Threads {
         Threads {
             stop: CancellationToken::new(),
             running: Vec::new(),
-            lent: Vec::new(),
         }
-    }
-
-    /// `value` as a `&'static T`: the group keeps it alive until every thread is joined.
-    /// The TPC connection driver takes the site this way, so the per-request path does no
-    /// refcount op (as in production TPC).
-    ///
-    /// # Safety
-    /// The reference must only be moved into closures run by this group's threads: it is
-    /// valid until the group is finished or dropped.
-    unsafe fn lend<T: Send + Sync + 'static>(&mut self, value: Arc<T>) -> &'static T {
-        let lent: *const T = Arc::as_ptr(&value);
-        self.lent.push(value);
-        // SAFETY: `self.lent` holds the allocation until after every thread of this group
-        // is joined; the caller keeps the reference inside those threads.
-        unsafe { &*lent }
     }
 
     fn spawn(
@@ -491,7 +455,7 @@ impl Threads {
                 Ok(failures) => failures,
                 Err(panic) => vec![Failure::Panicked {
                     thread,
-                    payload: panic_text(panic.as_ref()),
+                    payload: panic_message(panic.as_ref()),
                 }],
             })
             .collect()
@@ -508,28 +472,21 @@ impl Drop for Threads {
     }
 }
 
-fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
-    panic
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
-        .unwrap_or_else(|| "a non-string panic payload".to_string())
-}
-
-/// One pinned thread per worker: the worker's interpreter is rebound to that thread,
-/// `serve` runs on its current-thread runtime + LocalSet, then the interpreter is ended
-/// there. A worker is handed over only after its thread exists, so when a spawn fails,
-/// every worker not yet handed over (the one meant for that thread included) is ended
-/// here, on the thread that built them.
+/// One pinned thread per `(worker, site, payload)`: the worker's interpreter is rebound to
+/// that thread and wrapped in its [`TpcContext`] (as in production TPC), `serve` runs on
+/// its current-thread runtime + LocalSet, then the interpreter is ended there. A worker
+/// is handed over only after its thread exists, so when a spawn fails, every worker not
+/// yet handed over (the one meant for that thread included) is ended here, on the thread
+/// that built them.
 fn spawn_workers<T, F, Fut>(
     threads: &mut Threads,
     name: &str,
-    workers: Vec<(SubInterpreterWorker, T)>,
+    workers: Vec<(SubInterpreterWorker, SharedSite, T)>,
     serve: F,
 ) -> Result<(), BenchError>
 where
     T: Send + 'static,
-    F: Fn(Rc<RefCell<SubInterpreterWorker>>, T, CancellationToken) -> Fut + Clone + Send + 'static,
+    F: Fn(Rc<TpcContext>, T, CancellationToken) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Vec<Failure>> + 'static,
 {
     // No core list (unsupported platform) means no pinning.
@@ -545,14 +502,16 @@ where
             try_pin_current(core);
             elevate_thread_qos_macos();
             match rx.recv() {
-                Ok((worker, payload)) => serve_worker(name, worker, |w| serve(w, payload, stop)),
+                Ok((worker, site, payload)) => {
+                    serve_worker(name, worker, site, |context| serve(context, payload, stop))
+                }
                 Err(_) => vec![Failure::NoWorker { thread: name }],
             }
         });
         if let Err(e) = spawned {
             let unserved = std::iter::once(handoff)
                 .chain(pending.map(|(_, h)| h))
-                .map(|(w, _)| w);
+                .map(|(w, _, _)| w);
             // SAFETY: on the thread that built the workers, inside `py.detach` (no thread
             // state current); none of these was rebound.
             unsafe { SubInterpreterWorker::end_all(unserved) };
@@ -571,23 +530,28 @@ where
 fn serve_worker<Fut: Future<Output = Vec<Failure>>>(
     thread: String,
     mut worker: SubInterpreterWorker,
-    serve: impl FnOnce(Rc<RefCell<SubInterpreterWorker>>) -> Fut,
+    site: SharedSite,
+    serve: impl FnOnce(Rc<TpcContext>) -> Fut,
 ) -> Vec<Failure> {
     // SAFETY: this thread now owns the worker, which no other thread has bound.
     worker.tstate =
         unsafe { crate::python::interp::rebind_tstate_to_current_thread(worker.tstate) };
-    let worker = Rc::new(RefCell::new(worker));
+    let context = Rc::new(TpcContext {
+        worker: RefCell::new(worker),
+        site,
+        bridge: None,
+    });
     let failures = match RuntimeBuilder::new_current_thread().enable_all().build() {
         Ok(rt) => {
             let local = LocalSet::new();
-            let failures = local.block_on(&rt, serve(Rc::clone(&worker)));
-            // Its tasks hold the other `Rc`s to the worker.
+            let failures = local.block_on(&rt, serve(Rc::clone(&context)));
+            // Its tasks hold the other `Rc`s to the context.
             drop(local);
             failures
         }
         Err(source) => vec![Failure::Runtime { thread, source }],
     };
-    SubInterpreterWorker::end_shared(worker);
+    TpcContext::end(context);
     failures
 }
 
@@ -671,27 +635,6 @@ mod tests {
             join_failures(&failures),
             "client connection 3: the server closed the connection"
         );
-    }
-
-    #[test]
-    fn a_lent_value_is_released_after_its_threads_are_joined() {
-        // A stand-in for the site: `Site` holds Python handlers, which a Rust unit test
-        // cannot link against.
-        let value = Arc::new(AtomicU64::new(0));
-        let mut threads = Threads::new();
-        // SAFETY: the reference only goes into the thread below.
-        let lent = unsafe { threads.lend(Arc::clone(&value)) };
-        threads
-            .spawn("reader".into(), move |stop| {
-                while !stop.is_cancelled() {
-                    lent.fetch_add(1, Ordering::Relaxed);
-                }
-                Vec::new()
-            })
-            .unwrap();
-        assert_eq!(Arc::strong_count(&value), 2);
-        drop(threads); // the early-return path: no `finish`
-        assert_eq!(Arc::strong_count(&value), 1);
     }
 
     #[tokio::test]

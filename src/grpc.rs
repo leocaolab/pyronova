@@ -119,10 +119,12 @@ pub(crate) fn is_get_sum_call(req: &Request<Incoming>) -> bool {
             .is_some_and(|ct| ct.starts_with("application/grpc"))
 }
 
+/// Answers the benchmark method; `limit` is the app's `max_body_size`.
 pub(crate) async fn handle_get_sum(
     req: Request<Incoming>,
+    limit: usize,
 ) -> Result<Response<BoxBody>, hyper::Error> {
-    let reply = read_message(req.into_body())
+    let reply = read_message(req.into_body(), limit)
         .await
         .and_then(|message| get_sum(&message));
     Ok(match reply {
@@ -131,10 +133,9 @@ pub(crate) async fn handle_get_sum(
     })
 }
 
-/// Collect the body under the server's size cap (a multi-GB body behind an
+/// Collect the body under the app's size cap (a multi-GB body behind an
 /// `application/grpc` content-type must not OOM the process) and unframe it.
-async fn read_message(body: Incoming) -> Result<Bytes, GrpcError> {
-    let limit = crate::handlers::max_body_size();
+async fn read_message(body: Incoming, limit: usize) -> Result<Bytes, GrpcError> {
     let collected = Limited::new(body, limit)
         .collect()
         .await

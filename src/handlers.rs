@@ -30,22 +30,6 @@ pub(crate) use gil::handle_request;
 pub(crate) use subinterp::handle_request_subinterp;
 pub(crate) use tpc::handle_request_tpc_inline;
 
-/// Default max request body size (10 MB). Configurable via `app.max_body_size`.
-const DEFAULT_MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
-
-/// Global max body size — set once at startup, read on every request (lock-free).
-static MAX_BODY_SIZE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_BODY_SIZE);
-
-pub(crate) fn set_max_body_size(size: usize) {
-    MAX_BODY_SIZE.store(size, std::sync::atomic::Ordering::Relaxed);
-}
-
-#[inline]
-pub(crate) fn max_body_size() -> usize {
-    MAX_BODY_SIZE.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// What a main-interpreter handler answered: a buffered response, or a stream (SSE).
 pub(crate) enum MainReply {
     Response(ResponseData),

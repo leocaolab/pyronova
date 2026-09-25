@@ -133,6 +133,8 @@ type FmtLayer = Box<dyn Layer<Filtered> + Send + Sync>;
 /// The guard MUST outlive the writer — if dropped, the background I/O thread stops and
 /// every subsequent log line is lost — so both live here for the life of the process.
 struct Installed {
+    /// The level the filter currently applies; workers gate their Python logging on it.
+    level: LevelFilter,
     filter: reload::Handle<EnvFilter, Registry>,
     fmt: reload::Handle<FmtLayer, Filtered>,
     writer: tracing_appender::non_blocking::NonBlocking,
@@ -163,6 +165,7 @@ fn install(config: &LoggerConfig) -> Result<Installed, LoggerError> {
         .with(format_layer)
         .try_init()?;
     Ok(Installed {
+        level: config.level,
         filter,
         fmt,
         writer,
@@ -170,17 +173,18 @@ fn install(config: &LoggerConfig) -> Result<Installed, LoggerError> {
     })
 }
 
-fn reconfigure(installed: &Installed, config: &LoggerConfig) -> Result<(), LoggerError> {
+fn reconfigure(installed: &mut Installed, config: &LoggerConfig) -> Result<(), LoggerError> {
     installed.filter.reload(config.filter()?)?;
     installed
         .fmt
         .reload(fmt_layer(config.format, installed.writer.clone()))?;
+    installed.level = config.level;
     Ok(())
 }
 
 fn apply(config: &LoggerConfig) -> Result<(), LoggerError> {
     let mut slot = LOGGER.lock();
-    match slot.as_ref() {
+    match slot.as_mut() {
         Some(installed) => reconfigure(installed, config),
         None => {
             *slot = Some(install(config)?);
@@ -217,6 +221,23 @@ pub fn init_logger(level: &str, access_log: bool, format: &str) -> PyResult<()> 
     Ok(())
 }
 
+/// The Python `logging` level matching the level `init_logger` applied, or `None` before
+/// any `init_logger`. A worker's bootstrap sets its root logger to it, so records below
+/// the threshold are dropped before formatting or crossing into Rust. One source for the
+/// level: what the main interpreter parsed, never re-read from the environment.
+#[pyfunction]
+pub fn _python_log_level() -> Option<i64> {
+    let level = LOGGER.lock().as_ref()?.level;
+    Some(match level {
+        LevelFilter::OFF => py_level::CRITICAL + 10,
+        LevelFilter::ERROR => py_level::ERROR,
+        LevelFilter::WARN => py_level::WARNING,
+        LevelFilter::INFO => py_level::INFO,
+        // Python has no TRACE: DEBUG records are the finest it emits.
+        _ => py_level::DEBUG,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Python → Rust log bridge
 // ---------------------------------------------------------------------------
@@ -227,6 +248,7 @@ mod py_level {
     pub const INFO: i64 = 20;
     pub const WARNING: i64 = 30;
     pub const ERROR: i64 = 40;
+    pub const CRITICAL: i64 = 50;
 }
 
 /// The tracing level a Python record lands on. Python levels are an open integer

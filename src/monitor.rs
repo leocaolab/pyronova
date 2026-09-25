@@ -63,10 +63,9 @@ pub static TOTAL_REQUESTS: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::
 /// dashboards flip PYRONOVA_METRICS=1 and pay the ~30ns/req back.
 static METRICS_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Initialize the metrics kill-switch. Called once at app.run() startup.
-/// Idempotent.
-pub fn init_metrics_flag() {
-    let on = std::env::var("PYRONOVA_METRICS").unwrap_or_default() == "1";
+/// Set the metrics kill-switch (`PYRONOVA_METRICS`, parsed by `config::EnvConfig`).
+/// Called at every `run()` startup. Idempotent.
+pub fn init_metrics_flag(on: bool) {
     METRICS_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 

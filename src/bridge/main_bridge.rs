@@ -94,18 +94,17 @@ pub(crate) struct MainInterpBridge {
 }
 
 impl MainInterpBridge {
-    /// Spawn `workers` main-interp bridge threads sharing a single
-    /// crossbeam MPMC channel of the given capacity. Returns an
+    /// Spawn `config.workers` main-interp bridge threads sharing a single
+    /// crossbeam MPMC channel of `config.capacity`. Returns an
     /// Arc-safe handle for cloning to every TPC thread's dispatch path.
     ///
-    /// `capacity` is *total* (not per-worker) so the operator's mental
+    /// The capacity is *total* (not per-worker) so the operator's mental
     /// model — "how many requests can queue before 503" — stays simple.
-    /// Defaults applied at the call site in src/app.rs:
-    ///   PYRONOVA_GIL_BRIDGE_WORKERS=4
-    ///   PYRONOVA_GIL_BRIDGE_CAPACITY=16 × workers
-    pub(crate) fn spawn(site: SharedSite, capacity: usize, workers: usize) -> Arc<Self> {
-        let workers = workers.max(1);
-        let (tx, rx) = cbc::bounded::<GilWorkItem>(capacity);
+    /// Both are positive (`config::BridgeConfig`): a zero-capacity channel is a
+    /// rendezvous, which `try_dispatch` would answer 503 on every request.
+    pub(crate) fn spawn(site: SharedSite, config: crate::config::BridgeConfig) -> Arc<Self> {
+        let workers = config.workers.get();
+        let (tx, rx) = cbc::bounded::<GilWorkItem>(config.capacity.get());
 
         // Bridge workers intentionally do NOT spin up a tokio runtime.
         // Python handlers on the main interp may call
@@ -192,7 +191,7 @@ impl MainInterpBridge {
             target: "pyronova::server",
             spawned,
             requested = workers,
-            capacity,
+            capacity = config.capacity.get(),
             "main-interp bridge spawned"
         );
 
