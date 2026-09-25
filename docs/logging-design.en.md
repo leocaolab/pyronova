@@ -122,7 +122,7 @@ Pyronova hijacks Python's root logger in both the main interpreter and every sub
 class PyronovaRustHandler(logging.Handler):
     def emit(self, record):
         emit_python_log(           # PyO3 FFI → Rust
-            level=record.levelname,
+            levelno=record.levelno,
             name=record.name,
             message=record.getMessage(),
             pathname=record.pathname,
@@ -135,7 +135,7 @@ class PyronovaRustHandler(logging.Handler):
 class _PyronovaRustHandler(logging.Handler):
     def emit(self, record):
         _emit_python_log(              # pyronova.engine.emit_python_log, the same function main uses
-            record.levelname,
+            record.levelno,
             record.name,
             record.getMessage(),
             record.pathname or "",
@@ -179,7 +179,9 @@ class _PyronovaRustHandler(logging.Handler):
 
 3. **Same function in every interpreter** — Sub-interpreter workers import the real `pyronova.engine` (the PyO3 fork makes the module per-interpreter; Layer 2), so the worker's logging handler calls `pyronova.engine.emit_python_log` with its worker id. *Earlier versions* registered a C-FFI built-in `_pyronova_emit_log` instead, because the engine could not then be imported in a sub-interpreter.
 
-4. **Deferred `init_logger` to `run()`** — Allows `enable_logging()` to modify log config before the tracing subscriber is locked in. `tracing-subscriber` only allows one initialization per process.
+4. **Deferred `init_logger` to `run()`; later calls reconfigure** — Allows `enable_logging()` to modify log config before `run()`. `tracing-subscriber` allows one global subscriber per process, so the first `init_logger` installs it with its filter and format layer behind `reload` handles, and a later call (another app in the same process) swaps in its own level, access-log switch and format. An unknown level or format raises `ValueError`; a foreign subscriber already holding the global slot raises `RuntimeError`.
+
+6. **Python levels map by number** — `emit_python_log` takes the record's `levelno` and maps it to the highest standard threshold it reaches (≥40 ERROR, ≥30 WARN, ≥20 INFO, ≥10 DEBUG, else TRACE), so custom levels such as `logging.addLevelName(25, "NOTICE")` log at INFO.
 
 5. **`println!` retained for startup banner** — The human-readable startup banner (`Pyronova v1.2.0 [hybrid mode]...`) is kept as `println!` alongside `tracing::info!` because it's always-visible DX, not filterable log output.
 

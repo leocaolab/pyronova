@@ -93,7 +93,7 @@ class _PyronovaRustHandler(_logging.Handler):
                 exc_text = record.exc_text or self.formatException(record.exc_info)
                 msg = f"{msg}\n{exc_text}"
             emit_python_log(
-                level=record.levelname,
+                levelno=record.levelno,
                 name=record.name,
                 message=msg,
                 pathname=record.pathname or "",

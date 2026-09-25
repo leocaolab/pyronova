@@ -3,28 +3,33 @@
 from typing import Any, Callable, List, Optional, Tuple
 
 def init_logger(level: str, access_log: bool, format: str) -> None:
-    """Initialize the Rust tracing engine. Call once at startup.
+    """Install the Rust tracing engine, or reconfigure it if already installed.
 
-    :param level: one of ``"TRACE" | "DEBUG" | "INFO" | "WARN" |
-        "ERROR" | "OFF"`` (case-insensitive). An unrecognized value is
-        treated as ``"INFO"``.
-    :param format: ``"json"`` for structured logs, anything else for the
-        human-readable text formatter.
-    Calling more than once is a no-op after the first successful init
-    (the global subscriber can only be installed once); the later call
-    does not raise but also does not re-configure the level/format.
+    :param level: ``"OFF" | "ERROR" | "WARN" | "WARNING" | "INFO" | "DEBUG" |
+        "TRACE"`` (case-insensitive).
+    :param format: ``"text"`` (human-readable) or ``"json"`` (structured).
+    :raises ValueError: on an unknown level or format.
+    :raises RuntimeError: if the subscriber cannot be installed because a
+        foreign global tracing subscriber already holds the slot.
+
+    tracing allows one global subscriber per process; a later call applies its
+    level, access-log switch and format to that subscriber.
     """
     ...
 
 def emit_python_log(
-    level: str,
+    levelno: int,
     name: str,
     message: str,
     pathname: str,
     lineno: int,
     worker_id: Optional[int] = None,
 ) -> None:
-    """Route a Python log record through Rust tracing."""
+    """Route a Python log record through Rust tracing.
+
+    ``levelno`` is the record's numeric level; it maps to the highest standard
+    threshold it reaches, so a custom level 25 logs at INFO.
+    """
     ...
 
 class Request:
