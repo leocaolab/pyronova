@@ -28,12 +28,12 @@ use tokio::task::{JoinHandle, LocalSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::GcConfig;
+use crate::conn_driver::{TpcContext, Upgrades};
 use crate::handlers::error::panic_message;
-use crate::python::interp::SubInterpreterWorker;
+use crate::python::worker::SubInterpreterWorker;
 use crate::server::listener::{BoundListeners, ListenerSpec};
 use crate::site::SharedSite;
 use crate::tpc::{elevate_thread_qos_macos, tpc_accept_loop_inline, try_pin_current};
-use crate::worker::{TpcContext, Upgrades};
 
 /// The request every client connection sends, pipelined [`PIPELINE_DEPTH`] deep.
 const BENCH_REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: bench\r\nConnection: keep-alive\r\n\r\n";
@@ -257,7 +257,7 @@ async fn serve_inmem(
     let clients = (0..conns)
         .map(|_| {
             let (server_io, client_io) = tokio::io::duplex(DUPLEX_BUFFER_BYTES);
-            tokio::task::spawn_local(crate::worker::drive_conn(
+            tokio::task::spawn_local(crate::conn_driver::drive_conn(
                 server_io,
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
                 Rc::clone(&context),
@@ -534,8 +534,7 @@ fn serve_worker<Fut: Future<Output = Vec<Failure>>>(
     serve: impl FnOnce(Rc<TpcContext>) -> Fut,
 ) -> Vec<Failure> {
     // SAFETY: this thread now owns the worker, which no other thread has bound.
-    worker.tstate =
-        unsafe { crate::python::interp::rebind_tstate_to_current_thread(worker.tstate) };
+    unsafe { worker.bind_to_this_thread() };
     let context = Rc::new(TpcContext {
         worker: RefCell::new(worker),
         site,

@@ -108,9 +108,13 @@ where
     let main = main_interp();
     // SAFETY: always safe to call; null when this thread has no thread state.
     if unsafe { ffi::PyGILState_GetThisThreadState() }.is_null() {
-        // `try_with`: during thread-local teardown the slot may already be gone; the
-        // one-off path below still attaches correctly.
-        let _ = THREAD_MAIN_TSTATE.try_with(|slot| slot.ensure(main));
+        // During thread-local teardown the slot may already be gone, and a thread state
+        // can't be created when the runtime is out of memory. Either way `attach_to` below
+        // attaches through a thread state of its own for this one call.
+        match THREAD_MAIN_TSTATE.try_with(|slot| slot.ensure(main)) {
+            Ok(Ok(())) | Err(_) => {}
+            Ok(Err(e)) => tracing::warn!(target: "pyronova::server", "{e}"),
+        }
     }
     attach_to(main, f)
 }
@@ -173,17 +177,28 @@ thread_local! {
         const { ThreadMainTstate(std::cell::Cell::new(std::ptr::null_mut())) };
 }
 
+/// `PyThreadState_New` returned NULL (the runtime is out of memory).
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "could not create this thread's main-interpreter thread state (PyThreadState_New \
+     returned NULL); attaching with a thread state per call instead"
+)]
+pub(crate) struct NoThreadState;
+
 impl ThreadMainTstate {
-    fn ensure(&self, main: Interp) {
+    fn ensure(&self, main: Interp) -> Result<(), NoThreadState> {
         if !self.0.get().is_null() {
-            return;
+            return Ok(());
         }
         // SAFETY: the main interpreter is alive; `PyThreadState_New` needs no GIL. It binds
         // the new thread state to this OS thread and, since the thread has none, makes it the
         // thread's gilstate thread state, so `PyGILState_Ensure` re-attaches it.
         let tstate = unsafe { ffi::PyThreadState_New(main.raw) };
-        assert!(!tstate.is_null(), "PyThreadState_New returned null");
+        if tstate.is_null() {
+            return Err(NoThreadState);
+        }
         self.0.set(tstate);
+        Ok(())
     }
 }
 

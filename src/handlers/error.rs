@@ -56,12 +56,6 @@ impl PyException {
         }
     }
 
-    /// The exception pending on this thread's interpreter (after a C-API call returned
-    /// NULL), taken off it. A NULL with nothing pending is itself reported (SystemError).
-    pub(crate) fn fetch(py: Python<'_>) -> Self {
-        Self::capture(py, &PyErr::fetch(py))
-    }
-
     pub(crate) fn traceback(&self) -> &str {
         &self.traceback
     }

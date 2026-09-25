@@ -10,8 +10,9 @@ prepares the interpreter for it (Layer 2, FR-10):
 - installs per-worker C-extension isolation (private library copies for
   extensions that can't be shared between interpreters).
 
-It runs as the module `__pyronova_bootstrap__`, in its own namespace. Rust sets
-`WORKER_ID` and `POOL_ID` in it before it runs.
+It runs as the module `__pyronova_bootstrap__`, in its own namespace. Rust sets in it
+before it runs: `WORKER_ID` (this worker's index) and `ISOLATE_LIBS` (the libraries
+`app.isolate(...)` declared, a tuple of names).
 """
 
 # -- Python logging bridge to Rust tracing -----------------------------------
@@ -118,8 +119,9 @@ except Exception:
 # sub-interpreters ("does not support loading in subinterpreters").
 #
 # Two ways in, one machinery:
-#   • PROACTIVE — `app.isolate("numpy")` records the lib in PYRONOVA_ISOLATE_LIBS;
-#     `_pyronova_isolate_libs()` clones it at worker init, before the user script.
+#   • PROACTIVE — `app.isolate("numpy")` records the lib on the app; the worker gets the
+#     list as `ISOLATE_LIBS` and `_pyronova_isolate_libs()` clones it at worker init,
+#     before the user script.
 #   • REACTIVE  — `_iso_import` (installed as builtins.__import__ below) catches the
 #     "does not support loading in subinterpreters" / PyO3 #576 ImportError, reads
 #     the offending binary module straight out of the error, isolates it, and
@@ -483,12 +485,9 @@ def _pyronova_isolate_libs():
     Proactive just does the cloning up front so the first request pays no `cp`.
     (No persistent override: that would mask the collision signal an UNDECLARED
     single-phase lib needs to trigger its own reactive clone.)"""
-    import os
-    libs = [x.strip() for x in os.environ.get("PYRONOVA_ISOLATE_LIBS", "").split(",") if x.strip()]
+    libs = list(ISOLATE_LIBS)
     if not libs:
         return
-    if "pyronova" in libs:
-        raise RuntimeError(_ISO_PYRONOVA_REFUSED)
     # Sub-interpreter probe: the override raises on the main interp, where no
     # per-worker copy is needed. Probe and restore — real loads flip it later.
     prev, ok = _iso_transient_override()

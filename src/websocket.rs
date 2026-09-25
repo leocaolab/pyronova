@@ -30,7 +30,7 @@ use tungstenite::Message;
 
 use crate::handlers::error::{HandlerError, Logged, PyException, RequestTag, Stage};
 use crate::handlers::pipeline::{await_reply, fail, finish, RequestLine, Served};
-use crate::handlers::{full_body, run_before_hooks, BoxBody};
+use crate::handlers::{full_body, main_chain, BoxBody};
 use crate::request_id::RequestId;
 use crate::site::{SharedSite, Site};
 use crate::types::{PyronovaRequest, ResponseData};
@@ -655,7 +655,9 @@ fn serve_connection(
     let hooks = Py::new(py, request)
         .map_err(|e| HandlerError::python(py, Stage::Setup, &e))
         .and_then(|request| {
-            run_before_hooks(py, rc, &site.routes.before_hooks, &request).map(|r| (request, r))
+            main_chain(rc)
+                .before(&site.routes.before_hooks, request.bind(py))
+                .map(|r| (request, r))
         });
     // A verdict goes unread only if the handshake already gave up.
     let request = match hooks {

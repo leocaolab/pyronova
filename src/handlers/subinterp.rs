@@ -7,7 +7,7 @@ use std::sync::Arc;
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 
-use crate::python::interp;
+use crate::python::pool::{SubmitError, WorkRequest};
 use crate::router::{Call, HandlerKind, RouteId};
 use crate::site::SharedSite;
 
@@ -120,7 +120,7 @@ async fn run_on_pool(
     let _permit = admitted.permit;
 
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-    let submitted = pool.submit(interp::WorkRequest {
+    let submitted = pool.submit(WorkRequest {
         route: work.route,
         kind: work.kind,
         method: work.method,
@@ -135,12 +135,12 @@ async fn run_on_pool(
     });
     if let Err(e) = submitted {
         let error = match e {
-            interp::SubmitError::Full => HandlerError::Overloaded("sub-interpreter work queue"),
-            interp::SubmitError::Closed => HandlerError::PoolClosed("sub-interpreter pool"),
+            SubmitError::Full => HandlerError::Overloaded("sub-interpreter work queue"),
+            SubmitError::Closed => HandlerError::PoolClosed("sub-interpreter pool"),
         };
         return fail(error, tag);
     }
-    interp::WorkRequest::inc_created();
+    WorkRequest::inc_created();
 
     let lost = |_| HandlerError::WorkerLost("the sub-interpreter worker dropped the request");
     match await_reply(response_rx, lost).await {

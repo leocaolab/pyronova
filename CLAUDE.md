@@ -15,7 +15,8 @@ High-performance Python web framework powered by Rust. Per-Interpreter GIL (PEP 
   - `response.rs` — the one handler-result → `ResponseData` mapping every interpreter uses (type from the value, never sniffed from the text), response builders (200/404/413/500/503/504)
   - `json.rs` — Rust-side `py_to_json_value` serializer
   - `static_fs.rs` — async static file serving + MIME detection + path traversal protection
-  - `python/` — sub-interpreter workers: `worker.rs` (`SubInterpreterWorker`, runs the real `pyronova` package + engine), `pool.rs` (dual worker pool, sync+async), `worker_api.rs` (`_worker_recv`/`_worker_send` pyfunctions for the async engine), `ffi.rs` (`PyObjRef` RAII, tstate helpers)
+  - `python/` — sub-interpreter workers: `worker.rs` (`SubInterpreterWorker<Role>`, runs the real `pyronova` package + engine; owns its thread state and `Py<T>` references), `worker_app.rs` (the app a worker's script registered on), `hook_chain.rs` (before hooks → handler → after hooks, shared with the main interpreter), `pool.rs` (dual worker pool, sync+async), `worker_api.rs` (`_worker_recv`/`_worker_send` pyfunctions and the per-worker inbox for the async engine)
+  - `conn_driver.rs` — per-connection drivers (hyper connection loop, TPC connection context)
   - `run_context.rs` — explicit-interpreter attach (`main_attach`/`attach_to`) for every Rust thread that enters Python
   - `websocket.rs` — WebSocket upgrade, `WebSocket` pyclass, async↔sync bridge
   - `stream.rs` — `Stream` SSE with mpsc channel
@@ -67,7 +68,7 @@ bash benchmarks/run_bench.sh
 - `Pyronova` Python wrapper provides decorator syntax; `PyronovaApp` is the raw Rust engine
 - Sub-interpreter mode uses `crossbeam-channel` multi-consumer pool with `tokio::sync::oneshot` async responses
 - Errors: one typed `HandlerError` (`handlers/error.rs`) carries the raw error (exception text + traceback, panic payload); it is logged once where it happens with the request id (`request_id.rs`, one writer per request) and rendered once at the edge — 4xx carry the reason, 5xx are `{"error": "Internal Server Error", "request_id": ...}` (decision D4)
-- `PyObjRef` RAII wrapper for all raw FFI pointer operations — Drop auto-DECREFs
+- A worker holds its handlers, hooks and loop as `Py<T>` and runs them through `Bound`; they are released only by `SubInterpreterWorker::end`, with the worker's thread state current (FR-19)
 - Workers import the real `pyronova` package and engine (the fork makes the module per-interpreter); the async engine talks to Rust through `pyronova.engine._worker_recv`/`_worker_send`, which release the GIL during the channel wait
 - Every Rust thread that enters Python names its interpreter (`run_context::main_attach` / `attach_to`); a bare foreign-thread `Python::attach` is rejected by `tests/test_attach_allowlist.py`
 - Hybrid dispatch: `gil=True` routes go to main interpreter (for C extensions), others to sub-interpreters
@@ -99,7 +100,8 @@ src/
   json.rs             # py_to_json_value
   static_fs.rs        # try_static_file, mime_from_ext
   run_context.rs      # main_attach / attach_to: explicit-interpreter attach
-  python/             # worker.rs, pool.rs, worker_api.rs, ffi.rs: sub-interpreter workers
+  python/             # worker.rs, worker_app.rs, hook_chain.rs, pool.rs, worker_api.rs: sub-interpreter workers
+  conn_driver.rs      # per-connection drivers
   websocket.rs        # WebSocket, upgrade handler, async↔sync bridge
   stream.rs           # Stream SSE
   monitor.rs          # GIL watchdog, memory RSS, atomic counters

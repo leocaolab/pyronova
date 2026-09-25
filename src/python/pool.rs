@@ -1,16 +1,14 @@
 //! Channel-based interpreter pool: the `WorkRequest` domain type, the
-//! `InterpreterPool` orchestrator, and the per-OS-thread worker loops (sync + async)
-//! that drive `SubInterpreterWorker`s.
+//! `InterpreterPool` a server submits to, the worker threads it joins at shutdown, and
+//! the per-OS-thread worker loops (sync + async) that drive `SubInterpreterWorker`s.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use pyo3::ffi;
 use pyo3::prelude::*;
 
-use super::ffi::*;
-use super::worker::*;
+use super::worker::{AsyncEngine, SubInterpreterWorker, WorkerSpec, WorkerStartError};
+use super::worker_api::AsyncInbox;
 use crate::handlers::error::{Logged, RequestTag};
 use crate::request_id::RequestId;
 use crate::types::{PyronovaRequest, ResponseData};
@@ -81,6 +79,8 @@ impl WorkRequest {
         #[cfg(feature = "leak_detect")]
         WR_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    /// A request answered (or dropped because its caller had given up): exactly once per
+    /// request, on every path.
     #[inline(always)]
     pub fn inc_completed() {
         #[cfg(feature = "leak_detect")]
@@ -126,30 +126,19 @@ impl WorkerSplit {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum SplitError {
     /// A pool is needed and there are no workers at all.
+    #[error("workers=0: the sub-interpreter pool needs at least one worker")]
     NoWorkers,
     /// Sync and async handlers each need a worker of their own, and there is one.
+    #[error(
+        "workers=1 cannot serve both sync (`def`) and async (`async def`) routes: the \
+         sub-interpreter pool runs each kind on workers of its own, so it needs at least 2 \
+         workers (or handlers of one kind only)"
+    )]
     OneWorkerForBothKinds,
 }
-
-impl std::fmt::Display for SplitError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SplitError::NoWorkers => {
-                f.write_str("workers=0: the sub-interpreter pool needs at least one worker")
-            }
-            SplitError::OneWorkerForBothKinds => f.write_str(
-                "workers=1 cannot serve both sync (`def`) and async (`async def`) routes: the \
-                 sub-interpreter pool runs each kind on workers of its own, so it needs at least \
-                 2 workers (or handlers of one kind only)",
-            ),
-        }
-    }
-}
-
-impl std::error::Error for SplitError {}
 
 /// The split of `n` workers for the handler kinds the pool must serve: half (rounded
 /// down) async when both are needed, all of them for the only kind needed.
@@ -200,11 +189,8 @@ pub(crate) fn split_workers_for_routes(
 /// Why the sub-interpreter pool could not start.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PoolError {
-    #[error("sub-interpreter {index}: {source}")]
-    Worker {
-        index: usize,
-        source: WorkerStartError,
-    },
+    #[error(transparent)]
+    Worker(#[from] WorkerStartError),
     #[error("could not spawn the thread of worker {index}: {source}")]
     Spawn {
         index: usize,
@@ -212,239 +198,156 @@ pub(crate) enum PoolError {
     },
 }
 
-/// Worker threads a pool shutdown gave up on (still running after the grace period), each
-/// described with what it was running. Their interpreters are still alive, and finalizing
-/// with a live sub-interpreter aborts, so `Pyronova.run()` checks this and exits non-zero
-/// instead (Layer 2, design §12, M4 review N8).
-static FORGOTTEN_WORKERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-/// Takes the list of workers the last pool shutdown abandoned.
-pub(crate) fn take_forgotten_workers() -> Vec<String> {
-    std::mem::take(&mut *FORGOTTEN_WORKERS.lock().unwrap_or_else(|e| e.into_inner()))
-}
-
-/// `current_route` value of a sync worker that isn't running a handler.
-const IDLE: usize = usize::MAX;
-
-pub(crate) struct InterpreterPool {
-    /// Dropping senders closes the channel, signaling workers to exit.
-    sync_work_tx: crossbeam_channel::Sender<WorkRequest>,
-    async_work_tx: Option<crossbeam_channel::Sender<WorkRequest>>,
-    /// Admission-control gate: one permit per slot in the work channel.
-    /// Callers `try_acquire_owned()` BEFORE collecting the request body,
-    /// so an over-capacity surge of uploads doesn't let N × max_body_size
-    /// pile up in RAM while N requests sit waiting for a full queue.
-    /// Permit lifetime spans [body-collect, submit, worker-dispatch]
-    /// — see `handle_request_subinterp` for the acquire site and
-    /// `worker_thread_loop` where the permit rides inside WorkRequest.
-    pub(crate) submit_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Worker threads — joined on drop to ensure clean sub-interpreter shutdown.
-    worker_threads: Option<Vec<std::thread::JoinHandle<()>>>,
-    /// Per worker thread (same order), the route index its sync worker is running, or
-    /// `IDLE`; async workers keep `IDLE`. Only read when a shutdown abandons a worker.
-    current_route: Vec<Arc<AtomicUsize>>,
-    /// `METHOD path` per route index, for naming an abandoned worker's route.
-    route_names: Vec<String>,
-}
-
-impl Drop for InterpreterPool {
-    fn drop(&mut self) {
-        // 1. Drop senders to close the channels — workers will exit their recv loop.
-        //    (We need to replace them so the Sender::drop fires now, not later.)
-        let _ = std::mem::replace(&mut self.sync_work_tx, crossbeam_channel::bounded(0).0);
-        let _ = self.async_work_tx.take();
-
-        // 2. Join all worker threads so they finish Py_EndInterpreter BEFORE
-        //    the main interpreter tears down (Py_Finalize). Without this join,
-        //    workers race against Py_Finalize and segfault.
-        //
-        // Bounded wait: user handlers can block indefinitely (e.g. a synchronous
-        // `requests.get` with no timeout). An unconditional .join() would hang
-        // the whole process on shutdown. Give each worker 5s to observe the
-        // channel close and run its Py_EndInterpreter cleanup; if it's stuck
-        // in user code past that, forget the thread. The process is exiting
-        // anyway — the OS reclaims memory. A stuck sub-interp leaks only
-        // what hasn't been freed yet, which is strictly better than hanging
-        // indefinitely.
-        if let Some(threads) = self.worker_threads.take() {
-            const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-            for (i, t) in threads.into_iter().enumerate() {
-                // std::thread::JoinHandle has no timed join, so we spin a
-                // short poll loop by checking is_finished(). is_finished()
-                // is a cheap atomic read.
-                let deadline = std::time::Instant::now() + JOIN_TIMEOUT;
-                while !t.is_finished() && std::time::Instant::now() < deadline {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                if t.is_finished() {
-                    if let Err(panic) = t.join() {
-                        // A worker thread panicked (e.g. a bounds violation in
-                        // the handler dispatch). Surface the payload instead of
-                        // swallowing it — a silent Drop makes such bugs invisible.
-                        let msg = crate::handlers::error::panic_message(&*panic);
-                        tracing::error!(
-                            target: "pyronova::server",
-                            "worker thread panicked during shutdown: {msg}",
-                        );
-                    }
-                } else {
-                    let name = t.thread().name().unwrap_or("worker").to_string();
-                    let route = self
-                        .current_route
-                        .get(i)
-                        .map(|c| c.load(Ordering::Relaxed))
-                        .filter(|&idx| idx != IDLE)
-                        .and_then(|idx| self.route_names.get(idx));
-                    let what = match route {
-                        Some(r) => format!("{name} (running {r})"),
-                        None => name,
-                    };
-                    tracing::error!(
-                        target: "pyronova::server",
-                        "worker thread {what} did not exit within {:?}; abandoning it",
-                        JOIN_TIMEOUT,
-                    );
-                    FORGOTTEN_WORKERS
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push(what);
-                    // Leak the JoinHandle — OS will reclaim at process exit.
-                    std::mem::forget(t);
-                }
+impl PoolError {
+    /// This error as the main interpreter raises it (see [`WorkerStartError::into_pyerr`]).
+    pub(crate) fn into_pyerr(self, py: Python<'_>) -> PyErr {
+        match self {
+            PoolError::Worker(e) => e.into_pyerr(py),
+            spawn @ PoolError::Spawn { .. } => {
+                pyo3::exceptions::PyRuntimeError::new_err(spawn.to_string())
             }
         }
     }
 }
 
-unsafe impl Send for InterpreterPool {}
-unsafe impl Sync for InterpreterPool {}
+/// A worker thread a pool shutdown gave up on (still running after the grace period), with
+/// what it was running. Its interpreter is still alive, and finalizing with a live
+/// sub-interpreter aborts, so `Pyronova.run()` exits non-zero instead (Layer 2, design §12,
+/// M4 review N8).
+#[pyclass(module = "pyronova.engine", frozen, get_all)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AbandonedWorker {
+    /// The worker thread's name.
+    pub(crate) thread: String,
+    /// `METHOD path` of the route its sync worker was running, if any.
+    pub(crate) route: Option<String>,
+}
+
+#[pymethods]
+impl AbandonedWorker {
+    fn __str__(&self) -> String {
+        self.to_string()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("AbandonedWorker({self})")
+    }
+}
+
+impl std::fmt::Display for AbandonedWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.route {
+            Some(route) => write!(f, "{} (running {route})", self.thread),
+            None => f.write_str(&self.thread),
+        }
+    }
+}
+
+/// `running` value of a worker that isn't running a handler.
+const IDLE: usize = usize::MAX;
+
+/// How long a worker thread gets to finish its request and end its interpreter once the
+/// pool is closed.
+const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Where a server submits requests to its sub-interpreter workers. Dropping the last
+/// reference closes the channels, which tells the workers to finish; [`PoolThreads::join`]
+/// then waits for them.
+pub(crate) struct InterpreterPool {
+    sync_work_tx: crossbeam_channel::Sender<WorkRequest>,
+    async_work_tx: Option<crossbeam_channel::Sender<WorkRequest>>,
+    /// Admission-control gate: one permit per slot in the work channels. Callers take one
+    /// before collecting a large request body, so an over-capacity surge of uploads
+    /// doesn't pile N × max_body_size up in RAM while waiting for a full queue; the permit
+    /// is held until the response is ready (`handle_request_subinterp`).
+    pub(crate) submit_semaphore: Arc<tokio::sync::Semaphore>,
+}
+
+/// A pool's worker threads, joined when its server stops.
+pub(crate) struct PoolThreads {
+    threads: Vec<WorkerThread>,
+    /// `METHOD path` per route index, for naming an abandoned worker's route.
+    route_names: Vec<String>,
+}
+
+struct WorkerThread {
+    handle: std::thread::JoinHandle<()>,
+    /// The route index its sync worker is running, or `IDLE`; async workers stay `IDLE`.
+    /// Only read when a shutdown abandons the worker.
+    running: Arc<AtomicUsize>,
+}
 
 impl InterpreterPool {
     /// Create `split.total()` sub-interpreters, each in its own OS thread, connected via
     /// channels: the first `split.sync_workers` serve `def` handlers, the rest `async def`.
     ///
-    /// Must be called with the main interpreter's GIL held (before `py.detach()`).
+    /// # Safety
+    /// Must be called with the main interpreter's thread state current (before
+    /// `py.detach()`).
     pub unsafe fn new(
         split: WorkerSplit,
-        _py: Python<'_>,
         spec: &WorkerSpec<'_>,
-    ) -> Result<Self, PoolError> {
+    ) -> Result<(Self, PoolThreads), PoolError> {
         let n = split.total();
         let has_any_async = split.async_workers > 0;
-        // Every WorkerState created below carries it; `_worker_recv` / `_worker_send`
-        // reject zombies whose pool_id mismatches.
-        let pool_id = spec.pool_id;
-
-        // Create work channels
-        // Sync pool: handles def handlers (220k req/s)
-        // Async pool: handles async def handlers (133k req/s)
         let (sync_work_tx, sync_work_rx) = crossbeam_channel::bounded::<WorkRequest>(n * 128);
-        let (async_work_tx, async_work_rx) = if has_any_async {
-            let (tx, rx) = crossbeam_channel::bounded::<WorkRequest>(n * 128);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
-
-        // Create sub-interpreters and spawn worker threads
-        let mut workers = Vec::new();
-        let mut threads = Vec::new();
-
-        for i in 0..n {
-            match SubInterpreterWorker::new(i, spec) {
-                Ok(worker) => workers.push(worker),
-                Err(source) => {
-                    // End the workers built so far here, on their creating thread (FR-19).
-                    SubInterpreterWorker::end_all(workers);
-                    return Err(PoolError::Worker { index: i, source });
-                }
-            }
-        }
-
-        // Initialize async worker states if needed
-        if has_any_async {
-            let async_rx = async_work_rx.as_ref().unwrap();
-            let mut states = Vec::with_capacity(n);
-            for _ in 0..n {
-                states.push(Arc::new(WorkerState {
-                    rx: async_rx.clone(),
-                    response_map: Mutex::new(HashMap::new()),
-                    next_req_id: AtomicU64::new(0),
-                    pool_id,
-                }));
-            }
-            // Overwrite rather than .set() — this pool may not be the
-            // first one created in the process (tests / hot-reload).
-            // Stale states from a prior pool would cause workers to
-            // recv() on closed channels forever.
-            if let Ok(mut w) = WORKER_STATES.write() {
-                *w = states;
-            }
-        }
-
-        let current_route: Vec<Arc<AtomicUsize>> =
-            (0..n).map(|_| Arc::new(AtomicUsize::new(IDLE))).collect();
-
-        // Spawn workers: the first `split.sync_workers` as sync, the rest as async.
-        let mut pending = workers.into_iter().enumerate();
-        while let Some((i, worker)) = pending.next() {
-            let current = Arc::clone(&current_route[i]);
-
-            let spawned = if i >= split.sync_workers {
-                // Async worker
-                std::thread::Builder::new()
-                    .name(format!("pyronova-async-worker-{i}"))
-                    .stack_size(crate::python::PYTHON_THREAD_STACK)
-                    .spawn(move || {
-                        worker_thread_loop_async(worker);
-                    })
-                    .map_err(|source| PoolError::Spawn { index: i, source })
-            } else {
-                // Sync worker
-                let rx = sync_work_rx.clone();
-                std::thread::Builder::new()
-                    .name(format!("pyronova-worker-{i}"))
-                    .stack_size(crate::python::PYTHON_THREAD_STACK)
-                    .spawn(move || {
-                        worker_thread_loop(worker, rx, &current);
-                    })
-                    .map_err(|source| PoolError::Spawn { index: i, source })
-            };
-
-            match spawned {
-                Ok(handle) => threads.push(handle),
-                Err(e) => {
-                    // The worker moved into the failed spawn is gone (its drop logs and
-                    // leaks it); end the ones not yet handed to a thread (FR-19). The
-                    // spawned ones exit when the channels close as this returns.
-                    SubInterpreterWorker::end_all(pending.map(|(_, w)| w));
-                    return Err(e);
-                }
-            }
-        }
-
-        // Admission semaphore: one permit per total queue slot across
-        // both pools. `n * 128` matches the channel capacities so a
-        // permit-holder is guaranteed to find a slot when it reaches
-        // submit(). Could split sync/async but that complicates the
-        // acquire site — shared budget is fine and happens to model
-        // "N × 128 in-flight requests per process" as one number.
+        let (async_work_tx, async_work_rx) = crossbeam_channel::bounded::<WorkRequest>(n * 128);
+        // One permit per queue slot of the channels in use, so a permit-holder always finds
+        // a slot when it reaches `submit`.
         let total_permits = n * 128 * if has_any_async { 2 } else { 1 };
-        let submit_semaphore = Arc::new(tokio::sync::Semaphore::new(total_permits));
 
-        Ok(InterpreterPool {
+        let (sync_workers, async_workers) = build_workers(split, spec)?;
+        let pool = InterpreterPool {
             sync_work_tx,
-            async_work_tx,
-            worker_threads: Some(threads),
-            current_route,
+            async_work_tx: has_any_async.then_some(async_work_tx),
+            submit_semaphore: Arc::new(tokio::sync::Semaphore::new(total_permits)),
+        };
+        let mut threads = PoolThreads {
+            threads: Vec::with_capacity(split.total()),
             route_names: spec
                 .expected
                 .routes
                 .iter()
                 .map(|(method, path, _)| format!("{method} {path}"))
                 .collect(),
-            submit_semaphore,
-        })
+        };
+
+        // If a spawn fails, the workers not yet handed to a thread are ended here (FR-19),
+        // and the ones already running are stopped (the pool closes) and joined.
+        let mut sync_pending = sync_workers.into_iter().enumerate();
+        while let Some((i, worker)) = sync_pending.next() {
+            let running = Arc::new(AtomicUsize::new(IDLE));
+            let (rx, current) = (sync_work_rx.clone(), Arc::clone(&running));
+            match spawn(format!("pyronova-worker-{i}"), move || {
+                serve_sync(worker, rx, &current)
+            }) {
+                Ok(handle) => threads.threads.push(WorkerThread { handle, running }),
+                Err(source) => {
+                    SubInterpreterWorker::end_all(sync_pending.map(|(_, w)| w));
+                    SubInterpreterWorker::end_all(async_workers);
+                    return Err(stop_started(pool, threads, i, source));
+                }
+            }
+        }
+        let mut async_pending = async_workers.into_iter().enumerate();
+        while let Some((j, worker)) = async_pending.next() {
+            let i = split.sync_workers + j;
+            let inbox = AsyncInbox::new(async_work_rx.clone());
+            match spawn(format!("pyronova-async-worker-{i}"), move || {
+                serve_async(worker, inbox)
+            }) {
+                Ok(handle) => threads.threads.push(WorkerThread {
+                    handle,
+                    running: Arc::new(AtomicUsize::new(IDLE)),
+                }),
+                Err(source) => {
+                    SubInterpreterWorker::end_all(async_pending.map(|(_, w)| w));
+                    return Err(stop_started(pool, threads, i, source));
+                }
+            }
+        }
+
+        Ok((pool, threads))
     }
 
     /// Queue a request on the worker kind that runs it. Never waits: a full queue is an
@@ -463,6 +366,135 @@ impl InterpreterPool {
     }
 }
 
+/// Builds the sync workers, then the async ones, in index order on this (the main) thread.
+/// If one fails, the ones built so far are ended here, on their creating thread (FR-19).
+///
+/// # Safety
+/// As for [`InterpreterPool::new`].
+#[allow(clippy::type_complexity)]
+unsafe fn build_workers(
+    split: WorkerSplit,
+    spec: &WorkerSpec<'_>,
+) -> Result<
+    (
+        Vec<SubInterpreterWorker>,
+        Vec<SubInterpreterWorker<AsyncEngine>>,
+    ),
+    PoolError,
+> {
+    let mut sync_workers = Vec::with_capacity(split.sync_workers);
+    for i in 0..split.sync_workers {
+        match SubInterpreterWorker::new(i, spec) {
+            Ok(worker) => sync_workers.push(worker),
+            Err(e) => {
+                SubInterpreterWorker::end_all(sync_workers);
+                return Err(e.into());
+            }
+        }
+    }
+    let mut async_workers = Vec::with_capacity(split.async_workers);
+    for i in split.sync_workers..split.total() {
+        match SubInterpreterWorker::<AsyncEngine>::new(i, spec) {
+            Ok(worker) => async_workers.push(worker),
+            Err(e) => {
+                SubInterpreterWorker::end_all(sync_workers);
+                SubInterpreterWorker::end_all(async_workers);
+                return Err(e.into());
+            }
+        }
+    }
+    Ok((sync_workers, async_workers))
+}
+
+/// A start that failed spawning worker `index`'s thread: closes the pool, so the threads
+/// already running end their workers, and waits for them.
+fn stop_started(
+    pool: InterpreterPool,
+    threads: PoolThreads,
+    index: usize,
+    source: std::io::Error,
+) -> PoolError {
+    drop(pool);
+    for abandoned in threads.join() {
+        tracing::error!(
+            target: "pyronova::server",
+            "worker thread {abandoned} did not stop after a failed pool start"
+        );
+    }
+    PoolError::Spawn { index, source }
+}
+
+fn spawn(
+    name: String,
+    serve: impl FnOnce() + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(name)
+        .stack_size(crate::python::PYTHON_THREAD_STACK)
+        .spawn(serve)
+}
+
+impl PoolThreads {
+    /// Waits for every worker thread to end its interpreter, each for up to
+    /// [`JOIN_TIMEOUT`], and returns the ones still running then. The pool's senders must be
+    /// gone (every [`InterpreterPool`] reference dropped), or the workers never finish.
+    ///
+    /// A worker's handler can block forever (a `requests.get` with no timeout); waiting for
+    /// it would hang the process, so it is abandoned instead: its thread is leaked, and the
+    /// caller must not finalize the runtime while it lives.
+    pub(crate) fn join(self) -> Vec<AbandonedWorker> {
+        self.join_within(JOIN_TIMEOUT)
+    }
+
+    fn join_within(self, timeout: std::time::Duration) -> Vec<AbandonedWorker> {
+        let PoolThreads {
+            threads,
+            route_names,
+        } = self;
+        threads
+            .into_iter()
+            .filter_map(|thread| thread.join_or_abandon(timeout, &route_names))
+            .collect()
+    }
+}
+
+impl WorkerThread {
+    fn join_or_abandon(
+        self,
+        timeout: std::time::Duration,
+        route_names: &[String],
+    ) -> Option<AbandonedWorker> {
+        // `JoinHandle` has no timed join: poll `is_finished` (an atomic read).
+        let deadline = std::time::Instant::now() + timeout;
+        while !self.handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if self.handle.is_finished() {
+            if let Err(panic) = self.handle.join() {
+                let msg = crate::handlers::error::panic_message(&*panic);
+                tracing::error!(
+                    target: "pyronova::server",
+                    "worker thread panicked during shutdown: {msg}",
+                );
+            }
+            return None;
+        }
+        let abandoned = AbandonedWorker {
+            thread: self.handle.thread().name().unwrap_or("worker").to_string(),
+            route: route_names
+                .get(self.running.load(Ordering::Relaxed))
+                .cloned(),
+        };
+        tracing::error!(
+            target: "pyronova::server",
+            "worker thread {abandoned} did not exit within {timeout:?}; abandoning it",
+        );
+        // Leak the JoinHandle — the OS reclaims the thread at process exit.
+        std::mem::forget(self.handle);
+        Some(abandoned)
+    }
+}
+
 /// Why [`InterpreterPool::submit`] could not queue a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SubmitError {
@@ -472,26 +504,19 @@ pub(crate) enum SubmitError {
     Closed,
 }
 
-/// Main loop for each worker OS thread.
-fn worker_thread_loop(
+/// A sync worker's thread: runs each request it takes until the channel closes.
+fn serve_sync(
     mut worker: SubInterpreterWorker,
     rx: crossbeam_channel::Receiver<WorkRequest>,
-    current_route: &AtomicUsize,
+    running: &AtomicUsize,
 ) {
-    // Rebind the sub-interp tstate to this OS thread (fixes the
-    // cross-thread attach/detach leak). See
-    // `rebind_tstate_to_current_thread` doc for details.
-    unsafe {
-        worker.tstate = rebind_tstate_to_current_thread(worker.tstate);
-    }
+    // SAFETY: this thread now owns the worker, which no other thread has bound.
+    unsafe { worker.bind_to_this_thread() };
 
-    while let Ok(req) = rx.recv() {
-        // Skip requests whose caller already timed out (504) — avoid wasting
-        // CPU on "dead" requests during queue backlog (prevents snowball effect).
+    for req in rx.iter() {
+        // Skip requests whose caller already timed out (504): don't spend CPU on dead
+        // requests during a backlog.
         if req.response_tx.is_closed() {
-            // Account for the skipped request so the leak_detect invariant
-            // (inc_created == inc_completed at steady state) holds. A dropped
-            // dead request is still a fully-accounted WorkRequest, not a leak.
             WorkRequest::inc_completed();
             continue;
         }
@@ -504,10 +529,10 @@ fn worker_thread_loop(
             Arc::clone(&request.path),
         );
 
-        current_route.store(route.index(), Ordering::Relaxed);
-        // SAFETY: on the thread this worker was rebound to, no thread state current.
+        running.store(route.index(), Ordering::Relaxed);
+        // SAFETY: on the thread this worker was bound to, no thread state current.
         let result = unsafe { worker.serve(route, request) };
-        current_route.store(IDLE, Ordering::Relaxed);
+        running.store(IDLE, Ordering::Relaxed);
 
         let tag = RequestTag {
             id: &id,
@@ -519,53 +544,27 @@ fn worker_thread_loop(
         WorkRequest::inc_completed();
     }
 
-    // Channel closed — clean up the sub-interpreter.
-    //
-    // Zombie-safety: if `InterpreterPool::drop` `mem::forget`d this
-    // thread after the 5s grace period, the process may have already
-    // called `Py_Finalize` by the time we get here. `PyEval_RestoreThread`
-    // + `Py_EndInterpreter` on a finalized VM is UAF → segfault at
-    // shutdown. Skip cleanup in that case; the OS will reclaim whatever
-    // the sub-interp was holding as the process exits.
-    if unsafe { pyo3::ffi::Py_IsInitialized() != 0 } {
-        // SAFETY: on the worker's own thread, no thread state current.
-        unsafe { worker.end() };
-    } else {
-        worker.abandon();
-    }
+    worker.end_on_own_thread();
 }
 
-/// Async worker: Python asyncio event loop drives execution.
-/// Fetcher thread pulls requests from channel (releasing GIL during wait),
-/// asyncio loop runs handlers as concurrent tasks.
-fn worker_thread_loop_async(mut worker: SubInterpreterWorker) {
-    unsafe {
-        // Rebind tstate to this OS thread — same cross-thread leak as
-        // the sync worker loop. See `rebind_tstate_to_current_thread`
-        // doc for details.
-        worker.tstate = rebind_tstate_to_current_thread(worker.tstate);
+/// An async worker's thread: runs the async engine (`_async_engine.py`) on the worker's
+/// interpreter until its inbox closes or the engine stops. Requests the engine still held
+/// when it stopped were answered as it let go of them (see `AsyncJob`).
+fn serve_async(mut worker: SubInterpreterWorker<AsyncEngine>, inbox: AsyncInbox) {
+    // SAFETY: this thread now owns the worker, which no other thread has bound.
+    unsafe { worker.bind_to_this_thread() };
 
-        ffi::PyEval_RestoreThread(worker.tstate);
-        // Runs the async engine (`_async_engine.py`) in its own namespace; blocks until the
-        // request channel is closed.
-        if let Err(e) = worker.run_async_engine() {
-            tracing::error!(
-                target: "pyronova::server",
-                worker = worker.worker_id,
-                error = %e,
-                "async worker stopped serving"
-            );
-        }
-        worker.tstate = ffi::PyEval_SaveThread();
+    // SAFETY: on the thread this worker was bound to, no thread state current.
+    if let Err(e) = unsafe { worker.run_async_engine(inbox) } {
+        tracing::error!(
+            target: "pyronova::server",
+            worker = worker.worker_id(),
+            error = %e,
+            "async worker stopped serving"
+        );
     }
 
-    // Cleanup — same zombie-safety as the sync worker loop.
-    if unsafe { pyo3::ffi::Py_IsInitialized() != 0 } {
-        // SAFETY: on the worker's own thread, no thread state current.
-        unsafe { worker.end() };
-    } else {
-        worker.abandon();
-    }
+    worker.end_on_own_thread();
 }
 
 #[cfg(test)]
@@ -633,5 +632,81 @@ mod split_tests {
             split_workers_for_routes(3, &[false, false], &[true, true]),
             split(0, 3)
         );
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    const SHORT: std::time::Duration = std::time::Duration::from_millis(200);
+
+    fn thread_running(
+        name: &str,
+        release: crossbeam_channel::Receiver<()>,
+        route: usize,
+    ) -> WorkerThread {
+        let handle = std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || {
+                let _ = release.recv();
+            })
+            .unwrap();
+        WorkerThread {
+            handle,
+            running: Arc::new(AtomicUsize::new(route)),
+        }
+    }
+
+    #[test]
+    fn join_returns_the_abandoned_workers_to_its_caller() {
+        let (release, blocked) = crossbeam_channel::bounded::<()>(0);
+        let (_done, finished) = crossbeam_channel::bounded::<()>(0);
+        drop(_done);
+        let threads = PoolThreads {
+            threads: vec![
+                thread_running("w-finished", finished, IDLE),
+                thread_running("w-stuck", blocked, 1),
+            ],
+            route_names: vec!["GET /a".into(), "GET /stuck".into()],
+        };
+        let abandoned = threads.join_within(SHORT);
+        assert_eq!(
+            abandoned,
+            vec![AbandonedWorker {
+                thread: "w-stuck".into(),
+                route: Some("GET /stuck".into()),
+            }]
+        );
+        assert_eq!(abandoned[0].to_string(), "w-stuck (running GET /stuck)");
+        drop(release);
+    }
+
+    #[test]
+    fn two_pools_report_their_own_abandoned_workers() {
+        // Each pool's join returns only its own threads: nothing is shared through a
+        // process-wide list, so one server's stuck worker never reaches another's run.
+        let (release, blocked) = crossbeam_channel::bounded::<()>(0);
+        let stuck = PoolThreads {
+            threads: vec![thread_running("pool-a", blocked, IDLE)],
+            route_names: Vec::new(),
+        };
+        let (_done, finished) = crossbeam_channel::bounded::<()>(0);
+        drop(_done);
+        let clean = PoolThreads {
+            threads: vec![thread_running("pool-b", finished, IDLE)],
+            route_names: Vec::new(),
+        };
+        assert_eq!(clean.join_within(SHORT), vec![]);
+        assert_eq!(stuck.join_within(SHORT).len(), 1);
+        drop(release);
+    }
+
+    #[test]
+    fn split_errors_render_their_reason() {
+        assert!(SplitError::NoWorkers.to_string().starts_with("workers=0"));
+        assert!(SplitError::OneWorkerForBothKinds
+            .to_string()
+            .contains("needs at least 2 workers"));
     }
 }

@@ -7,6 +7,7 @@ mod bench;
 mod bridge;
 mod compression;
 mod config;
+mod conn_driver;
 mod db;
 mod grpc;
 mod handlers;
@@ -27,7 +28,6 @@ mod tls;
 mod tpc;
 mod types;
 mod websocket;
-mod worker;
 
 use pyo3::prelude::*;
 
@@ -49,17 +49,9 @@ fn _fault_panic(message: String) {
 #[pyo3::pyfunction]
 fn workrequest_counts() -> (u64, u64) {
     (
-        python::interp::WorkRequest::created_count(),
-        python::interp::WorkRequest::dropped_count(),
+        python::pool::WorkRequest::created_count(),
+        python::pool::WorkRequest::dropped_count(),
     )
-}
-
-/// Worker threads the last sub-interpreter pool shutdown abandoned, each with what it was
-/// running; taking the list clears it. `Pyronova.run()` exits non-zero when it is not
-/// empty, because finalizing with a live worker interpreter aborts (Layer 2, N8).
-#[pyo3::pyfunction]
-fn _forgotten_workers() -> Vec<String> {
-    python::pool::take_forgotten_workers()
 }
 
 /// The parameter names of the route path `path`, in order (`{*rest}` gives `rest`). A path
@@ -95,6 +87,11 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<state::SharedState>()?;
     m.add_class::<python::stream::PyronovaStream>()?;
     m.add_class::<python::body_stream::PyronovaBodyStream>()?;
+    m.add_class::<python::pool::AbandonedWorker>()?;
+    m.add(
+        "WorkerException",
+        m.py().get_type::<python::worker::WorkerException>(),
+    )?;
     m.add(
         "BodyRejected",
         m.py().get_type::<python::body_stream::BodyRejected>(),
@@ -109,9 +106,12 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(workrequest_counts, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(_in_worker, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(_route_params, m)?)?;
-    m.add_function(pyo3::wrap_pyfunction!(_forgotten_workers, m)?)?;
     // Called by the async engine in sub-interpreter workers (Layer 2, C5).
     m.add_function(pyo3::wrap_pyfunction!(python::worker_api::_worker_recv, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        python::worker_api::_worker_close,
+        m
+    )?)?;
     m.add_function(pyo3::wrap_pyfunction!(python::worker_api::_worker_send, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(python::worker_api::_worker_fail, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(

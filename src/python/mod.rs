@@ -1,44 +1,33 @@
-//! Python runtime boundary — sub-interpreter management + streaming
-//! glue between hyper and Python.
+//! Python runtime boundary — sub-interpreter workers + streaming glue between hyper and
+//! Python.
 //!
-//! Grouping rationale: these three modules hold the densest
-//! concentration of `unsafe` + `pyo3::ffi::*` in the codebase.
-//! Everything else in the tree either uses PyO3's safe bindings
-//! (`Python::attach`, `Py<PyAny>`, #[pyclass] getters) or has no
-//! PyO3 contact at all. Physically grouping the unsafe-heavy files
+//! Grouping rationale: these modules hold the densest concentration of `unsafe` +
+//! `pyo3::ffi::*` in the codebase. Everything else in the tree either uses PyO3's safe
+//! bindings or has no PyO3 contact at all. Physically grouping the unsafe-heavy files
 //! makes the FFI boundary easy to audit and isolate.
 //!
-//! Sub-interpreter management was historically one ~2.7k-LOC `interp`
-//! god module. It is now split into cohesive siblings (all still
-//! unsafe-heavy, so the audit-isolation rationale above still holds):
-//!
-//! - `ffi`: raw FFI primitives — `PyObjRef` RAII, `SubInterpGilGuard`,
-//!   tstate rebinding, and the async worker-state registry.
-//! - `worker_api`: the `#[pyfunction]`s the async engine calls
-//!   (`_worker_recv`/`_worker_send`/...).
-//! - `worker`: `SubInterpreterWorker` — owns one sub-interpreter.
-//! - `pool`: `InterpreterPool`, `WorkRequest`, and the per-OS-thread worker
-//!   loops.
-//! - `interp`: thin facade re-exporting the four above so existing
-//!   `crate::python::interp::X` call sites keep compiling unchanged.
-//! - `body_stream`: hyper Request body → Python channel. Used by
-//!   `stream=True` routes to feed upload data incrementally into
-//!   a Python async generator.
-//! - `stream`: Python channel → hyper Response body. Backs
-//!   Server-Sent Events (SSE) responses.
-//!
-//! Exports the previous crate-root module paths by re-exporting
-//! as `pub(crate) use`, so existing `crate::interp::X`-style call
-//! sites keep compiling with `crate::python::interp::X`.
+//! - `worker`: `SubInterpreterWorker` — owns one sub-interpreter, its thread state and
+//!   the references it serves with.
+//! - `worker_app`: the app a worker's script registered on.
+//! - `hook_chain`: one request's before hooks → handler → after hooks, shared by the main
+//!   interpreter and the workers.
+//! - `request_context`: one `contextvars.Context` per request.
+//! - `pool`: `InterpreterPool`, `WorkRequest`, and the per-OS-thread worker loops.
+//! - `worker_api`: the `#[pyfunction]`s the async engine calls (`_worker_recv` /
+//!   `_worker_send` / ...), and its per-worker inbox.
+//! - `body_stream`: hyper Request body → Python channel. Used by `stream=True` routes to
+//!   feed upload data incrementally into a Python async generator.
+//! - `stream`: Python channel → hyper Response body. Backs Server-Sent Events (SSE)
+//!   responses.
 
 pub(crate) mod body_stream;
-pub(crate) mod ffi;
-pub(crate) mod interp;
+pub(crate) mod hook_chain;
 pub(crate) mod pool;
 pub(crate) mod request_context;
 pub(crate) mod stream;
 pub(crate) mod worker;
 pub(crate) mod worker_api;
+pub(crate) mod worker_app;
 
 /// Stack size for every thread that runs Python code.
 ///

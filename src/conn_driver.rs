@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bridge::main_bridge::MainInterpBridge;
 use crate::handlers::{handle_request_tpc_inline, BoxBody};
-use crate::python::interp::SubInterpreterWorker;
+use crate::python::worker::SubInterpreterWorker;
 use crate::server::listener::Accepted;
 use crate::site::SharedSite;
 use crate::websocket;
@@ -63,10 +63,10 @@ impl TpcContext {
     /// context is gone (FR-19). A context still shared is leaked, with an error.
     pub(crate) fn end(context: Rc<TpcContext>) {
         match Rc::try_unwrap(context) {
-            Ok(context) => context.worker.into_inner().end_served(),
+            Ok(context) => context.worker.into_inner().end_on_own_thread(),
             Err(still_shared) => tracing::error!(
                 target: "pyronova::server",
-                worker = still_shared.worker.borrow().worker_id,
+                worker = still_shared.worker.borrow().worker_id(),
                 "a worker is still referenced after its thread's runtime ended; leaking its \
                  interpreter"
             ),

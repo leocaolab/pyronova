@@ -15,12 +15,12 @@ use hyper::http::request::Parts;
 use hyper::{Request, Response};
 
 use crate::bridge::main_bridge::{GilWorkItem, MainInterpBridge, TryDispatchError};
-use crate::python::interp::SubInterpreterWorker;
+use crate::conn_driver::TpcContext;
+use crate::python::worker::SubInterpreterWorker;
 use crate::request_id::RequestId;
 use crate::router::{Call, Params, RequestBody, RouteId, Target};
 use crate::site::Site;
 use crate::types::PyronovaRequest;
-use crate::worker::TpcContext;
 
 use super::error::{HandlerError, RequestTag};
 use super::pipeline::{

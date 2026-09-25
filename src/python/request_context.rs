@@ -76,6 +76,11 @@ impl Returned {
 }
 
 impl<'py> RequestContext<'py> {
+    /// The interpreter the request runs in.
+    pub(crate) fn py(&self) -> Python<'py> {
+        self.0.py()
+    }
+
     /// Runs the coroutine `coro` to completion on `event_loop` as a task whose context is
     /// this one: the context is left for the run (a context can't be entered twice) and
     /// entered again after it, however the run ends.

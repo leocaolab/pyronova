@@ -11,19 +11,17 @@ use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ConfigError, EnvConfig, Mode};
+use crate::conn_driver::drive_connection;
 use crate::handlers::{handle_request, handle_request_subinterp};
-use crate::python::interp;
+use crate::python::pool::{AbandonedWorker, InterpreterPool};
+use crate::python::worker::{SubInterpreterWorker, WorkerProgram, WorkerSpec};
+use crate::python::worker_app::{self, WorkerRoutes};
 use crate::router::{Dispatch, HandlerKind, MutableRoutes, RequestBody, RouteTable, Sealed};
 use crate::server::listener::{AcceptSource, Accepted, BoundListeners, Listener, ListenerSpec};
 use crate::site::{AccessLog, Cors, CorsSpec, Limits, SharedSite, Site, SiteConfig};
 use crate::state::SharedState;
 use crate::websocket;
-use crate::worker::drive_connection;
 use hyper_util::rt::TokioExecutor;
-
-/// The `PyronovaApp` a worker's script created: one per worker interpreter (Layer 2, C3).
-/// The worker takes its handlers from it after the script has run.
-static WORKER_APP: pyo3::sync::PyOnceLock<Py<PyronovaApp>> = pyo3::sync::PyOnceLock::new();
 
 #[pyclass(module = "pyronova.engine")]
 pub(crate) struct PyronovaApp {
@@ -40,8 +38,13 @@ pub(crate) struct PyronovaApp {
     request_id_header: Option<hyper::header::HeaderName>,
     /// This app's request-body and WebSocket limits, served by its runs.
     limits: Limits,
+    /// The libraries each worker loads from a private copy (`isolate`).
+    isolated: Vec<String>,
     /// The server `run` is serving; `None` while nothing is serving.
     serving: parking_lot::Mutex<Option<Serving>>,
+    /// The worker threads this app's last `run()` abandoned at its shutdown (still running
+    /// past the grace period), until taken (`_take_abandoned_workers`).
+    abandoned: parking_lot::Mutex<Vec<AbandonedWorker>>,
 }
 
 /// The server one `run()` call is serving.
@@ -65,8 +68,29 @@ impl PyronovaApp {
             grpc_benchmark: false,
             request_id_header: None,
             limits: Limits::DEFAULT,
+            isolated: Vec::new(),
             serving: parking_lot::Mutex::new(None),
+            abandoned: parking_lot::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Gives each sub-interpreter worker its own private copy of these C-extension
+    /// libraries, cloned by the worker's bootstrap before the script runs. `pyronova`
+    /// itself can't be isolated: one shared copy of it and its engine is required
+    /// (FR-11).
+    fn isolate(&mut self, libraries: Vec<String>) -> PyResult<()> {
+        if libraries.iter().any(|lib| lib == "pyronova") {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "pyronova cannot be isolated: one shared copy of pyronova and its engine is \
+                 required (it keeps process-wide state). Remove it from app.isolate(...).",
+            ));
+        }
+        for lib in libraries {
+            if !self.isolated.contains(&lib) {
+                self.isolated.push(lib);
+            }
+        }
+        Ok(())
     }
 
     /// Set full per-instance CORS configuration. All fields are applied to
@@ -573,7 +597,7 @@ impl PyronovaApp {
             stop: stop.clone(),
             bound: Vec::new(),
         });
-        let served = (|| -> PyResult<()> {
+        let served = (|| -> PyResult<Vec<AbandonedWorker>> {
             // Every listener is bound before any thread or worker exists: a port in use is
             // this call's `OSError(EADDRINUSE)`, not a log line from a serving thread.
             let listeners = BoundListeners::bind(&specs, accept_loops)?;
@@ -589,18 +613,31 @@ impl PyronovaApp {
                 num_cpus,
             };
             match (mode, tpc_enabled) {
-                (Mode::Subinterp, true) => self.run_tpc_subinterp(py, run, &env),
+                (Mode::Subinterp, true) => {
+                    self.run_tpc_subinterp(py, run, &env).map(|()| Vec::new())
+                }
                 (Mode::Subinterp, false) => self.run_subinterp(py, run, &env),
                 (Mode::Gil, true) => py
                     .detach(move || {
                         crate::tpc::run_tpc_gil(run.listeners, run.num_cpus, run.site, run.stop)
                     })
-                    .map_err(PyErr::from),
-                (Mode::Gil, false) => run_gil(py, run),
+                    .map_err(PyErr::from)
+                    .map(|()| Vec::new()),
+                (Mode::Gil, false) => run_gil(py, run).map(|()| Vec::new()),
             }
         })();
         *self.serving.lock() = None;
-        served
+        // Kept for the caller, not returned: a SIGINT's KeyboardInterrupt can land in
+        // Python before a return value is stored, and the caller must still see them.
+        served.map(|abandoned| *self.abandoned.lock() = abandoned)
+    }
+
+    /// The worker threads this app's last `run()` abandoned (still running past the
+    /// shutdown grace period), taken: a second call returns none. Their interpreters are
+    /// alive, and finalizing with a live sub-interpreter aborts, so `Pyronova.run()` exits
+    /// non-zero without finalizing when there are any (Layer 2, N8).
+    fn _take_abandoned_workers(&self) -> Vec<AbandonedWorker> {
+        std::mem::take(&mut *self.abandoned.lock())
     }
 
     /// The port the server `run()` is serving listens on (its first listener's; a
@@ -873,69 +910,32 @@ fn run_gil(py: Python<'_>, run: ServerRun) -> PyResult<()> {
     })
 }
 
-/// The handlers and hooks of the app a worker's script registered on, indexed like main's
-/// table, with their signature (Layer 2, C3).
-pub(crate) struct WorkerRoutes {
-    pub(crate) signature: crate::router::RouteSignature,
-    pub(crate) handlers: Vec<Py<PyAny>>,
-    pub(crate) before_hooks: Vec<Py<PyAny>>,
-    pub(crate) after_hooks: Vec<Py<PyAny>>,
-    /// The limits the script set on its app (never served: main's app is).
-    pub(crate) limits: Limits,
-}
-
-impl WorkerRoutes {
-    /// A script that registered nothing (a main table with no routes either).
-    pub(crate) fn empty() -> Self {
-        WorkerRoutes {
-            signature: crate::router::RouteSignature::default(),
-            handlers: Vec::new(),
-            before_hooks: Vec::new(),
-            after_hooks: Vec::new(),
-            limits: Limits::DEFAULT,
-        }
-    }
-}
-
-/// The routes of the app this worker's script registered on, or `None` if it registered
-/// none. Meaningful only in a worker, after its script ran.
-pub(crate) fn worker_routes(py: Python<'_>) -> Option<WorkerRoutes> {
-    let app = WORKER_APP.get(py)?.bind(py).borrow();
-    let table = app.routes.read();
-    Some(WorkerRoutes {
-        signature: crate::router::RouteSignature::of(&table),
-        handlers: table
-            .routes()
-            .iter()
-            .map(|r| r.handler.clone_ref(py))
-            .collect(),
-        before_hooks: table.before_hooks.iter().map(|h| h.clone_ref(py)).collect(),
-        after_hooks: table.after_hooks.iter().map(|h| h.clone_ref(py)).collect(),
-        limits: app.limits,
-    })
-}
-
 impl PyronovaApp {
     /// In a worker, the app the script registers routes or hooks on is the one the worker
     /// serves: the first registration records it, and a registration on a second app is an
     /// error (Layer 2, FR-4; decision Q-2 (a)). Raw `PyronovaApp()` scripts and `Pyronova`
     /// apps work the same way. A no-op on the main interpreter.
     fn serve_in_worker(slf: &Bound<'_, Self>) -> PyResult<()> {
-        let py = slf.py();
-        if crate::run_context::on_main(py) {
-            return Ok(());
-        }
-        match WORKER_APP.get(py) {
-            Some(app) if app.bind(py).is(slf) => Ok(()),
-            Some(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "the script registers routes or hooks on a second app; a worker serves \
-                 exactly one app per script (create one Pyronova()/PyronovaApp() and register \
-                 everything on it)",
-            )),
-            None => WORKER_APP.set(py, slf.clone().unbind()).map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err("worker app already recorded")
-            }),
-        }
+        worker_app::record(slf.as_any(), Self::worker_routes)
+    }
+
+    /// The routes and limits of `app` (a `PyronovaApp`), as its worker serves them.
+    fn worker_routes<'py>(app: &Bound<'py, PyAny>) -> PyResult<WorkerRoutes<'py>> {
+        let py = app.py();
+        let app = app.cast::<Self>()?.borrow();
+        let table = app.routes.read();
+        let bind = |hooks: &[Py<PyAny>]| hooks.iter().map(|h| h.bind(py).clone()).collect();
+        Ok(WorkerRoutes {
+            signature: crate::router::RouteSignature::of(&table),
+            handlers: table
+                .routes()
+                .iter()
+                .map(|r| r.handler.bind(py).clone())
+                .collect(),
+            before_hooks: bind(&table.before_hooks),
+            after_hooks: bind(&table.after_hooks),
+            limits: app.limits,
+        })
     }
 
     fn register_route(
@@ -1047,7 +1047,12 @@ impl PyronovaApp {
 
     /// The multi-thread sub-interpreter server (`PYRONOVA_TPC=0`): a channel pool of
     /// workers behind Tokio accept loops.
-    fn run_subinterp(&self, py: Python<'_>, run: ServerRun, env: &EnvConfig) -> PyResult<()> {
+    fn run_subinterp(
+        &self,
+        py: Python<'_>,
+        run: ServerRun,
+        env: &EnvConfig,
+    ) -> PyResult<Vec<AbandonedWorker>> {
         let ServerRun {
             listeners,
             site: routes,
@@ -1061,8 +1066,9 @@ impl PyronovaApp {
         // What every worker's script must register (Layer 2, C3), as plain values.
         let expected = crate::router::RouteSignature::of(&routes.routes);
         let shape = crate::router::RouteShape::of(&routes.routes);
-        let split = interp::split_workers_for_routes(workers, &shape.gil, &shape.is_async)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let split =
+            crate::python::pool::split_workers_for_routes(workers, &shape.gil, &shape.is_async)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
         let gil_count = shape.gil_count();
         let async_count_routes = shape.async_count();
@@ -1100,24 +1106,19 @@ impl PyronovaApp {
         );
         println!("  Script: {}\n", program.script_path);
 
-        let spec = interp::WorkerSpec {
+        let spec = WorkerSpec {
             program: &program,
             expected: &expected,
-            pool_id: interp::next_pool_id(),
             shared_state: &self.shared_state,
             gc_threshold: env.gc.threshold,
             limits: routes.config.limits,
         };
-        let pool = unsafe {
-            interp::InterpreterPool::new(split, py, &spec).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "sub-interpreter pool error: {e}"
-                ))
-            })?
-        };
+        // SAFETY: on the main thread with main's thread state current (`py`).
+        let (pool, threads) =
+            unsafe { InterpreterPool::new(split, &spec) }.map_err(|e| e.into_pyerr(py))?;
         let pool = Arc::new(pool);
 
-        py.detach(move || {
+        let served = py.detach(move || {
             serve_multi_thread(
                 listeners.groups,
                 io_workers,
@@ -1145,7 +1146,18 @@ impl PyronovaApp {
                     }
                 },
             )
-        })
+        });
+        // Every pool reference was in the serving closures, gone with them: the workers
+        // finish. The ones that don't within the grace period go back to this run's caller.
+        let abandoned = py.detach(|| threads.join());
+        if served.is_err() && !abandoned.is_empty() {
+            tracing::error!(
+                target: "pyronova::server",
+                "the server failed with worker(s) still running: {}",
+                abandoned.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+            );
+        }
+        served.map(|()| abandoned)
     }
 
     /// TPC sub-interp inline mode — each TPC thread owns its
@@ -1197,12 +1209,12 @@ impl PyronovaApp {
 
     /// The program workers run: the script `set_script_path` named, else
     /// `__main__.__file__`, with main's `sys.path` as it is now.
-    fn worker_program(&self, py: Python<'_>) -> PyResult<interp::WorkerProgram> {
+    fn worker_program(&self, py: Python<'_>) -> PyResult<WorkerProgram> {
         let script_path = match &self.script_path {
             Some(path) => path.clone(),
             None => py.import("__main__")?.getattr("__file__")?.extract()?,
         };
-        interp::WorkerProgram::read(py, script_path)
+        WorkerProgram::read(py, script_path, self.isolated.clone())
     }
 
     /// Builds `n` TPC sub-interpreter workers, in order, on the main thread: each runs the
@@ -1216,7 +1228,7 @@ impl PyronovaApp {
         n: usize,
         site: &Site,
         gc_threshold: u64,
-    ) -> PyResult<Vec<interp::SubInterpreterWorker>> {
+    ) -> PyResult<Vec<SubInterpreterWorker>> {
         if !crate::run_context::on_main(py) {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "sub-interpreter workers are built on the main interpreter only",
@@ -1225,11 +1237,9 @@ impl PyronovaApp {
         let program = self.worker_program(py)?;
 
         let expected = crate::router::RouteSignature::of(&site.routes);
-        let spec = interp::WorkerSpec {
+        let spec = WorkerSpec {
             program: &program,
             expected: &expected,
-            // Each worker gets it as `POOL_ID` (the async engine's zombie guard).
-            pool_id: interp::next_pool_id(),
             shared_state: &self.shared_state,
             gc_threshold,
             limits: site.config.limits,
@@ -1237,15 +1247,13 @@ impl PyronovaApp {
         let mut built = Vec::with_capacity(n);
         for i in 0..n {
             // SAFETY: on the main thread with main's thread state current (checked above).
-            let worker = unsafe { interp::SubInterpreterWorker::new(i, &spec) };
+            let worker = unsafe { SubInterpreterWorker::new(i, &spec) };
             match worker {
                 Ok(w) => built.push(w),
                 Err(e) => {
                     // SAFETY: as above; none of `built` was rebound to another thread.
-                    unsafe { interp::SubInterpreterWorker::end_all(built) };
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "sub-interp {i} init: {e}"
-                    )));
+                    unsafe { SubInterpreterWorker::end_all(built) };
+                    return Err(e.into_pyerr(py));
                 }
             }
         }
