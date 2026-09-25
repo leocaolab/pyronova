@@ -76,7 +76,10 @@ pub(crate) async fn run_on_main(
                 None => await_reply(task, task_lost).await,
             };
             match reply {
-                Ok(result) => build_main_http_response(result, accept_encoding.as_str()),
+                Ok(result) => {
+                    let compression = site.config.compression.as_ref();
+                    build_main_http_response(result, accept_encoding.as_str(), compression).await
+                }
                 Err(e) => fail(e, &tag),
             }
         }

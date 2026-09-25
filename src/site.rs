@@ -28,6 +28,8 @@ pub(crate) struct SiteConfig {
     pub(crate) request_id_header: Option<HeaderName>,
     /// This app's request-body and WebSocket limits.
     pub(crate) limits: Limits,
+    /// This app's response compression (`app.enable_compression()`); `None` = off.
+    pub(crate) compression: Option<crate::compression::Settings>,
     /// The WebSocket connections this run has open, against `limits.ws.max_connections`.
     pub(crate) ws_connections: crate::websocket::OpenConnections,
 }

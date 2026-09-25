@@ -40,6 +40,8 @@ pub(crate) struct PyronovaApp {
     request_id_header: Option<hyper::header::HeaderName>,
     /// This app's request-body and WebSocket limits, served by its runs.
     limits: Limits,
+    /// This app's response compression, served by its runs; `None` = off.
+    compression: Option<crate::compression::Settings>,
     /// The server `run` is serving; `None` while nothing is serving.
     serving: parking_lot::Mutex<Option<Serving>>,
 }
@@ -65,6 +67,7 @@ impl PyronovaApp {
             grpc_benchmark: false,
             request_id_header: None,
             limits: Limits::DEFAULT,
+            compression: None,
             serving: parking_lot::Mutex::new(None),
         }
     }
@@ -250,63 +253,14 @@ impl PyronovaApp {
         Ok(())
     }
 
-    /// Configure response compression. Disabled by default; opt-in only.
-    ///
-    /// Args:
-    ///   enabled: master switch — when false, compression logic is a
-    ///     single relaxed-atomic load + branch-not-taken.
-    ///   min_size: responses smaller than this (in bytes) are not compressed.
-    ///   gzip / brotli: enable each algorithm. Server prefers brotli when both
-    ///     are enabled and the client accepts it.
-    ///   gzip_level: 1..=9, default 6. Higher = better ratio, more CPU.
-    ///   brotli_quality: 0..=11, default 4. Production sweet spot is 4–6.
-    #[pyo3(signature = (
-        enabled,
-        min_size = crate::compression::DEFAULT_MIN_SIZE,
-        gzip = true,
-        brotli = true,
-        gzip_level = 6,
-        brotli_quality = 4,
-    ))]
-    #[allow(clippy::too_many_arguments)]
+    /// This app's response compression: a `Compression` to turn it on, `None` to turn it
+    /// off (the default). Per app, like the limits.
+    #[pyo3(signature = (settings))]
     fn configure_compression(
-        &self,
-        py: Python<'_>,
-        enabled: bool,
-        min_size: u32,
-        gzip: bool,
-        brotli: bool,
-        gzip_level: u32,
-        brotli_quality: u32,
+        &mut self,
+        settings: Option<&Bound<'_, crate::compression::Settings>>,
     ) {
-        let wanted = crate::compression::requested(
-            enabled,
-            min_size,
-            gzip,
-            brotli,
-            gzip_level,
-            brotli_quality,
-        );
-        // Process-wide (unlike the per-app limits): main sets it, a worker only warns (FR-17).
-        if crate::run_context::on_main(py) {
-            crate::compression::configure(
-                enabled,
-                min_size,
-                gzip,
-                brotli,
-                gzip_level,
-                brotli_quality,
-            );
-            return;
-        }
-        let current = crate::compression::current();
-        if wanted != current {
-            tracing::warn!(
-                target: "pyronova::server",
-                "configure_compression({wanted:?}) in a worker is ignored: compression is \
-                 process-wide, and the main interpreter set {current:?}"
-            );
-        }
+        self.compression = settings.map(|s| *s.get());
     }
 
     /// Marks the end of the script's registrations. `Pyronova` calls it once, on the main
@@ -977,6 +931,7 @@ impl PyronovaApp {
                 grpc_benchmark: self.grpc_benchmark,
                 request_id_header: self.request_id_header.clone(),
                 limits: self.limits,
+                compression: self.compression,
                 ws_connections: crate::websocket::OpenConnections::default(),
             },
         }

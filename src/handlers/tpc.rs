@@ -93,7 +93,7 @@ async fn run_inline(
                 client_ip: client_ip_addr,
                 request_id: request_id.clone(),
             };
-            call_inline(site, worker, route, request, &tag)
+            call_inline(site, worker, route, request, &tag).await
         }
         Err(e) => fail(e, &tag),
     };
@@ -128,7 +128,7 @@ impl InlineRequest<'_> {
     }
 }
 
-fn call_inline(
+async fn call_inline(
     site: &Site,
     worker: &RefCell<SubInterpreterWorker>,
     route: RouteId,
@@ -156,7 +156,12 @@ fn call_inline(
         );
         return fail(HandlerError::Timeout, tag);
     }
-    http_response(result, accept_encoding.as_str())
+    http_response(
+        result,
+        accept_encoding.as_str(),
+        site.config.compression.as_ref(),
+    )
+    .await
 }
 
 /// Runs a main-interpreter call (a `gil=True` route or the fallback) through the bridge.
@@ -196,6 +201,7 @@ async fn run_on_bridge(
                 headers,
                 client_ip: client_ip_addr,
                 max_body: site.config.limits.max_body_bytes,
+                compression: site.config.compression,
             };
             dispatch_to_bridge(bridge, &parts, incoming, call, &tag).await
         }
@@ -216,6 +222,8 @@ struct BridgeCall {
     client_ip: std::net::IpAddr,
     /// The app's `max_body_size`.
     max_body: usize,
+    /// The app's compression settings; `None` = off.
+    compression: Option<crate::compression::Settings>,
 }
 
 async fn dispatch_to_bridge(
@@ -281,7 +289,10 @@ async fn dispatch_to_bridge(
         None => await_reply(response_rx, lost).await,
     };
     match reply {
-        Ok(result) => build_main_http_response(result, accept_encoding.as_str()),
+        Ok(result) => {
+            let compression = call.compression.as_ref();
+            build_main_http_response(result, accept_encoding.as_str(), compression).await
+        }
         Err(e) => fail(e, tag),
     }
 }

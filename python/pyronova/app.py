@@ -11,7 +11,7 @@ import json as _json_module
 
 import os
 
-from pyronova.engine import Mode, PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log, _in_worker, _forgotten_workers, _route_params
+from pyronova.engine import Compression, Mode, PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log, _in_worker, _forgotten_workers, _route_params
 from pyronova.mcp import MCPServer
 from pyronova import _reload
 import logging as _logging
@@ -312,13 +312,14 @@ class Pyronova:
         gzip_level: int = 6,
         brotli_quality: int = 4,
     ) -> None:
-        """Enable gzip / brotli response compression.
+        """Enable gzip / brotli response compression for this app.
 
-        Disabled by default; call once at startup to turn on. The server
-        negotiates with the client's ``Accept-Encoding`` header and prefers
-        brotli when both are enabled. Skips responses under ``min_size``,
-        non-text content types (images, octet-stream), streaming responses
-        (SSE), and responses that set ``Content-Encoding`` explicitly.
+        Disabled by default; call once at startup to turn on. Per app: another app in
+        the same process keeps its own setting. The server negotiates with the client's
+        ``Accept-Encoding`` header and prefers brotli when both are enabled. Skips
+        responses under ``min_size``, non-text content types (images, octet-stream),
+        streaming responses (SSE), and responses that set ``Content-Encoding``
+        explicitly. A large body is compressed off the I/O threads.
 
         Args:
             min_size: minimum body size (bytes) to compress. Default 512.
@@ -326,14 +327,24 @@ class Pyronova:
             brotli: enable brotli (``Content-Encoding: br``). Default True.
             gzip_level: 1..=9, default 6 (balanced speed/ratio).
             brotli_quality: 0..=11, default 4 (production sweet spot).
+
+        :raises ValueError: a level out of its range, a negative ``min_size``, or
+            ``gzip=False, brotli=False`` (nothing to enable; use
+            ``disable_compression()``).
         """
         self._engine.configure_compression(
-            True, min_size, gzip, brotli, gzip_level, brotli_quality
+            Compression(
+                min_size=min_size,
+                gzip=gzip,
+                brotli=brotli,
+                gzip_level=gzip_level,
+                brotli_quality=brotli_quality,
+            )
         )
 
     def disable_compression(self) -> None:
         """Disable response compression. No-op if already disabled."""
-        self._engine.configure_compression(False)
+        self._engine.configure_compression(None)
 
     def enable_grpc_benchmark(self) -> None:
         """Serve HttpArena's ``benchmark.BenchmarkService/GetSum`` gRPC method.

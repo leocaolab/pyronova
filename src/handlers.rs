@@ -171,28 +171,34 @@ pub(crate) fn full_body(resp: Response<Full<Bytes>>) -> Response<BoxBody> {
     resp.map(|b| b.map_err(|e| match e {}).boxed())
 }
 
-/// A handler's result as a hyper response, compressed if the client accepts it. Every
-/// interpreter's handlers (main, pool workers, TPC inline) end here.
-pub(crate) fn http_response(
-    mut result: Result<ResponseData, Logged>,
+/// A handler's result as a hyper response, compressed as the app's `compression` settings
+/// allow if the client accepts it. Every interpreter's handlers (main, pool workers, TPC
+/// inline) end here.
+pub(crate) async fn http_response(
+    result: Result<ResponseData, Logged>,
     accept_encoding: &str,
+    compression: Option<&crate::compression::Settings>,
 ) -> Response<BoxBody> {
-    if let Ok(data) = result.as_mut() {
-        crate::compression::maybe_compress(data, accept_encoding);
-    }
+    let result = match result {
+        Ok(data) => Ok(crate::compression::compress(data, accept_encoding, compression).await),
+        Err(logged) => Err(logged),
+    };
     full_body(crate::response::build_response(result))
 }
 
 /// A main-interpreter handler result (GIL mode, the pool's `gil=True` routes, the TPC
 /// bridge) as a hyper response: a buffered response, or an SSE stream.
-pub(crate) fn build_main_http_response(
+pub(crate) async fn build_main_http_response(
     result: Result<MainReply, Logged>,
     accept_encoding: &str,
+    compression: Option<&crate::compression::Settings>,
 ) -> Response<BoxBody> {
     match result {
-        Ok(MainReply::Response(data)) => http_response(Ok(data), accept_encoding),
+        Ok(MainReply::Response(data)) => {
+            http_response(Ok(data), accept_encoding, compression).await
+        }
         Ok(MainReply::Stream(info)) => build_stream_response(info),
-        Err(logged) => http_response(Err(logged), accept_encoding),
+        Err(logged) => http_response(Err(logged), accept_encoding, compression).await,
     }
 }
 

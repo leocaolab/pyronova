@@ -89,6 +89,7 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     run_context::capture_main(m.py());
     m.add_class::<app::PyronovaApp>()?;
     m.add_class::<config::Mode>()?;
+    m.add_class::<compression::Settings>()?;
     m.add_class::<types::PyronovaRequest>()?;
     m.add_class::<types::PyronovaResponse>()?;
     m.add_class::<types::PyronovaHeaders>()?;
