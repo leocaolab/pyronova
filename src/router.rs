@@ -443,6 +443,8 @@ impl RouteShape {
         self.is_async.iter().filter(|&&a| a).count()
     }
 
+    /// Every route runs inline on a TPC worker: what the benches serve.
+    #[cfg(feature = "bench")]
     pub(crate) fn all_inline_sync(&self) -> bool {
         self.gil_count() == 0 && self.async_count() == 0
     }

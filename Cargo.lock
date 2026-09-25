@@ -1351,6 +1351,7 @@ dependencies = [
  "form_urlencoded",
  "futures-util",
  "http-body-util",
+ "httparse",
  "hyper",
  "hyper-util",
  "itoa",

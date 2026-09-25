@@ -124,13 +124,14 @@ pub(crate) fn accept_encoding(headers: &hyper::HeaderMap) -> &str {
         .unwrap_or("")
 }
 
-/// gRPC short-circuit, fast path, route resolution, then static file, fallback or 404.
+/// gRPC benchmark method (when enabled), fast path, route resolution, then static file,
+/// fallback or 404.
 pub(crate) async fn preprocess(
     req: Request<Incoming>,
     site: &Site,
 ) -> Result<Preprocessed, hyper::Error> {
-    if crate::grpc::is_grpc_request(&req) {
-        return grpc(req, site).await.map(Preprocessed::Respond);
+    if site.config.grpc_benchmark && crate::grpc::is_get_sum_call(&req) {
+        return grpc_get_sum(req, site).await.map(Preprocessed::Respond);
     }
     crate::monitor::count_request();
     let start = Instant::now();
@@ -204,15 +205,17 @@ async fn unrouted(parts: &Parts, site: &Site) -> Unrouted {
     }
 }
 
-/// gRPC needs HTTP/2 trailers (`grpc-status`) the normal response path can't model, so it
-/// goes to the hand-rolled unary dispatcher.
-async fn grpc(req: Request<Incoming>, site: &Site) -> Result<Response<BoxBody>, hyper::Error> {
+/// gRPC needs HTTP/2 trailers (`grpc-status`) the normal response path can't model, so the
+/// benchmark method is answered outside the route table.
+async fn grpc_get_sum(
+    req: Request<Incoming>,
+    site: &Site,
+) -> Result<Response<BoxBody>, hyper::Error> {
     let start = Instant::now();
-    let path = req.uri().path().to_owned();
-    let resp = crate::grpc::handle_grpc(req).await?;
+    let resp = crate::grpc::handle_get_sum(req).await?;
     let line = RequestLine {
         method: "POST",
-        path: &path,
+        path: crate::grpc::GET_SUM_PATH,
         start,
     };
     Ok(finish(resp, site, &line, Served::Engine))

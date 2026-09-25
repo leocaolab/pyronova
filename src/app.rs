@@ -32,6 +32,8 @@ pub(crate) struct PyronovaApp {
     cors: Option<Cors>,
     /// Per-instance access log. Its sampling counter is shared by every copy served.
     access_log: AccessLog,
+    /// Answer the built-in gRPC benchmark method (`enable_grpc_benchmark`).
+    grpc_benchmark: bool,
     /// Opt into Thread-Per-Core mode. See docs/tpc-rearch.md. Can also
     /// be flipped via the `PYRONOVA_TPC=1` env var; either is sufficient.
     tpc: bool,
@@ -47,6 +49,7 @@ impl PyronovaApp {
             shared_state: crate::state::map_for_new(py),
             cors: None,
             access_log: AccessLog::disabled(),
+            grpc_benchmark: false,
             tpc: false,
         }
     }
@@ -105,6 +108,13 @@ impl PyronovaApp {
             allow_credentials,
         })?);
         Ok(())
+    }
+
+    /// Answer HttpArena's `benchmark.BenchmarkService/GetSum` gRPC method. Only a POST to
+    /// that exact path with an `application/grpc*` content-type reaches it; every other
+    /// request is routed as usual.
+    fn enable_grpc_benchmark(&mut self) {
+        self.grpc_benchmark = true;
     }
 
     /// Enable/disable per-instance request logging.
@@ -615,12 +625,13 @@ impl PyronovaApp {
         }
     }
 
-    /// In-memory benchmark: spin up N TPC sub-interp workers, feed
-    /// them virtual connections via `tokio::io::duplex` (no TCP).
-    /// Bypasses the kernel network stack entirely — used to bound
-    /// the pure-framework ceiling (Hyper parse → routing → handler
-    /// → response build). Only supports sync, non-GIL, non-streaming
-    /// routes. Returns `(total_requests, elapsed_s)`.
+    /// In-memory benchmark (`--features bench` builds only): N TPC sub-interpreter
+    /// workers serve virtual connections (`tokio::io::duplex`, no TCP) that pipeline
+    /// `GET /`. The pure-framework ceiling: hyper parse → routing → handler → response.
+    /// Every route must be sync, non-GIL, non-stream. Returns
+    /// `(requests, elapsed_s)` over the measured window; any failed worker or client
+    /// raises instead.
+    #[cfg(feature = "bench")]
     #[pyo3(signature = (duration_s=10, workers=None, conns_per_worker=8))]
     fn bench_inmem(
         &self,
@@ -629,13 +640,30 @@ impl PyronovaApp {
         workers: Option<usize>,
         conns_per_worker: usize,
     ) -> PyResult<(u64, f64)> {
-        self.__bench_inmem_impl(py, duration_s, workers, conns_per_worker)
+        let n = bench_worker_count(workers)?;
+        // One copy of the site per worker, so no two cores share its refcount cacheline.
+        let sites: Vec<SharedSite> = (0..n)
+            .map(|_| self.bench_site(py).map(Arc::new))
+            .collect::<PyResult<_>>()?;
+        let expected = crate::router::RouteSignature::of(&sites[0].routes);
+        crate::monitor::init_metrics_flag();
+        let workers = self.build_workers(py, n, &expected)?;
+
+        let paired = workers.into_iter().zip(sites).collect();
+        let duration = std::time::Duration::from_secs(duration_s);
+        let measured = py
+            .detach(move || crate::bench::run_inmem_bench(conns_per_worker, duration, paired))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok((measured.requests, measured.elapsed.as_secs_f64()))
     }
 
-    /// Loopback bench: real TCP on 127.0.0.1, server + client in the
-    /// same process. Measures the framework ceiling with the kernel
-    /// network stack included, but zero external-client CPU
-    /// contention (unlike wrk). Returns (total_requests, elapsed_s, port).
+    /// Loopback benchmark (`--features bench` builds only): N TPC sub-interpreter
+    /// workers accept real TCP on an ephemeral 127.0.0.1 port, and `client_conns`
+    /// pipelining clients run in this process. The ceiling with the kernel network stack
+    /// but no external-client CPU contention (unlike wrk). Every route must be sync,
+    /// non-GIL, non-stream. Returns `(requests, elapsed_s, port)`; any failed worker or
+    /// client raises instead.
+    #[cfg(feature = "bench")]
     #[pyo3(signature = (duration_s=10, workers=None, client_conns=32))]
     fn bench_loopback(
         &self,
@@ -644,7 +672,33 @@ impl PyronovaApp {
         workers: Option<usize>,
         client_conns: usize,
     ) -> PyResult<(u64, f64, u16)> {
-        self.__bench_loopback_impl(py, duration_s, workers, client_conns)
+        let n = bench_worker_count(workers)?;
+        let site: SharedSite = Arc::new(self.bench_site(py)?);
+        let expected = crate::router::RouteSignature::of(&site.routes);
+        let gc_mode = crate::tpc::GcMode::from_env()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        crate::monitor::init_metrics_flag();
+        let workers = self.build_workers(py, n, &expected)?;
+
+        let duration = std::time::Duration::from_secs(duration_s);
+        let (measured, port) = py
+            .detach(move || {
+                crate::bench::run_loopback_bench(client_conns, duration, workers, site, gc_mode)
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok((measured.requests, measured.elapsed.as_secs_f64(), port))
+    }
+}
+
+/// `workers=None` means one per physical core; zero workers has nothing to measure.
+#[cfg(feature = "bench")]
+fn bench_worker_count(workers: Option<usize>) -> PyResult<usize> {
+    match workers {
+        None => Ok(crate::tpc::physical_core_count()),
+        Some(0) => Err(pyo3::exceptions::PyValueError::new_err(
+            "bench workers must be at least 1",
+        )),
+        Some(n) => Ok(n),
     }
 }
 
@@ -812,6 +866,7 @@ impl PyronovaApp {
             config: SiteConfig {
                 cors: self.cors.clone(),
                 access_log: self.access_log.clone(),
+                grpc_benchmark: self.grpc_benchmark,
             },
         }
     }
@@ -1056,12 +1111,7 @@ impl PyronovaApp {
         routes: SharedSite,
         tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     ) -> PyResult<()> {
-        let script_path = if let Some(ref p) = self.script_path {
-            p.clone()
-        } else {
-            let main_mod = py.import("__main__")?;
-            main_mod.getattr("__file__")?.extract::<String>()?
-        };
+        let script_path = self.worker_script_path(py)?;
 
         // What every worker's script must register (Layer 2, C3), as plain values.
         let expected = crate::router::RouteSignature::of(&routes.routes);
@@ -1304,58 +1354,11 @@ impl PyronovaApp {
         //   so all stream routes flow through the main-interp bridge.
         //   Phase 5 wires stream responses back through the bridge
         //   oneshot (BridgeResponse enum).
-        let script_path = if let Some(ref p) = self.script_path {
-            p.clone()
-        } else {
-            let main_mod = py.import("__main__")?;
-            main_mod.getattr("__file__")?.extract::<String>()?
-        };
-
-        // What every worker's script must register (Layer 2, C3), as plain values.
         let expected = crate::router::RouteSignature::of(&routes.routes);
-
         let gc_mode = crate::tpc::GcMode::from_env()
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-
-        // Read the user script once.
-        let raw_script = std::fs::read_to_string(&script_path).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("read script '{script_path}': {e}"))
-        })?;
-
-        // Allocate a pool_id for this TPC server; each worker gets it as
-        // `POOL_ID` (the async engine's zombie guard; TPC doesn't use it).
-        let pool_id = interp::next_pool_id();
-
-        // Build N sub-interpreters on the MAIN thread (main tstate current).
-        // Each SubInterpreterWorker::new swaps to a fresh sub-interp, runs
-        // the bootstrap script, then swaps back. Returned workers have
-        // `tstate` saved (GIL released) — the TPC thread will rebind it
-        // via rebind_tstate_to_current_thread before use.
         let n_threads = workers;
-        let mut sub_workers = Vec::with_capacity(n_threads);
-        for i in 0..n_threads {
-            let built = unsafe {
-                interp::SubInterpreterWorker::new(
-                    i,
-                    &raw_script,
-                    &script_path,
-                    &expected,
-                    pool_id,
-                    &self.shared_state,
-                )
-            };
-            match built {
-                Ok(w) => sub_workers.push(w),
-                Err(e) => {
-                    // End the workers built so far, here on their creating thread (FR-19).
-                    // SAFETY: main thread, main's thread state current, none rebound yet.
-                    unsafe { interp::SubInterpreterWorker::end_all(sub_workers) };
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "TPC sub-interp {i} init: {e}"
-                    )));
-                }
-            }
-        }
+        let sub_workers = self.build_workers(py, n_threads, &expected)?;
 
         // The main-interp bridge serves `gil=True` routes and the fallback with the main
         // GIL, while TPC threads handle the rest inline. See src/bridge/main_bridge.rs.
@@ -1409,151 +1412,78 @@ impl PyronovaApp {
         })
     }
 
-    #[allow(dead_code)]
-    fn __bench_inmem_impl(
-        &self,
-        py: Python<'_>,
-        duration_s: u64,
-        workers: Option<usize>,
-        conns_per_worker: usize,
-    ) -> PyResult<(u64, f64)> {
-        let n_threads = workers.unwrap_or_else(crate::tpc::physical_core_count);
-
-        // Build N independent FrozenRoutes — one per TPC worker. Each
-        // gets its own Arc allocation so the refcount cacheline is
-        // exclusive to the worker's P-core. Removes the cross-core
-        // ping-pong from per-request Arc::clone(&routes) at the cost
-        // of N × Py handler IncRefs at startup (one-time).
-        // Seal first, so the tables below carry the boundary workers compare against
-        // (Layer 2, FR-2).
-        self.seal_if_unsealed();
-        let build_one = |py: Python<'_>| -> SharedSite { Arc::new(self.snapshot(py)) };
-
-        // Route-shape validation uses one sample.
-        let sample = build_one(py);
-        if !crate::router::RouteShape::of(&sample.routes).all_inline_sync() {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "bench_inmem supports only sync, non-GIL, non-stream routes",
-            ));
+    /// The script workers execute: `set_script_path`'s, else `__main__.__file__`.
+    fn worker_script_path(&self, py: Python<'_>) -> PyResult<String> {
+        match &self.script_path {
+            Some(path) => Ok(path.clone()),
+            None => py.import("__main__")?.getattr("__file__")?.extract(),
         }
-        let expected = crate::router::RouteSignature::of(&sample.routes);
-
-        let mut per_worker_routes: Vec<SharedSite> = Vec::with_capacity(n_threads);
-        per_worker_routes.push(sample);
-        for _ in 1..n_threads {
-            per_worker_routes.push(build_one(py));
-        }
-
-        let script_path = if let Some(ref p) = self.script_path {
-            p.clone()
-        } else {
-            let main_mod = py.import("__main__")?;
-            main_mod.getattr("__file__")?.extract::<String>()?
-        };
-
-        crate::monitor::init_metrics_flag();
-        let raw_script = std::fs::read_to_string(&script_path).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("read script '{script_path}': {e}"))
-        })?;
-        let pool_id = interp::next_pool_id();
-        let mut built_workers = Vec::with_capacity(n_threads);
-        for i in 0..n_threads {
-            let w = unsafe {
-                interp::SubInterpreterWorker::new(
-                    i,
-                    &raw_script,
-                    &script_path,
-                    &expected,
-                    pool_id,
-                    &self.shared_state,
-                )
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "bench_inmem sub-interp {i} init: {e}"
-                    ))
-                })?
-            };
-            built_workers.push(w);
-        }
-
-        py.detach(move || -> PyResult<(u64, f64)> {
-            crate::bench::run_inmem_bench(
-                n_threads,
-                conns_per_worker,
-                duration_s,
-                built_workers,
-                per_worker_routes,
-                None,
-            )
-            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
-        })
     }
 
-    #[allow(dead_code)]
-    fn __bench_loopback_impl(
+    /// Builds `n` TPC sub-interpreter workers, in order, on the main thread: each runs the
+    /// app's script and must register `expected`. If worker `i` fails, the workers already
+    /// built are ended here, on the thread that created them (FR-19), before the error is
+    /// raised. The workers come back with their thread state saved; the thread that
+    /// serves one rebinds it first.
+    fn build_workers(
         &self,
         py: Python<'_>,
-        duration_s: u64,
-        workers: Option<usize>,
-        client_conns: usize,
-    ) -> PyResult<(u64, f64, u16)> {
-        self.seal_if_unsealed(); // see __bench_inmem_impl
-        let routes: SharedSite = Arc::new(self.snapshot(py));
-
-        if !crate::router::RouteShape::of(&routes.routes).all_inline_sync() {
+        n: usize,
+        expected: &crate::router::RouteSignature,
+    ) -> PyResult<Vec<interp::SubInterpreterWorker>> {
+        if !crate::run_context::on_main(py) {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "bench_loopback requires all routes to be sync, non-GIL, non-stream",
+                "sub-interpreter workers are built on the main interpreter only",
             ));
         }
-
-        let n_threads = workers.unwrap_or_else(crate::tpc::physical_core_count);
-        let script_path = if let Some(ref p) = self.script_path {
-            p.clone()
-        } else {
-            let main_mod = py.import("__main__")?;
-            main_mod.getattr("__file__")?.extract::<String>()?
-        };
-        let expected = crate::router::RouteSignature::of(&routes.routes);
-        let gc_mode = crate::tpc::GcMode::from_env()
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-
-        crate::monitor::init_metrics_flag();
-        let raw_script = std::fs::read_to_string(&script_path).map_err(|e| {
+        let script_path = self.worker_script_path(py)?;
+        let script = std::fs::read_to_string(&script_path).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("read script '{script_path}': {e}"))
         })?;
+        // Each worker gets it as `POOL_ID` (the async engine's zombie guard).
         let pool_id = interp::next_pool_id();
-        let mut built_workers = Vec::with_capacity(n_threads);
-        for i in 0..n_threads {
-            let w = unsafe {
+
+        let mut built = Vec::with_capacity(n);
+        for i in 0..n {
+            // SAFETY: on the main thread with main's thread state current (checked above).
+            let worker = unsafe {
                 interp::SubInterpreterWorker::new(
                     i,
-                    &raw_script,
+                    &script,
                     &script_path,
-                    &expected,
+                    expected,
                     pool_id,
                     &self.shared_state,
                 )
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "bench_loopback sub-interp {i} init: {e}"
-                    ))
-                })?
             };
-            built_workers.push(w);
+            match worker {
+                Ok(w) => built.push(w),
+                Err(e) => {
+                    // SAFETY: as above; none of `built` was rebound to another thread.
+                    unsafe { interp::SubInterpreterWorker::end_all(built) };
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "sub-interp {i} init: {e}"
+                    )));
+                }
+            }
         }
+        Ok(built)
+    }
+}
 
-        py.detach(move || -> PyResult<(u64, f64, u16)> {
-            crate::bench::run_loopback_bench(
-                n_threads,
-                client_conns,
-                duration_s,
-                built_workers,
-                routes,
-                None,
-                gc_mode,
-            )
-            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
-        })
+#[cfg(feature = "bench")]
+impl PyronovaApp {
+    /// What a bench serves: the sealed route table, which must be all sync, non-GIL,
+    /// non-stream (the TPC inline path with no main-interpreter bridge).
+    fn bench_site(&self, py: Python<'_>) -> PyResult<Site> {
+        self.seal_if_unsealed();
+        let site = self.snapshot(py);
+        if !crate::router::RouteShape::of(&site.routes).all_inline_sync() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "the benches support only sync, non-GIL, non-stream routes",
+            ));
+        }
+        Ok(site)
     }
 }
 

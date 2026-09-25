@@ -314,6 +314,16 @@ class Pyronova:
         """Disable response compression. No-op if already disabled."""
         self._engine.configure_compression(False)
 
+    def enable_grpc_benchmark(self) -> None:
+        """Serve HttpArena's ``benchmark.BenchmarkService/GetSum`` gRPC method.
+
+        Off by default. When enabled, only a ``POST`` to exactly
+        ``/benchmark.BenchmarkService/GetSum`` with an ``application/grpc*``
+        content-type is answered by the built-in service; every other request,
+        gRPC or not, is routed to your handlers as usual.
+        """
+        self._engine.enable_grpc_benchmark()
+
     def add_fast_response(
         self,
         method: str,

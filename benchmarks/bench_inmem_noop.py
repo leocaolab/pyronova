@@ -4,10 +4,13 @@
 from the TPC accept loop — no sub-interp GIL, no handler dispatch,
 no response build. Measures the floor cost of Hyper parse + routing
 + response write, per worker.
+
+Needs an engine built with `maturin develop --release --features bench`.
 """
 
 import sys
 from pyronova import Pyronova
+from _bench_build import require_bench
 
 app = Pyronova()
 
@@ -28,6 +31,7 @@ if __name__ == "__main__":
     conns = int(sys.argv[2]) if len(sys.argv) > 2 else 8
     duration = int(sys.argv[3]) if len(sys.argv) > 3 else 6
 
+    require_bench(app)
     total, elapsed = app._engine.bench_inmem(
         duration_s=duration, workers=workers, conns_per_worker=conns
     )

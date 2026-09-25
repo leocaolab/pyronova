@@ -21,9 +21,11 @@ adds per-object counters and is disabled in the published wheel.
 | MCP server endpoint | any `@mcp.tool` decorator | off |
 | WebSocket | `@app.websocket(path)` | off |
 | SSE streaming (response) | `return Stream(...)` | off |
+| gRPC benchmark service (HttpArena `GetSum`) | `app.enable_grpc_benchmark()` | off |
 | `leak_detect` (diagnostic) | `maturin develop --features leak_detect` | compile-time off |
+| `bench` (in-process benches) | `maturin develop --release --features bench` | compile-time off |
 
-All items above (except `leak_detect`) are zero-cost when disabled —
+All items above (except the compile-time features) are zero-cost when disabled —
 a single relaxed atomic load or a feature-flag branch that predicts away.
 
 ## Detailed usage
@@ -152,6 +154,18 @@ leak_detect_dump()   # prints top buckets to stderr
 See `docs/memory-leak-investigation-2026-04-19.md` for how this was
 used to pin down the PEP 684 tstate bug.
 
+### `bench`
+
+`PyronovaApp.bench_inmem` (virtual connections, no TCP) and
+`PyronovaApp.bench_loopback` (real TCP, client in the same process), used by
+`benchmarks/bench_inmem*.py` and `benchmarks/bench_loopback*.py`. Absent from the
+default build.
+
+```bash
+maturin develop --release --features bench
+python benchmarks/bench_inmem.py 4 8 8      # workers, conns per worker, seconds
+```
+
 ## Why not Cargo features for Postgres / Redis / etc.?
 
 We considered it. The math didn't work:
@@ -163,8 +177,9 @@ We considered it. The math didn't work:
   A 20 MB wheel is well within norms.
 
 Plan: everything compiles in by default. Only diagnostic/debug code
-(like `leak_detect`) stays behind a Cargo feature flag, because those
-carry a runtime cost we can't hide behind a lazy toggle.
+(like `leak_detect`) and benchmark harnesses (`bench`) stay behind a Cargo
+feature flag: the first carries a runtime cost we can't hide behind a lazy
+toggle, the second is not part of the library.
 
 If binary size ever becomes a real problem (e.g. Lambda cold-start, edge
 deployment), we'll revisit. Until then, one wheel, one `pip install`.

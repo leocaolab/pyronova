@@ -38,6 +38,11 @@ jobs:
           PYO3_PYTHON: ${{ env.pythonLocation }}/bin/python
         run: cargo test
 
+      - name: cargo test --features bench
+        env:
+          PYO3_PYTHON: ${{ env.pythonLocation }}/bin/python
+        run: cargo test --features bench
+
       - name: Build (release)
         run: |
           source .venv/bin/activate
@@ -129,3 +134,7 @@ jobs:
         env:
           PYO3_PYTHON: ${{ env.pythonLocation }}/bin/python
         run: cargo clippy --all-targets -- -D warnings
+      - name: cargo clippy --features bench
+        env:
+          PYO3_PYTHON: ${{ env.pythonLocation }}/bin/python
+        run: cargo clippy --all-targets --features bench -- -D warnings
