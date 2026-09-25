@@ -9,6 +9,7 @@ options set).
 
 import pytest
 
+from pyronova import Pyronova
 from pyronova.testing import TestClient
 
 
@@ -31,11 +32,8 @@ def test_set_request_log_sampling_directly():
         assert r.status_code == 200
 
 
-def test_sample_zero_clamped_to_one():
-    """sample_n=0 would divide-by-zero — Rust clamps to 1."""
-    # Its own module: a worker serves one app per module.
-    from tests.apps.log_sampling_zero import app
-
-    with TestClient(app, port=None) as c:
-        for _ in range(3):
-            assert c.get("/h").status_code == 200
+def test_sample_zero_is_rejected():
+    """sample_n=0 would divide by zero — Rust rejects it with ValueError."""
+    app = Pyronova()
+    with pytest.raises(ValueError, match="sample_n must be at least 1"):
+        app._engine.set_request_log_sampling(0, None)
