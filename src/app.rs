@@ -32,7 +32,7 @@ pub(crate) struct PyronovaApp {
     shared_state: Arc<dashmap::DashMap<String, bytes::Bytes>>,
     /// Per-instance CORS configuration (None = disabled), parsed when it is set.
     cors: Option<Cors>,
-    /// Per-instance access log. Its sampling counter is shared by every copy served.
+    /// Per-instance access log settings.
     access_log: AccessLog,
     /// Answer the built-in gRPC benchmark method (`enable_grpc_benchmark`).
     grpc_benchmark: bool,
@@ -859,7 +859,7 @@ fn run_gil(py: Python<'_>, run: ServerRun) -> PyResult<()> {
                     let svc = service_fn(move |req: Request<Incoming>| {
                         let site = Arc::clone(&site);
                         async move {
-                            if websocket::is_websocket_upgrade(&req) {
+                            if websocket::wants_websocket(&req, &site) {
                                 websocket::handle_websocket(req, site, client_ip).await
                             } else {
                                 handle_request(req, site, client_ip).await
@@ -1134,7 +1134,7 @@ impl PyronovaApp {
                         let svc = service_fn(move |req: Request<Incoming>| {
                             let (pool, site) = (Arc::clone(&pool), Arc::clone(&site));
                             async move {
-                                if websocket::is_websocket_upgrade(&req) {
+                                if websocket::wants_websocket(&req, &site) {
                                     websocket::handle_websocket(req, site, client_ip).await
                                 } else {
                                     handle_request_subinterp(req, pool, site, client_ip).await
@@ -1172,9 +1172,17 @@ impl PyronovaApp {
 
         // The main-interp bridge serves `gil=True` routes and the fallback with the main
         // GIL, while TPC threads handle the rest inline. See src/bridge/main_bridge.rs.
-        let bridge = routes.routes.uses_main().then(|| {
-            crate::bridge::main_bridge::MainInterpBridge::spawn(Arc::clone(&routes), env.bridge)
+        let spawned = routes.routes.uses_main().then(|| {
+            crate::bridge::main_bridge::MainInterpBridge::spawn(py, Arc::clone(&routes), env.bridge)
         });
+        let bridge = match spawned.transpose() {
+            Ok(bridge) => bridge,
+            Err(e) => {
+                // SAFETY: on the main thread that built them; none was handed to a thread.
+                unsafe { interp::SubInterpreterWorker::end_all(workers) };
+                return Err(e.into());
+            }
+        };
         let server = crate::tpc::TpcServer {
             workers,
             site: routes,

@@ -20,8 +20,9 @@ use hyper_util::server::conn::auto::{Builder as AutoBuilder, HttpServerConnExec}
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 
+use crate::body::BoxBody;
 use crate::bridge::main_bridge::MainInterpBridge;
-use crate::handlers::{handle_request_tpc_inline, BoxBody};
+use crate::handlers::handle_request_tpc_inline;
 use crate::python::interp::SubInterpreterWorker;
 use crate::server::listener::Accepted;
 use crate::site::SharedSite;
@@ -185,7 +186,7 @@ pub(crate) async fn drive_conn<IO>(
             let svc = service_fn(move |req: Request<Incoming>| {
                 let context = Rc::clone(&context);
                 async move {
-                    if websocket::is_websocket_upgrade(&req) {
+                    if websocket::wants_websocket(&req, &context.site) {
                         let site = Arc::clone(&context.site);
                         websocket::handle_websocket(req, site, remote_addr).await
                     } else {

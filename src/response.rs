@@ -9,7 +9,7 @@ use hyper::{Response, StatusCode};
 use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList, PyString};
 
-use crate::handlers::error::{Logged, PyException};
+use crate::error::{PyException, ResponseError};
 use crate::request_id::RequestId;
 use crate::types::{PyronovaResponse, ResponseData, ResponseHeaders};
 
@@ -63,44 +63,6 @@ fn json_dumps(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Result<Bytes, ResponseE
 // ---------------------------------------------------------------------------
 // Handler return value → ResponseData
 // ---------------------------------------------------------------------------
-
-/// Why a handler's return value is not a response.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum ResponseError {
-    #[error("the returned value could not be serialized as JSON: {0}")]
-    Json(PyException),
-    #[error("response text is not valid Unicode: {0}")]
-    Text(PyException),
-    #[error("str() of the returned {type_name} raised {exception}")]
-    Str {
-        type_name: String,
-        exception: PyException,
-    },
-    #[error("handler returned invalid HTTP status {0}")]
-    Status(u16),
-    #[error(
-        "a sub-interpreter handler returned a Stream; streaming responses need gil=True, \
-         stream=True on the route"
-    )]
-    StreamInWorker,
-    #[error("the returned Stream was already consumed")]
-    StreamConsumed,
-    #[error("could not build the Response an after_request hook receives: {0}")]
-    ToPy(PyException),
-}
-
-impl ResponseError {
-    /// The Python exception behind this error, if one raised.
-    pub(crate) fn exception(&self) -> Option<&PyException> {
-        match self {
-            ResponseError::Json(e) | ResponseError::Text(e) | ResponseError::ToPy(e) => Some(e),
-            ResponseError::Str { exception, .. } => Some(exception),
-            ResponseError::Status(_)
-            | ResponseError::StreamInWorker
-            | ResponseError::StreamConsumed => None,
-        }
-    }
-}
 
 /// What a handler (or a hook) returned, as a response. The type comes from the value,
 /// never from the text:
@@ -228,15 +190,11 @@ impl ResponseData {
 // HTTP response builders
 // ---------------------------------------------------------------------------
 
-/// The HTTP response for a handler's result. An error was logged where it happened and
-/// renders as its own status. The headers were validated when the `Response` was made, so
-/// building can't fail: the handler's header map becomes the response's, and
-/// `content-type` / `server` are added only if the handler didn't set them.
-pub(crate) fn build_response(result: Result<ResponseData, Logged>) -> Response<Full<Bytes>> {
-    let data = match result {
-        Ok(data) => data,
-        Err(logged) => return logged.into_response(),
-    };
+/// The HTTP response for a handler's response. The headers were validated when the
+/// `Response` was made, so building can't fail: the handler's header map becomes the
+/// response's, and `content-type` / `server` are added only if the handler didn't set
+/// them.
+pub(crate) fn build_response(data: ResponseData) -> Response<Full<Bytes>> {
     let mut headers = data.headers.into_map();
     headers.entry(CONTENT_TYPE).or_insert(data.content_type);
     headers
@@ -344,6 +302,17 @@ pub(crate) fn not_found_response() -> Response<Full<Bytes>> {
     )
 }
 
+/// 405 for a path that has routes, none for the request's method; `allow` lists the
+/// methods it has.
+pub(crate) fn method_not_allowed_response(allow: HeaderValue) -> Response<Full<Bytes>> {
+    let mut resp = json_error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        Bytes::from_static(b"{\"error\":\"method not allowed\"}"),
+    );
+    resp.headers_mut().insert(hyper::header::ALLOW, allow);
+    resp
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,7 +396,7 @@ mod tests {
             status: StatusCode::OK,
             headers: ResponseHeaders::new(),
         };
-        let resp = build_response(Ok(data));
+        let resp = build_response(data);
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()["content-type"], "text/plain");
     }
@@ -444,22 +413,9 @@ mod tests {
             status: StatusCode::CREATED,
             headers,
         };
-        let resp = build_response(Ok(data));
+        let resp = build_response(data);
         assert_eq!(resp.status(), StatusCode::CREATED);
         assert_eq!(resp.headers()["x-custom"], "value");
-    }
-
-    #[test]
-    fn build_response_error_falls_back_to_500() {
-        let id = RequestId::mint();
-        let tag = crate::handlers::error::RequestTag {
-            id: &id,
-            method: "GET",
-            path: "/",
-        };
-        let oops = crate::handlers::error::HandlerError::WorkerLost("oops").log(&tag);
-        let resp = build_response(Err(oops));
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
@@ -468,12 +424,12 @@ mod tests {
         let map = headers.as_map_mut();
         map.insert(CONTENT_TYPE, HeaderValue::from_static("text/csv"));
         map.insert(SERVER, HeaderValue::from_static("mine"));
-        let resp = build_response(Ok(ResponseData {
+        let resp = build_response(ResponseData {
             body: Bytes::from("a,b"),
             content_type: TEXT,
             status: StatusCode::OK,
             headers,
-        }));
+        });
         let all = |name| {
             resp.headers()
                 .get_all(name)
@@ -491,12 +447,12 @@ mod tests {
         let map = headers.as_map_mut();
         map.append("set-cookie", HeaderValue::from_static("a=1"));
         map.append("set-cookie", HeaderValue::from_static("b=2"));
-        let resp = build_response(Ok(ResponseData {
+        let resp = build_response(ResponseData {
             body: Bytes::new(),
             content_type: TEXT,
             status: StatusCode::OK,
             headers,
-        }));
+        });
         let cookies: Vec<_> = resp.headers().get_all("set-cookie").iter().collect();
         assert_eq!(cookies, ["a=1", "b=2"]);
     }

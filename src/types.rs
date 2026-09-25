@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use bytes::Bytes;
 use hyper::header::{HeaderMap, HeaderName, HeaderValue};
@@ -18,14 +18,12 @@ use crate::request_id::RequestId;
 
 #[pyclass(frozen, name = "Request", module = "pyronova.engine")]
 pub(crate) struct PyronovaRequest {
-    /// Arc<str> — shared with access log, zero-cost clone.
-    pub(crate) method: Arc<str>,
-    /// Arc<str> — shared with access log, zero-cost clone.
-    pub(crate) path: Arc<str>,
+    /// Moved from hyper's request: a standard method is a plain value, no allocation.
+    pub(crate) method: hyper::Method,
+    /// Moved from hyper's request: path and query are views into the bytes hyper read.
+    pub(crate) uri: hyper::Uri,
     /// Stored as Vec for small-count path params (typically 1-2).
     pub(crate) params: Vec<(String, String)>,
-    #[pyo3(get)]
-    pub(crate) query: String,
     /// The header fields as received, one entry per field line. Python reads them through
     /// the `Headers` view (`req.headers`), which converts only what it is asked for.
     pub(crate) headers: HeaderMap,
@@ -35,16 +33,8 @@ pub(crate) struct PyronovaRequest {
     pub(crate) request_id: RequestId,
     /// Stored as Bytes (ref-counted, zero-copy from hyper).
     pub(crate) body_bytes: Bytes,
-    /// For streaming routes (`stream=True`), this holds the feeder channel's
-    /// receiver end, shared across all clones of this request so the
-    /// handler (which receives a clone from `call_handler_with_hooks`) can
-    /// take ownership. The first `.stream` access wins; subsequent calls
-    /// return None. Stored as raw receiver (not `Py<PyronovaBodyStream>`) to
-    /// keep `drop_in_place::<PyronovaRequest>` free of `_Py_Dealloc` — that
-    /// would break `cargo test` linking for the pure-Rust unit tests.
-    pub(crate) body_stream_rx: Arc<
-        std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<crate::python::body_stream::ChunkMsg>>>,
-    >,
+    /// `req.stream`: the streamed body of a `stream=True` route, handed out once.
+    pub(crate) body_stream: crate::body::StreamSlot,
     /// Cached parse of the query string. `form_urlencoded::parse + collect`
     /// costs ~100-200 ns for a two-param query and building a fresh
     /// Python dict on top is another ~500 ns. OnceLock matches the
@@ -55,45 +45,22 @@ pub(crate) struct PyronovaRequest {
     pub(crate) query_all_cache: OnceLock<HashMap<String, Vec<String>>>,
 }
 
-/// Manual Clone: OnceLock doesn't impl Clone, so we reset the cache on clone.
-/// Cloned requests lazily recompute headers if accessed.
-impl Clone for PyronovaRequest {
-    fn clone(&self) -> Self {
-        // body_stream_rx is `Arc<Mutex<Option<Receiver>>>`, so clones share the
-        // *same* receiver slot rather than getting an independent one. This is
-        // deliberate and required: the handler runs on a clone (handed down by
-        // `call_handler_with_hooks`), so it must be able to take the receiver
-        // out of the shared slot. `.stream` is take-once — the first access
-        // (whichever clone) wins and later accesses see None. If two clones
-        // race for `.stream` only one gets the receiver; that's a caller bug,
-        // not a framework one, since streaming is expected on a single copy.
-        Self {
-            method: self.method.clone(),
-            path: self.path.clone(),
-            params: self.params.clone(),
-            query: self.query.clone(),
-            headers: self.headers.clone(),
-            client_ip_addr: self.client_ip_addr,
-            request_id: self.request_id.clone(),
-            body_bytes: self.body_bytes.clone(),
-            body_stream_rx: Arc::clone(&self.body_stream_rx),
-            query_cache: OnceLock::new(),
-            query_all_cache: OnceLock::new(),
-        }
+impl PyronovaRequest {
+    fn query_str(&self) -> &str {
+        self.uri.query().unwrap_or("")
     }
 }
 
 #[pymethods]
 impl PyronovaRequest {
     /// Python-side constructor: `Request(method, path, params, query,
-    /// body_bytes, headers, client_ip)`. Pyronova itself builds requests in
-    /// Rust (the worker paths through `worker::new_request`, the GIL route path
-    /// in `handlers/subinterp.rs`) and never goes through here.
+    /// body_bytes, headers, client_ip)`, through the same constructor the server uses
+    /// (`request_head`).
     ///
     /// `params` / `headers` arrive as `dict[str, str]`, `body_bytes` as `bytes`, and
-    /// `client_ip` as a string. A header that is not a valid field, or a `client_ip` that
-    /// is not an IP address, is a `ValueError` naming it. The request gets a fresh
-    /// `request_id`.
+    /// `client_ip` as a string. A method, path or query that is not valid in a request
+    /// line, a header that is not a valid field, or a `client_ip` that is not an IP
+    /// address is a `ValueError` naming it. The request gets a fresh `request_id`.
     #[new]
     fn py_new(
         method: &str,
@@ -111,29 +78,48 @@ impl PyronovaRequest {
         let client_ip_addr = client_ip.parse::<IpAddr>().map_err(|e| {
             PyValueError::new_err(format!("client_ip {client_ip:?} is not an IP address: {e}"))
         })?;
-        Ok(PyronovaRequest {
-            method: Arc::from(method),
-            path: Arc::from(path),
+        let target = if query.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}?{query}")
+        };
+        let (mut parts, ()) = hyper::Request::builder()
+            .method(method)
+            .uri(&target)
+            .body(())
+            .map_err(|e| {
+                PyValueError::new_err(format!(
+                    "method {method:?} with target {target:?} is not a valid request line: {e}"
+                ))
+            })?
+            .into_parts();
+        parts.headers = headers;
+        let head = crate::request_head::RequestHead {
+            parts,
             params: params.into_iter().collect(),
-            query: query.to_string(),
-            headers,
-            client_ip_addr,
+            client_ip: client_ip_addr,
             request_id: RequestId::mint(),
-            body_bytes: Bytes::from(body_bytes),
-            body_stream_rx: Arc::new(std::sync::Mutex::new(None)),
-            query_cache: OnceLock::new(),
-            query_all_cache: OnceLock::new(),
-        })
+        };
+        Ok(PyronovaRequest::new(
+            head,
+            crate::request_head::Body::Buffered(Bytes::from(body_bytes)),
+        ))
     }
 
     #[getter]
     fn method(&self) -> &str {
-        &self.method
+        self.method.as_str()
     }
 
     #[getter]
     fn path(&self) -> &str {
-        &self.path
+        self.uri.path()
+    }
+
+    /// The raw query string, without the `?`; `""` when the request has none.
+    #[getter]
+    fn query(&self) -> &str {
+        self.query_str()
     }
 
     /// Converts Vec<(String, String)> → Python dict on access.
@@ -174,14 +160,12 @@ impl PyronovaRequest {
     }
 
     /// Streaming body iterator. Only populated on routes registered with
-    /// `stream=True`; returns `None` otherwise so code that doesn't opt-in
-    /// never sees a stream object.
+    /// `stream=True`; `None` otherwise, so code that doesn't opt in never sees a stream
+    /// object.
     ///
-    /// **Consumed on first access.** The receiver is taken out of the
-    /// shared slot, so a second call to `req.stream` in the same request
-    /// lifecycle returns `None`. Before/after hooks that clone the request
-    /// and read `.stream` will steal chunks from the handler — that's the
-    /// caller's bug, not ours.
+    /// **Taken on first access.** A second `req.stream` in the same request raises
+    /// `RuntimeError`: one stream reads the body, so a hook that took it would leave the
+    /// handler none.
     ///
     /// Usage in a `@app.post(..., gil=True, stream=True)` handler:
     ///
@@ -194,14 +178,12 @@ impl PyronovaRequest {
         &self,
         py: Python<'_>,
     ) -> PyResult<Option<Py<crate::python::body_stream::PyronovaBodyStream>>> {
-        let rx = { self.body_stream_rx.lock().unwrap().take() };
-        match rx {
-            Some(rx) => Ok(Some(Py::new(
-                py,
-                crate::python::body_stream::PyronovaBodyStream::new(rx),
-            )?)),
-            None => Ok(None),
-        }
+        let rx = self
+            .body_stream
+            .take()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        rx.map(|rx| Py::new(py, crate::python::body_stream::PyronovaBodyStream::new(rx)))
+            .transpose()
     }
 
     /// Zero-copy: validates UTF-8 on the Bytes slice, creates Python str directly.
@@ -229,7 +211,7 @@ impl PyronovaRequest {
         if let Some(cache) = self.query_cache.get() {
             return cache.get(key).cloned();
         }
-        form_urlencoded::parse(self.query.as_bytes())
+        form_urlencoded::parse(self.query_str().as_bytes())
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.into_owned())
     }
@@ -251,7 +233,7 @@ impl PyronovaRequest {
         self.query_cache
             .get_or_init(|| {
                 let mut map: HashMap<String, String> = HashMap::new();
-                for (k, v) in form_urlencoded::parse(self.query.as_bytes()) {
+                for (k, v) in form_urlencoded::parse(self.query_str().as_bytes()) {
                     map.entry(k.into_owned()).or_insert_with(|| v.into_owned());
                 }
                 map
@@ -265,7 +247,7 @@ impl PyronovaRequest {
         self.query_all_cache
             .get_or_init(|| {
                 let mut map: HashMap<String, Vec<String>> = HashMap::new();
-                for (k, v) in form_urlencoded::parse(self.query.as_bytes()) {
+                for (k, v) in form_urlencoded::parse(self.query_str().as_bytes()) {
                     map.entry(k.into_owned()).or_default().push(v.into_owned());
                 }
                 map
@@ -697,21 +679,22 @@ mod tests {
         assert_eq!(joined_value(&hm, "x-name").as_deref(), Some("café"));
     }
 
+    fn request_with_query(query: &str) -> PyronovaRequest {
+        PyronovaRequest::py_new(
+            "GET",
+            "/search",
+            HashMap::new(),
+            query,
+            Vec::new(),
+            HashMap::new(),
+            "127.0.0.1",
+        )
+        .unwrap()
+    }
+
     #[test]
     fn query_params_parsing() {
-        let req = PyronovaRequest {
-            method: Arc::from("GET"),
-            path: Arc::from("/search"),
-            params: Vec::new(),
-            query: "q=hello+world&page=2&lang=en".to_string(),
-            headers: HeaderMap::new(),
-            client_ip_addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-            request_id: crate::request_id::RequestId::mint(),
-            body_bytes: Bytes::new(),
-            body_stream_rx: Arc::new(std::sync::Mutex::new(None)),
-            query_cache: OnceLock::new(),
-            query_all_cache: OnceLock::new(),
-        };
+        let req = request_with_query("q=hello+world&page=2&lang=en");
         let qp = req.query_params();
         assert_eq!(qp["q"], "hello world");
         assert_eq!(qp["page"], "2");
@@ -720,37 +703,13 @@ mod tests {
 
     #[test]
     fn query_params_empty() {
-        let req = PyronovaRequest {
-            method: Arc::from("GET"),
-            path: Arc::from("/"),
-            params: Vec::new(),
-            query: "".to_string(),
-            headers: HeaderMap::new(),
-            client_ip_addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-            request_id: crate::request_id::RequestId::mint(),
-            body_bytes: Bytes::new(),
-            body_stream_rx: Arc::new(std::sync::Mutex::new(None)),
-            query_cache: OnceLock::new(),
-            query_all_cache: OnceLock::new(),
-        };
+        let req = request_with_query("");
         assert!(req.query_params().is_empty());
     }
 
     #[test]
     fn query_params_percent_encoded() {
-        let req = PyronovaRequest {
-            method: Arc::from("GET"),
-            path: Arc::from("/"),
-            params: Vec::new(),
-            query: "name=%E4%B8%AD%E6%96%87".to_string(),
-            headers: HeaderMap::new(),
-            client_ip_addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-            request_id: crate::request_id::RequestId::mint(),
-            body_bytes: Bytes::new(),
-            body_stream_rx: Arc::new(std::sync::Mutex::new(None)),
-            query_cache: OnceLock::new(),
-            query_all_cache: OnceLock::new(),
-        };
+        let req = request_with_query("name=%E4%B8%AD%E6%96%87");
         assert_eq!(req.query_params()["name"], "中文");
     }
 

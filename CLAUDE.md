@@ -66,9 +66,10 @@ bash benchmarks/run_bench.sh
 - `#[pyclass(frozen)]` on Request/Response for thread safety
 - `Pyronova` Python wrapper provides decorator syntax; `PyronovaApp` is the raw Rust engine
 - Sub-interpreter mode uses `crossbeam-channel` multi-consumer pool with `tokio::sync::oneshot` async responses
-- Errors: one typed `HandlerError` (`handlers/error.rs`) carries the raw error (exception text + traceback, panic payload); it is logged once where it happens with the request id (`request_id.rs`, one writer per request) and rendered once at the edge — 4xx carry the reason, 5xx are `{"error": "Internal Server Error", "request_id": ...}` (decision D4)
+- Errors: one typed `HandlerError` (`error.rs`, the bottom layer beside `body.rs`; rendered by `handlers/error.rs`) carries the raw error (exception text + traceback, panic payload); it is logged once where it happens with the request id (`request_id.rs`, one writer per request) and rendered once at the edge — 4xx carry the reason, 5xx are `{"error": "Internal Server Error", "request_id": ...}` (decision D4)
 - `PyObjRef` RAII wrapper for all raw FFI pointer operations — Drop auto-DECREFs
 - Workers import the real `pyronova` package and engine (the fork makes the module per-interpreter); the async engine talks to Rust through `pyronova.engine._worker_recv`/`_worker_send`, which release the GIL during the channel wait
+- One `Request` constructor (`request_head.rs`) for every path; the TPC inline path moves hyper's method, URI, headers and body into it without allocating
 - Every Rust thread that enters Python names its interpreter (`run_context::main_attach` / `attach_to`); a bare foreign-thread `Python::attach` is rejected by `tests/test_attach_allowlist.py`
 - Hybrid dispatch: `gil=True` routes go to main interpreter (for C extensions), others to sub-interpreters
 - Auto dual-pool: framework detects `async def` vs `def` handlers, routes to appropriate worker pool

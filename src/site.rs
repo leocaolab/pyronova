@@ -1,8 +1,8 @@
 //! What one server run serves: the frozen route table plus the per-run settings applied
 //! to every response (CORS, access log). Built once when `run()` starts; read-only after.
 
+use std::cell::Cell;
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use hyper::header::{HeaderMap, HeaderName, HeaderValue};
@@ -163,9 +163,13 @@ pub(crate) struct AccessLog {
     pub(crate) sample_n: NonZeroU64,
     /// Responses with a status at or above this always log, sampled or not.
     pub(crate) always_status: Option<StatusCode>,
-    /// One sampling roll shared by every copy of the settings (every TPC thread), so
-    /// `sample_n = 100` keeps 1% overall rather than 1% per thread.
-    pub(crate) counter: Arc<AtomicU64>,
+}
+
+thread_local! {
+    /// This thread's sampling roll. Each thread keeps 1 in N of the responses it serves,
+    /// so the log keeps 1 in N overall, without every thread incrementing one shared
+    /// cache line per response.
+    static SAMPLE_ROLL: Cell<u64> = const { Cell::new(0) };
 }
 
 impl AccessLog {
@@ -174,12 +178,11 @@ impl AccessLog {
             enabled: false,
             sample_n: NonZeroU64::MIN,
             always_status: None,
-            counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// Cheapest check first: off, then the status floor, then the 1-in-N roll (`1` never
-    /// touches the shared counter).
+    /// touches the roll).
     #[inline]
     pub(crate) fn samples(&self, status: StatusCode) -> bool {
         if !self.enabled {
@@ -189,10 +192,62 @@ impl AccessLog {
             return true;
         }
         let n = self.sample_n.get();
-        n == 1
-            || self
-                .counter
-                .fetch_add(1, Ordering::Relaxed)
-                .is_multiple_of(n)
+        n == 1 || SAMPLE_ROLL.with(|roll| next_roll(roll).is_multiple_of(n))
+    }
+}
+
+/// The roll's current value, advancing it.
+fn next_roll(roll: &Cell<u64>) -> u64 {
+    let current = roll.get();
+    roll.set(current.wrapping_add(1));
+    current
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn one_in(n: u64) -> AccessLog {
+        AccessLog {
+            enabled: true,
+            sample_n: NonZeroU64::new(n).unwrap(),
+            always_status: None,
+        }
+    }
+
+    #[test]
+    fn each_thread_keeps_one_in_n_of_its_own_responses() {
+        let log = one_in(10);
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let log = log.clone();
+                std::thread::spawn(move || {
+                    // A fresh thread's roll starts at its own first response, whatever
+                    // the other threads did.
+                    let first = log.samples(StatusCode::OK);
+                    let rest = (0..99).filter(|_| log.samples(StatusCode::OK)).count();
+                    (first, rest)
+                })
+            })
+            .collect();
+        for t in threads {
+            // 100 responses on the thread: responses 0, 10, ..., 90 kept.
+            assert_eq!(t.join().unwrap(), (true, 9));
+        }
+    }
+
+    #[test]
+    fn the_status_floor_always_logs() {
+        let log = AccessLog {
+            always_status: Some(StatusCode::INTERNAL_SERVER_ERROR),
+            ..one_in(1000)
+        };
+        std::thread::spawn(move || {
+            assert!(log.samples(StatusCode::OK)); // the thread's roll 0
+            assert!(!log.samples(StatusCode::OK));
+            assert!(log.samples(StatusCode::BAD_GATEWAY));
+        })
+        .join()
+        .unwrap();
     }
 }

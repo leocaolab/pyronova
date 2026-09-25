@@ -1,21 +1,23 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, StreamBody};
-use hyper::body::{Frame, Incoming};
+use http_body_util::{BodyExt, StreamBody};
+use hyper::body::Frame;
 use hyper::header::{HeaderValue, CACHE_CONTROL, CONNECTION, CONTENT_TYPE, SERVER};
 use hyper::Response;
 use pyo3::prelude::*;
 
+use crate::body::{full_body, BoxBody};
+use crate::error::{catch_panic, HandlerError, Logged, ResponseError, Stage};
 use crate::python::interp;
-use crate::python::request_context::{in_request_context, RequestContext, Returned};
+use crate::python::request_context::{in_request_context, Awaitable, RequestContext};
 use crate::python::stream::PyronovaStream;
-use crate::response::{extract_response_data, ResponseError};
+use crate::response::extract_response_data;
 use crate::router::Target;
 use crate::site::Site;
 use crate::types::{PyronovaRequest, ResponseData, ResponseHeaders};
 
-use error::{HandlerError, Logged, RequestTag, Stage};
+use pipeline::AcceptEncoding;
 
 pub(crate) type SharedPool = Arc<interp::InterpreterPool>;
 
@@ -104,8 +106,8 @@ pub(crate) fn close_thread_event_loop(py: Python<'_>) {
 
 /// Runs what a hook or handler returned to a value: an awaitable is driven to completion
 /// on this thread's persistent asyncio event loop (cached per thread, so no loop is made
-/// and torn down per request), an `async def` coroutine in the request's own context
-/// (`rc`). A plain value is returned unchanged.
+/// and torn down per request), in the request's own context (`rc`) unless it is a
+/// `Future`, which runs in its own. A plain value is returned unchanged.
 ///
 /// An exception the awaitable raises is `stage`'s; one creating the loop is setup's.
 fn resolve_coroutine(
@@ -115,10 +117,9 @@ fn resolve_coroutine(
     stage: Stage,
 ) -> Result<Py<PyAny>, HandlerError> {
     let bound = obj.bind(py);
-    let returned = Returned::of(bound);
-    if returned == Returned::Value {
+    let Some(awaitable) = Awaitable::of(bound) else {
         return Ok(obj);
-    }
+    };
 
     LOOP.with(|tl| {
         let mut guard = tl.borrow_mut();
@@ -131,17 +132,20 @@ fn resolve_coroutine(
                 &*empty.insert((new_loop.unbind(), crate::run_context::Interp::current(py)))
             }
         };
-        // R-4: the loop belongs to the interpreter that created it. Only main-side threads
-        // reach this path; one arriving from another interpreter is a bug.
-        debug_assert_eq!(
-            loop_interp.id(),
-            crate::run_context::Interp::current(py).id(),
-            "thread-local event loop reused from a different interpreter"
-        );
+        // The loop belongs to the interpreter that created it. Only main-side threads reach
+        // this path; running it from another interpreter would mix two interpreters'
+        // objects, so the request fails instead.
+        let current = crate::run_context::Interp::current(py);
+        if loop_interp.id() != current.id() {
+            return Err(HandlerError::ForeignEventLoop {
+                loop_interp: loop_interp.id(),
+                current: current.id(),
+            });
+        }
         let event_loop = loop_obj.bind(py);
-        let result = match returned {
-            Returned::Coroutine => rc.run_coroutine(event_loop, bound),
-            _ => event_loop.call_method1("run_until_complete", (bound,)),
+        let result = match awaitable {
+            Awaitable::InTask => rc.run_in_task(event_loop, bound),
+            Awaitable::Future => event_loop.call_method1("run_until_complete", (bound,)),
         };
         Ok(result
             .map_err(|e| HandlerError::python(py, stage, &e))?
@@ -161,98 +165,35 @@ fn new_event_loop(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
 // Shared helpers — imported by tpc.rs / gil.rs / subinterp.rs submodules
 // ---------------------------------------------------------------------------
 
-pub(crate) type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
-
-#[inline]
-pub(crate) fn full_body(resp: Response<Full<Bytes>>) -> Response<BoxBody> {
-    // `Full<Bytes>::Error` is `std::convert::Infallible` (uninhabited) — this
-    // body can never yield an error. `match e {}` is the compiler-proven total
-    // conversion to the boxed body's `hyper::Error`, with no runtime panic path.
-    resp.map(|b| b.map_err(|e| match e {}).boxed())
-}
-
 /// A handler's result as a hyper response, compressed if the client accepts it. Every
 /// interpreter's handlers (main, pool workers, TPC inline) end here.
 pub(crate) fn http_response(
-    mut result: Result<ResponseData, Logged>,
-    accept_encoding: &str,
+    result: Result<ResponseData, Logged>,
+    accept_encoding: &AcceptEncoding,
 ) -> Response<BoxBody> {
-    if let Ok(data) = result.as_mut() {
-        crate::compression::maybe_compress(data, accept_encoding);
-    }
-    full_body(crate::response::build_response(result))
+    let resp = match result {
+        Ok(mut data) => {
+            if let Some(accepted) = accept_encoding.as_str() {
+                crate::compression::maybe_compress(&mut data, accepted);
+            }
+            crate::response::build_response(data)
+        }
+        Err(logged) => logged.into_response(),
+    };
+    full_body(resp)
 }
 
 /// A main-interpreter handler result (GIL mode, the pool's `gil=True` routes, the TPC
 /// bridge) as a hyper response: a buffered response, or an SSE stream.
 pub(crate) fn build_main_http_response(
     result: Result<MainReply, Logged>,
-    accept_encoding: &str,
+    accept_encoding: &AcceptEncoding,
 ) -> Response<BoxBody> {
     match result {
         Ok(MainReply::Response(data)) => http_response(Ok(data), accept_encoding),
         Ok(MainReply::Stream(info)) => build_stream_response(info),
         Err(logged) => http_response(Err(logged), accept_encoding),
     }
-}
-
-/// Feeder task for `stream=True` routes. Reads one hyper body frame at a
-/// time and pushes each data chunk into the `PyronovaBodyStream`'s mpsc channel.
-/// Enforces `max_size` as a running total (defense against malicious
-/// unbounded uploads) and a per-frame read deadline of [`pipeline::REQUEST_BUDGET`]
-/// (Slowloris defense, same budget as the buffered path). A body it gives up on is sent as
-/// the same [`pipeline::BodyReject`] a buffered body gets, so it answers the same 413/408.
-/// Handing a chunk to the handler is bounded by the same budget: a handler that stops
-/// reading ends the stream without its end, which reading it then reports. The
-/// dispatcher's reply budget starts when this returns ([`pipeline::await_streamed_reply`]).
-pub(crate) async fn stream_body_feeder(
-    body: Incoming,
-    tx: tokio::sync::mpsc::Sender<crate::python::body_stream::ChunkMsg>,
-    max_size: usize,
-) {
-    use crate::python::body_stream::ChunkMsg;
-    use hyper::body::Body;
-    use pipeline::BodyReject;
-    let mut body = body;
-    let mut total: usize = 0;
-    let reject = loop {
-        let next = tokio::time::timeout(
-            pipeline::REQUEST_BUDGET,
-            std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)),
-        )
-        .await;
-        let frame = match next {
-            Ok(Some(Ok(f))) => f,
-            Ok(Some(Err(e))) => break BodyReject::Read(Arc::new(e)),
-            Ok(None) => {
-                // The handler may have stopped reading: nobody left to tell.
-                let _ = tx.send(ChunkMsg::Eof).await;
-                return;
-            }
-            Err(_) => break BodyReject::TimedOut,
-        };
-        // Trailer / metadata frames are ignored for body streaming.
-        let Ok(chunk) = frame.into_data() else {
-            continue;
-        };
-        total = total.saturating_add(chunk.len());
-        if total > max_size {
-            break BodyReject::TooLarge;
-        }
-        // `.send().await` propagates backpressure all the way back to
-        // hyper's poll_frame: a slow Python consumer blocks the feeder,
-        // which blocks the next poll, which closes the TCP receive
-        // window so the client slows down on the wire. See body_stream.rs
-        // module doc for the bound (CHANNEL_CAPACITY = 8 frames in flight).
-        let handed = async { tx.send(ChunkMsg::Data(chunk)).await };
-        match tokio::time::timeout(pipeline::REQUEST_BUDGET, handed).await {
-            Ok(Ok(())) => {}
-            // The handler dropped the stream, or stopped reading it for a whole budget.
-            Ok(Err(_)) | Err(_) => return,
-        }
-    };
-    // The handler may have stopped reading: nobody left to tell.
-    let _ = tx.send(ChunkMsg::Err(reject)).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -279,30 +220,21 @@ pub(crate) fn call_handler_with_hooks(
     let gil_wait_start = std::time::Instant::now();
 
     // The request as its error log line names it; `sky_req` moves into its `Request`.
-    let (id, method, path) = (
-        sky_req.request_id.clone(),
-        Arc::clone(&sky_req.method),
-        Arc::clone(&sky_req.path),
-    );
-    let tag = RequestTag {
-        id: &id,
-        method: &method,
-        path: &path,
-    };
+    let label = sky_req.label();
 
     crate::run_context::main_attach(|py| {
         crate::monitor::GIL_QUEUE_LENGTH.fetch_sub(1, Relaxed);
         crate::monitor::record_gil_wait(gil_wait_start.elapsed().as_micros() as u64);
         let hold_start = std::time::Instant::now();
 
-        let result = error::catch_panic(|| {
+        let result = catch_panic(|| {
             in_request_context(py, |rc| run_with_hooks(py, rc, site, target, sky_req))
                 .unwrap_or_else(|e| Err(HandlerError::python(py, Stage::Setup, &e)))
         });
 
         // Record GIL hold time before releasing GIL
         crate::monitor::GIL_HOLD_MAX_US.fetch_max(hold_start.elapsed().as_micros() as u64, Relaxed);
-        result.map_err(|e| e.log(&tag))
+        result.map_err(|e| e.log(&label.tag()))
     })
 }
 

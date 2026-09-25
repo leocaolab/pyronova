@@ -11,8 +11,7 @@ use pyo3::prelude::*;
 
 use super::ffi::*;
 use super::worker::*;
-use crate::handlers::error::{Logged, RequestTag};
-use crate::request_id::RequestId;
+use crate::error::Logged;
 use crate::types::{PyronovaRequest, ResponseData};
 
 /// What a worker sends back for a request: its response, or its error, logged.
@@ -26,39 +25,16 @@ pub(crate) struct WorkRequest {
     pub route: crate::router::RouteId,
     /// Which worker kind runs it: the sync pool or the async engine's.
     pub kind: crate::router::HandlerKind,
-    /// Arc<str>: zero-cost clone of the value already Arc'd in handle_request_subinterp.
-    pub method: Arc<str>,
-    /// Arc<str>: same — avoids String alloc + memcpy on the Tokio thread.
-    pub path: Arc<str>,
-    pub params: Vec<(String, String)>,
-    pub query: String,
-    pub body: bytes::Bytes,
-    /// The request's header fields, moved into its `Request` as is.
-    pub headers: hyper::HeaderMap,
-    /// IpAddr: deferred to_string() to the worker thread.
-    pub client_ip: std::net::IpAddr,
-    pub request_id: RequestId,
+    /// The handler's `Request`, built on the Tokio thread (`request_head`); it moves into
+    /// the worker's interpreter as is.
+    pub request: PyronovaRequest,
     pub response_tx: WorkReply,
 }
 
 impl WorkRequest {
-    /// The handler's `Request`, and where its reply goes. The method, path and body move
-    /// in; nothing is copied.
+    /// The route, the handler's `Request`, and where its reply goes.
     pub(crate) fn into_request(self) -> (crate::router::RouteId, PyronovaRequest, WorkReply) {
-        let request = PyronovaRequest {
-            method: self.method,
-            path: self.path,
-            params: self.params,
-            query: self.query,
-            headers: self.headers,
-            client_ip_addr: self.client_ip,
-            request_id: self.request_id,
-            body_bytes: self.body,
-            body_stream_rx: Arc::new(Mutex::new(None)),
-            query_cache: std::sync::OnceLock::new(),
-            query_all_cache: std::sync::OnceLock::new(),
-        };
-        (self.route, request, self.response_tx)
+        (self.route, self.request, self.response_tx)
     }
 }
 
@@ -281,7 +257,7 @@ impl Drop for InterpreterPool {
                         // A worker thread panicked (e.g. a bounds violation in
                         // the handler dispatch). Surface the payload instead of
                         // swallowing it — a silent Drop makes such bugs invisible.
-                        let msg = crate::handlers::error::panic_message(&*panic);
+                        let msg = crate::error::panic_message(&*panic);
                         tracing::error!(
                             target: "pyronova::server",
                             "worker thread panicked during shutdown: {msg}",
@@ -498,24 +474,15 @@ fn worker_thread_loop(
 
         let (route, request, reply) = req.into_request();
         // The request as its error log line names it; `request` moves into the call.
-        let (id, method, path) = (
-            request.request_id.clone(),
-            Arc::clone(&request.method),
-            Arc::clone(&request.path),
-        );
+        let label = request.label();
 
         current_route.store(route.index(), Ordering::Relaxed);
         // SAFETY: on the thread this worker was rebound to, no thread state current.
         let result = unsafe { worker.serve(route, request) };
         current_route.store(IDLE, Ordering::Relaxed);
 
-        let tag = RequestTag {
-            id: &id,
-            method: &method,
-            path: &path,
-        };
         // The caller may have given up (504) meanwhile; the error is logged either way.
-        let _ = reply.send(result.map_err(|e| e.log(&tag)));
+        let _ = reply.send(result.map_err(|e| e.log(&label.tag())));
         WorkRequest::inc_completed();
     }
 

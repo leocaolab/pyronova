@@ -227,18 +227,8 @@ pub(crate) enum TaskError {
 impl From<tokio::task::JoinError> for TaskError {
     fn from(e: tokio::task::JoinError) -> Self {
         match e.try_into_panic() {
-            Ok(payload) => Self::Panicked(panic_message(payload)),
+            Ok(payload) => Self::Panicked(crate::error::panic_message(&*payload)),
             Err(_cancelled) => Self::Cancelled,
         }
-    }
-}
-
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    match payload.downcast::<String>() {
-        Ok(s) => *s,
-        Err(payload) => match payload.downcast::<&'static str>() {
-            Ok(s) => (*s).to_owned(),
-            Err(_) => "the panic payload is not a string".to_owned(),
-        },
     }
 }

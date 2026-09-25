@@ -16,7 +16,7 @@ use pyo3::prelude::*;
 
 use super::ffi::{get_worker_state, Pending, PyObjRef};
 use super::worker::worker_response;
-use crate::handlers::error::{panic_message, HandlerError, PyException, RequestTag, Stage};
+use crate::error::{panic_message, refuse, HandlerError, PyException, Refusal, Stage};
 use crate::types::ResponseData;
 
 /// Runs `f`, turning a Rust panic into a `RuntimeError` naming `context`.
@@ -57,9 +57,7 @@ pub(crate) fn _worker_recv(
         let (route, request, reply) = req.into_request();
         let pending = Pending {
             reply,
-            request_id: request.request_id.clone(),
-            method: Arc::clone(&request.method),
-            path: Arc::clone(&request.path),
+            label: request.label(),
         };
         let request = Py::new(py, request)?;
         // Only now that nothing can fail: a send dropped before this point reaches the
@@ -128,7 +126,7 @@ pub(crate) fn _worker_fail(
 #[pyfunction]
 pub(crate) fn _worker_timed_out(worker_id: usize, pool_id: u64, req_id: u64) -> PyResult<()> {
     no_panic("_worker_timed_out", || {
-        answer(worker_id, pool_id, req_id, Err(HandlerError::Timeout));
+        answer(worker_id, pool_id, req_id, Err(refuse(Refusal::Timeout)));
         Ok(())
     })
 }
@@ -160,12 +158,7 @@ fn answer(worker_id: usize, pool_id: u64, req_id: u64, result: Result<ResponseDa
         }
         return;
     };
-    let tag = RequestTag {
-        id: &pending.request_id,
-        method: &pending.method,
-        path: &pending.path,
-    };
-    let reply = result.map_err(|e| e.log(&tag));
+    let reply = result.map_err(|e| e.log(&pending.label.tag()));
     if pending.reply.send(reply).is_err() {
         tracing::debug!(target: "pyronova::server", req_id, worker_id, "the caller timed out (504); dropping the result");
     }

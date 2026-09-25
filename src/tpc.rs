@@ -29,7 +29,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::bridge::main_bridge::MainInterpBridge;
 use crate::config::{DarwinTopology, GcConfig, GC_MODE_ENV};
-use crate::handlers::error::panic_message;
+use crate::error::panic_message;
 use crate::handlers::handle_request;
 use crate::python::interp::SubInterpreterWorker;
 use crate::server::listener::{
@@ -357,7 +357,7 @@ async fn serve_main_conn(accepted: Accepted, site: SharedSite, conn_token: Cance
     let svc = service_fn(move |req: Request<Incoming>| {
         let site = Arc::clone(&site);
         async move {
-            if websocket::is_websocket_upgrade(&req) {
+            if websocket::wants_websocket(&req, &site) {
                 websocket::handle_websocket(req, site, client_ip).await
             } else {
                 handle_request(req, site, client_ip).await
