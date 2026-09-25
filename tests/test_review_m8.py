@@ -112,8 +112,8 @@ def test_an_app_built_in_a_function_names_why_workers_cannot_serve_it():
 
     with pytest.raises(RuntimeError) as err:
         TestClient(make())
-    text = str(err.value)
-    # The engine's own error, plus what to do about it.
+    text = "\n".join([str(err.value), *getattr(err.value, "__notes__", ())])
+    # The engine's own error, plus what to do about it (as a note on it).
     assert "registered no routes in the worker" in text, text
     assert "created inside a function" in text, text
     assert "mode='gil'" in text, text
@@ -124,32 +124,30 @@ def test_an_app_built_in_a_function_names_why_workers_cannot_serve_it():
 # ---------------------------------------------------------------------------
 
 
-def test_retried_start_prepares_once_and_runs_startup_once(monkeypatch, caplog):
-    # The pool path raises on a failed bind; the TPC path only logs it until M5.
-    monkeypatch.setenv("PYRONOVA_TPC", "0")
+def test_a_failed_start_then_a_start_prepares_once():
+    # A bind that fails is an OSError from the start (M5 binds before serving); the
+    # next start on the same app does not prepare it again, and each start runs the
+    # startup and shutdown hooks once.
     taken = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     taken.bind((HOST, 0))
     taken.listen()
     busy = taken.getsockname()[1]
-    picks = iter([busy])
-    monkeypatch.setattr(
-        testing, "_free_port", lambda host: next(picks, None) or _unused_port(),
-        raising=False,
-    )
     start = len(LIFECYCLE)
     try:
-        with caplog.at_level(logging.INFO, logger="pyronova.testing"):
-            with TestClient(app) as c:
-                assert c.port != busy
-                tools = c.post(
-                    "/mcp", body={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
-                ).json()
-                assert [t["name"] for t in tools["result"]["tools"]] == ["echo"]
-                assert LIFECYCLE[start:] == ["startup"]
+        with pytest.raises(OSError):
+            with TestClient(app, port=busy):
+                pass
     finally:
         taken.close()
-    assert "repicking" in caplog.text, "the first bind never collided"
     assert LIFECYCLE[start:] == ["startup", "shutdown"]
+
+    with TestClient(app) as c:
+        assert c.port != busy
+        tools = c.post(
+            "/mcp", body={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        ).json()
+        assert [t["name"] for t in tools["result"]["tools"]] == ["echo"]
+    assert LIFECYCLE[start:] == ["startup", "shutdown", "startup", "shutdown"]
 
 
 def test_each_start_runs_startup_and_shutdown_once():

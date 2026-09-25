@@ -943,8 +943,7 @@ class Pyronova:
 
     def _serve(self, settings: _ServeSettings, start: Callable[[_ServeSettings], None]) -> None:
         """One server's lifetime: prepare the app (once), run the startup hooks, ``start``
-        it (bind and serve until it stops), run the shutdown hooks. ``start`` may retry
-        its bind; everything else here happens once per server."""
+        it (bind and serve until it stops), run the shutdown hooks."""
         self._prepare(settings)
 
         graceful = False

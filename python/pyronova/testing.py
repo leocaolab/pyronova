@@ -42,7 +42,7 @@ import urllib.error
 from collections import defaultdict
 from dataclasses import dataclass, field
 from http.cookiejar import CookieJar
-from typing import Any, Iterator
+from typing import Any, Iterator, NoReturn
 
 from pyronova.app import Pyronova, _ServeSettings
 
@@ -210,7 +210,7 @@ class TestClient:
         for _ in range(_READY_POLLS):
             time.sleep(_READY_POLL_S)
             if not self._thread.is_alive():
-                raise RuntimeError(self._exited_early())
+                self._raise_exited_early()
             if self._port is None:
                 self._port = self._app._engine.bound_port()
                 if self._port is None:
@@ -232,23 +232,23 @@ class TestClient:
 
         # The thread may have died during the final probe iteration.
         if not self._thread.is_alive():
-            raise RuntimeError(self._exited_early())
+            self._raise_exited_early()
         raise RuntimeError(
             f"TestClient: server failed to start within {_READY_POLLS * _READY_POLL_S:.0f}s"
         )
 
-    def _exited_early(self) -> str:
+    def _raise_exited_early(self) -> NoReturn:
+        """The server thread ended before serving: raise what stopped it, as it is."""
         err = self._server_error
-        text = "TestClient: server thread exited before accepting connections"
-        if err is not None:
-            text += f": {type(err).__name__}: {err}"
+        if err is None:
+            raise RuntimeError("TestClient: server thread exited before accepting connections")
         if self._app._defined_in is None and self._settings.mode.uses_workers:
-            text += (
-                "\n(This app was created inside a function, so sub-interpreter workers "
+            err.add_note(
+                "This app was created inside a function, so sub-interpreter workers "
                 "cannot rebuild it by executing its module. Define it at module level, "
-                "or pass mode='gil' to serve every handler on the main interpreter.)"
+                "or pass mode='gil' to serve every handler on the main interpreter."
             )
-        return text
+        raise err
 
     def close(self) -> None:
         """Stop the server and wait until it has: its shutdown hooks have run and the port
