@@ -1,6 +1,6 @@
 """Type stubs for pyronova.engine (Rust extension module)."""
 
-from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 def init_logger(level: str, access_log: bool, format: str) -> None:
     """Install the Rust tracing engine, or reconfigure it if already installed.
@@ -30,6 +30,11 @@ def emit_python_log(
     ``levelno`` is the record's numeric level; it maps to the highest standard
     threshold it reaches, so a custom level 25 logs at INFO.
     """
+    ...
+
+def _python_log_level() -> Optional[int]:
+    """The Python ``logging`` level matching the level ``init_logger`` applied, or
+    ``None`` before any ``init_logger``. Workers gate their root logger on it."""
     ...
 
 class Metrics:
@@ -235,6 +240,21 @@ class SharedState:
     def __len__(self) -> int: ...
     def __repr__(self) -> str: ...
 
+class Mode:
+    """Where non-``gil=True`` handlers run."""
+
+    Gil: Mode
+    """Every handler on the main interpreter."""
+    Subinterp: Mode
+    """Handlers in sub-interpreter workers; ``gil=True`` routes on the main interpreter."""
+    @staticmethod
+    def parse(name: str) -> Mode:
+        """``"gil"`` (or ``"default"``) / ``"subinterp"`` (or ``"auto"``); anything else
+        raises ``ValueError``."""
+        ...
+    @property
+    def uses_workers(self) -> bool: ...
+
 class PyronovaApp:
     def __init__(self) -> None: ...
     def get(self, path: str, handler: Callable[..., Any], gil: bool = False) -> None: ...
@@ -285,6 +305,13 @@ class PyronovaApp:
         """
         ...
     def enable_request_logging(self, enabled: bool) -> None: ...
+    def set_request_log_sampling(
+        self, sample_n: int = 1, always_status: Optional[int] = None
+    ) -> None:
+        """Log 1 in ``sample_n`` requests; responses with a status at or above
+        ``always_status`` always log. ``ValueError`` for ``sample_n < 1`` or an
+        ``always_status`` that isn't an HTTP status (100-999)."""
+        ...
     def set_request_id_header(self, header: str) -> None:
         """Take ``req.request_id`` from the client's ``header`` when it sends a
         usable one (visible ASCII, at most 128 bytes); otherwise the server
@@ -309,8 +336,19 @@ class PyronovaApp:
         host: Optional[str] = None,
         port: Optional[int] = None,
         workers: Optional[int] = None,
-        mode: Optional[str] = None,
-    ) -> None: ...
+        mode: Union[Mode, str, None] = None,
+        io_workers: Optional[int] = None,
+        tls_cert: Optional[str] = None,
+        tls_key: Optional[str] = None,
+        extra_tls_ports: Optional[List[int]] = None,
+    ) -> None:
+        """Serve until SIGINT or ``shutdown()``. ``mode`` defaults to ``Mode.Gil``.
+
+        The engine's environment variables (``PYRONOVA_TPC``, ``PYRONOVA_GC_*``,
+        ``PYRONOVA_GIL_BRIDGE_*``, ``PYRONOVA_METRICS``, ``PYRONOVA_TPC_DARWIN``) are
+        parsed once here; an invalid mode or value raises ``ValueError`` before
+        anything starts."""
+        ...
     def shutdown(self) -> None:
         """Stop the server ``run()`` is serving, as SIGINT does: stop accepting, drain the
         in-flight connections, return from ``run()``. Callable from any thread; a no-op

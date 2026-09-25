@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from http.cookiejar import CookieJar
 from typing import Any, Iterator
 
-from pyronova.app import _WORKER_MODES, Pyronova, _ServeSettings
+from pyronova.app import Pyronova, _ServeSettings
 
 _logger = _logging.getLogger("pyronova.testing")
 
@@ -284,7 +284,7 @@ class TestClient:
         text = "TestClient: server thread exited before accepting connections"
         if err is not None:
             text += f": {type(err).__name__}: {err}"
-        if self._app._defined_in is None and self._settings.mode in _WORKER_MODES:
+        if self._app._defined_in is None and self._settings.mode.uses_workers:
             text += (
                 "\n(This app was created inside a function, so sub-interpreter workers "
                 "cannot rebuild it by executing its module. Define it at module level, "

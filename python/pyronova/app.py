@@ -11,7 +11,7 @@ import json as _json_module
 
 import os
 
-from pyronova.engine import PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log, _in_worker, _forgotten_workers
+from pyronova.engine import Mode, PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log, _in_worker, _forgotten_workers
 from pyronova.mcp import MCPServer
 from pyronova import _reload
 import logging as _logging
@@ -828,7 +828,7 @@ class Pyronova:
         self,
         level: str = "info",
         sample: int = 1,
-        always_log_status: int = 0,
+        always_log_status: int | None = None,
     ) -> None:
         """Enable the per-request access log (``pyronova::access``).
 
@@ -847,14 +847,15 @@ class Pyronova:
             atomic counter; sampling decision is global.
         :param always_log_status: bypass sampling for responses whose
             status is >= this value. ``400`` keeps full visibility of
-            4xx/5xx errors while sampling 2xx success traffic. ``0``
+            4xx/5xx errors while sampling 2xx success traffic. ``None``
             (default) applies sampling uniformly.
+
+        ``sample < 1`` or an ``always_log_status`` that isn't an HTTP status
+        raises ``ValueError``.
         """
+        # Validated first, so a bad value leaves the logging settings as they were.
+        self._engine.set_request_log_sampling(sample, always_log_status)
         self._engine.enable_request_logging(True)
-        # Sampling / always-log knobs land on the Rust route table; the
-        # decision happens inside each handler's logging path.
-        if sample > 1 or always_log_status > 0:
-            self._engine.set_request_log_sampling(sample, always_log_status)
 
         # The deferred init_logger picks these up (and validates the level).
         if self._log_config.get("level", "ERROR") in ("ERROR", "OFF"):
@@ -1024,8 +1025,7 @@ class Pyronova:
         if os.environ.get("PYRONOVA_LOG") == "1" or self.debug:
             self.enable_logging()
         # Deferred from __init__ so enable_logging() can adjust the config first.
-        # Sub-interpreter bootstrap reads the level from the environment.
-        os.environ["PYRONOVA_LOG_LEVEL"] = self._log_config["level"]
+        # Workers take the level the engine parsed here (`_python_log_level`).
         init_logger(
             self._log_config["level"],
             self._log_config["access_log"],
@@ -1045,7 +1045,7 @@ class Pyronova:
             self._route("POST", "/mcp", _mcp_handler, gil=True)
             print(f"  MCP: {len(mcp._tools)} tools, {len(mcp._resources)} resources, {len(mcp._prompts)} prompts → POST /mcp")
 
-        if settings.mode in _WORKER_MODES and settings.workers != 1:
+        if settings.mode.uses_workers and settings.workers != 1:
             print(f"  BLAS: {_limit_blas_threads()} (override: set OPENBLAS_NUM_THREADS)", flush=True)
         self._prepared = True
 
@@ -1068,10 +1068,6 @@ class Pyronova:
         self._engine.shutdown()
 
 
-# Modes whose non-``gil=True`` routes run in sub-interpreter workers.
-_WORKER_MODES = ("subinterp", "auto")
-
-
 @dataclass(frozen=True)
 class _ServeSettings:
     """Where and how one server runs, resolved once: explicit argument, else environment
@@ -1079,7 +1075,7 @@ class _ServeSettings:
 
     host: str
     port: int
-    mode: str
+    mode: Mode
     workers: int | None
     io_workers: int | None
     tls_cert: str | None
@@ -1093,12 +1089,14 @@ class _ServeSettings:
         host: str | None = None,
         port: int | None = None,
         workers: int | None = None,
-        mode: str | None = None,
+        mode: str | Mode | None = None,
         io_workers: int | None = None,
         tls_cert: str | None = None,
         tls_key: str | None = None,
         extra_tls_ports: list[int] | None = None,
     ) -> _ServeSettings:
+        if not isinstance(mode, Mode):
+            mode = Mode.parse(mode or "subinterp")
         if port is None:
             port = _env_int("PYRONOVA_PORT", "8000")
         if workers is None:
@@ -1119,10 +1117,13 @@ class _ServeSettings:
             )
         if extra_tls_ports is None:
             extra_tls_ports = _env_ports("PYRONOVA_TLS_PORTS")
+        else:
+            for p in extra_tls_ports:
+                _check_port("extra_tls_ports", p)
         return cls(
             host=host or os.environ.get("PYRONOVA_HOST", "127.0.0.1"),
             port=port,
-            mode=mode or "subinterp",
+            mode=mode,
             workers=workers,
             io_workers=io_workers,
             tls_cert=tls_cert,
@@ -1155,10 +1156,18 @@ def _env_ports(name: str) -> list[int] | None:
         if not p:
             continue
         try:
-            ports.append(int(p))
+            port = int(p)
         except ValueError:
             raise ValueError(f"{name} contains non-integer port {p!r}") from None
+        ports.append(_check_port(name, port))
     return ports
+
+
+def _check_port(source: str, port: int) -> int:
+    """An extra listening port: 1-65535 (an ephemeral port 0 could not be reached)."""
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError(f"{source} contains {port!r}, which is not a port (1-65535)")
+    return port
 
 
 def _defining_module_file(app: object) -> str | None:

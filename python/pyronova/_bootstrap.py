@@ -71,22 +71,8 @@ class _PyronovaRustHandler(_logging.Handler):
 _root = _logging.getLogger()
 _root.handlers.clear()
 _root.addHandler(_PyronovaRustHandler(WORKER_ID))
-# Sync Python's level gate with Rust's EnvFilter — rejects calls below
-# threshold *before* getMessage() formatting or FFI crossing occurs.
-# e.g. level=ERROR → logger.debug() returns immediately, no FFI overhead.
-_PYRONOVA_LEVEL_MAP = {
-    "TRACE": _logging.DEBUG, "DEBUG": _logging.DEBUG,
-    "INFO": _logging.INFO, "WARN": _logging.WARNING, "WARNING": _logging.WARNING,
-    "ERROR": _logging.ERROR, "CRITICAL": _logging.CRITICAL,
-    "OFF": _logging.CRITICAL + 10,
-}
-_log_level_str = _os.environ.get("PYRONOVA_LOG_LEVEL", "DEBUG").upper()
-if _log_level_str not in _PYRONOVA_LEVEL_MAP:
-    print(
-        f"pyronova: unrecognized PYRONOVA_LOG_LEVEL={_log_level_str!r}, defaulting to DEBUG",
-        file=sys.stderr,
-    )
-_root.setLevel(_PYRONOVA_LEVEL_MAP.get(_log_level_str, _logging.DEBUG))
+# The root level is synced with Rust's filter at the end of this file, once the
+# engine is imported.
 
 # -- Smart GC: hand Python GC scheduling off to the Rust engine --------------
 #
@@ -99,7 +85,7 @@ _root.setLevel(_PYRONOVA_LEVEL_MAP.get(_log_level_str, _logging.DEBUG))
 #
 # Fix: turn off CPython's automatic trigger entirely. The Rust engine
 # holds a cached `gc.collect` function pointer per sub-interp and fires
-# it at a configurable request-count interval (default 5000, control
+# it at a configurable request-count interval (default 100_000, control
 # via `PYRONOVA_GC_THRESHOLD=N` — set 0 to disable scheduled collection
 # entirely on workloads that never accrete cycles).
 #
@@ -906,3 +892,11 @@ _builtins.__import__ = _iso_import
 # Imported last, with the isolation machinery above in place: importing the
 # engine imports the `pyronova` package, and its own imports go through it.
 from pyronova.engine import emit_python_log as _emit_python_log  # noqa: E402
+from pyronova.engine import _python_log_level  # noqa: E402
+
+# Sync Python's level gate with the level the main interpreter's `init_logger` applied:
+# a record below it is rejected *before* getMessage() formatting or the FFI crossing
+# (level=ERROR → logger.debug() returns immediately). Before any `init_logger` (a raw
+# engine app), every record goes to Rust, whose filter decides.
+_level = _python_log_level()
+_root.setLevel(_logging.DEBUG if _level is None else _level)

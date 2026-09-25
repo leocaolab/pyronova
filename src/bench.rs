@@ -27,9 +27,10 @@ use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::task::{JoinHandle, LocalSet};
 use tokio_util::sync::CancellationToken;
 
+use crate::config::GcConfig;
 use crate::python::interp::SubInterpreterWorker;
 use crate::site::{SharedSite, Site};
-use crate::tpc::{elevate_thread_qos_macos, tpc_accept_loop_inline, try_pin_current, GcMode};
+use crate::tpc::{elevate_thread_qos_macos, tpc_accept_loop_inline, try_pin_current};
 
 /// The request every client connection sends, pipelined [`PIPELINE_DEPTH`] deep.
 const BENCH_REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: bench\r\nConnection: keep-alive\r\n\r\n";
@@ -175,7 +176,7 @@ pub(crate) fn run_loopback_bench(
     duration: Duration,
     workers: Vec<SubInterpreterWorker>,
     site: SharedSite,
-    gc_mode: GcMode,
+    gc: GcConfig,
 ) -> Result<(Measured, u16), BenchError> {
     let addr = free_loopback_addr()?;
     println!(
@@ -200,18 +201,8 @@ pub(crate) fn run_loopback_bench(
         move |worker, site_ref, stop| {
             let site = Arc::clone(&site);
             async move {
-                tpc_accept_loop_inline(
-                    addr,
-                    vec![],
-                    worker,
-                    site_ref,
-                    site,
-                    stop,
-                    None,
-                    None,
-                    gc_mode,
-                )
-                .await;
+                tpc_accept_loop_inline(addr, vec![], worker, site_ref, site, stop, None, None, gc)
+                    .await;
                 Vec::new()
             }
         },

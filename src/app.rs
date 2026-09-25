@@ -12,6 +12,7 @@ use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
+use crate::config::{ConfigError, EnvConfig, Mode};
 use crate::handlers::{handle_request, handle_request_subinterp};
 use crate::python::interp;
 use crate::router::{Dispatch, HandlerKind, MutableRoutes, RequestBody, RouteTable, Sealed};
@@ -37,9 +38,6 @@ pub(crate) struct PyronovaApp {
     grpc_benchmark: bool,
     /// The header a client's request id arrives in (`set_request_id_header`).
     request_id_header: Option<hyper::header::HeaderName>,
-    /// Opt into Thread-Per-Core mode. See docs/tpc-rearch.md. Can also
-    /// be flipped via the `PYRONOVA_TPC=1` env var; either is sufficient.
-    tpc: bool,
     /// The stop signal of the server `run` is serving; `None` while nothing is serving.
     serving: parking_lot::Mutex<Option<CancellationToken>>,
 }
@@ -56,14 +54,8 @@ impl PyronovaApp {
             access_log: AccessLog::disabled(),
             grpc_benchmark: false,
             request_id_header: None,
-            tpc: false,
             serving: parking_lot::Mutex::new(None),
         }
-    }
-
-    /// Enable Thread-Per-Core mode (Phase 1 scaffolding).
-    fn set_tpc(&mut self, enabled: bool) {
-        self.tpc = enabled;
     }
 
     /// Set per-instance CORS origin (legacy setter — disables advanced CORS
@@ -143,16 +135,35 @@ impl PyronovaApp {
     }
 
     /// Configure access-log sampling. `sample_n=1` (default) logs every
-    /// request; `sample_n=100` logs ~1% of requests. `always_status` is
-    /// the lower bound for "always log regardless of sampling" — set to
-    /// `400` to keep full visibility of 4xx/5xx while sampling 2xx, or
-    /// `0` (default) to apply sampling uniformly.
+    /// request; `sample_n=100` logs ~1% of requests; `0` raises `ValueError`.
+    /// `always_status` is the lower bound for "always log regardless of sampling" —
+    /// `400` keeps full visibility of 4xx/5xx while sampling 2xx; `None` (default)
+    /// applies sampling uniformly. A value that isn't an HTTP status raises `ValueError`.
     ///
     /// Has no effect unless `enable_request_logging(True)` is also set.
-    #[pyo3(signature = (sample_n=1, always_status=0))]
-    fn set_request_log_sampling(&mut self, sample_n: u64, always_status: u16) {
-        self.access_log.sample_n = sample_n.max(1);
+    #[pyo3(signature = (sample_n=1, always_status=None))]
+    fn set_request_log_sampling(
+        &mut self,
+        sample_n: u64,
+        always_status: Option<u16>,
+    ) -> PyResult<()> {
+        let sample_n = std::num::NonZeroU64::new(sample_n).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "sample_n must be at least 1 (1 logs every request)",
+            )
+        })?;
+        let always_status = always_status
+            .map(|code| {
+                hyper::StatusCode::from_u16(code).map_err(|_| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "always_status must be an HTTP status (100-999) or None, got {code}"
+                    ))
+                })
+            })
+            .transpose()?;
+        self.access_log.sample_n = sample_n;
         self.access_log.always_status = always_status;
+        Ok(())
     }
 
     /// Set max request body size in bytes. Default: 10 MB.
@@ -417,7 +428,7 @@ impl PyronovaApp {
 
     #[pyo3(signature = (
         host=None, port=None, workers=None, mode=None, io_workers=None,
-        tls_cert=None, tls_key=None, tpc=None, extra_tls_ports=None,
+        tls_cert=None, tls_key=None, extra_tls_ports=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn run(
@@ -426,11 +437,10 @@ impl PyronovaApp {
         host: Option<&str>,
         port: Option<u16>,
         workers: Option<usize>,
-        mode: Option<&str>,
+        mode: Option<&Bound<'_, PyAny>>,
         io_workers: Option<usize>,
         tls_cert: Option<&str>,
         tls_key: Option<&str>,
-        tpc: Option<bool>,
         extra_tls_ports: Option<Vec<u16>>,
     ) -> PyResult<()> {
         // A worker executes the whole script, so an unguarded `app.run()` in a raw-engine
@@ -446,26 +456,24 @@ impl PyronovaApp {
         }
         // isojson is a hard dependency: without it the server doesn't start.
         crate::response::require_json(py)?;
-        // Refresh the metrics kill-switch from the current env every
-        // run() — process-level state, but tests / hot-reload may flip
-        // PYRONOVA_METRICS between runs and we want each new server to
-        // honor the latest value.
-        crate::monitor::init_metrics_flag();
-        // RSS sampler is a real OS thread; spawning it twice would
-        // leak. Once-protect the spawn (and the log line) but leave
-        // the flag refresh above unguarded.
-        use std::sync::Once;
-        static RSS_SAMPLER_INIT: Once = Once::new();
-        RSS_SAMPLER_INIT.call_once(|| {
-            if std::env::var("PYRONOVA_METRICS").unwrap_or_default() == "1" {
+        // Everything this run takes from the environment, parsed once; a bad value stops
+        // it here, before anything is built.
+        let env = EnvConfig::from_env()?;
+        let mode = mode.map(Mode::from_arg).transpose()?.unwrap_or(Mode::Gil);
+        // Process-level, refreshed every run: tests / hot-reload may flip PYRONOVA_METRICS
+        // between runs, and each new server honours the latest value.
+        crate::monitor::init_metrics_flag(env.metrics);
+        if env.metrics {
+            // The RSS sampler is a real OS thread; spawning it twice would leak one.
+            static RSS_SAMPLER_INIT: std::sync::Once = std::sync::Once::new();
+            RSS_SAMPLER_INIT.call_once(|| {
                 crate::monitor::spawn_rss_sampler();
                 tracing::info!(target: "pyronova::server", "Metrics enabled (PYRONOVA_METRICS=1): passive GIL monitor + RSS sampler");
-            }
-        });
+            });
+        }
 
         let host = host.unwrap_or("127.0.0.1");
         let port = port.unwrap_or(8000);
-        let mode = mode.unwrap_or("default");
         let addr: SocketAddr =
             format!("{host}:{port}")
                 .parse()
@@ -510,14 +518,8 @@ impl PyronovaApp {
             }
         };
 
-        // Extra TLS ports: read from PYRONOVA_TLS_PORTS env if not provided.
-        let extra_tls_ports: Vec<u16> = extra_tls_ports
-            .or_else(|| {
-                std::env::var("PYRONOVA_TLS_PORTS")
-                    .ok()
-                    .map(|s| s.split(',').filter_map(|p| p.trim().parse().ok()).collect())
-            })
-            .unwrap_or_default();
+        // `Pyronova.run()` resolves PYRONOVA_TLS_PORTS into this argument (one parser).
+        let extra_tls_ports: Vec<u16> = extra_tls_ports.unwrap_or_default();
 
         let extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)> =
             if let Some(ref acc) = tls_acceptor {
@@ -562,47 +564,12 @@ impl PyronovaApp {
                 vec![]
             };
 
-        // TPC is now the default — automatic when the route set is
-        // compatible (no gil=True / async def / stream=True routes).
-        // Incompatible workloads fall back silently to the old
-        // multi-thread InterpreterPool. Opt out explicitly via
-        // `tpc=False`, `PYRONOVA_TPC=0`, or `PYRONOVA_TPC=off`.
-        //
-        // Why default-on: measured +7% throughput and ~10× P99
-        // improvement over the multi_thread path on the baseline
-        // test. Kernel SO_REUSEPORT + per-core current_thread runtime
-        // + physical-core pinning + zero cross-thread handler dispatch
-        // is a strict win for the common "sync handler" shape.
-        // After Phase 3+4+5 TPC covers every route shape:
-        //   gil=True        → main-interp bridge
-        //   async def       → sub-interp asyncio loop (inline, blocking)
-        //   response stream → main-interp bridge (MainReply::Stream)
-        //   stream=True     → body feeder on TPC LocalSet, receiver
-        //                     forwarded to bridge via GilWorkItem.body_stream_rx
-        //
-        // `PYRONOVA_TPC=0` remains as an escape hatch for unforeseen bugs
-        // or niche C-extension loading issues.
-        let tpc_incompatible = false;
-        let tpc_forced_off = std::env::var("PYRONOVA_TPC")
-            .map(|v| {
-                matches!(
-                    v.to_ascii_lowercase().as_str(),
-                    "0" | "off" | "no" | "false"
-                )
-            })
-            .unwrap_or(false);
-        let tpc_explicit_opt_in = tpc.unwrap_or(false) || self.tpc || crate::tpc::env_enabled();
-        // Explicit opt-in on an incompatible route set is a startup
-        // error (existing behavior in run_tpc_subinterp). Implicit
-        // default on incompatible set silently falls back — this is
-        // the whole point of the auto path.
-        let tpc_enabled = if tpc_forced_off {
-            false
-        } else if tpc_explicit_opt_in {
-            true // run_tpc_subinterp will error if incompatible
-        } else {
-            !tpc_incompatible
-        };
+        // Thread-per-core serves every route shape (gil=True and response streams through
+        // the main-interpreter bridge, async def on the worker's own loop, stream=True
+        // bodies fed from the TPC thread) and measured +7% throughput and ~10× better P99
+        // than the multi-thread pool, so it is the default. `PYRONOVA_TPC=0` keeps the
+        // pool path as an escape hatch for niche C-extension loading issues.
+        let tpc_enabled = env.tpc;
 
         // TPC defaults to PHYSICAL core count, not logical. On SMT
         // systems, pinning 2 TPC threads to sibling hyperthreads
@@ -620,7 +587,7 @@ impl PyronovaApp {
 
         let stop = CancellationToken::new();
         *self.serving.lock() = Some(stop.clone());
-        let served = if mode == "subinterp" || mode == "auto" {
+        let served = if mode == Mode::Subinterp {
             if tpc_enabled {
                 // When extra_tls is non-empty the TLS ports are handled by
                 // those extra listeners; the main addr is plain HTTP.
@@ -630,7 +597,7 @@ impl PyronovaApp {
                     None
                 };
                 self.run_tpc_subinterp(
-                    py, addr, workers, io_workers, num_cpus, frozen, main_tls, extra_tls, stop,
+                    py, addr, workers, num_cpus, frozen, main_tls, extra_tls, &env, stop,
                 )
             } else {
                 self.run_subinterp(
@@ -641,6 +608,7 @@ impl PyronovaApp {
                     num_cpus,
                     frozen,
                     tls_acceptor,
+                    &env,
                     stop,
                 )
             }
@@ -683,8 +651,9 @@ impl PyronovaApp {
             .map(|_| self.bench_site(py).map(Arc::new))
             .collect::<PyResult<_>>()?;
         let expected = crate::router::RouteSignature::of(&sites[0].routes);
-        crate::monitor::init_metrics_flag();
-        let workers = self.build_workers(py, n, &expected)?;
+        let env = EnvConfig::from_env()?;
+        crate::monitor::init_metrics_flag(env.metrics);
+        let workers = self.build_workers(py, n, &expected, env.gc.count_trigger())?;
 
         let paired = workers.into_iter().zip(sites).collect();
         let duration = std::time::Duration::from_secs(duration_s);
@@ -712,15 +681,14 @@ impl PyronovaApp {
         let n = bench_worker_count(workers)?;
         let site: SharedSite = Arc::new(self.bench_site(py)?);
         let expected = crate::router::RouteSignature::of(&site.routes);
-        let gc_mode = crate::tpc::GcMode::from_env()
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        crate::monitor::init_metrics_flag();
-        let workers = self.build_workers(py, n, &expected)?;
+        let env = EnvConfig::from_env()?;
+        crate::monitor::init_metrics_flag(env.metrics);
+        let workers = self.build_workers(py, n, &expected, env.gc.count_trigger())?;
 
         let duration = std::time::Duration::from_secs(duration_s);
         let (measured, port) = py
             .detach(move || {
-                crate::bench::run_loopback_bench(client_conns, duration, workers, site, gc_mode)
+                crate::bench::run_loopback_bench(client_conns, duration, workers, site, env.gc)
             })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok((measured.requests, measured.elapsed.as_secs_f64(), port))
@@ -1162,6 +1130,7 @@ impl PyronovaApp {
         num_cpus: usize,
         routes: SharedSite,
         tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
+        env: &EnvConfig,
         stop: CancellationToken,
     ) -> PyResult<()> {
         let script_path = self.worker_script_path(py)?;
@@ -1171,9 +1140,12 @@ impl PyronovaApp {
         let shape = crate::router::RouteShape::of(&routes.routes);
 
         // The pool's workers keep their `PYRONOVA_GC_THRESHOLD` count trigger: count mode only.
-        crate::tpc::GcMode::from_env()
-            .and_then(|mode| mode.supported_by(crate::tpc::GcServer::SubInterpreterPool))
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let gc_mode = env
+            .gc
+            .mode
+            .supported_by(crate::tpc::GcServer::SubInterpreterPool)
+            .map_err(ConfigError::from)?;
+        debug_assert_eq!(gc_mode, crate::tpc::GcMode::Count);
         let split = interp::split_workers_for_routes(workers, &shape.gil, &shape.is_async)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
@@ -1217,12 +1189,19 @@ impl PyronovaApp {
         println!("  Script: {script_path}\n");
 
         let pool = unsafe {
-            interp::InterpreterPool::new(split, py, &script_path, &expected, &self.shared_state)
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "sub-interpreter pool error: {e}"
-                    ))
-                })?
+            interp::InterpreterPool::new(
+                split,
+                py,
+                &script_path,
+                &expected,
+                &self.shared_state,
+                env.gc.threshold,
+            )
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "sub-interpreter pool error: {e}"
+                ))
+            })?
         };
         let pool = Arc::new(pool);
 
@@ -1345,25 +1324,20 @@ impl PyronovaApp {
         })
     }
 
-    /// TPC sub-interp inline mode (Phase 2) — each TPC thread owns its
+    /// TPC sub-interp inline mode — each TPC thread owns its
     /// own sub-interp and runs handlers synchronously on the accept
     /// thread. No pool, no channel, no oneshot wake.
-    ///
-    /// Phase 2 constraint: every route must be sync + non-GIL. Any
-    /// route with `gil=True`, `async def`, or `stream=True` causes this
-    /// to bail at startup with a clear error. Users with such routes
-    /// should stay on the old multi_thread path (drop `tpc=True`).
     #[allow(clippy::too_many_arguments)]
     fn run_tpc_subinterp(
         &self,
         py: Python<'_>,
         addr: SocketAddr,
         workers: usize,
-        _io_workers: usize,
         num_cpus: usize,
         routes: SharedSite,
         tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
         extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
+        env: &EnvConfig,
         stop: CancellationToken,
     ) -> PyResult<()> {
         // gil=True routes: main-interp bridge (Phase 3).
@@ -1385,40 +1359,23 @@ impl PyronovaApp {
         //   Phase 5 wires stream responses back through the bridge
         //   oneshot (`MainReply::Stream`).
         let expected = crate::router::RouteSignature::of(&routes.routes);
-        let gc_mode = crate::tpc::GcMode::from_env()
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        #[cfg(target_os = "macos")]
+        if env.darwin_topology == crate::config::DarwinTopology::Fanout {
+            // The fanout loop has no idle tick: count or off only.
+            env.gc
+                .mode
+                .supported_by(crate::tpc::GcServer::DarwinFanout)
+                .map_err(ConfigError::from)?;
+        }
+        let (gc, topology) = (env.gc, env.darwin_topology);
         let n_threads = workers;
-        let sub_workers = self.build_workers(py, n_threads, &expected)?;
+        let sub_workers = self.build_workers(py, n_threads, &expected, gc.count_trigger())?;
 
         // The main-interp bridge serves `gil=True` routes and the fallback with the main
         // GIL, while TPC threads handle the rest inline. See src/bridge/main_bridge.rs.
-        let main_bridge = if routes.routes.uses_main() {
-            // 4 workers default — handlers mix CPU + I/O. Pure-CPU
-            // (numpy) workloads serialize on the GIL anyway so extra
-            // workers cost only thread-stack memory; I/O-bound (DB,
-            // file, sleep, sqlx-via-runtime) workloads gain real
-            // concurrency because each worker can pick up the GIL the
-            // moment a peer's handler releases it.
-            let workers: usize = std::env::var("PYRONOVA_GIL_BRIDGE_WORKERS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .filter(|&n: &usize| n > 0)
-                .unwrap_or(4);
-            // Capacity scales with workers so per-worker queue depth
-            // stays at 16 (matches the original single-thread design's
-            // back-pressure behavior).
-            let capacity: usize = std::env::var("PYRONOVA_GIL_BRIDGE_CAPACITY")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(16 * workers);
-            Some(crate::bridge::main_bridge::MainInterpBridge::spawn(
-                Arc::clone(&routes),
-                capacity,
-                workers,
-            ))
-        } else {
-            None
-        };
+        let main_bridge = routes.routes.uses_main().then(|| {
+            crate::bridge::main_bridge::MainInterpBridge::spawn(Arc::clone(&routes), env.bridge)
+        });
 
         py.detach(move || -> PyResult<()> {
             let bridge_to_join = main_bridge.clone();
@@ -1431,7 +1388,8 @@ impl PyronovaApp {
                 tls_acceptor,
                 main_bridge,
                 extra_tls,
-                gc_mode,
+                gc,
+                topology,
                 stop,
             );
             // The TPC threads are joined, so this is the last bridge reference: close it and
@@ -1461,6 +1419,7 @@ impl PyronovaApp {
         py: Python<'_>,
         n: usize,
         expected: &crate::router::RouteSignature,
+        gc_threshold: u64,
     ) -> PyResult<Vec<interp::SubInterpreterWorker>> {
         if !crate::run_context::on_main(py) {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -1474,19 +1433,18 @@ impl PyronovaApp {
         // Each worker gets it as `POOL_ID` (the async engine's zombie guard).
         let pool_id = interp::next_pool_id();
 
+        let spec = interp::WorkerSpec {
+            script: &script,
+            script_path: &script_path,
+            expected,
+            pool_id,
+            shared_state: &self.shared_state,
+            gc_threshold,
+        };
         let mut built = Vec::with_capacity(n);
         for i in 0..n {
             // SAFETY: on the main thread with main's thread state current (checked above).
-            let worker = unsafe {
-                interp::SubInterpreterWorker::new(
-                    i,
-                    &script,
-                    &script_path,
-                    expected,
-                    pool_id,
-                    &self.shared_state,
-                )
-            };
+            let worker = unsafe { interp::SubInterpreterWorker::new(i, &spec) };
             match worker {
                 Ok(w) => built.push(w),
                 Err(e) => {

@@ -1,13 +1,11 @@
-//! Thread-Per-Core (TPC) accept layer. See docs/tpc-rearch.md.
+//! Thread-Per-Core (TPC) accept layer, the default server. See docs/tpc-rearch.md.
 //!
-//! Phase 1: scaffolding only. Each TPC thread owns a pinned OS thread, a
+//! Each TPC thread owns a pinned OS thread, a
 //! `tokio::runtime::Builder::new_current_thread()` runtime, a
 //! `LocalSet` for spawn_local tasks, and its own `SO_REUSEPORT`
-//! listener. Dispatch still flows through the old `InterpreterPool` —
-//! Phase 2 replaces that with a per-thread sub-interpreter.
-//!
-//! Opt-in via `PYRONOVA_TPC=1` (env) or `app.run(tpc=True)` (kwarg).
-//! Old multi-thread path remains the default until Phase 1 proves out.
+//! listener; in sub-interpreter mode it also owns one worker and runs its
+//! handlers inline. `PYRONOVA_TPC=0` serves through the multi-thread pool
+//! instead (`app.rs`).
 //!
 //! Why no `Send` bounds on the per-connection future? Because
 //! `LocalSet::spawn_local` runs the task on the same OS thread that
@@ -29,6 +27,7 @@ use tokio::task::LocalSet;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use crate::config::{DarwinTopology, GcConfig, GC_MODE_ENV};
 use crate::handlers::handle_request;
 use crate::python::interp::SubInterpreterWorker;
 use crate::server::listener::{create_reuseport_listener, handle_accept_error, setup_tcp_quickack};
@@ -398,7 +397,8 @@ pub(crate) fn run_tpc_subinterp(
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
     extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
-    gc_mode: GcMode,
+    gc: GcConfig,
+    topology: DarwinTopology,
     shutdown: CancellationToken,
 ) -> Result<(), ServeError> {
     if workers.len() != n_threads {
@@ -416,36 +416,20 @@ pub(crate) fn run_tpc_subinterp(
     // benefit. The fanout topology stays behind an env opt-in for
     // real-NIC testing and hardware where the loopback isn't the
     // bottleneck. Set `PYRONOVA_TPC_DARWIN=fanout` to opt in.
-    #[cfg(target_os = "macos")]
-    {
-        let use_fanout = matches!(
-            std::env::var("PYRONOVA_TPC_DARWIN").ok().as_deref(),
-            Some("fanout")
-        );
-        if use_fanout {
-            let gc_mode = match gc_mode.supported_by(GcServer::DarwinFanout) {
-                Ok(mode) => mode,
-                Err(e) => {
-                    // SAFETY: called from `PyronovaApp::run_tpc_subinterp` on the main thread
-                    // inside `py.detach`, so no thread state is current; none was rebound.
-                    unsafe { SubInterpreterWorker::end_all(workers) };
-                    return Err(e.into());
-                }
-            };
-            return run_tpc_subinterp_fanout(
-                addr,
-                n_threads,
-                n_cpus,
-                workers,
-                routes,
-                tls_acceptor,
-                main_bridge,
-                extra_tls,
-                gc_mode,
-                shutdown,
-            );
-        }
-        run_tpc_subinterp_per_thread_listener(
+    match topology {
+        #[cfg(target_os = "macos")]
+        DarwinTopology::Fanout => run_tpc_subinterp_fanout(
+            addr,
+            n_threads,
+            n_cpus,
+            workers,
+            routes,
+            tls_acceptor,
+            main_bridge,
+            extra_tls,
+            shutdown,
+        ),
+        _ => run_tpc_subinterp_per_thread_listener(
             addr,
             n_threads,
             n_cpus,
@@ -454,25 +438,9 @@ pub(crate) fn run_tpc_subinterp(
             tls_acceptor,
             main_bridge,
             extra_tls,
-            gc_mode,
+            gc,
             shutdown,
-        )
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        run_tpc_subinterp_per_thread_listener(
-            addr,
-            n_threads,
-            n_cpus,
-            &mut workers,
-            routes,
-            tls_acceptor,
-            main_bridge,
-            extra_tls,
-            gc_mode,
-            shutdown,
-        )
+        ),
     }
 }
 
@@ -486,7 +454,7 @@ fn run_tpc_subinterp_per_thread_listener(
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
     extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
-    gc_mode: GcMode,
+    gc: GcConfig,
     shutdown: CancellationToken,
 ) -> Result<(), ServeError> {
     log_startup("hybrid-inline", &addr, n_threads, n_cpus, &routes);
@@ -544,7 +512,7 @@ fn run_tpc_subinterp_per_thread_listener(
                         shutdown_thread,
                         tls,
                         bridge,
-                        gc_mode,
+                        gc,
                     )
                     .await;
                 });
@@ -611,7 +579,6 @@ fn run_tpc_subinterp_fanout(
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
     _extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
-    gc_mode: GcMode,
     shutdown: CancellationToken,
 ) -> Result<(), ServeError> {
     log_startup("hybrid-inline-fanout", &addr, n_threads, n_cpus, &routes);
@@ -670,8 +637,6 @@ fn run_tpc_subinterp_fanout(
                 worker.tstate = unsafe {
                     crate::python::interp::rebind_tstate_to_current_thread(worker.tstate)
                 };
-                // Count or off only (`GcServer::DarwinFanout`): the fanout loop has no idle tick.
-                apply_gc_mode(&mut worker, gc_mode);
                 let worker = std::rc::Rc::new(std::cell::RefCell::new(worker));
                 let worker_exit = std::rc::Rc::clone(&worker);
                 local.block_on(&rt, async move {
@@ -879,8 +844,6 @@ async fn tpc_worker_loop_fanout(
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), tracker.wait()).await;
 }
 
-const GC_MODE_ENV: &str = "PYRONOVA_GC_MODE";
-
 /// GC scheduling mode, parsed once at startup from `PYRONOVA_GC_MODE` (unset = count):
 ///   - `count` — the count trigger inside `SubInterpreterWorker::call_handler` fires
 ///     `gc.collect()` every `PYRONOVA_GC_THRESHOLD` requests per worker. Simple,
@@ -923,17 +886,6 @@ impl std::str::FromStr for GcMode {
 }
 
 impl GcMode {
-    /// `PYRONOVA_GC_MODE`, parsed.
-    pub(crate) fn from_env() -> Result<Self, GcModeError> {
-        match std::env::var(GC_MODE_ENV) {
-            Err(std::env::VarError::NotPresent) => Ok(GcMode::Count),
-            Err(std::env::VarError::NotUnicode(raw)) => {
-                Err(GcModeError::Unknown(raw.to_string_lossy().into_owned()))
-            }
-            Ok(raw) => raw.parse(),
-        }
-    }
-
     /// This mode, if `server` can run it.
     pub(crate) fn supported_by(self, server: GcServer) -> Result<Self, GcModeError> {
         let supported = match server {
@@ -989,16 +941,6 @@ impl std::fmt::Display for GcModeError {
 
 impl std::error::Error for GcModeError {}
 
-/// Sets `worker`'s count trigger for `mode`: count keeps `PYRONOVA_GC_THRESHOLD`, idle
-/// makes it the OOM failsafe, off disables it.
-fn apply_gc_mode(worker: &mut SubInterpreterWorker, mode: GcMode) {
-    match mode {
-        GcMode::Count => {}
-        GcMode::Idle => worker.gc_threshold = oom_failsafe_from_env(),
-        GcMode::Off => worker.gc_threshold = 0,
-    }
-}
-
 /// The idle-mode trigger: collect at a tick when the worker ran requests since its last
 /// collect and none since the previous tick.
 #[derive(Default)]
@@ -1013,21 +955,6 @@ impl IdleGc {
         self.served_at_last_tick = served;
         quiet && since_collect > 0
     }
-}
-
-fn oom_failsafe_from_env() -> u64 {
-    std::env::var("PYRONOVA_GC_OOM_FAILSAFE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50_000)
-}
-
-fn idle_tick_ms_from_env() -> u64 {
-    std::env::var("PYRONOVA_GC_IDLE_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100)
-        .max(1) // tokio::time::interval panics on Duration::ZERO
 }
 
 /// The idle tick: collect on `worker` if it went quiet (see [`IdleGc`]).
@@ -1066,7 +993,7 @@ pub(crate) async fn tpc_accept_loop_inline(
     shutdown: CancellationToken,
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
-    gc_mode: GcMode,
+    gc: GcConfig,
 ) {
     let std_listener = match create_reuseport_listener(addr) {
         Ok(l) => l,
@@ -1105,17 +1032,13 @@ pub(crate) async fn tpc_accept_loop_inline(
     let tls_slot0 = extra_listeners.first();
     let tls_slot1 = extra_listeners.get(1);
 
-    // Each TPC thread owns its worker exclusively, so the borrow_mut is uncontended.
-    apply_gc_mode(&mut worker.borrow_mut(), gc_mode);
-
     let tracker = TaskTracker::new();
-    match gc_mode {
+    match gc.mode {
         GcMode::Idle => {
             // The worker counts requests as it runs them and fires the OOM failsafe
             // itself; this loop adds the idle tick.
             let mut idle_gc = IdleGc::default();
-            let mut gc_timer =
-                tokio::time::interval(std::time::Duration::from_millis(idle_tick_ms_from_env()));
+            let mut gc_timer = tokio::time::interval(gc.idle_tick);
             // First tick fires immediately — skip it so we don't collect
             // an empty heap before any requests have run.
             gc_timer.tick().await;
@@ -1240,13 +1163,6 @@ pub(crate) async fn tpc_accept_loop_inline(
 
 // drive_inline_conn moved to worker::drive_tcp_conn.
 
-// ---------------------------------------------------------------------------
-// Flag
-// ---------------------------------------------------------------------------
-
-/// Env-var gate for Phase 1. The Python-side `app.run(tpc=True)` kwarg
-/// goes through a different path in `PyronovaApp` and does not consult
-/// this function.
 /// Count physical CPU cores to size the TPC pool.
 ///
 /// Linux: parses /sys/devices/system/cpu/cpu*/topology/thread_siblings_list —
@@ -1325,13 +1241,6 @@ pub(crate) fn physical_core_count() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
-}
-
-pub(crate) fn env_enabled() -> bool {
-    matches!(
-        std::env::var("PYRONOVA_TPC").ok().as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    )
 }
 
 #[cfg(test)]

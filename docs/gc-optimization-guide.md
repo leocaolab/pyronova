@@ -66,6 +66,9 @@ PYRONOVA_GC_MODE=off
 # PYRONOVA_TPC=0（线程池）不支持 off，启动报错；线程池下用 PYRONOVA_GC_THRESHOLD=0。
 
 # 其他取值（拼错如 "idel"）启动即报错，不会静默退回 count。
+# 数值变量同理：PYRONOVA_GC_THRESHOLD / PYRONOVA_GC_OOM_FAILSAFE 须为 ≥0 的整数，
+# PYRONOVA_GC_IDLE_MS 须为 ≥1 的整数；写错（如 "5k"、IDLE_MS=0）启动即报错，
+# 所有模式都会校验（启动时统一解析一次，见 src/config.rs）。
 ```
 
 本地实测（7840HS, TPC-8, 零循环 hello workload）：

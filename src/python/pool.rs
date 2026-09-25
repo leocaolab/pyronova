@@ -335,6 +335,7 @@ impl InterpreterPool {
         script_path: &str,
         expected: &crate::router::RouteSignature,
         shared_state: &crate::state::SharedMap,
+        gc_threshold: u64,
     ) -> Result<Self, PoolError> {
         let n = split.total();
         let has_any_async = split.async_workers > 0;
@@ -365,15 +366,16 @@ impl InterpreterPool {
         let mut workers = Vec::new();
         let mut threads = Vec::new();
 
+        let spec = WorkerSpec {
+            script: &raw_script,
+            script_path,
+            expected,
+            pool_id,
+            shared_state,
+            gc_threshold,
+        };
         for i in 0..n {
-            match SubInterpreterWorker::new(
-                i,
-                &raw_script,
-                script_path,
-                expected,
-                pool_id,
-                shared_state,
-            ) {
+            match SubInterpreterWorker::new(i, &spec) {
                 Ok(worker) => workers.push(worker),
                 Err(source) => {
                     // End the workers built so far here, on their creating thread (FR-19).

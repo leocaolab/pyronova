@@ -1,6 +1,7 @@
 //! What one server run serves: the frozen route table plus the per-run settings applied
 //! to every response (CORS, access log). Built once when `run()` starts; read-only after.
 
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -104,10 +105,9 @@ impl Cors {
 pub(crate) struct AccessLog {
     pub(crate) enabled: bool,
     /// Log 1 in N responses; `1` logs every one.
-    pub(crate) sample_n: u64,
-    /// Responses with a status at or above this always log, sampled or not; `0` disables
-    /// the bypass.
-    pub(crate) always_status: u16,
+    pub(crate) sample_n: NonZeroU64,
+    /// Responses with a status at or above this always log, sampled or not.
+    pub(crate) always_status: Option<StatusCode>,
     /// One sampling roll shared by every copy of the settings (every TPC thread), so
     /// `sample_n = 100` keeps 1% overall rather than 1% per thread.
     pub(crate) counter: Arc<AtomicU64>,
@@ -117,8 +117,8 @@ impl AccessLog {
     pub(crate) fn disabled() -> Self {
         AccessLog {
             enabled: false,
-            sample_n: 1,
-            always_status: 0,
+            sample_n: NonZeroU64::MIN,
+            always_status: None,
             counter: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -130,13 +130,14 @@ impl AccessLog {
         if !self.enabled {
             return false;
         }
-        if self.always_status > 0 && status.as_u16() >= self.always_status {
+        if self.always_status.is_some_and(|floor| status >= floor) {
             return true;
         }
-        self.sample_n <= 1
+        let n = self.sample_n.get();
+        n == 1
             || self
                 .counter
                 .fetch_add(1, Ordering::Relaxed)
-                .is_multiple_of(self.sample_n)
+                .is_multiple_of(n)
     }
 }

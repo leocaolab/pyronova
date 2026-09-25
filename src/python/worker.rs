@@ -136,9 +136,10 @@ pub(crate) struct SubInterpreterWorker {
     gc_collect_func: *mut ffi::PyObject,
     /// Collect once this many requests ran since the last collect; 0 disables the
     /// count trigger (use when you've verified your handler graph creates no cycles —
-    /// ref-counting handles everything else instantly). `PYRONOVA_GC_THRESHOLD=N`;
-    /// TPC idle mode sets it to the OOM failsafe.
-    pub(crate) gc_threshold: u64,
+    /// ref-counting handles everything else instantly). Set at build from the GC config
+    /// (`GcConfig::count_trigger`): the threshold in count mode, the OOM failsafe in idle
+    /// mode, 0 in off mode.
+    gc_threshold: u64,
     /// Requests this worker has run, counted as each is dispatched (`call_handler`).
     /// Per-worker = per-thread, so no atomics needed.
     requests_served: u64,
@@ -166,6 +167,21 @@ impl Drop for SubInterpreterWorker {
     }
 }
 
+/// What every worker of one server is built from.
+#[derive(Clone, Copy)]
+pub(crate) struct WorkerSpec<'a> {
+    /// The app's script (`script_path`'s text), which each worker executes.
+    pub(crate) script: &'a str,
+    pub(crate) script_path: &'a str,
+    /// The routes the script must register: main's table up to its seal.
+    pub(crate) expected: &'a RouteSignature,
+    /// See `SubInterpreterWorker::pool_id`.
+    pub(crate) pool_id: u64,
+    pub(crate) shared_state: &'a crate::state::SharedMap,
+    /// See `SubInterpreterWorker::gc_threshold`.
+    pub(crate) gc_threshold: u64,
+}
+
 /// What a worker's interpreter holds for serving, built by its init.
 struct Serving<'py> {
     handlers: Vec<Py<PyAny>>,
@@ -185,11 +201,7 @@ impl SubInterpreterWorker {
     /// Switches to the new sub-interpreter and back to main on completion.
     pub(crate) unsafe fn new(
         worker_id: usize,
-        script: &str,
-        script_path: &str,
-        expected: &RouteSignature,
-        pool_id: u64,
-        shared_state: &crate::state::SharedMap,
+        spec: &WorkerSpec<'_>,
     ) -> Result<Self, WorkerStartError> {
         let main_tstate = ffi::PyThreadState_Get();
 
@@ -215,14 +227,7 @@ impl SubInterpreterWorker {
         // (and the thread resources it pins) leak permanently. The half-built
         // worker's references are released inside `init_in_sub_interp`, while
         // this interpreter is still current.
-        match Self::init_in_sub_interp(
-            worker_id,
-            script,
-            script_path,
-            expected,
-            pool_id,
-            shared_state,
-        ) {
+        match Self::init_in_sub_interp(worker_id, spec) {
             Ok(worker) => {
                 ffi::PyThreadState_Swap(main_tstate);
                 Ok(worker)
@@ -244,44 +249,13 @@ impl SubInterpreterWorker {
     /// Must be called with a sub-interpreter's thread state current.
     unsafe fn init_in_sub_interp(
         worker_id: usize,
-        script: &str,
-        script_path: &str,
-        expected: &RouteSignature,
-        pool_id: u64,
-        shared_state: &crate::state::SharedMap,
+        spec: &WorkerSpec<'_>,
     ) -> Result<Self, WorkerStartError> {
         // NOT `Python::attach`: this runs on the main OS thread, whose gilstate thread
         // state is main's, while this sub-interpreter's thread state is current and holds
         // its GIL (`Py_NewInterpreterFromConfig` in `new`). Take the token for it directly.
         let py = Python::assume_attached();
-        let serving = Self::prepare(
-            py,
-            worker_id,
-            script,
-            script_path,
-            expected,
-            pool_id,
-            shared_state,
-        )?;
-
-        // Read the threshold env var once at sub-interp init (it's set
-        // on the main process before any sub-interp spawns). 0 disables
-        // scheduled collection.
-        // Default 100_000 — conservative. At 100k rps/thread that's one
-        // scheduled collect per second, which is invisible in P99. The
-        // old CPython-default threshold-based auto-trigger fired at
-        // ~hundreds of collects per second under the same load → P99
-        // jumps to 2-10ms. Measurement: on the baseline test,
-        // threshold=5000 gave p99=2.0ms; threshold=100_000 gave
-        // p99≈300µs; threshold=0 (disabled) gave p99=240µs.
-        //
-        // Workloads that verified they create no cycles can set
-        // PYRONOVA_GC_THRESHOLD=0 for best P99. Workloads with
-        // known-high cycle churn may want threshold=10_000.
-        let gc_threshold: u64 = std::env::var("PYRONOVA_GC_THRESHOLD")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100_000);
+        let serving = Self::prepare(py, worker_id, spec)?;
 
         let owned = |v: Vec<Py<PyAny>>| -> Vec<*mut ffi::PyObject> {
             v.into_iter().map(|h| h.into_ptr()).collect()
@@ -294,9 +268,9 @@ impl SubInterpreterWorker {
             after_hooks: owned(serving.after_hooks),
             asyncio_loop: serving.asyncio_loop.into_ptr(),
             loop_run_func: serving.loop_run_func.into_ptr(),
-            pool_id,
+            pool_id: spec.pool_id,
             gc_collect_func: serving.gc_collect_func.into_ptr(),
-            gc_threshold,
+            gc_threshold: spec.gc_threshold,
             requests_served: 0,
             collected_at: 0,
             ended: false,
@@ -317,12 +291,16 @@ impl SubInterpreterWorker {
     unsafe fn prepare<'py>(
         py: Python<'py>,
         worker_id: usize,
-        script: &str,
-        script_path: &str,
-        expected: &RouteSignature,
-        pool_id: u64,
-        shared_state: &crate::state::SharedMap,
+        spec: &WorkerSpec<'_>,
     ) -> Result<Serving<'py>, WorkerStartError> {
+        let WorkerSpec {
+            script,
+            script_path,
+            expected,
+            pool_id,
+            shared_state,
+            ..
+        } = *spec;
         let setup = |step: &'static str| {
             move |e: PyErr| WorkerStartError::Setup {
                 worker: worker_id,
