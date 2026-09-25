@@ -31,6 +31,7 @@ test = [
     "numpy",
     "msgpack",
     "pydantic-settings>=2",
+    "watchfiles",
 ]
 
 [project.scripts]
