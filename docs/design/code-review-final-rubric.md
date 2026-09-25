@@ -67,7 +67,27 @@ been run yet.
 - Darwin-only fanout guard never runs in CI (Ubuntu only) → macOS CI job.
 - Listener bind test depends on host network (`192.0.2.1`).
 
-## Decisions for the human
+## Decisions (human, 2026-09-25)
+
+- **G1 → per app.** Compression settings move into `SiteConfig` like M5's limits; out-of-range levels and "enable with no algorithm" raise `ValueError`. FR-17's process-wide note is superseded.
+- **G2 → total deadline.** A streamed body must arrive within `REQUEST_BUDGET` in total, the same standard as a buffered body.
+- **G3 → JSON + Origin allow-list.** `/mcp` and `@app.rpc`: non-`application/json` → 415; an `Origin` not on the allow-list → 403. Default allow-list: requests without `Origin`, and same-host origins; configurable.
+- **G4 → probe-bind.** Bind once without `SO_REUSEPORT` to prove the port is free, release, then bind the reuseport set; a port in use is `OSError(EADDRINUSE)` again.
+- **G5 (supervisor default) → revalidate.** The static-file cache revalidates on `(mtime, len)` from one `stat` per request.
+
+## Fix waves (one full-suite run at the end — human decision)
+
+Implementers run Rust checks only (`fmt`, `clippy` for default / `bench` / `fault_injection`, `cargo test` once W2 fixes the macOS link); **no pytest** — they write the tests, the supervisor runs everything once after wave B.
+
+| Wave | Owner | Files (primary) | Items |
+|---|---|---|---|
+| A | **W1 server** | `app.rs` run/serve/topology, `tpc.rs`, `config.rs`, `server/*`, `testing.py` | Q1 (TPC `async def` → async pool); one `enum Topology`; GC policy into `config.rs`; `server/cpu.rs`; `NonZeroUsize` workers/io_workers; G4 probe-bind; R5 per-server stop handle; `run(host=…)` error names the host; `stream=True` without `gil=True` → registration error; F3 hooks after seal → error; RSS sampler lifetime; `os._exit` from TestClient; `_prepare` lock |
+| A | **W2 request path** | `handlers.rs`, `handlers/*`, `pipeline.rs`, `bridge/*`, `websocket.rs`, `python/body_stream.rs`, `router.rs`, new `crate::error` / `crate::body` | one `PyronovaRequest` constructor (TPC zero-alloc); F4 + G2 streamed-body budget; `StreamState`; R4 residual awaitables; inline-timeout double log; bridge spawn failure → error; R2 WS slot + typed `WsHandshake`; error/body types to bottom layer + one `panic_message`; sampling counter per thread; `into_response` without hidden counter; `AcceptEncoding` sentinel; `try_dispatch`; HEAD on GET, 405 on wrong method; WS handler errors with the tag; `debug_assert` → real check |
+| A | **W3 workers (M7)** | `python/*.rs` except `body_stream.rs`, `run_context.rs`, `worker.rs`→`conn_driver.rs`, `_bootstrap.py`, `_async_engine.py`, `leak_detect.rs` | all M7 roadmap items; reconcile §4 FFI rows; `WORKER_STATES` per pool; `FORGOTTEN_WORKERS` per run; `WorkerStartError` → Python exceptions (ImportError stays ImportError); ScriptImport hint only for relative imports; non-str `sys.path`; `run_context` assert; `WorkerRoutes` out of `app.rs`; F6 iso clone; macOS `cargo test` link failure |
+| A | **W4 package & data** | `python/pyronova/*` except `testing.py`/`_bootstrap.py`/`_async_engine.py`, `types.rs`, `compression.rs`, `static_fs.rs`, `db*`, `grpc.rs`, `logging.rs`, `monitor.rs`, `state.rs`, `stream.rs` | F1/G3 CSRF; F2 `req.json()` via isojson; F5 `cached_json`; F7 readiness helper (+ one shared drive-with-timeout, MCP too); MCP field types + prompts; crud `id_type`; `rpc.py` result; `DbError::Connect` sqlstate; G1 per-app compression + validation + brotli off the tokio worker; G5 static revalidation; log level parsed once; one Python→Rust log handler; `types.rs` split into request/response; hot-path clones (query map, SharedState, SSE); `total_requests: Option`; remove unused deps |
+| B | **W5 hygiene & tests** | all (comments), `tests/` | M9 + F8 false comments first + internal vocabulary (user-visible "(v1 limitation)" first); test-quality advisories; §7 no fixed ports; property tests; macOS CI job |
+
+## Decisions asked (answered above)
 
 - **G1** Compression settings: per app in `SiteConfig` (like M5's limits) vs keep process-wide (FR-17 made it process-wide on purpose).
 - **G2** Streamed-body budget: a total deadline per body vs per-frame (document the exposure).
