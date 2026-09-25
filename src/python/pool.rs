@@ -573,7 +573,8 @@ fn worker_thread_loop_async(mut worker: SubInterpreterWorker) {
             tracing::error!(
                 target: "pyronova::server",
                 worker = worker.worker_id,
-                "async engine failed: {e}"
+                error = %e,
+                "async worker stopped serving"
             );
         }
         worker.tstate = ffi::PyEval_SaveThread();

@@ -391,3 +391,102 @@ def test_brace_params_and_catch_all_are_injected(path):
         assert (r.status, r.json()) == (200, {"rest": "a/b c.txt"})
         r = srv.get("/gil-files/x/y")
         assert (r.status, r.json()) == (200, {"rest": "x/y"})
+
+
+# ---------------------------------------------------------------------------
+# M4 gaps: isojson is required in every worker; the async engine's death at run time is
+# its own error; a relative import failing in a worker says why
+# ---------------------------------------------------------------------------
+
+
+def _start_failure(script: str, path: str) -> str:
+    """Runs a script whose `app.run` must fail; returns its output."""
+    s = Server(textwrap.dedent(script) + RUN, path, wait=False)
+    try:
+        s.proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        pass
+    out = s.stop()
+    assert s.proc.returncode not in (None, 0), out[-3000:]
+    return out
+
+
+@pytest.mark.parametrize("path", ["pool", "tpc"])
+def test_isojson_refused_in_a_worker_stops_the_start(path):
+    # isojson imports fine on main; the script hides it only inside the workers, so the
+    # start fails at the worker's own JSON check, not main's.
+    script = """
+    import sys
+    from pyronova import Pyronova
+    app = Pyronova()
+
+    @app.get("/")
+    def index(req):
+        return {"a": 1}
+
+    if __name__ == "__pyronova_worker__":
+        sys.modules["isojson"] = None
+    """
+    out = _start_failure(script, path)
+    assert "loading the JSON serializer failed" in out, out[-3000:]
+    assert "import of isojson halted" in out, out[-3000:]
+
+
+ENGINE_DEATH_SCRIPT = """
+from pyronova import Pyronova
+app = Pyronova()
+
+@app.get("/die")
+async def die(req):
+    raise SystemExit("ra-engine-died")
+""" + RUN
+
+
+def test_async_engine_death_at_run_time_is_reported_as_such():
+    srv = Server(ENGINE_DEATH_SCRIPT, "pool", workers=1)
+    try:
+        # The request itself is lost with the engine (M7); only the log matters here.
+        with pytest.raises(OSError):
+            srv.get("/die", timeout=2)
+    finally:
+        out = srv.stop()
+    # The engine ends when its fetcher does, at shutdown; the record is written then.
+    stopped = [
+        line for line in out.splitlines()
+        if "the async engine stopped: SystemExit: ra-engine-died" in line
+    ]
+    assert len(stopped) == 1, out[-4000:]
+    assert "async worker stopped serving" in stopped[0]
+    assert "raised while the worker started" not in out, out[-4000:]
+
+
+def test_relative_import_failing_in_a_worker_says_why(tmp_path):
+    # A worker executes the app's file as a module of its own, outside its package: a
+    # relative import there fails, and the start error now says so.
+    pkg = tmp_path / "ra_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "models.py").write_text("GREETING = 'hi'\n")
+    (pkg / "app.py").write_text(textwrap.dedent("""
+        import os
+        from .models import GREETING
+        from pyronova import Pyronova
+        app = Pyronova()
+
+        @app.get("/")
+        def index(req):
+            return GREETING
+
+        if __name__ == "__main__":
+            app.run(host="127.0.0.1", port=int(os.environ["RA_PORT"]), mode="subinterp",
+                    workers=1)
+    """))
+    env = dict(os.environ, RA_PORT=str(_free_port()), PYRONOVA_TPC="0")
+    proc = subprocess.run(
+        [PYTHON, "-m", "ra_pkg.app"], cwd=tmp_path, env=env,
+        capture_output=True, text=True, timeout=60,
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out[-3000:]
+    assert "attempted relative import" in out, out[-3000:]
+    assert "outside any package, so a relative import" in out, out[-3000:]
