@@ -7,6 +7,7 @@ use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::SystemTime;
 use tokio::io::AsyncReadExt;
 
 /// Maximum size (in bytes) of a static file served out of memory.
@@ -169,13 +170,40 @@ fn found<T>(path: &Path, result: io::Result<T>) -> Result<Option<T>, StaticError
 
 // ─── Cache ──────────────────────────────────────────────────────────────────
 
-/// Cache entry: the file bytes + precomputed content-type. We cache on
-/// the canonical path so symlinks inside the static root resolve to the
-/// same entry as their target.
+/// What identifies one version of a file for the cache: its modification time and length.
+/// An edit that keeps both (same length, within the filesystem's timestamp resolution) is
+/// not seen; any other edit is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stamp {
+    modified: SystemTime,
+    len: u64,
+}
+
+impl Stamp {
+    /// `None` on a platform without modification times: such a file is never cached.
+    fn of(metadata: &std::fs::Metadata) -> Option<Self> {
+        Some(Self {
+            modified: metadata.modified().ok()?,
+            len: metadata.len(),
+        })
+    }
+}
+
+/// Cache entry: the file bytes, precomputed content-type, and the stamp of the version
+/// read. We cache on the canonical path so symlinks inside the static root resolve to
+/// the same entry as their target.
 #[derive(Clone)]
 struct CachedFile {
     bytes: Bytes,
     content_type: &'static str,
+    stamp: Stamp,
+}
+
+impl CachedFile {
+    /// Whether this entry is the version of the file `current` describes.
+    fn is_current(&self, current: Stamp) -> bool {
+        self.stamp == current
+    }
 }
 
 fn cache() -> &'static DashMap<PathBuf, CachedFile> {
@@ -190,11 +218,11 @@ fn cache_bytes() -> &'static std::sync::atomic::AtomicU64 {
 
 /// Populate the cache for future requests. Skip once the cumulative cache size has
 /// crossed the soft cap — serving uncached is still correct, just pays the re-read
-/// cost. We don't evict: static files rarely rotate, and an LRU would need locking
-/// around every hit.
-fn cache_insert(path: PathBuf, bytes: Bytes, content_type: &'static str) {
+/// cost. We don't evict by age: static files rarely rotate, and an LRU would need locking
+/// around every hit. A changed file replaces its entry; a removed one drops it.
+fn cache_insert(path: PathBuf, entry: CachedFile) {
     use std::sync::atomic::Ordering::Relaxed;
-    let len = bytes.len() as u64;
+    let len = entry.bytes.len() as u64;
     // Atomically reserve space: fetch_add first, then check the new total.
     // If we overshoot the soft cap, roll back and skip caching.
     if cache_bytes().fetch_add(len, Relaxed) + len > STATIC_CACHE_MAX_BYTES {
@@ -205,14 +233,18 @@ fn cache_insert(path: PathBuf, bytes: Bytes, content_type: &'static str) {
     // request) already cached this key, our `fetch_add` double-counted: subtract the
     // replaced entry's bytes so the counter tracks live map contents. This sub is
     // balanced — `prev` was added by whoever inserted it — so it cannot underflow.
-    if let Some(prev) = cache().insert(
-        path,
-        CachedFile {
-            bytes,
-            content_type,
-        },
-    ) {
+    if let Some(prev) = cache().insert(path, entry) {
         cache_bytes().fetch_sub(prev.bytes.len() as u64, Relaxed);
+    }
+}
+
+/// Drops `path`'s entry (the file is gone or no longer a regular file).
+fn cache_remove(path: &Path) {
+    if let Some((_, prev)) = cache().remove(path) {
+        cache_bytes().fetch_sub(
+            prev.bytes.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 
@@ -284,22 +316,42 @@ async fn serve(root: &Path, rel: &str) -> Result<Option<Response<Full<Bytes>>>, 
         return Ok(None);
     };
 
+    // One stat per request revalidates the cache: an edited file is re-read, a removed
+    // one is dropped.
+    let metadata = found(&path, tokio::fs::metadata(&path).await)?;
+    let Some(current) = metadata.as_ref().filter(|m| m.is_file()).map(Stamp::of) else {
+        cache_remove(&path);
+        return Ok(None);
+    };
+
     // Cache hit: reuse the shared Bytes (Arc clone, zero-copy). Benchmark-grade static
     // profiles hit the same 20 files from thousands of connections per second; without
     // this cache every request re-reads its file into a fresh Vec<u8>.
-    if let Some(entry) = cache().get(&path) {
-        return Ok(Some(ok_response_bytes(
-            entry.content_type,
-            entry.bytes.clone(),
-        )));
+    if let Some(entry) = current.and_then(|stamp| cached(&path, stamp)) {
+        return Ok(Some(ok_response_bytes(entry.content_type, entry.bytes)));
     }
 
-    let Some(bytes) = read_regular_file(&path).await? else {
+    let Some((bytes, stamp)) = read_regular_file(&path).await? else {
         return Ok(None);
     };
     let ct = content_type(&path);
-    cache_insert(path, bytes.clone(), ct);
+    if let Some(stamp) = stamp {
+        let entry = CachedFile {
+            bytes: bytes.clone(),
+            content_type: ct,
+            stamp,
+        };
+        cache_insert(path, entry);
+    }
     Ok(Some(ok_response_bytes(ct, bytes)))
+}
+
+/// `path`'s cache entry if it is the version `current` describes.
+fn cached(path: &Path, current: Stamp) -> Option<CachedFile> {
+    cache()
+        .get(path)
+        .filter(|entry| entry.is_current(current))
+        .map(|entry| entry.clone())
 }
 
 /// `root` joined with the percent-decoded request segments. Only plain file names are
@@ -349,8 +401,9 @@ async fn canonical_within(root: &Path, candidate: &Path) -> Result<Option<PathBu
     Ok(Some(path))
 }
 
-/// Read a regular file of at most `MAX_STATIC_FILE_BYTES`; `None` if it is gone or
-/// not a regular file (a directory).
+/// Read a regular file of at most `MAX_STATIC_FILE_BYTES`, with the stamp of the version
+/// read (from the open file, so it describes these bytes); `None` if it is gone or not a
+/// regular file (a directory).
 ///
 /// Open once and derive metadata from the fd, so the size check and the read operate
 /// on the same inode (no metadata-then-read TOCTOU).
@@ -360,7 +413,7 @@ async fn canonical_within(root: &Path, candidate: &Path) -> Result<Option<PathBu
 /// the file for a symlink pointing anywhere on disk; with O_NOFOLLOW the open refuses
 /// a symlink at the last component (ELOOP). Legitimate symlinks inside the root were
 /// already resolved by `canonical_within`.
-async fn read_regular_file(path: &Path) -> Result<Option<Bytes>, StaticError> {
+async fn read_regular_file(path: &Path) -> Result<Option<(Bytes, Option<Stamp>)>, StaticError> {
     let opened = match open_no_follow(path).await {
         Err(source) if is_symlink_refusal(&source) => {
             return Err(StaticError::SymlinkSwapped {
@@ -393,7 +446,8 @@ async fn read_regular_file(path: &Path) -> Result<Option<Bytes>, StaticError> {
         .take(MAX_STATIC_FILE_BYTES)
         .read_to_end(&mut contents)
         .await;
-    Ok(found(path, read)?.map(|_| Bytes::from(contents)))
+    let stamp = Stamp::of(&metadata);
+    Ok(found(path, read)?.map(|_| (Bytes::from(contents), stamp)))
 }
 
 #[cfg(unix)]
@@ -449,6 +503,62 @@ fn ok_response_bytes(content_type: &'static str, bytes: Bytes) -> Response<Full<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(modified: SystemTime, len: u64) -> CachedFile {
+        CachedFile {
+            bytes: Bytes::from(vec![b'x'; len as usize]),
+            content_type: "text/plain",
+            stamp: Stamp { modified, len },
+        }
+    }
+
+    #[test]
+    fn cached_entry_is_current_only_for_the_same_mtime_and_len() {
+        let t0 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let t1 = t0 + std::time::Duration::from_nanos(1);
+        let cached = entry(t0, 5);
+        assert!(cached.is_current(Stamp {
+            modified: t0,
+            len: 5
+        }));
+        assert!(!cached.is_current(Stamp {
+            modified: t1,
+            len: 5
+        }));
+        assert!(!cached.is_current(Stamp {
+            modified: t0,
+            len: 6
+        }));
+    }
+
+    #[test]
+    fn an_edited_file_is_served_fresh() {
+        let dir =
+            std::env::temp_dir().join(format!("pyronova_static_reval_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("page.txt");
+        std::fs::write(&file, "old").unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let root = std::fs::canonicalize(&dir).unwrap();
+        let body = |resp: Response<Full<Bytes>>| {
+            rt.block_on(http_body_util::BodyExt::collect(resp.into_body()))
+                .unwrap()
+                .to_bytes()
+        };
+
+        let first = rt.block_on(serve(&root, "page.txt")).unwrap().unwrap();
+        assert_eq!(body(first), "old");
+        std::fs::write(&file, "newer").unwrap();
+        let second = rt.block_on(serve(&root, "page.txt")).unwrap().unwrap();
+        assert_eq!(body(second), "newer");
+        std::fs::remove_file(&file).unwrap();
+        assert!(rt.block_on(serve(&root, "page.txt")).unwrap().is_none());
+        assert!(!cache().contains_key(&root.join("page.txt")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn mime_html() {
