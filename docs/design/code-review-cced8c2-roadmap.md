@@ -116,6 +116,12 @@ fallback marker.
 
 Verify: `tests/test_routing_e2e.py tests/test_cors_*.py tests/test_middleware_hooks.py tests/test_subinterp_*.py tests/test_fast_response.py tests/test_admission_control.py tests/test_tls_slowloris.py tests/test_hybrid.py` + new tests: fallback on TPC, TPC slow-body timeout, TPC handler timeout.
 
+### Carried into M2 from M1
+
+- **Per-request `contextvars.Context`** (M1a item 3): the dispatcher creates and enters a fresh context around before-hooks + handler + after-hooks on every sync path (GIL, sub-interp, TPC inline, bridge) — `PyContext_New` + `PyContext_Enter`/`Exit`; then delete the opt-in reset in `context.py` / `observability.py`. Async path already gets one per Task.
+- **404 (and every other non-handler response) must write the access log line**: observed on `3cba81e`, `GET /nope` in GIL/TPC mode produces no `pyronova::access` line. The single `finish()` writes it for every response.
+- **D3 WebSocket** (M1d item 2): `ws.request` + `before_request` before the 101, on top of the unified pipeline — do it in M2 once `preprocess_request` exists.
+
 ## M3 — One response mapping + real header multimap (root B + F)
 
 - One Python-result → response mapping for GIL and sub-interp; `SubInterpResponse` merges into `ResponseData`. Fixes ✅ list returned from a sub-interp handler serialized as Python repr (`python/worker.rs:1019,1064` vs `response.rs:62`).
@@ -138,7 +144,7 @@ to the log/response, never replaced by a fixed string.
 - `BridgeResponse` duplicates `HandlerResult` (`main_bridge.rs:67-70,303-307`).
 - tls/listener/router/state `Result<_, String>` (`tls.rs`, `listener.rs`, `router.rs:201`, `state.rs:26`); `state.rs` get/values/items vs `__getitem__` policy on non-UTF-8 values.
 - Sub-interp setup failures cleared then surfaced as placeholder (`python/worker.rs:223-273,244,499`); `isojson` ImportError silently falls back to `json` (`python/worker.rs:895`).
-- Client-facing text policy **gated by D4**.
+- Client-facing text policy per **D4** (4xx carry the reason; 5xx generic + request id). Includes M1a item 9: rpc / health / mcp use the same policy.
 
 Verify: `tests/test_pyerr_no_stderr.py tests/test_ffi_panic_safety.py tests/test_fixes.py tests/test_subinterp_*.py tests/test_shared_state.py` + new tests asserting the real error text reaches the log.
 
@@ -168,6 +174,7 @@ Verify: `tests/test_tls*.py tests/test_env_var_worker.py tests/test_lifecycle.py
 - `&WorkRequest` instead of 8–11 exploded params (`pool.rs:225`, `python/worker.rs:435,523,553`).
 - `_async_engine.py`: RuntimeError from a Rust panic retried forever; `_HANDLER_TIMEOUT = 28` duplicates the Rust budget (take it from M2's `REQUEST_BUDGET`).
 - `_bootstrap.py`: `packages_distributions` failure swallowed (381-386); module-global `_iso_in_hook` bool not thread-safe (501).
+- `isolate()` list handed to workers through `os.environ` (M1a item 10 deferred): pass it into worker init explicitly.
 - Rename `src/worker.rs` (TPC connection driver) → `conn_driver.rs`; delete `python/interp.rs` compat facade.
 
 Verify: `tests/test_worker_no_leaked_refs.py tests/test_capi_hygiene.py tests/test_attach_allowlist.py tests/test_assume_attached_allowlist.py tests/test_subinterp_memory_regression.py tests/test_async_*.py tests/test_isolate*.py tests/test_c_extensions.py` + new test (async engine death → prompt 500).
@@ -192,3 +199,10 @@ History / WHAT comments, stale "Phase 1 / old pool" docs, misplaced doc comments
 - **D2** `bench.rs` + `bench_*` → **behind a `bench` cargo feature**, off by default; `benchmarks/` builds with `--features bench`. Also fix the leaks / Ok-after-panic. (M6)
 - **D3** WebSocket → **`ws.request` attribute** (a `Request`; handler signature unchanged) **and run `before_request` before replying 101**; a hook returning a response rejects the upgrade with that response. (M1d item 2, dispatched after M2 so it reuses the unified pipeline)
 - **D4** client-facing error text → **4xx carry the reason; 5xx carry a generic message + request id**, full exception + traceback go to the log. Applies to rpc / health / mcp / hook errors / handler 500 bodies. (M1a item 9, M4)
+
+## Status
+
+- M1a / M1b / M1c / M1d merged (`ab8c510`, `9622f05`, `b68c638`, M1d merge). Full suite after M1: 546 passed, 6 failed (all pre-announced frozen-wrong tests, approved for update), 2 skipped.
+- Logging: the Rust access log is the only request log (human decision; `3cba81e`).
+- Approved test updates: `test_mcp.py:91`, `test_db_pg.py::test_unknown_column_types_do_not_explode`, `test_passive_gil_metrics.py` ×4, `static_fs.rs` unit-test setup, `tests/e2e/ws_binary_server.py`.
+- DB `connect()` with the same DSN but different settings → raises (human decision); fixtures stop passing differing settings.
