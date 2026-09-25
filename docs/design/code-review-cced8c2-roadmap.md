@@ -158,6 +158,8 @@ Verify: `tests/test_pyerr_no_stderr.py tests/test_ffi_panic_safety.py tests/test
 - `websocket()` silently overwrites duplicate path (`app.rs:370`); `unwrap_or(false)` swallowing inspect errors (`app.rs:843-852`); `let _ = set_nodelay` (`app.rs:964,1186`).
 - **Per-app limits, not process globals**: `max_body_size` is a process-wide `static AtomicUsize` written through a per-app setter (`handlers.rs` `MAX_BODY_SIZE`, `app.rs` `set_max_body_size`), so one app's setting leaks into every other app in the process (observed: `test_upload_streaming` → `test_request_fields::test_post_large_body` order dependence). Move it (and the other limits) into `SiteConfig`. The human approved restoring it in the test instead; the supervisor chose the root fix — the test then needs no edit.
 - `tpc.rs` production driver (deferred from M6): `Arc::into_raw` `&'static Site` handling → owned/`Rc` site (then `bench.rs` `Threads::lend` loses its last `unsafe`); the worker moved into a failed `thread::spawn` is lost; accept loop logs-and-returns on bind failure.
+- From M8: TPC bind failure is logged and `run()` returns Ok (port retry only works on the pool path). Bind before spawning, return a typed error, and have the engine report the port it bound so `TestClient` can bind port 0 and delete its retry loop. After a programmatic stop on the main thread, `_serve` leaves SIGINT ignored — restore it.
+- From M4: the ×5 panic-message extraction copies in `tpc.rs` → the shared helper M4 added.
 - `MaybeTlsStream` forwards `poll_write_vectored`/`is_write_vectored` (hot-path copy, `tls.rs:35-71`); `tls.rs:133` hardcoded "10s".
 
 Verify: `tests/test_tls*.py tests/test_env_var_worker.py tests/test_lifecycle.py tests/test_async_shutdown.py tests/test_cli.py` + new tests (extra TLS port served in each mode, bad mode string rejected, port-in-use → error).
@@ -174,6 +176,7 @@ Verify: `tests/test_tls*.py tests/test_env_var_worker.py tests/test_lifecycle.py
 - Lock poisoning swallowed (`pool.rs:306`, `ffi.rs:59`); unnecessary `unsafe impl Send/Sync for InterpreterPool` (`pool.rs:218`); `worker.rs:73` unsafe impl without SAFETY.
 - Async engine exit leaves `response_map` waiters hanging 30s; never calls `inc_completed` (`pool.rs:565-571`).
 - `&WorkRequest` instead of 8–11 exploded params (`pool.rs:225`, `python/worker.rs:435,523,553`).
+- From M4: `ffi.rs` `rebind_tstate` `PyErr_Clear`.
 - `_async_engine.py`: RuntimeError from a Rust panic retried forever; `_HANDLER_TIMEOUT = 28` duplicates the Rust budget (take it from M2's `REQUEST_BUDGET`).
 - `_bootstrap.py`: `packages_distributions` failure swallowed (381-386); module-global `_iso_in_hook` bool not thread-safe (501).
 - `isolate()` list handed to workers through `os.environ` (M1a item 10 deferred): pass it into worker init explicitly.
@@ -210,3 +213,4 @@ History / WHAT comments, stale "Phase 1 / old pool" docs, misplaced doc comments
 - DB `connect()` with the same DSN but different settings → raises (human decision); fixtures stop passing differing settings.
 - M2 merged (`129d1fb`). Full suite after M2: 580 passed, 2 failed (the two source-grep admission tests, approved for deletion), 2 skipped. TPC inline handler timeout: late 504, no preemption (human decision; documented in `docs/tpc-rearch.md` Line 3). M2 measured about -1.3% on TPC inline `def` (per-request context + one `Instant::now()`), no change on the fast and GIL paths.
 - M6 merged (`4539104`), M3 merged (`82b9758`). Full suite after M3+M6: 658 passed, 1 failed (`test_pyerr_no_stderr.py::test_log_helper_present_and_wired`, a source-grep test — deletion approved), 8 skipped (bench-feature-only tests in the default build). M3 wrk A/B: dict +3%, str +2.5% on TPC `def`.
+- M4 merged (`109152e`), M8 merged (`4a181c4`; conflicts in `app.py` `run()`/`_prepare`, `app.rs`, `tpc.rs` resolved: M8's structure + M4's typed `ServeError` and `request_id` on `/mcp`). Human decisions: TestClient defaults to the production path, red tests migrated in two categories (module-level app vs explicit `mode="gil"`); M4's 10 frozen-wrong tests (rpc ×1, health ×3, json_serialization ×5, layer2_m3 ×1) approved for update.
