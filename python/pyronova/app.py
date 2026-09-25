@@ -77,6 +77,11 @@ def _limit_blas_threads() -> str:
     return "1 thread per worker"
 
 
+# Formats a record's exception (`logger.exception`) as its traceback. A `Handler`
+# has no `formatException`; that is a `Formatter` method.
+_TRACEBACK_FORMAT = _logging.Formatter()
+
+
 class _PyronovaRustHandler(_logging.Handler):
     """logging.Handler that bridges to Rust tracing via FFI.
 
@@ -91,7 +96,7 @@ class _PyronovaRustHandler(_logging.Handler):
             # Use a local variable rather than mutating record.exc_text so the
             # same LogRecord can safely be routed to multiple handlers.
             if record.exc_info:
-                exc_text = record.exc_text or self.formatException(record.exc_info)
+                exc_text = record.exc_text or _TRACEBACK_FORMAT.formatException(record.exc_info)
                 msg = f"{msg}\n{exc_text}"
             emit_python_log(
                 levelno=record.levelno,
@@ -668,14 +673,17 @@ class Pyronova:
     def enable_request_id(self, header: str = "X-Request-ID") -> None:
         """Guarantee every response carries an ``X-Request-ID`` header.
 
-        If the client sent one, it's echoed back verbatim (so trace IDs
-        propagated from an upstream proxy survive). If not, a fresh UUID
-        v4 hex is minted. Idempotent.
+        If the client sent one (visible ASCII, at most 128 bytes), it's
+        echoed back verbatim, so trace IDs propagated from an upstream proxy
+        survive. If not, the server's own id (32 hex digits) is used. Either
+        way it is ``req.request_id``, and a 5xx response and its error log
+        line report the same id. Idempotent.
         """
         with self._enable_lock:
             if getattr(self, "_request_id_enabled", False):
                 return
             from pyronova.observability import install_request_id
+            self._engine.set_request_id_header(header)
             install_request_id(self, header)
             self._request_id_enabled = True
 
@@ -996,7 +1004,10 @@ class Pyronova:
             mcp = self._mcp
 
             def _mcp_handler(req):
-                return Response(body=mcp.handle_request(req.body), content_type="application/json")
+                return Response(
+                    body=mcp.handle_request(req.body, request_id=req.request_id),
+                    content_type="application/json",
+                )
 
             self._route("POST", "/mcp", _mcp_handler, gil=True)
             print(f"  MCP: {len(mcp._tools)} tools, {len(mcp._resources)} resources, {len(mcp._prompts)} prompts → POST /mcp")

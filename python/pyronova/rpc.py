@@ -12,6 +12,8 @@ import inspect
 import urllib.parse
 from typing import Callable
 
+from pyronova._errors import log_server_error, server_error_body
+
 _log = logging.getLogger("pyronova.rpc")
 
 try:
@@ -66,8 +68,9 @@ class RPCClient:
                     "Accept": content_type,
                 },
             )
-            resp.raise_for_status()
 
+            # A failed call still answers with the envelope (400: the reason; 500:
+            # a request id to quote to the server's operator), so read it first.
             try:
                 if self.use_msgpack and "msgpack" in resp.headers.get("content-type", ""):
                     data = msgpack.unpackb(resp.content, raw=False)
@@ -81,8 +84,10 @@ class RPCClient:
 
             if not isinstance(data, dict) or not data.get("ok", False):
                 err = data.get("error") if isinstance(data, dict) else repr(data)
+                rid = data.get("request_id") if isinstance(data, dict) else None
+                where = f" (request_id={rid})" if rid else ""
                 raise RuntimeError(
-                    f"RPC {method_name} at {self.base_url}: {err}"
+                    f"RPC {method_name} at {self.base_url}: HTTP {resp.status_code} {err}{where}"
                 )
 
             return data.get("result", data)
@@ -99,11 +104,41 @@ class RPCClient:
         self.close()
 
 
+class _MalformedBody(Exception):
+    """The request body could not be decoded: the client's error (400)."""
+
+
+def _client_error(reason: Exception):
+    """400 envelope carrying the reason the body was rejected."""
+    from pyronova.engine import Response
+
+    return Response(
+        body=json.dumps({"ok": False, "error": str(reason)}),
+        status_code=400,
+        content_type="application/json",
+    )
+
+
+def _server_error(fn: Callable, req):
+    """500 envelope: generic text and the request id; the exception goes to the log with
+    the same id (decision D4)."""
+    from pyronova.engine import Response
+
+    log_server_error(_log, req.request_id, "RPC handler %s raised", fn.__qualname__)
+    return Response(
+        body=json.dumps({"ok": False, **server_error_body(req.request_id)}),
+        status_code=500,
+        content_type="application/json",
+    )
+
+
 def rpc_decorator(app, path: str, proto_model=None):
     """Create an RPC endpoint with content negotiation.
 
     Supports MsgPack, JSON, and optional Protobuf.
-    Auto-wraps response in {"ok": true, "result": ...} envelope.
+    Auto-wraps response in {"ok": true, "result": ...} envelope. A body that can't be
+    decoded answers 400 ``{"ok": false, "error": <reason>}``; a handler that raises
+    answers 500 ``{"ok": false, "error": "Internal Server Error", "request_id": ...}``.
     """
 
     def decorator(fn: Callable) -> Callable:
@@ -113,12 +148,17 @@ def rpc_decorator(app, path: str, proto_model=None):
             if not req.body:
                 return {}
             ct = req.headers.get("content-type", "application/json").lower()
-            if HAS_MSGPACK and "msgpack" in ct:
-                return msgpack.unpackb(req.body, raw=False)
-            elif "protobuf" in ct and proto_model:
-                return proto_model().parse(req.body)
-            else:
-                return json.loads(req.text())
+            try:
+                if HAS_MSGPACK and "msgpack" in ct:
+                    return msgpack.unpackb(req.body, raw=False)
+                elif "protobuf" in ct and proto_model:
+                    return proto_model().parse(req.body)
+                else:
+                    return json.loads(req.text())
+            except ValueError as e:
+                # JSONDecodeError, UnicodeDecodeError and msgpack's decode errors are
+                # all ValueErrors.
+                raise _MalformedBody(e) from e
 
         def _encode_response(result, req):
             accept = req.headers.get("accept", req.headers.get("content-type", "")).lower()
@@ -165,32 +205,32 @@ def rpc_decorator(app, path: str, proto_model=None):
                 "RPC dispatcher supplies; give them defaults or remove them"
             )
 
-        # Any uncaught exception in an RPC handler becomes a structured
-        # {ok: false, error: ...} envelope so clients don't see a raw 500.
-        # The envelope carries ONLY the exception class name — never the
-        # exception message — because messages routinely embed filesystem
-        # paths, SQL fragments, connection strings, or config values that
-        # must not cross the wire to RPC clients. The full message and stack
-        # trace are preserved for operators via log.exception below; without
-        # that, recurring handler crashes would be invisible on the server.
+        # An exception from the handler never crosses the wire: its message can embed
+        # filesystem paths, SQL, connection strings or config values. The client gets a
+        # generic 500 with the request id; the operator finds the exception and its
+        # traceback on the log line with the same id.
 
         def sync_wrapper(req):
             try:
                 data = _decode_request(req)
+            except _MalformedBody as e:
+                return _client_error(e.__cause__)
+            try:
                 result = fn(req, data) if takes_data else fn(data)
                 return _encode_response(result, req)
-            except Exception as e:
-                _log.exception("RPC handler %s raised", fn.__qualname__)
-                return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            except Exception:
+                return _server_error(fn, req)
 
         async def async_wrapper(req):
             try:
                 data = _decode_request(req)
+            except _MalformedBody as e:
+                return _client_error(e.__cause__)
+            try:
                 result = await (fn(req, data) if takes_data else fn(data))
                 return _encode_response(result, req)
-            except Exception as e:
-                _log.exception("RPC handler %s raised", fn.__qualname__)
-                return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            except Exception:
+                return _server_error(fn, req)
 
         handler = async_wrapper if is_async else sync_wrapper
         # Name it after fn (sub-interp workers find a route's handler by name),

@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from typing import Callable, TYPE_CHECKING
 
 from .app import Response
+from ._errors import log_server_error, server_error_body
 from .db import IntegrityError
 
 _log = logging.getLogger("pyronova.crud")
@@ -92,10 +93,10 @@ def _json_object(req) -> "dict | _Rejected":
     return body
 
 
-def _query(what: str, call: Callable, *args) -> object:
-    """Run one pool call. A failure the client caused is refused with the
-    database's reason; any other failure is logged and answered with a
-    generic 500 (4xx carry the reason, 5xx do not).
+def _query(req, what: str, call: Callable, *args) -> object:
+    """Run one pool call for `req`. A failure the client caused is refused with
+    the database's reason; any other failure is logged with the request id and
+    answered with a generic 500 carrying that id (decision D4).
 
     - ``IntegrityError`` (SQLSTATE class 23: duplicate key, NOT NULL, CHECK,
       foreign key; ``UniqueViolation`` is a subclass) → 409.
@@ -114,8 +115,8 @@ def _query(what: str, call: Callable, *args) -> object:
         _log.info("%s: refused a value: %s", what, e)
         return _Rejected(Response(body={"error": str(e)}, status_code=422))
     except Exception:
-        _log.exception("%s failed", what)
-        return _Rejected(Response(body={"error": "database error"}, status_code=500))
+        log_server_error(_log, req.request_id, "%s failed", what)
+        return _Rejected(Response(body=server_error_body(req.request_id), status_code=500))
 
 
 def register_crud(
@@ -248,7 +249,7 @@ def register_crud(
                 body={"error": "invalid limit/offset"},
                 status_code=400,
             )
-        rows = _query("list_rows", pool.fetch_all, list_sql, limit, offset)
+        rows = _query(req, "list_rows", pool.fetch_all, list_sql, limit, offset)
         if isinstance(rows, _Rejected):
             return rows.response
         return rows
@@ -261,7 +262,7 @@ def register_crud(
         id_val = parse_id(req)
         if isinstance(id_val, _Rejected):
             return id_val.response
-        row = _query("get_row", pool.fetch_one, get_sql, id_val)
+        row = _query(req, "get_row", pool.fetch_one, get_sql, id_val)
         if isinstance(row, _Rejected):
             return row.response
         if row is None:
@@ -291,7 +292,7 @@ def register_crud(
             f"RETURNING {col_list}"
         )
         args = [body[c] for c in present]
-        row = _query(f"create_row: INSERT into {table}", pool.fetch_one, insert_sql, *args)
+        row = _query(req, f"create_row: INSERT into {table}", pool.fetch_one, insert_sql, *args)
         if isinstance(row, _Rejected):
             return row.response
         return Response(body=row, status_code=201)
@@ -320,7 +321,7 @@ def register_crud(
             f"RETURNING {col_list}"
         )
         args = [body[c] for c in present] + [id_val]
-        row = _query(f"update_row: UPDATE in {table}", pool.fetch_one, update_sql, *args)
+        row = _query(req, f"update_row: UPDATE in {table}", pool.fetch_one, update_sql, *args)
         if isinstance(row, _Rejected):
             return row.response
         if row is None:
@@ -335,7 +336,7 @@ def register_crud(
         id_val = parse_id(req)
         if isinstance(id_val, _Rejected):
             return id_val.response
-        affected = _query(f"delete_row: DELETE from {table}", pool.execute, delete_sql, id_val)
+        affected = _query(req, f"delete_row: DELETE from {table}", pool.execute, delete_sql, id_val)
         if isinstance(affected, _Rejected):
             return affected.response
         if affected == 0:

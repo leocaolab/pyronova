@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import logging
 import time
-import uuid
 from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
@@ -57,10 +56,10 @@ def install_request_id(app: "Pyronova", header: str) -> None:
     header_lower = header.lower()
 
     def _before(req):
-        # Stash the incoming id (or a freshly-minted one) for this request so
-        # the after-hook can echo it back without mutating the frozen req.
-        headers = req.headers
-        rid = headers.get(header_lower) or headers.get(header) or uuid.uuid4().hex
+        # The engine wrote the request's id once, as `req.request_id` (the client's `header`
+        # value when it sent a usable one); a 5xx reports the same id. Stash it for the
+        # after-hook, which echoes it without mutating the frozen req.
+        rid = req.request_id
         _request_id.set(rid)
         ctx.set_request_id(rid)
         return None

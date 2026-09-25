@@ -24,9 +24,11 @@ Behaviour:
   is running; that's all this probe answers. k8s uses it to decide
   whether to restart the pod.
 - ``GET /readyz`` runs every registered check. Success → ``200
-  {"status":"ready","checks":{...}}``. Any failure (exception or
-  falsy-non-None return) → ``503 {"status":"not_ready","checks":{...}}``.
-  k8s uses this to gate traffic.
+  {"status":"ready","checks":{"db":{"ok":true},...}}``. Any failure
+  (exception or falsy-non-None return) → ``503 {"status":"not_ready",
+  "checks":{"db":{"ok":false},...},"request_id":"..."}``. The probe is
+  unauthenticated, so why a check failed is never in the body: it goes
+  to the log with the same request id. k8s uses this to gate traffic.
 
 Checks run sequentially in the handler. Keep them fast — a readyz
 handler is a hot loop during rolling deploys. Sync + async both work;
@@ -41,6 +43,7 @@ import inspect
 import logging
 from typing import Any, Awaitable, Callable, Union
 
+from pyronova._errors import log_server_error
 from pyronova.engine import Response
 
 _log = logging.getLogger(__name__)
@@ -99,8 +102,11 @@ def _drive(coro: Awaitable[Any]) -> Any:
         ex.shutdown(wait=False)
 
 
-def _run_checks_sync(checks: list[tuple[str, CheckFn]]) -> tuple[bool, dict[str, Any]]:
-    """Run every check, catching exceptions. Returns (all_ok, results)."""
+def _run_checks_sync(
+    checks: list[tuple[str, CheckFn]], request_id: str
+) -> tuple[bool, dict[str, Any]]:
+    """Run every check, catching exceptions. Returns (all_ok, results). A failure is
+    logged with `request_id`; the results only say which checks passed."""
     results: dict[str, Any] = {}
     all_ok = True
     for name, fn in checks:
@@ -119,13 +125,16 @@ def _run_checks_sync(checks: list[tuple[str, CheckFn]]) -> tuple[bool, dict[str,
             # Treat False OR any other falsy non-None value as failure,
             # matching the docstring contract.
             if res is not None and not res:
-                results[name] = {"ok": False, "error": "check returned falsy value"}
+                _log.error(
+                    "readiness check %r returned %r (request_id=%s)", name, res, request_id
+                )
+                results[name] = {"ok": False}
                 all_ok = False
             else:
                 results[name] = {"ok": True}
-        except Exception as e:  # noqa: BLE001 — probe must never crash
-            _log.exception("readiness check %r raised", name)
-            results[name] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        except Exception:  # noqa: BLE001 — probe must never crash
+            log_server_error(_log, request_id, "readiness check %r raised", name)
+            results[name] = {"ok": False}
             all_ok = False
     return all_ok, results
 
@@ -141,11 +150,11 @@ def _build_livez_handler():
 
 def _build_readyz_handler(checks: list[tuple[str, CheckFn]]):
     def readyz(req):
-        ok, results = _run_checks_sync(checks)
-        payload = json.dumps({
-            "status": "ready" if ok else "not_ready",
-            "checks": results,
-        }).encode("utf-8")
+        ok, results = _run_checks_sync(checks, req.request_id)
+        body: dict[str, Any] = {"status": "ready" if ok else "not_ready", "checks": results}
+        if not ok:
+            body["request_id"] = req.request_id
+        payload = json.dumps(body).encode("utf-8")
         return Response(
             body=payload,
             status_code=200 if ok else 503,

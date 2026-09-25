@@ -36,6 +36,8 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Callable
 
+from pyronova._errors import log_server_error
+
 _log = logging.getLogger(__name__)
 
 # Upper bound on how long a single async tool/resource/prompt handler may
@@ -325,8 +327,13 @@ class MCPServer:
     # JSON-RPC 2.0 handler
     # ------------------------------------------------------------------
 
-    def handle_request(self, body: str | bytes) -> str:
-        """Process a JSON-RPC 2.0 request and return a response."""
+    def handle_request(self, body: str | bytes, request_id: str | None = None) -> str:
+        """Process a JSON-RPC 2.0 request and return a response.
+
+        ``request_id`` is the HTTP request's id: an internal error (-32603) reports it
+        in ``error.data.request_id`` and logs it with the exception, so the two can be
+        matched up (decision D4). Without one (a direct call) the error has no ``data``.
+        """
         try:
             req = json.loads(body)
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -391,9 +398,10 @@ class MCPServer:
             # Do NOT echo str(e) to the client — a handler error can embed
             # file paths, DSNs, or stack fragments that leak internals to an
             # untrusted MCP caller (arc finding mcp-54).
-            _log.exception("MCP handler %r raised", method)
+            log_server_error(_log, request_id, "MCP handler %r raised", method)
             return "" if is_notification else self._error_response(
-                req_id, JsonRpcCode.INTERNAL_ERROR, "Internal error"
+                req_id, JsonRpcCode.INTERNAL_ERROR, "Internal error",
+                data=None if request_id is None else {"request_id": request_id},
             )
         if is_notification:
             return ""
@@ -489,12 +497,13 @@ class MCPServer:
         }
 
     @staticmethod
-    def _error_response(req_id: Any, code: JsonRpcCode, message: str) -> str:
-        return json.dumps({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "error": {"code": int(code), "message": message},
-        })
+    def _error_response(
+        req_id: Any, code: JsonRpcCode, message: str, data: dict | None = None
+    ) -> str:
+        error: dict[str, Any] = {"code": int(code), "message": message}
+        if data is not None:
+            error["data"] = data
+        return json.dumps({"jsonrpc": "2.0", "id": req_id, "error": error})
 
 
 def _arguments_object(params: dict) -> dict:
