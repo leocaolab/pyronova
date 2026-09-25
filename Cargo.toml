@@ -52,6 +52,7 @@ socket2 = { version = "0.5", features = ["all"] }
 libc = "0.2"
 core_affinity = "0.8"
 pythonize = "0.29"
+thiserror = "2"
 flate2 = "1"
 brotli = "7"
 tokio-rustls = "0.26"
