@@ -191,6 +191,8 @@ match resp {
 }
 ```
 
+**Inline sub-interp handlers are the exception (decided 2026-09-25).** A `def` route served inline on the TPC thread runs the Python call on the current_thread runtime's only thread, so no timer can fire until the call returns — `tokio::time::timeout` cannot preempt it. The implemented behaviour: when the call returns past `REQUEST_BUDGET`, the response is a 504, counted in `DROPPED_REQUESTS`, with an error log naming the handler; the client still waits for the handler. Preemption was rejected: `PyThreadState_SetAsyncExc` can land inside C extensions or `finally` blocks, and moving the call off-thread costs a cross-thread wake on every request. Slow handlers belong on `async def` or `gil=True`, where the timeout is enforced on time.
+
 ## gil=True / blocking=True bridge — concrete design
 
 - Channel: `tokio::sync::mpsc::channel::<GilWorkRequest>(16)` (not flume, not SPSC-per-core). Rationale:

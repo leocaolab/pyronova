@@ -10,59 +10,14 @@ Now a `tokio::sync::Semaphore` on `InterpreterPool` is acquired
 *before* the body collect. No permit → 503 Overloaded, body stays
 in the kernel TCP buffer.
 
-We verify the submit_semaphore is structurally wired in (the permit
-is acquired in the right place) and that the permit lifecycle
-defaults are correct. A true DOS simulation needs real traffic.
+The ordering (permit before body) and the rejection (503 + CORS, counted
+as dropped) are covered behaviourally by
+tests/test_review_m2.py::test_pool_admission_rejects_large_bodies_past_the_permit_budget.
 """
 
 import pathlib
 
 _REPO = pathlib.Path(__file__).parent.parent
-
-
-def test_submit_semaphore_wired_before_body_collect():
-    src = (_REPO / "src/handlers/subinterp.rs").read_text()
-    # The permit must be taken BEFORE the body-collect phase. The
-    # body-collect is guarded by `if is_stream_route` / `else` on
-    # the `body_obj = req.into_body()` — find the submit_semaphore
-    # call and assert it comes before that branch.
-    acquire_idx = src.find("submit_semaphore.clone().try_acquire_owned()")
-    assert acquire_idx != -1, (
-        "handle_request_subinterp must try_acquire_owned() a permit "
-        "from pool.submit_semaphore before collecting the request body"
-    )
-    # The body-decide `let (body_bytes, body_stream_rx_early) = if is_stream_route`
-    # must come AFTER the acquire.
-    body_decide_idx = src.find(
-        "let (body_bytes, body_stream_rx_early) = if is_stream_route"
-    )
-    assert body_decide_idx != -1
-    assert acquire_idx < body_decide_idx, (
-        "permit acquire must precede the body-collect — otherwise a full "
-        "queue lets N × max_body_size of in-flight uploads pile into RAM"
-    )
-
-
-def test_semaphore_reject_returns_503():
-    """Confirm the rejection branch is 503 + CORS-applied, not a panic
-    or silent drop (the CORS 404 bug from round 3 — don't regress it)."""
-    src = (_REPO / "src/handlers/subinterp.rs").read_text()
-    # The Err branch of try_acquire_owned should construct an
-    # overloaded_response and apply_cors before returning.
-    # Search for the critical pieces close to the acquire site.
-    idx = src.find("submit_semaphore.clone().try_acquire_owned()")
-    assert idx != -1, "submit_semaphore.clone().try_acquire_owned() not found in subinterp.rs"
-    window = src[idx:idx + 1500]
-    assert "overloaded_response" in window, (
-        "rejection must return 503 (overloaded_response), not 500 or silent drop"
-    )
-    assert "apply_cors" in window, (
-        "rejection path must still apply CORS headers — the CORS-404 "
-        "bug we fixed in round 3 must not regress here"
-    )
-    assert "DROPPED_REQUESTS" in window, (
-        "rejection should bump the dropped-requests metric for observability"
-    )
 
 
 def test_pool_exposes_submit_semaphore():

@@ -156,6 +156,7 @@ Verify: `tests/test_pyerr_no_stderr.py tests/test_ffi_panic_safety.py tests/test
 - Dead TPC selection plumbing: `tpc_incompatible`, `set_tpc`, `tpc=`/`PYRONOVA_TPC=1` opt-in (`app.rs:559-579,63`), `set_cors_origin` shim (`app.rs:67`).
 - `tpc.rs` duplication: accept arm ×6 (1047-1185) → merged `AcceptSource` stream; sigint thread ×3; panic-message extraction ×5; `TpcContext` param object replacing `too_many_arguments`; error classified by message text (`tpc.rs:325`, `app.rs:698-705`) → typed predicates; accept loop + shutdown duplicated between run_gil / run_subinterp (`app.rs:921-1046` vs `1151-1261`).
 - `websocket()` silently overwrites duplicate path (`app.rs:370`); `unwrap_or(false)` swallowing inspect errors (`app.rs:843-852`); `let _ = set_nodelay` (`app.rs:964,1186`).
+- **Per-app limits, not process globals**: `max_body_size` is a process-wide `static AtomicUsize` written through a per-app setter (`handlers.rs` `MAX_BODY_SIZE`, `app.rs` `set_max_body_size`), so one app's setting leaks into every other app in the process (observed: `test_upload_streaming` → `test_request_fields::test_post_large_body` order dependence). Move it (and the other limits) into `SiteConfig`. The human approved restoring it in the test instead; the supervisor chose the root fix — the test then needs no edit.
 - `MaybeTlsStream` forwards `poll_write_vectored`/`is_write_vectored` (hot-path copy, `tls.rs:35-71`); `tls.rs:133` hardcoded "10s".
 
 Verify: `tests/test_tls*.py tests/test_env_var_worker.py tests/test_lifecycle.py tests/test_async_shutdown.py tests/test_cli.py` + new tests (extra TLS port served in each mode, bad mode string rejected, port-in-use → error).
@@ -206,3 +207,4 @@ History / WHAT comments, stale "Phase 1 / old pool" docs, misplaced doc comments
 - Logging: the Rust access log is the only request log (human decision; `3cba81e`).
 - Approved test updates: `test_mcp.py:91`, `test_db_pg.py::test_unknown_column_types_do_not_explode`, `test_passive_gil_metrics.py` ×4, `static_fs.rs` unit-test setup, `tests/e2e/ws_binary_server.py`.
 - DB `connect()` with the same DSN but different settings → raises (human decision); fixtures stop passing differing settings.
+- M2 merged (`129d1fb`). Full suite after M2: 580 passed, 2 failed (the two source-grep admission tests, approved for deletion), 2 skipped. TPC inline handler timeout: late 504, no preemption (human decision; documented in `docs/tpc-rearch.md` Line 3). M2 measured about -1.3% on TPC inline `def` (per-request context + one `Instant::now()`), no change on the fast and GIL paths.
