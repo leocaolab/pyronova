@@ -244,8 +244,9 @@ class Pyronova:
 
     @property
     def max_body_size(self) -> int:
-        """Max request body size in bytes. Default: 10 MB."""
-        return getattr(self, "_max_body_size", 10 * 1024 * 1024)
+        """Max request body size in bytes; a larger body is answered 413. Default: 10 MB.
+        Per app: another app in the same process keeps its own."""
+        return self._engine.max_body_size()
 
     @max_body_size.setter
     def max_body_size(self, size: int) -> None:
@@ -259,7 +260,6 @@ class Pyronova:
             )
         if size < 0:
             raise ValueError(f"max_body_size must be non-negative, got {size}")
-        self._max_body_size = size
         self._engine.set_max_body_size(size)
 
     @property

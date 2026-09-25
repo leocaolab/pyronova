@@ -17,7 +17,7 @@ use super::pipeline::{
     await_reply, collect_body_with_admission, fail, finish, preprocess, Admission, Prepared,
     Preprocessed, RequestLine, Served, OVERLOADED,
 };
-use super::{http_response, max_body_size, BoxBody, SharedPool};
+use super::{http_response, BoxBody, SharedPool};
 
 /// Bodies up to this size skip the admission gate. HTTP/2 multiplexes hundreds of streams
 /// per connection, so tens of thousands of small requests can be in flight at once: a
@@ -56,6 +56,7 @@ pub(crate) async fn handle_request_subinterp(
                 method: Arc::clone(&method),
                 path: Arc::clone(&path),
                 client_ip: client_ip_addr,
+                max_body: site.config.limits.max_body_bytes,
             };
             let resp = run_on_pool(&pool, prepared, work, &tag).await;
             let line = RequestLine {
@@ -76,6 +77,8 @@ struct PoolWork {
     method: Arc<str>,
     path: Arc<str>,
     client_ip: std::net::IpAddr,
+    /// The app's `max_body_size`.
+    max_body: usize,
 }
 
 async fn run_on_pool(
@@ -108,11 +111,11 @@ async fn run_on_pool(
     };
     let accept_encoding = prepared.accept_encoding();
     let query = prepared.query().to_owned();
-    let admitted =
-        match collect_body_with_admission(prepared.body, max_body_size(), admission).await {
-            Ok(admitted) => admitted,
-            Err(e) => return fail(e, tag),
-        };
+    let admitted = match collect_body_with_admission(prepared.body, work.max_body, admission).await
+    {
+        Ok(admitted) => admitted,
+        Err(e) => return fail(e, tag),
+    };
     // Held until the response is ready.
     let _permit = admitted.permit;
 

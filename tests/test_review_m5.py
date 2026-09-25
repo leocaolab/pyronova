@@ -192,3 +192,51 @@ def test_the_worker_log_level_comes_from_the_engine_not_the_environment():
     assert "m5-warning-line" in out, out
     assert "m5-info-line" not in out, out
     assert "NOT-LEAKED" in out, out
+
+
+# ---------------------------------------------------------------------------
+# 2. Limits are per app, not process globals
+# ---------------------------------------------------------------------------
+
+# Module level: served with mode="gil", so nothing re-executes this file.
+from pyronova import Pyronova  # noqa: E402
+from pyronova.testing import TestClient  # noqa: E402
+
+_small = Pyronova()
+_small.max_body_size = 1000
+_small.max_websocket_connections = 1
+_default = Pyronova()
+
+
+@_small.post("/len")
+def _small_len(req):
+    return {"len": len(req.body)}
+
+
+@_default.post("/len")
+def _default_len(req):
+    return {"len": len(req.body)}
+
+
+@_default.websocket("/echo")
+def _default_echo(ws):
+    while (msg := ws.recv()) is not None:
+        ws.send(msg)
+
+
+def test_two_apps_in_one_process_keep_their_own_max_body_size():
+    with TestClient(_default, mode="gil") as big, TestClient(_small, mode="gil") as small:
+        assert big.post("/len", body=b"x" * 5000).json() == {"len": 5000}
+        assert small.post("/len", body=b"x" * 5000).status_code == 413
+        assert small.post("/len", body=b"x" * 500).json() == {"len": 500}
+    assert _small.max_body_size == 1000
+    assert _default.max_body_size == 10 * 1024 * 1024
+
+
+def test_two_apps_in_one_process_keep_their_own_websocket_cap():
+    assert _default.max_websocket_connections == 1024
+    with TestClient(_default, mode="gil") as c:
+        with c.websocket_connect("/echo") as a, c.websocket_connect("/echo") as b:
+            a.send("1")
+            b.send("2")
+            assert (a.recv(timeout=5), b.recv(timeout=5)) == ("1", "2")

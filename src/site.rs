@@ -26,6 +26,61 @@ pub(crate) struct SiteConfig {
     /// The header a client's request id arrives in (`app.enable_request_id()`); `None`
     /// means every request id is minted by the server.
     pub(crate) request_id_header: Option<HeaderName>,
+    /// This app's request-body and WebSocket limits.
+    pub(crate) limits: Limits,
+    /// The WebSocket connections this run has open, against `limits.ws.max_connections`.
+    pub(crate) ws_connections: crate::websocket::OpenConnections,
+}
+
+/// Default max request body size (10 MB). Configurable via `app.max_body_size`.
+const DEFAULT_MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// An app's limits. Each app has its own (set through its `PyronovaApp`), so two apps in
+/// one process never see each other's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Limits {
+    /// Largest request body, in bytes; a larger one is answered 413.
+    pub(crate) max_body_bytes: usize,
+    pub(crate) ws: crate::websocket::WsLimits,
+}
+
+impl Limits {
+    pub(crate) const DEFAULT: Self = Self {
+        max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+        ws: crate::websocket::WsLimits::DEFAULT,
+    };
+
+    /// One line per setter whose value in a worker's script (`in_worker`) differs from
+    /// the served app's (`self`, the main interpreter's), naming the call and both values;
+    /// empty when they agree. A worker's app is never served, so such a call has no effect
+    /// and the worker says so (FR-17).
+    pub(crate) fn ignored_in_worker(&self, in_worker: &Limits) -> Vec<String> {
+        let mut ignored = Vec::new();
+        let mut differ = |call: &str, worker: usize, served: usize| {
+            if worker != served {
+                ignored.push(format!(
+                    "{call}({worker}) in a worker is ignored: limits are per app, and the app \
+                     served is the main interpreter's, which has {served}"
+                ));
+            }
+        };
+        differ(
+            "set_max_body_size",
+            in_worker.max_body_bytes,
+            self.max_body_bytes,
+        );
+        differ(
+            "set_max_websocket_message_size",
+            in_worker.ws.max_message_bytes as usize,
+            self.ws.max_message_bytes as usize,
+        );
+        differ(
+            "set_max_websocket_connections",
+            in_worker.ws.max_connections,
+            self.ws.max_connections,
+        );
+        ignored
+    }
 }
 
 /// CORS response headers, parsed once at configuration. Applied to every response, not

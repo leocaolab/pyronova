@@ -17,7 +17,7 @@ use crate::handlers::{handle_request, handle_request_subinterp};
 use crate::python::interp;
 use crate::router::{Dispatch, HandlerKind, MutableRoutes, RequestBody, RouteTable, Sealed};
 use crate::server::listener::{create_reuseport_listener, handle_accept_error, setup_tcp_quickack};
-use crate::site::{AccessLog, Cors, CorsSpec, SharedSite, Site, SiteConfig};
+use crate::site::{AccessLog, Cors, CorsSpec, Limits, SharedSite, Site, SiteConfig};
 use crate::state::SharedState;
 use crate::websocket;
 
@@ -38,6 +38,8 @@ pub(crate) struct PyronovaApp {
     grpc_benchmark: bool,
     /// The header a client's request id arrives in (`set_request_id_header`).
     request_id_header: Option<hyper::header::HeaderName>,
+    /// This app's request-body and WebSocket limits, served by its runs.
+    limits: Limits,
     /// The stop signal of the server `run` is serving; `None` while nothing is serving.
     serving: parking_lot::Mutex<Option<CancellationToken>>,
 }
@@ -54,6 +56,7 @@ impl PyronovaApp {
             access_log: AccessLog::disabled(),
             grpc_benchmark: false,
             request_id_header: None,
+            limits: Limits::DEFAULT,
             serving: parking_lot::Mutex::new(None),
         }
     }
@@ -166,45 +169,34 @@ impl PyronovaApp {
         Ok(())
     }
 
-    /// Set max request body size in bytes. Default: 10 MB.
-    ///
-    /// The limit is process-wide, so only the main interpreter sets it. A worker replaying
-    /// the script calls this again; there it only warns if the value differs (FR-17).
-    fn set_max_body_size(&self, py: Python<'_>, size: usize) {
-        if crate::run_context::on_main(py) {
-            crate::handlers::set_max_body_size(size);
-            return;
-        }
-        let current = crate::handlers::max_body_size();
-        if size != current {
-            tracing::warn!(
-                target: "pyronova::server",
-                "set_max_body_size({size}) in a worker is ignored: the limit is process-wide, \
-                 and the main interpreter set it to {current}"
-            );
-        }
+    /// Set this app's max request body size in bytes; a larger body is answered 413.
+    /// Default: 10 MB. Per app: another app in the process keeps its own.
+    fn set_max_body_size(&mut self, size: usize) {
+        self.limits.max_body_bytes = size;
+    }
+
+    fn max_body_size(&self) -> usize {
+        self.limits.max_body_bytes
     }
 
     /// Largest WebSocket message (and frame), in bytes, in either direction. Default 1 MiB.
-    fn set_max_websocket_message_size(&self, py: Python<'_>, size: i64) -> PyResult<()> {
-        let wanted = crate::websocket::limits().with_max_message_bytes(size)?;
-        set_websocket_limits(py, wanted);
+    fn set_max_websocket_message_size(&mut self, size: i64) -> PyResult<()> {
+        self.limits.ws = self.limits.ws.with_max_message_bytes(size)?;
         Ok(())
     }
 
     fn max_websocket_message_size(&self) -> u32 {
-        crate::websocket::limits().max_message_bytes
+        self.limits.ws.max_message_bytes
     }
 
     /// Concurrent WebSocket connections; an upgrade beyond it is answered 503. Default 1024.
-    fn set_max_websocket_connections(&self, py: Python<'_>, count: i64) -> PyResult<()> {
-        let wanted = crate::websocket::limits().with_max_connections(count)?;
-        set_websocket_limits(py, wanted);
+    fn set_max_websocket_connections(&mut self, count: i64) -> PyResult<()> {
+        self.limits.ws = self.limits.ws.with_max_connections(count)?;
         Ok(())
     }
 
     fn max_websocket_connections(&self) -> usize {
-        crate::websocket::limits().max_connections
+        self.limits.ws.max_connections
     }
 
     /// Register a fast-path route — a response that never enters Python.
@@ -301,7 +293,7 @@ impl PyronovaApp {
             gzip_level,
             brotli_quality,
         );
-        // Process-wide, like set_max_body_size: main sets it, a worker only warns (FR-17).
+        // Process-wide (unlike the per-app limits): main sets it, a worker only warns (FR-17).
         if crate::run_context::on_main(py) {
             crate::compression::configure(
                 enabled,
@@ -650,10 +642,9 @@ impl PyronovaApp {
         let sites: Vec<SharedSite> = (0..n)
             .map(|_| self.bench_site(py).map(Arc::new))
             .collect::<PyResult<_>>()?;
-        let expected = crate::router::RouteSignature::of(&sites[0].routes);
         let env = EnvConfig::from_env()?;
         crate::monitor::init_metrics_flag(env.metrics);
-        let workers = self.build_workers(py, n, &expected, env.gc.count_trigger())?;
+        let workers = self.build_workers(py, n, &sites[0], env.gc.count_trigger())?;
 
         let paired = workers.into_iter().zip(sites).collect();
         let duration = std::time::Duration::from_secs(duration_s);
@@ -680,10 +671,9 @@ impl PyronovaApp {
     ) -> PyResult<(u64, f64, u16)> {
         let n = bench_worker_count(workers)?;
         let site: SharedSite = Arc::new(self.bench_site(py)?);
-        let expected = crate::router::RouteSignature::of(&site.routes);
         let env = EnvConfig::from_env()?;
         crate::monitor::init_metrics_flag(env.metrics);
-        let workers = self.build_workers(py, n, &expected, env.gc.count_trigger())?;
+        let workers = self.build_workers(py, n, &site, env.gc.count_trigger())?;
 
         let duration = std::time::Duration::from_secs(duration_s);
         let (measured, port) = py
@@ -794,23 +784,6 @@ async fn serve_connection<S>(
     }
 }
 
-/// WebSocket limits are process-wide, like `set_max_body_size`: main sets them; a worker
-/// replaying the script only warns if its value differs (FR-17).
-fn set_websocket_limits(py: Python<'_>, wanted: crate::websocket::WsLimits) {
-    if crate::run_context::on_main(py) {
-        crate::websocket::set_limits(wanted);
-        return;
-    }
-    let current = crate::websocket::limits();
-    if wanted != current {
-        tracing::warn!(
-            target: "pyronova::server",
-            "WebSocket limits {wanted:?} set in a worker are ignored: they are process-wide, \
-             and the main interpreter set {current:?}"
-        );
-    }
-}
-
 /// The handlers and hooks of the app a worker's script registered on, indexed like main's
 /// table, with their signature (Layer 2, C3).
 pub(crate) struct WorkerRoutes {
@@ -818,6 +791,8 @@ pub(crate) struct WorkerRoutes {
     pub(crate) handlers: Vec<Py<PyAny>>,
     pub(crate) before_hooks: Vec<Py<PyAny>>,
     pub(crate) after_hooks: Vec<Py<PyAny>>,
+    /// The limits the script set on its app (never served: main's app is).
+    pub(crate) limits: Limits,
 }
 
 impl WorkerRoutes {
@@ -828,6 +803,7 @@ impl WorkerRoutes {
             handlers: Vec::new(),
             before_hooks: Vec::new(),
             after_hooks: Vec::new(),
+            limits: Limits::DEFAULT,
         }
     }
 }
@@ -846,6 +822,7 @@ pub(crate) fn worker_routes(py: Python<'_>) -> Option<WorkerRoutes> {
             .collect(),
         before_hooks: table.before_hooks.iter().map(|h| h.clone_ref(py)).collect(),
         after_hooks: table.after_hooks.iter().map(|h| h.clone_ref(py)).collect(),
+        limits: app.limits,
     })
 }
 
@@ -910,6 +887,8 @@ impl PyronovaApp {
                 access_log: self.access_log.clone(),
                 grpc_benchmark: self.grpc_benchmark,
                 request_id_header: self.request_id_header.clone(),
+                limits: self.limits,
+                ws_connections: crate::websocket::OpenConnections::default(),
             },
         }
     }
@@ -1196,6 +1175,7 @@ impl PyronovaApp {
                 &expected,
                 &self.shared_state,
                 env.gc.threshold,
+                routes.config.limits,
             )
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -1358,7 +1338,6 @@ impl PyronovaApp {
         //   so all stream routes flow through the main-interp bridge.
         //   Phase 5 wires stream responses back through the bridge
         //   oneshot (`MainReply::Stream`).
-        let expected = crate::router::RouteSignature::of(&routes.routes);
         #[cfg(target_os = "macos")]
         if env.darwin_topology == crate::config::DarwinTopology::Fanout {
             // The fanout loop has no idle tick: count or off only.
@@ -1369,7 +1348,7 @@ impl PyronovaApp {
         }
         let (gc, topology) = (env.gc, env.darwin_topology);
         let n_threads = workers;
-        let sub_workers = self.build_workers(py, n_threads, &expected, gc.count_trigger())?;
+        let sub_workers = self.build_workers(py, n_threads, &routes, gc.count_trigger())?;
 
         // The main-interp bridge serves `gil=True` routes and the fallback with the main
         // GIL, while TPC threads handle the rest inline. See src/bridge/main_bridge.rs.
@@ -1410,7 +1389,7 @@ impl PyronovaApp {
     }
 
     /// Builds `n` TPC sub-interpreter workers, in order, on the main thread: each runs the
-    /// app's script and must register `expected`. If worker `i` fails, the workers already
+    /// app's script and must register `site`'s routes. If worker `i` fails, the workers already
     /// built are ended here, on the thread that created them (FR-19), before the error is
     /// raised. The workers come back with their thread state saved; the thread that
     /// serves one rebinds it first.
@@ -1418,7 +1397,7 @@ impl PyronovaApp {
         &self,
         py: Python<'_>,
         n: usize,
-        expected: &crate::router::RouteSignature,
+        site: &Site,
         gc_threshold: u64,
     ) -> PyResult<Vec<interp::SubInterpreterWorker>> {
         if !crate::run_context::on_main(py) {
@@ -1433,13 +1412,15 @@ impl PyronovaApp {
         // Each worker gets it as `POOL_ID` (the async engine's zombie guard).
         let pool_id = interp::next_pool_id();
 
+        let expected = crate::router::RouteSignature::of(&site.routes);
         let spec = interp::WorkerSpec {
             script: &script,
             script_path: &script_path,
-            expected,
+            expected: &expected,
             pool_id,
             shared_state: &self.shared_state,
             gc_threshold,
+            limits: site.config.limits,
         };
         let mut built = Vec::with_capacity(n);
         for i in 0..n {

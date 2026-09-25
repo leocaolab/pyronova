@@ -336,6 +336,7 @@ impl InterpreterPool {
         expected: &crate::router::RouteSignature,
         shared_state: &crate::state::SharedMap,
         gc_threshold: u64,
+        limits: crate::site::Limits,
     ) -> Result<Self, PoolError> {
         let n = split.total();
         let has_any_async = split.async_workers > 0;
@@ -373,6 +374,7 @@ impl InterpreterPool {
             pool_id,
             shared_state,
             gc_threshold,
+            limits,
         };
         for i in 0..n {
             match SubInterpreterWorker::new(i, &spec) {

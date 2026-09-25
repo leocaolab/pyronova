@@ -26,7 +26,7 @@ use super::pipeline::{
     await_reply, collect_body, fail, finish, preprocess, AcceptEncoding, Prepared, Preprocessed,
     RequestLine, Served, REQUEST_BUDGET,
 };
-use super::{build_main_http_response, http_response, max_body_size, stream_body_feeder, BoxBody};
+use super::{build_main_http_response, http_response, stream_body_feeder, BoxBody};
 
 pub(crate) async fn handle_request_tpc_inline(
     req: Request<Incoming>,
@@ -80,7 +80,7 @@ async fn run_inline(
         method: parts.method.as_str(),
         path: parts.uri.path(),
     };
-    let resp = match collect_body(body, max_body_size()).await {
+    let resp = match collect_body(body, site.config.limits.max_body_bytes).await {
         Ok(body) => {
             let request = InlineRequest {
                 parts: &parts,
@@ -192,6 +192,7 @@ async fn run_on_bridge(
                 params,
                 headers,
                 client_ip: client_ip_addr,
+                max_body: site.config.limits.max_body_bytes,
             };
             dispatch_to_bridge(&bridge, &parts, incoming, call, &tag).await
         }
@@ -210,6 +211,8 @@ struct BridgeCall {
     params: Params,
     headers: hyper::HeaderMap,
     client_ip: std::net::IpAddr,
+    /// The app's `max_body_size`.
+    max_body: usize,
 }
 
 async fn dispatch_to_bridge(
@@ -225,15 +228,14 @@ async fn dispatch_to_bridge(
     let (body_bytes, body_stream_rx, feeder) = match call.body {
         RequestBody::Streamed => {
             let (tx, rx) = tokio::sync::mpsc::channel(crate::python::body_stream::CHANNEL_CAPACITY);
-            let feeder =
-                tokio::task::spawn_local(stream_body_feeder(incoming, tx, max_body_size()));
+            let feeder = tokio::task::spawn_local(stream_body_feeder(incoming, tx, call.max_body));
             (
                 Bytes::new(),
                 Arc::new(std::sync::Mutex::new(Some(rx))),
                 Some(feeder),
             )
         }
-        RequestBody::Buffered => match collect_body(incoming, max_body_size()).await {
+        RequestBody::Buffered => match collect_body(incoming, call.max_body).await {
             Ok(bytes) => (
                 bytes,
                 crate::python::body_stream::empty_body_stream_rx(),

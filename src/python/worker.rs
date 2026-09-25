@@ -180,6 +180,8 @@ pub(crate) struct WorkerSpec<'a> {
     pub(crate) shared_state: &'a crate::state::SharedMap,
     /// See `SubInterpreterWorker::gc_threshold`.
     pub(crate) gc_threshold: u64,
+    /// The served app's limits; a worker whose script set others says they are ignored.
+    pub(crate) limits: crate::site::Limits,
 }
 
 /// What a worker's interpreter holds for serving, built by its init.
@@ -366,6 +368,9 @@ impl SubInterpreterWorker {
                 })
             }
         };
+        for ignored in spec.limits.ignored_in_worker(&routes.limits) {
+            tracing::warn!(target: "pyronova::server", worker = worker_id, "{ignored}");
+        }
 
         Ok(Serving {
             handlers: routes.handlers,

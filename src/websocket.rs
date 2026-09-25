@@ -16,7 +16,7 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use pyo3::exceptions::{PyBlockingIOError, PyConnectionError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
@@ -36,7 +36,7 @@ use crate::site::{SharedSite, Site};
 use crate::types::{PyronovaRequest, ResponseData};
 
 // ---------------------------------------------------------------------------
-// Limits (process-wide, like max_body_size)
+// Limits (per app: `site::Limits`)
 // ---------------------------------------------------------------------------
 
 /// Largest message (and frame) accepted from a client or queued by a handler, in bytes.
@@ -74,7 +74,7 @@ impl From<WsLimitError> for PyErr {
 }
 
 impl WsLimits {
-    const DEFAULT: Self = Self {
+    pub(crate) const DEFAULT: Self = Self {
         max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
         max_connections: DEFAULT_MAX_CONNECTIONS,
     };
@@ -109,36 +109,28 @@ impl WsLimits {
     }
 }
 
-static LIMITS: RwLock<WsLimits> = RwLock::new(WsLimits::DEFAULT);
-
-pub(crate) fn limits() -> WsLimits {
-    *LIMITS.read()
-}
-
-pub(crate) fn set_limits(limits: WsLimits) {
-    *LIMITS.write() = limits;
-}
-
-static OPEN_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+/// The WebSocket connections one server run has open (`SiteConfig::ws_connections`).
+#[derive(Clone, Default)]
+pub(crate) struct OpenConnections(Arc<AtomicUsize>);
 
 /// One of the `max_connections` slots, held for the connection's whole life (until its
 /// Python handler thread has been joined) and released on drop.
-struct ConnectionSlot(());
+struct ConnectionSlot(Arc<AtomicUsize>);
 
 impl ConnectionSlot {
-    fn try_acquire(max_connections: usize) -> Option<Self> {
-        OPEN_CONNECTIONS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |open| {
-                (open < max_connections).then_some(open + 1)
+    fn try_acquire(open: &OpenConnections, max_connections: usize) -> Option<Self> {
+        open.0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < max_connections).then_some(n + 1)
             })
             .ok()
-            .map(|_| Self(()))
+            .map(|_| Self(Arc::clone(&open.0)))
     }
 }
 
 impl Drop for ConnectionSlot {
     fn drop(&mut self) {
-        OPEN_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -499,8 +491,10 @@ async fn answer_upgrade(
     let Some(key) = handshake.key else {
         return refusal(StatusCode::BAD_REQUEST, "missing sec-websocket-key");
     };
-    let limits = limits();
-    let Some(slot) = ConnectionSlot::try_acquire(limits.max_connections) else {
+    let limits = site.config.limits.ws;
+    let Some(slot) =
+        ConnectionSlot::try_acquire(&site.config.ws_connections, limits.max_connections)
+    else {
         tracing::debug!(target: "pyronova::server", path = %path, max_connections = limits.max_connections,
             "WebSocket connection limit reached; answered 503");
         return fail(HandlerError::Overloaded("websocket connections"), tag);
@@ -947,12 +941,13 @@ mod tests {
 
     #[test]
     fn connection_slots_are_bounded_and_released() {
-        // Other tests do not open WebSocket connections, so the counter starts at 0.
-        let first = ConnectionSlot::try_acquire(2).expect("slot 1");
-        let second = ConnectionSlot::try_acquire(2).expect("slot 2");
-        assert!(ConnectionSlot::try_acquire(2).is_none());
+        // A fresh run's counter starts at 0.
+        let open = OpenConnections::default();
+        let first = ConnectionSlot::try_acquire(&open, 2).expect("slot 1");
+        let second = ConnectionSlot::try_acquire(&open, 2).expect("slot 2");
+        assert!(ConnectionSlot::try_acquire(&open, 2).is_none());
         drop(first);
-        let third = ConnectionSlot::try_acquire(2).expect("released slot");
+        let third = ConnectionSlot::try_acquire(&open, 2).expect("released slot");
         drop((second, third));
     }
 
