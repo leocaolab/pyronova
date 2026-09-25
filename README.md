@@ -471,7 +471,7 @@ Details and measurements: [docs/subinterp-c-extension-status.en.md §10](docs/su
 ## Install
 
 ```bash
-# From source (requires Rust toolchain + Python 3.13+)
+# From source (requires Rust toolchain + Python 3.14+)
 git clone https://github.com/leocaolab/pyronova.git
 cd pyronova
 python -m venv .venv && source .venv/bin/activate
@@ -864,16 +864,18 @@ def analyze(req):
 sub-interpreter bug report as not planned ([numpy#27192](https://github.com/numpy/numpy/issues/27192)),
 and the feature request ([numpy#24755](https://github.com/numpy/numpy/issues/24755)) is open.
 
-### Python 3.13+ required
+### Python 3.14+ required
 
-**What:** Pyronova requires Python 3.13 or later.
+**What:** Pyronova requires Python 3.14 or later.
 
 **Why:** Per-Interpreter GIL (PEP 684) was introduced in Python 3.12, but
 v1.5.0 onwards uses `PyThreadState_GetUnchecked` and the new tstate
 rebinding helper added in CPython 3.13 to close a per-request memory
-leak. Earlier 3.12 builds cannot run this code path safely.
+leak, so 3.12 can't run it. 3.13 is not supported either: its own `_datetime`
+crashes under concurrent strict sub-interpreters (measured 2026-09-24, isojson
+E2E-6), and Pyronova is tested and released on 3.14 only.
 
-**Workaround:** None. Python 3.13+ is required. Consider using [pyenv](https://github.com/pyenv/pyenv) to manage multiple Python versions.
+**Workaround:** None. Python 3.14+ is required. Consider using [pyenv](https://github.com/pyenv/pyenv) to manage multiple Python versions.
 
 ### Build from source
 
@@ -897,7 +899,7 @@ leak. Earlier 3.12 builds cannot run this code path safely.
 
 ## Requirements
 
-- Python 3.13+ (PEP 684 sub-interpreters + `PyThreadState_GetUnchecked`)
+- Python 3.14+ (PEP 684 sub-interpreters + `PyThreadState_GetUnchecked`)
 - Rust toolchain (build from source)
 - macOS or Linux
 

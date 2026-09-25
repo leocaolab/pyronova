@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "pyronova"
 dynamic = ["version"]
 description = "High-performance Python web framework powered by Rust — 2x faster than Robyn"
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 license = { text = "MIT" }
 readme = "README.md"
 classifiers = [

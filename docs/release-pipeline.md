@@ -24,7 +24,7 @@ Python versions, unit tests, lint. It never claims the build is
 | **dev**        | `--profile dev` (default) | on | local + `pytest` | Fast iteration. Debug symbols, no LTO. Diagnostic hooks always live so a stray leak shows up immediately. |
 | **release**    | `--profile release` (LTO fat, codegen-units=1, strip) | **off** | shipped to PyPI | What end users get. Zero cost from any diagnostic — the `cfg`-gated code does not link. |
 | **canary**     | `--profile release` | **on** | local pre-release soak | Same compile flags as release, but with the leak counter wired up. If `just canary-soak` ever shows a rc≥2 growth curve on a non-whitelisted type, the release is held. |
-| **ci-compile** | `--profile dev` | off | GitHub Actions | Compile-only smoke across Python 3.13 / 3.14, no stress. |
+| **ci-compile** | `--profile dev` | off | GitHub Actions | Compile-only smoke on Python 3.14, no stress. |
 
 Rule of thumb: **release and canary share the exact same codegen.**
 `leak_detect` only adds a conditional `counter!` increment at
