@@ -647,11 +647,15 @@ impl PyronovaApp {
         crate::monitor::init_metrics_flag(env.metrics);
         let workers = self.build_workers(py, n, &sites[0], env.gc.count_trigger())?;
 
+        // The sites hold main-interpreter `Py<T>`s: the last reference to each is this
+        // one, dropped here, attached, after the bench threads are joined (FR-6).
+        let sites_keepalive = sites.clone();
         let paired = workers.into_iter().zip(sites).collect();
         let duration = std::time::Duration::from_secs(duration_s);
         let measured = py
             .detach(move || crate::bench::run_inmem_bench(conns_per_worker, duration, paired))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        drop(sites_keepalive);
         Ok((measured.requests, measured.elapsed.as_secs_f64()))
     }
 
@@ -676,12 +680,15 @@ impl PyronovaApp {
         crate::monitor::init_metrics_flag(env.metrics);
         let workers = self.build_workers(py, n, &site, env.gc.count_trigger())?;
 
+        // As in `bench_inmem`: the site's last reference is dropped here, attached.
+        let site_keepalive = Arc::clone(&site);
         let duration = std::time::Duration::from_secs(duration_s);
         let (measured, port) = py
             .detach(move || {
                 crate::bench::run_loopback_bench(client_conns, duration, workers, site, env.gc)
             })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        drop(site_keepalive);
         Ok((measured.requests, measured.elapsed.as_secs_f64(), port))
     }
 }
@@ -739,13 +746,14 @@ struct ServerRun {
 
 /// Accept loops of the multi-thread (`PYRONOVA_TPC=0`) server. Linux's `SO_REUSEPORT`
 /// load-balances connections across several loops; macOS's doesn't, so it gets one.
+#[cfg(target_os = "linux")]
 fn multi_thread_accept_loops(io_workers: usize, num_cpus: usize) -> usize {
-    if cfg!(target_os = "linux") {
-        io_workers.min(num_cpus)
-    } else {
-        let _ = (io_workers, num_cpus);
-        1
-    }
+    io_workers.min(num_cpus)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn multi_thread_accept_loops(_io_workers: usize, _num_cpus: usize) -> usize {
+    1
 }
 
 /// How long the multi-thread server's in-flight connections get to finish after a stop.
