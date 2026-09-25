@@ -46,8 +46,10 @@ values came first, and ``None`` is a NULL of the right type. Python ↔ Postgres
     datetime.datetime (naive)   timestamp
     datetime.datetime (aware)   timestamptz (read back in UTC)
 
-A value the declared type cannot take raises ``TypeError`` (``ValueError`` when
-it is out of range). A column of any other type — arrays, inet, interval,
+A value the declared type cannot take (wrong type, out of range, not encodable)
+raises ``ParamError``, a subclass of both ``TypeError`` and ``ValueError``,
+before the query is sent. An int past 64 bits can be a ``numeric``; for an
+integer column it is out of range. A column of any other type — arrays, inet, interval,
 citext, … — reads back as its raw binary wire ``bytes``; cast it in SQL
 (``col::text``) to get text. An ambiguous parameter such as ``SELECT $1`` is
 text; cast it (``$1::int``) to send another type.
@@ -72,6 +74,6 @@ so an export-style handler looks like this:
 Deferred to v2: transactions; automatic Pydantic model mapping.
 """
 
-from .engine import DatabaseError, IntegrityError, PgCursor, PgPool, UniqueViolation
+from .engine import DatabaseError, IntegrityError, ParamError, PgCursor, PgPool, UniqueViolation
 
-__all__ = ["DatabaseError", "IntegrityError", "PgCursor", "PgPool", "UniqueViolation"]
+__all__ = ["DatabaseError", "IntegrityError", "ParamError", "PgCursor", "PgPool", "UniqueViolation"]

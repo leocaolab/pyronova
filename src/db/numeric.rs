@@ -9,6 +9,11 @@
 
 const DIGITS_PER_GROUP: usize = 4;
 const HEADER_WORDS: usize = 4;
+/// Every group is one base-10000 digit.
+const NBASE: u16 = 10_000;
+/// The largest display scale Postgres accepts (`NUMERIC_DSCALE_MAX`, `numeric.c`);
+/// `numeric_recv` rejects a larger one.
+const MAX_DSCALE: u16 = 0x3FFF;
 
 const SIGN_POSITIVE: u16 = 0x0000;
 const SIGN_NEGATIVE: u16 = 0x4000;
@@ -26,6 +31,10 @@ pub(crate) enum NumericError {
     Syntax(String),
     #[error("{0:?} has more digits than a Postgres numeric holds")]
     TooLarge(String),
+    #[error("{0:?} has more than {MAX_DSCALE} decimal places, the most a Postgres numeric shows")]
+    Scale(String),
+    #[error("numeric value has a digit group {0}, not a base-10000 digit")]
+    Digit(u16),
 }
 
 /// Reads a binary NUMERIC as the decimal text Python's `Decimal` parses exactly.
@@ -42,6 +51,9 @@ pub(crate) fn decode(buf: &[u8]) -> Result<String, NumericError> {
     let digits = (0..ndigits)
         .map(|i| word(HEADER_WORDS + i))
         .collect::<Result<Vec<u16>, _>>()?;
+    if let Some(&digit) = digits.iter().find(|&&d| d >= NBASE) {
+        return Err(NumericError::Digit(digit));
+    }
 
     let prefix = match sign {
         SIGN_POSITIVE => "",
@@ -135,7 +147,10 @@ pub(crate) fn encode(text: &str, out: &mut Vec<u8>) -> Result<(), NumericError> 
         SIGN_POSITIVE
     };
     let ndigits = u16::try_from(significant.len()).map_err(|_| too_large())?;
-    let dscale = u16::try_from(fraction.len()).map_err(|_| too_large())?;
+    let dscale = u16::try_from(fraction.len())
+        .ok()
+        .filter(|&scale| scale <= MAX_DSCALE)
+        .ok_or_else(|| NumericError::Scale(text.to_owned()))?;
 
     write_words(out, &[ndigits, weight as u16, sign, dscale]);
     write_words(out, significant);
@@ -202,6 +217,27 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_digit_group_of_10000_or_more_is_an_error() {
+        // ndigits 1, weight 0, positive, dscale 0, digit 10000
+        let wire = [0, 1, 0, 0, 0, 0, 0, 0, 0x27, 0x10];
+        assert_eq!(decode(&wire), Err(NumericError::Digit(10_000)));
+        let wire = [0, 1, 0, 0, 0, 0, 0, 0, 0x27, 0x0f];
+        assert_eq!(decode(&wire).unwrap(), "9999");
+    }
+
+    #[test]
+    fn a_scale_past_0x3fff_is_refused() {
+        let at_max = format!("0.{}", "1".repeat(usize::from(MAX_DSCALE)));
+        let mut wire = Vec::new();
+        assert_eq!(encode(&at_max, &mut wire), Ok(()));
+        let past = format!("0.{}", "1".repeat(usize::from(MAX_DSCALE) + 1));
+        assert_eq!(
+            encode(&past, &mut Vec::new()),
+            Err(NumericError::Scale(past.clone()))
+        );
     }
 
     #[test]

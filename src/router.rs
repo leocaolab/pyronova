@@ -90,7 +90,62 @@ fn header_value(name: &str, value: &str) -> Result<HeaderValue, FastResponseErro
 pub(crate) struct RouteError {
     method: String,
     path: String,
-    source: matchit::InsertError,
+    source: RouteRejection,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RouteRejection {
+    #[error(transparent)]
+    Template(#[from] TemplateError),
+    #[error(transparent)]
+    Insert(#[from] matchit::InsertError),
+}
+
+/// A route path the router would take differently from what it says.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum TemplateError {
+    /// Express/Flask-style `:name`: matchit reads it as literal text, so the route would
+    /// match only a request for the path `:name` itself.
+    #[error("`:{name}` is not a path parameter; write it as `{{{name}}}`")]
+    ColonParam { name: String },
+}
+
+/// The parameter names of a route path, in order: `{name}` (one per segment, with any
+/// prefix or suffix) and a final `{*name}` catch-all, whose name is given without the `*`.
+/// `{{` and `}}` are literal braces. A segment starting with `:name` is an error.
+/// Malformed braces are left to the router's insert, which rejects them.
+pub(crate) fn template_params(path: &str) -> Result<Vec<&str>, TemplateError> {
+    if let Some(name) = path.split('/').find_map(colon_param) {
+        return Err(TemplateError::ColonParam {
+            name: name.to_string(),
+        });
+    }
+    let mut names = Vec::new();
+    let mut rest = path;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        if let Some(escaped) = after.strip_prefix('{') {
+            rest = escaped;
+            continue;
+        }
+        let Some(close) = after.find('}') else {
+            break;
+        };
+        let name = &after[..close];
+        names.push(name.strip_prefix('*').unwrap_or(name));
+        rest = &after[close + 1..];
+    }
+    Ok(names)
+}
+
+/// `name` for a path segment `:name` (an identifier after the colon).
+fn colon_param(segment: &str) -> Option<&str> {
+    let name = segment.strip_prefix(':')?;
+    let starts_ident = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    starts_ident.then_some(name)
 }
 
 /// A registered route's index in its [`RouteTable`]. Only the table hands them out, so an
@@ -318,12 +373,14 @@ impl RouteTable {
         // leaves the table untouched.
         let id = RouteId(self.routes.len());
         let method = method.to_uppercase();
-        let router = self.routers.entry(method.clone()).or_default();
-        router.insert(path, id).map_err(|source| RouteError {
+        let rejected = |source: RouteRejection| RouteError {
             method: method.clone(),
             path: path.to_string(),
             source,
-        })?;
+        };
+        template_params(path).map_err(|e| rejected(e.into()))?;
+        let router = self.routers.entry(method.clone()).or_default();
+        router.insert(path, id).map_err(|e| rejected(e.into()))?;
         self.routes.push(Route {
             handler,
             name,
@@ -465,3 +522,44 @@ impl RouteShape {
 
 /// Mutable during registration (before run).
 pub(crate) type MutableRoutes = Arc<RwLock<RouteTable>>;
+
+#[cfg(test)]
+mod template_tests {
+    use super::*;
+
+    #[test]
+    fn params_are_named_in_order_catch_all_without_its_star() {
+        assert_eq!(template_params("/a/{x}/b/{y}"), Ok(vec!["x", "y"]));
+        assert_eq!(template_params("/img{id}.png"), Ok(vec!["id"]));
+        assert_eq!(template_params("/files/{*rest}"), Ok(vec!["rest"]));
+        assert_eq!(template_params("/static"), Ok(vec![]));
+    }
+
+    #[test]
+    fn escaped_braces_are_literal() {
+        assert_eq!(template_params("/{{x}}/{y}"), Ok(vec!["y"]));
+    }
+
+    #[test]
+    fn a_colon_segment_names_the_brace_form() {
+        let err = template_params("/items/:item_id").unwrap_err();
+        assert_eq!(
+            err,
+            TemplateError::ColonParam {
+                name: "item_id".into()
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "`:item_id` is not a path parameter; write it as `{item_id}`"
+        );
+    }
+
+    #[test]
+    fn a_colon_inside_a_segment_is_literal() {
+        assert_eq!(template_params("/v1/items:batchGet"), Ok(vec![]));
+        assert_eq!(template_params("/{id}:archive"), Ok(vec!["id"]));
+        assert_eq!(template_params("/:/x"), Ok(vec![]));
+        assert_eq!(template_params("/:8080"), Ok(vec![]));
+    }
+}

@@ -96,7 +96,12 @@ app = Pyronova(log_config={"level": "OFF"})
 # 5. enable_logging() — 激活访问日志 + Python 钩子输出
 app = Pyronova()
 app.enable_logging()       # 将级别提升到 INFO，开启 access_log
+app.enable_logging(level="warn")  # 显式级别优先于 log_config / debug=True
 ```
+
+`enable_logging(level=...)` 是显式级别的唯一写入者：它覆盖 `log_config` 或 `debug=True`
+设定的级别，之后不带级别的调用（`PYRONOVA_LOG=1` 或 `run()` 时的 `debug=True`）保留它。
+不带级别时，`enable_logging()` 保留已配置的级别，若为 ERROR 或 OFF 则提升到 INFO（访问日志是 INFO）。
 
 ### 环境变量
 

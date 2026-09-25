@@ -11,7 +11,7 @@ import json as _json_module
 
 import os
 
-from pyronova.engine import Mode, PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log, _in_worker, _forgotten_workers
+from pyronova.engine import Mode, PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log, _in_worker, _forgotten_workers, _route_params
 from pyronova.mcp import MCPServer
 from pyronova import _reload
 import logging as _logging
@@ -123,6 +123,17 @@ _LOGGING_LEVEL_MAP = {
 }
 
 
+def _level_with_access_log(current: str, requested: str | None, pinned: bool) -> str:
+    """The log level once the access log is on: the level asked for; else the current
+    one, raised to INFO when it would hide the access lines (ERROR, OFF), unless an
+    explicit ``enable_logging(level=...)`` chose it."""
+    if requested is not None:
+        return requested.upper()
+    if pinned or current not in ("ERROR", "OFF"):
+        return current
+    return "INFO"
+
+
 def _require_int(name: str, value: object) -> None:
     """``bool`` is an ``int`` subclass; a limit set to ``True`` is a bug, not 1."""
     if not isinstance(value, int) or isinstance(value, bool):
@@ -227,6 +238,8 @@ class Pyronova:
                 "access_log": user.get("access_log", False),
                 "format": user.get("format", "json"),
             }
+        # Whether enable_logging(level=...) chose the level (it then keeps it).
+        self._log_level_pinned = False
         # Set by the first server's _prepare(); later servers reuse it.
         self._prepared = False
         self._defined_in = _defining_module_file(self)
@@ -826,7 +839,7 @@ class Pyronova:
 
     def enable_logging(
         self,
-        level: str = "info",
+        level: str | None = None,
         sample: int = 1,
         always_log_status: int | None = None,
     ) -> None:
@@ -839,6 +852,10 @@ class Pyronova:
             INFO  pyronova::access Request handled method=GET path=/ status=200 latency_us=198 mode="gil"
 
         :param level: minimum log level — "debug" / "info" / "warn" / "error".
+            Given, it is the level, whatever ``log_config`` or ``debug=True`` set,
+            and a later call without one (``PYRONOVA_LOG=1``, ``debug=True`` at
+            ``run()``) keeps it. Left out, the level stays as configured, raised
+            to "info" when it is "error" or "off" (the access lines are INFO).
             An unknown level raises ``ValueError`` when the server starts.
         :param sample: log 1 in every ``sample`` requests. ``1`` (default)
             logs every request. ``100`` keeps roughly 1% — production knob
@@ -858,8 +875,10 @@ class Pyronova:
         self._engine.enable_request_logging(True)
 
         # The deferred init_logger picks these up (and validates the level).
-        if self._log_config.get("level", "ERROR") in ("ERROR", "OFF"):
-            self._log_config["level"] = level.upper()
+        self._log_level_pinned = self._log_level_pinned or level is not None
+        self._log_config["level"] = _level_with_access_log(
+            self._log_config["level"], level, self._log_level_pinned
+        )
         self._log_config["access_log"] = True
 
     # ------------------------------------------------------------------
@@ -1027,7 +1046,6 @@ class Pyronova:
             return
         self._engine._seal_registrations()
 
-        # enable_logging() is itself idempotent + lock-guarded.
         if os.environ.get("PYRONOVA_LOG") == "1" or self.debug:
             self.enable_logging()
         # Deferred from __init__ so enable_logging() can adjust the config first.
@@ -1193,34 +1211,39 @@ def _bind_handler(fn: Callable, path: str, model: type | None) -> Callable:
     """The callable the engine dispatches for a route: ``fn`` itself when it
     takes only the request, else a wrapper that validates the body against
     ``model`` and injects the path params ``fn`` declares. Signature mistakes
-    raise here, at registration, not on every request."""
+    and a path the router would not take as written (``:name``) raise here, at
+    registration, not on every request."""
+    template = frozenset(_route_params(path))
     if model is None:
-        return _bind_path_params(fn, path)
-    return _bind_model(fn, path, model)
+        return _bind_path_params(fn, path, template)
+    return _bind_model(fn, path, template, model)
 
 
-def _bind_path_params(fn: Callable, path: str) -> Callable:
+def _bind_path_params(fn: Callable, path: str, template: frozenset[str]) -> Callable:
     try:
         sig = inspect.signature(fn)
     except (TypeError, ValueError):
         return fn  # a builtin/C callable: nothing to inject
-    names = _path_param_names(fn, sig, path, leading=1)
+    names = _path_param_names(fn, sig, path, template, leading=1)
     if not names:
         return fn  # hot path — the handler is registered as is
 
+    # Every name is in the template, so the router always fills it: `p[n]`, never a
+    # silent None.
     if inspect.iscoroutinefunction(fn):
         async def bound(req):
             p = req.params
-            return await fn(req, **{n: p.get(n) for n in names})
+            return await fn(req, **{n: p[n] for n in names})
     else:
         def bound(req):
             p = req.params
-            return fn(req, **{n: p.get(n) for n in names})
+            return fn(req, **{n: p[n] for n in names})
     return _named_like(bound, fn)
 
 
-def _bind_model(fn: Callable, path: str, model: type) -> Callable:
-    """``fn(req, body, **path_params)`` or ``fn(body, **path_params)``."""
+def _bind_model(fn: Callable, path: str, template: frozenset[str], model: type) -> Callable:
+    """``fn(req, body, **path_params)`` or ``fn(body, **path_params)``, by the rule
+    ``_model_takes_request`` checks at registration."""
     # Imported here, only for routes that declare model=: importing pydantic at
     # module level would load pydantic_core in every worker of every app. If it
     # can't be imported, route registration fails with the ImportError.
@@ -1229,19 +1252,15 @@ def _bind_model(fn: Callable, path: str, model: type) -> Callable:
     if not (isinstance(model, type) and issubclass(model, BaseModel)):
         raise TypeError(f"model= must be a pydantic BaseModel subclass, got {model!r}")
     sig = inspect.signature(fn)
-    positional = [
-        p for p in sig.parameters.values()
-        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-    ]
-    takes_request = len(positional) >= 2 and positional[1].name not in _path_template_names(path)
-    names = _path_param_names(fn, sig, path, leading=2 if takes_request else 1)
+    takes_request = _model_takes_request(fn, sig, template, model)
+    names = _path_param_names(fn, sig, path, template, leading=2 if takes_request else 1)
 
     def args(req, body):
         return (req, body) if takes_request else (body,)
 
     def kwargs(req):
         p = req.params
-        return {n: p.get(n) for n in names}
+        return {n: p[n] for n in names}
 
     if inspect.iscoroutinefunction(fn):
         async def bound(req):
@@ -1260,6 +1279,46 @@ def _bind_model(fn: Callable, path: str, model: type) -> Callable:
     return _named_like(bound, fn)
 
 
+def _model_takes_request(
+    fn: Callable, sig: inspect.Signature, template: frozenset[str], model: type
+) -> bool:
+    """The ``model=`` rule: a handler's leading positional parameters that are not path
+    params are the request and the validated body, ``(req, body)``, or the body alone,
+    ``(body)``; every other parameter names a path param. Whether it takes the request
+    follows from that count, never from a guess. A signature the rule rejects raises here:
+    no parameter for the body, or the parameter annotated as ``model`` in the request's
+    place. (More than two is left to the path-param check, which names the extras.)"""
+    leading = []
+    for param in sig.parameters.values():
+        positional = param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD
+        )
+        if not positional or param.name in template:
+            break
+        leading.append(param)
+    if not leading:
+        raise TypeError(
+            f"handler {fn.__name__!r} has no parameter for the validated "
+            f"{model.__name__} body: with model=, a handler is "
+            f"fn(req, body, **path_params) or fn(body, **path_params)"
+        )
+    takes_request = len(leading) >= 2
+    if takes_request and _annotated_as(leading[0], model):
+        raise TypeError(
+            f"handler {fn.__name__!r}: parameter {leading[0].name!r} is annotated "
+            f"{model.__name__} but stands where the request goes (with model=, a handler "
+            f"is fn(req, body, **path_params) or fn(body, **path_params); is "
+            f"{leading[1].name!r} a path param missing from the URL template?)"
+        )
+    return takes_request
+
+
+def _annotated_as(param: inspect.Parameter, cls: type) -> bool:
+    """Whether ``param`` is annotated as ``cls``: the class itself, or its name as a string
+    (``from __future__ import annotations``)."""
+    return param.annotation is cls or param.annotation in (cls.__name__, cls.__qualname__)
+
+
 def _validation_error_response(e) -> Response:
     _logging.getLogger("pyronova.validation").warning(
         "request body validation failed: %s", type(e).__name__, exc_info=True
@@ -1271,47 +1330,24 @@ def _validation_error_response(e) -> Response:
     )
 
 
-def _path_param_names(fn: Callable, sig: inspect.Signature, path: str, leading: int) -> tuple[str, ...]:
+def _path_param_names(
+    fn: Callable, sig: inspect.Signature, path: str, template: frozenset[str], leading: int
+) -> tuple[str, ...]:
     """The parameters after the ``leading`` ones the dispatcher fills (request,
     body), each of which must name a param in the URL template."""
     names = tuple(
         p.name for p in list(sig.parameters.values())[leading:]
         if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
     )
-    template = _path_template_names(path)
     missing = [n for n in names if n not in template]
     if missing:
         raise ValueError(
             f"handler {fn.__name__!r} declares parameter(s) {missing!r} "
             f"that are not in the URL template {path!r}. Path-param "
             f"injection only fills names that appear as `{{name}}` "
-            f"or `:name` in the route path."
+            f"or `{{*name}}` in the route path."
         )
     return names
-
-
-def _path_template_names(path: str) -> frozenset[str]:
-    """Param names in a route template; matchit accepts both ``{id}`` and ``:id``."""
-    names = set()
-    i = 0
-    while i < len(path):
-        ch = path[i]
-        if ch == "{":
-            end = path.find("}", i + 1)
-            if end == -1:
-                break
-            names.add(path[i + 1 : end].split(":")[0])
-            i = end + 1
-        elif ch == ":":
-            j = i + 1
-            while j < len(path) and (path[j].isalnum() or path[j] == "_"):
-                j += 1
-            if j > i + 1:
-                names.add(path[i + 1 : j])
-            i = j
-        else:
-            i += 1
-    return frozenset(names)
 
 
 def _named_like(wrapper: Callable, fn: Callable) -> Callable:

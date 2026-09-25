@@ -612,8 +612,8 @@ fn spawn_handler_thread(
         .name("pyronova-ws".to_string())
         .spawn(move || {
             crate::run_context::attach_to(main, move |py| {
-                let served = crate::python::request_context::in_request_context(py, || {
-                    serve_connection(py, &site, request, ends, verdict)
+                let served = crate::python::request_context::in_request_context(py, |rc| {
+                    serve_connection(py, rc, &site, request, ends, verdict)
                 });
                 if let Err(e) = served {
                     tracing::error!(target: "pyronova::server", error = %e,
@@ -626,6 +626,7 @@ fn spawn_handler_thread(
 
 fn serve_connection(
     py: Python<'_>,
+    rc: &crate::python::request_context::RequestContext<'_>,
     site: &Site,
     request: PyronovaRequest,
     ends: HandlerEnds,
@@ -654,7 +655,7 @@ fn serve_connection(
     let hooks = Py::new(py, request)
         .map_err(|e| HandlerError::python(py, Stage::Setup, &e))
         .and_then(|request| {
-            run_before_hooks(py, &site.routes.before_hooks, &request).map(|r| (request, r))
+            run_before_hooks(py, rc, &site.routes.before_hooks, &request).map(|r| (request, r))
         });
     // A verdict goes unread only if the handshake already gave up.
     let request = match hooks {

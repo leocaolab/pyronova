@@ -31,6 +31,16 @@ leak_detect = ["dep:metrics", "dep:metrics-util"]
 # then run the scripts in benchmarks/ (bench_inmem*.py, bench_loopback*.py).
 bench = ["dep:httparse"]
 
+# Test-only fault injection: `pyronova.engine._fault_panic(message)` panics in Rust, so a
+# handler that calls it drives a real panic through the dispatch path that runs it (bridge,
+# pool worker, TPC inline, GIL). Compiled out of every other build: a production wheel has
+# no way to reach it.
+#
+# Build with:
+#   maturin develop --release --features fault_injection
+# then run `pytest tests/test_review_ra.py -k panic`.
+fault_injection = []
+
 [dependencies]
 pyo3 = { version = "0.29", features = ["extension-module"] }
 tokio = { version = "1", features = ["full"] }

@@ -120,7 +120,6 @@ def install_metrics(app: "Pyronova", path: str) -> None:
         except Exception:
             # Log via stdlib (routed to Rust tracing in sub-interps);
             # do NOT propagate.
-            import logging
             logging.getLogger("pyronova.observability").exception(
                 "metrics _after hook failed; request unaffected"
             )
@@ -141,18 +140,21 @@ def install_metrics(app: "Pyronova", path: str) -> None:
     app.get(path, gil=True)(_metrics_handler)
 
 
-_log = logging.getLogger("pyronova.observability")
+class CorruptMetric(ValueError):
+    """A metrics counter in ``app.state`` holds something that is not an integer."""
 
 
 def _read_int(state, key: str) -> int:
+    """The counter ``key``; one never incremented is 0. A value that is not an integer is
+    ``CorruptMetric`` (the scrape fails, with the key and value in the log): reporting it
+    as 0 would hand the monitoring a made-up number."""
     v = state.get(key)
     if v is None:
         return 0
     try:
         return int(v)
     except (ValueError, TypeError):
-        _log.warning("metrics key %r has non-integer value %r", key, v)
-        return 0
+        raise CorruptMetric(f"metrics counter {key!r} holds {v!r}, not an integer") from None
 
 
 def _render_prometheus(state) -> str:

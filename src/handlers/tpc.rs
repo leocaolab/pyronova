@@ -24,8 +24,8 @@ use crate::worker::TpcContext;
 
 use super::error::{HandlerError, RequestTag};
 use super::pipeline::{
-    await_reply, collect_body, fail, finish, preprocess, AcceptEncoding, Prepared, Preprocessed,
-    RequestLine, Served, REQUEST_BUDGET,
+    await_reply, await_streamed_reply, collect_body, fail, finish, preprocess, AcceptEncoding,
+    Prepared, Preprocessed, RequestLine, Served, REQUEST_BUDGET,
 };
 use super::{build_main_http_response, http_response, stream_body_feeder, BoxBody};
 
@@ -276,7 +276,11 @@ async fn dispatch_to_bridge(
     }
 
     let lost = |_| HandlerError::WorkerLost("the gil=True bridge dropped the request");
-    match await_reply(response_rx, lost).await {
+    let reply = match feeder {
+        Some(mut feeder) => await_streamed_reply(&mut feeder, response_rx, lost).await,
+        None => await_reply(response_rx, lost).await,
+    };
+    match reply {
         Ok(result) => build_main_http_response(result, accept_encoding.as_str()),
         Err(e) => fail(e, tag),
     }

@@ -4,12 +4,16 @@
 //! server's SQLSTATE in `.sqlstate` (`None` when the failure never reached the server:
 //! pool timeout, dropped connection). Integrity violations (SQLSTATE class 23) raise
 //! `IntegrityError`, and duplicate keys (23505) its subclass `UniqueViolation`, so a
-//! handler can answer 409 without parsing message text.
+//! handler can answer 409 without parsing message text. A value its parameter can't take
+//! raises `ParamError`, a subclass of both `TypeError` and `ValueError`, before the query
+//! is sent: a handler can answer it 422 without catching every `TypeError`.
 
 use std::time::Duration;
 
 use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::sync::PerInterpreterCell;
+use pyo3::types::{PyTuple, PyType};
 
 use super::numeric::NumericError;
 
@@ -74,12 +78,12 @@ impl DbError {
             Self::NotConnected | Self::Task(_) => PyRuntimeError::new_err(message),
             Self::Reconfigured(_) => PyValueError::new_err(message),
             Self::Connect(_) => PyConnectionError::new_err(message),
-            Self::Param(ParamError::Count { .. } | ParamError::Type { .. }) => {
-                PyTypeError::new_err(message)
-            }
-            Self::Param(ParamError::Value { .. } | ParamError::Encode { .. }) => {
-                PyValueError::new_err(message)
-            }
+            // The statement's arity is the caller's code, not a value.
+            Self::Param(ParamError::Count { .. }) => PyTypeError::new_err(message),
+            Self::Param(_) => match param_error_type(py) {
+                Ok(ty) => PyErr::from_type(ty.clone(), message),
+                Err(e) => e,
+            },
             Self::Query { .. } => database_error(py, message, self.sqlstate()),
         }
     }
@@ -101,6 +105,37 @@ fn database_error(py: Python<'_>, message: String, sqlstate: Option<String>) -> 
     }
 }
 
+/// `pyronova.engine.ParamError`, this interpreter's class: `class ParamError(TypeError,
+/// ValueError)`, so code written against either base still catches it.
+/// (`create_exception!` takes one base.)
+fn param_error_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
+    static TYPE_OBJECT: PerInterpreterCell<Py<PyType>> = PerInterpreterCell::new();
+    let ty = TYPE_OBJECT.get_or_try_init(py, || {
+        let bases = PyTuple::new(
+            py,
+            [py.get_type::<PyTypeError>(), py.get_type::<PyValueError>()],
+        )?;
+        // SAFETY: attached; NUL-terminated strings; `bases` is a tuple of exception
+        // classes. Returns a new reference or NULL with an exception set.
+        unsafe {
+            Bound::from_owned_ptr_or_err(
+                py,
+                pyo3::ffi::PyErr_NewExceptionWithDoc(
+                    c"pyronova.engine.ParamError".as_ptr(),
+                    c"A value a statement parameter can't take (wrong type, out of range, not \
+                      encodable), refused before the query is sent. Both a TypeError and a \
+                      ValueError."
+                        .as_ptr(),
+                    bases.as_ptr(),
+                    std::ptr::null_mut(),
+                ),
+            )
+        }
+        .and_then(|t| Ok(t.cast_into::<PyType>()?.unbind()))
+    })?;
+    Ok(ty.bind(py))
+}
+
 /// Adds the exception classes to the engine module. `sqlstate` defaults to None on the
 /// class, so an instance raised by Python code also has it.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -110,6 +145,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("DatabaseError", base)?;
     m.add("IntegrityError", py.get_type::<IntegrityError>())?;
     m.add("UniqueViolation", py.get_type::<UniqueViolation>())?;
+    m.add("ParamError", param_error_type(py)?)?;
     Ok(())
 }
 
@@ -148,13 +184,31 @@ pub(crate) enum ParamError {
         #[source]
         source: sqlx::error::BoxDynError,
     },
+    #[error(
+        "parameter ${index}: unsupported parameter type {python_type} (supported: int, \
+         float, str, bool, bytes, None, dict, list, datetime.date, datetime.datetime, \
+         uuid.UUID, decimal.Decimal)"
+    )]
+    Unsupported { index: usize, python_type: String },
+    /// Reading the value out of Python raised (a `str` with a lone surrogate, a `dict`
+    /// that isn't JSON).
+    #[error("parameter ${index}: {source}")]
+    Unreadable {
+        index: usize,
+        #[source]
+        source: PyErr,
+    },
 }
 
 /// Why a value of an accepted Python type still does not fit its parameter.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ValueProblem {
+    /// `value` as Python shows it (an int of any size, a float).
     #[error("{value} is out of range for {pg_type}")]
-    OutOfRange { value: i64, pg_type: &'static str },
+    OutOfRange {
+        value: String,
+        pg_type: &'static str,
+    },
     #[error(transparent)]
     Numeric(#[from] NumericError),
 }

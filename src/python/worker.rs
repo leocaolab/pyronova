@@ -10,11 +10,13 @@
 
 use std::ffi::{CStr, CString};
 
+use pyo3::exceptions::PyImportError;
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyString;
 
 use super::ffi::*;
+use super::request_context::{in_request_context, RequestContext, Returned};
 use crate::handlers::error::{catch_panic, HandlerError, PyException, Stage};
 use crate::response::ResponseError;
 use crate::router::{RouteId, RouteSignature};
@@ -77,6 +79,22 @@ pub(crate) enum WorkerStartError {
         file: String,
         exception: PyException,
     },
+    /// The user's script raised `ImportError` in the worker. A worker executes the script
+    /// as a module of its own, outside the package it belongs to on main, so a relative
+    /// import there fails with "attempted relative import with no known parent package".
+    #[error(
+        "worker {worker}: {file} raised while the worker started: {exception}\n{}\
+         (A worker executes {file} as a module of its own, `__pyronova_worker__`, outside \
+         any package, so a relative import in it (`from . import x`, `from .models import \
+         X`) cannot resolve there. Import by absolute name (`from mypkg.models import X`), \
+         with the package importable from sys.path.)",
+        .exception.traceback()
+    )]
+    ScriptImport {
+        worker: usize,
+        file: String,
+        exception: PyException,
+    },
     #[error("worker {worker}: {step} failed: {exception}\n{}", .exception.traceback())]
     Setup {
         worker: usize,
@@ -102,6 +120,59 @@ pub(crate) enum WorkerStartError {
          the app it registers routes on; don't register routes only in the main interpreter."
     )]
     NoRoutes { worker: usize, expected: usize },
+}
+
+impl WorkerStartError {
+    /// The bootstrap, which ships with the engine, did not run.
+    fn bootstrap(worker: usize, file: &str, error: ExecError) -> Self {
+        match error {
+            ExecError::Nul(source) => WorkerStartError::Nul {
+                worker,
+                file: file.to_string(),
+                source,
+            },
+            ExecError::Import(exception) | ExecError::Raised(exception) => {
+                WorkerStartError::Script {
+                    worker,
+                    file: file.to_string(),
+                    exception,
+                }
+            }
+        }
+    }
+
+    /// The user's script did not run.
+    fn script(worker: usize, file: &str, error: ExecError) -> Self {
+        match error {
+            ExecError::Import(exception) => WorkerStartError::ScriptImport {
+                worker,
+                file: file.to_string(),
+                exception,
+            },
+            other => Self::bootstrap(worker, file, other),
+        }
+    }
+}
+
+/// Why a worker's async engine stopped serving. The engine runs for the worker's whole
+/// life, so an exception it ends with happened at run time, not while the worker started.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AsyncEngineError {
+    #[error("worker {worker}: creating the async engine module failed: {exception}\n{}", .exception.traceback())]
+    Setup {
+        worker: usize,
+        exception: PyException,
+    },
+    #[error("worker {worker}: the async engine source contains a NUL byte ({source})")]
+    Nul {
+        worker: usize,
+        source: std::ffi::NulError,
+    },
+    #[error("worker {worker}: the async engine stopped: {exception}\n{}", .exception.traceback())]
+    Stopped {
+        worker: usize,
+        exception: PyException,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -355,20 +426,22 @@ impl SubInterpreterWorker {
         //    namespace, with this worker's id (FR-20).
         let bootstrap = new_module(py, BOOTSTRAP_MODULE, None, Some((worker_id, pool_id)))
             .map_err(setup("creating the bootstrap module"))?;
+        const BOOTSTRAP_FILE: &str = "pyronova/_bootstrap.py";
         exec_in(
             py,
             include_str!("../../python/pyronova/_bootstrap.py"),
-            "pyronova/_bootstrap.py",
+            BOOTSTRAP_FILE,
             &bootstrap,
-            worker_id,
-        )?;
+        )
+        .map_err(|e| WorkerStartError::bootstrap(worker_id, BOOTSTRAP_FILE, e))?;
 
         // 2. The user's script as a real module, compiled with its own path so tracebacks
         //    point at it, `from __future__` imports work, and `typing.get_type_hints` finds
         //    the module in `sys.modules` (FR-20).
         let script_module = new_module(py, SCRIPT_MODULE, Some(script_path.as_str()), None)
             .map_err(setup("creating the script module"))?;
-        exec_in(py, script, script_path, &script_module, worker_id)?;
+        exec_in(py, script, script_path, &script_module)
+            .map_err(|e| WorkerStartError::script(worker_id, script_path, e))?;
 
         // 3. The persistent event loop async handlers and hooks run on.
         let asyncio_loop = new_event_loop(py).map_err(setup("creating the asyncio event loop"))?;
@@ -500,15 +573,14 @@ impl SubInterpreterWorker {
     ///
     /// # Safety
     /// Must be called with this worker's thread state current.
-    pub(crate) unsafe fn run_async_engine(&mut self) -> Result<(), WorkerStartError> {
-        let (worker_id, pool_id) = (self.worker_id, self.pool_id);
+    pub(crate) unsafe fn run_async_engine(&mut self) -> Result<(), AsyncEngineError> {
+        let (worker, pool_id) = (self.worker_id, self.pool_id);
         self.attached(|_, py| {
             // Its own namespace, not the script's globals (M4 review N1d); `WORKER_ID` and
             // `POOL_ID` identify this worker's slot in `WORKER_STATES`.
-            let engine = new_module(py, ASYNC_ENGINE_MODULE, None, Some((worker_id, pool_id)))
-                .map_err(|e| WorkerStartError::Setup {
-                    worker: worker_id,
-                    step: "creating the async engine module",
+            let engine = new_module(py, ASYNC_ENGINE_MODULE, None, Some((worker, pool_id)))
+                .map_err(|e| AsyncEngineError::Setup {
+                    worker,
                     exception: PyException::capture(py, &e),
                 })?;
             exec_in(
@@ -516,8 +588,13 @@ impl SubInterpreterWorker {
                 include_str!("../../python/pyronova/_async_engine.py"),
                 "pyronova/_async_engine.py",
                 &engine,
-                worker_id,
             )
+            .map_err(|e| match e {
+                ExecError::Nul(source) => AsyncEngineError::Nul { worker, source },
+                ExecError::Import(exception) | ExecError::Raised(exception) => {
+                    AsyncEngineError::Stopped { worker, exception }
+                }
+            })
         })
     }
 
@@ -543,47 +620,38 @@ impl SubInterpreterWorker {
         result
     }
 
-    /// If obj is awaitable (coroutine / Task / Future / custom __await__),
-    /// drive it via the persistent event loop. Otherwise return unchanged.
-    ///
-    /// Detection is a C-level type-slot probe:
-    ///   1. Fast path `PyCoro_CheckExact` — one tag compare, catches
-    ///      the common `async def` case.
-    ///   2. Fallback: read `Py_TYPE(obj)->tp_as_async->am_await` —
-    ///      any real awaitable (Task, Future, user class with
-    ///      `__await__`) has this slot populated. One pointer chase +
-    ///      null check. Nanoseconds, L1-resident.
-    ///
-    /// We avoid `PyObject_HasAttrString(obj, "__await__")` here: that
-    /// path would intern the string, walk the MRO, and potentially
-    /// trigger descriptor protocol — μs-level, and at 400k rps on the
-    /// hot hook path it showed up as a measurable 5% throughput loss.
+    /// Runs what a hook or handler returned to a value: an awaitable is driven to
+    /// completion on this interpreter's persistent event loop, an `async def` coroutine in
+    /// the request's own context (`rc`). A plain value is returned unchanged.
     ///
     /// An exception the awaitable raises is `stage`'s.
+    ///
+    /// # Safety
+    /// Must be called with this sub-interpreter's GIL held.
     unsafe fn resolve_coroutine(
         &self,
         py: Python<'_>,
+        rc: &RequestContext<'_>,
         obj: PyObjRef,
         stage: Stage,
     ) -> Result<PyObjRef, HandlerError> {
         let ptr = obj.as_ptr();
-        let is_awaitable = if ffi::PyCoro_CheckExact(ptr) == 1 {
-            true
-        } else {
-            let tp = ffi::Py_TYPE(ptr);
-            if tp.is_null() {
-                false
-            } else {
-                let async_slots = (*tp).tp_as_async;
-                !async_slots.is_null() && (*async_slots).am_await.is_some()
+        match Returned::of(&Bound::from_borrowed_ptr(py, ptr)) {
+            Returned::Value => Ok(obj),
+            Returned::Coroutine => {
+                let event_loop = Bound::from_borrowed_ptr(py, self.asyncio_loop);
+                let coro = Bound::from_borrowed_ptr(py, ptr);
+                let result = rc
+                    .run_coroutine(&event_loop, &coro)
+                    .map_err(|e| HandlerError::python(py, stage, &e))?;
+                PyObjRef::from_owned(result.into_ptr()).ok_or_else(|| raised(py, stage))
             }
-        };
-        if !is_awaitable {
-            return Ok(obj); // Plain value — pass through
+            // loop.run_until_complete(awaitable)
+            Returned::OtherAwaitable => {
+                PyObjRef::from_owned(ffi::PyObject_CallOneArg(self.loop_run_func, ptr))
+                    .ok_or_else(|| raised(py, stage))
+            }
         }
-        // loop.run_until_complete(awaitable)
-        PyObjRef::from_owned(ffi::PyObject_CallOneArg(self.loop_run_func, ptr))
-            .ok_or_else(|| raised(py, stage))
     }
 
     /// Runs the hooks and the handler for one request, in its own `contextvars.Context`.
@@ -598,8 +666,8 @@ impl SubInterpreterWorker {
         self.attached(|worker, py| {
             worker.requests_served += 1;
             // The hooks and the handler share one fresh `contextvars.Context`.
-            let response = crate::python::request_context::in_request_context(py, || {
-                worker.call_handler_attached(py, route.index(), request)
+            let response = in_request_context(py, |rc| {
+                worker.call_handler_attached(py, rc, route.index(), request)
             })
             .unwrap_or_else(|e| Err(HandlerError::python(py, Stage::Setup, &e)));
             if worker.gc_threshold > 0 && worker.requests_since_collect() >= worker.gc_threshold {
@@ -671,6 +739,7 @@ impl SubInterpreterWorker {
     unsafe fn call_handler_attached(
         &mut self,
         py: Python<'_>,
+        rc: &RequestContext<'_>,
         handler_idx: usize,
         request: PyronovaRequest,
     ) -> Result<ResponseData, HandlerError> {
@@ -731,7 +800,7 @@ impl SubInterpreterWorker {
                     .ok_or_else(|| raised(py, Stage::BeforeHook))?;
             // Drive async hooks through the event loop so `async def` middleware doesn't
             // leak a bare coroutine object as a "short-circuit response".
-            let resolved = self.resolve_coroutine(py, hook_result, Stage::BeforeHook)?;
+            let resolved = self.resolve_coroutine(py, rc, hook_result, Stage::BeforeHook)?;
             if resolved.as_ptr() != ffi::Py_None() {
                 return Ok(worker_response(py, resolved)?);
             }
@@ -746,7 +815,7 @@ impl SubInterpreterWorker {
             std::ptr::null_mut(),
         ))
         .ok_or_else(|| raised(py, Stage::Handler))?;
-        let resolved = self.resolve_coroutine(py, result_obj, Stage::Handler)?;
+        let resolved = self.resolve_coroutine(py, rc, result_obj, Stage::Handler)?;
         let mut response = worker_response(py, resolved)?;
 
         // Run after_request hooks: hook(request, response) → response. One that raises
@@ -763,7 +832,7 @@ impl SubInterpreterWorker {
             ))
             .ok_or_else(|| raised(py, Stage::AfterHook))?;
             // Drive async after_hooks through the event loop.
-            let resolved = self.resolve_coroutine(py, hook_result, Stage::AfterHook)?;
+            let resolved = self.resolve_coroutine(py, rc, hook_result, Stage::AfterHook)?;
             if resolved.as_ptr() != ffi::Py_None() {
                 response = worker_response(py, resolved)?;
             }
@@ -819,6 +888,17 @@ fn new_module<'py>(
     Ok(module)
 }
 
+/// Why a module's source did not run.
+#[derive(Debug)]
+enum ExecError {
+    /// The source or its file name contains a NUL byte, so it can't be compiled.
+    Nul(std::ffi::NulError),
+    /// It raised `ImportError` itself (not a subclass such as `ModuleNotFoundError`).
+    Import(PyException),
+    /// It raised, with this exception.
+    Raised(PyException),
+}
+
 /// Compiles `src` as `filename` and executes it in `module`'s namespace. An exception is
 /// returned with its text and traceback (nothing is printed).
 fn exec_in(
@@ -826,15 +906,9 @@ fn exec_in(
     src: &str,
     filename: &str,
     module: &Bound<'_, pyo3::types::PyModule>,
-    worker_id: usize,
-) -> Result<(), WorkerStartError> {
-    let nul = |source| WorkerStartError::Nul {
-        worker: worker_id,
-        file: filename.to_string(),
-        source,
-    };
-    let src_c = CString::new(src).map_err(nul)?;
-    let file_c = CString::new(filename).map_err(nul)?;
+) -> Result<(), ExecError> {
+    let src_c = CString::new(src).map_err(ExecError::Nul)?;
+    let file_c = CString::new(filename).map_err(ExecError::Nul)?;
     let dict = module.dict();
     // SAFETY: attached (`py`); the strings are NUL-terminated; `dict` is a live dict.
     // `Py_CompileString` and `PyEval_EvalCode` return a new reference or NULL with an
@@ -851,10 +925,13 @@ fn exec_in(
             )
         })
     };
-    ran.map(drop).map_err(|e| WorkerStartError::Script {
-        worker: worker_id,
-        file: filename.to_string(),
-        exception: PyException::capture(py, &e),
+    ran.map(drop).map_err(|e| {
+        let exception = PyException::capture(py, &e);
+        if e.get_type(py).is(py.get_type::<PyImportError>()) {
+            ExecError::Import(exception)
+        } else {
+            ExecError::Raised(exception)
+        }
     })
 }
 

@@ -18,8 +18,9 @@ or await; the next request starts empty.
 
 Under the hood it is a ``ContextVar[dict]``, and the server runs each
 request's before-hooks, handler and after-hooks inside a fresh
-``contextvars.Context`` (an ``async def`` handler's task runs in a copy of
-it), so nothing set by one request is visible to another, on any thread.
+``contextvars.Context``, so nothing set by one request is visible to another,
+on any thread. An ``async def`` hook or handler runs in that same context,
+so what it sets is seen by the rest of the request, sync or async.
 
 ``request_id()`` is a dedicated accessor because it's the canonical
 correlation ID everyone needs and we don't want every caller to know

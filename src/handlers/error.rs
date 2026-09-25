@@ -20,6 +20,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyString;
 
 use super::pipeline::{BodyReject, REQUEST_BUDGET};
+use crate::python::body_stream;
 use crate::request_id::RequestId;
 use crate::response::{self, ResponseError};
 
@@ -153,7 +154,13 @@ pub(crate) enum HandlerError {
 }
 
 impl HandlerError {
+    /// What `stage` raising `err` means for the request: a streamed body's rejection
+    /// (`req.stream` raised `BodyRejected` and the handler let it through) is that
+    /// rejection, a 4xx like a buffered body's; anything else is the exception.
     pub(crate) fn python(py: Python<'_>, stage: Stage, err: &PyErr) -> Self {
+        if let Some(reject) = body_stream::rejection_of(py, err) {
+            return HandlerError::BodyRejected(reject);
+        }
         HandlerError::Python {
             stage,
             exception: PyException::capture(py, err),

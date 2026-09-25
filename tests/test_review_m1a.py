@@ -426,7 +426,9 @@ def test_crud_client_bad_json_is_400_with_the_parse_error_not_logged_as_error(ca
     assert r.status_code == 400
     assert r.json()["error"].startswith("invalid JSON: ")
     assert r.json()["error"] != "invalid JSON: "
-    assert not [
-        rec for rec in caplog.records
-        if rec.name == "pyronova.crud" and rec.levelno >= logging.ERROR
-    ]
+    crud_records = [rec for rec in caplog.records if rec.name == "pyronova.crud"]
+    # Capture works (the rejection is logged, at INFO), so "no ERROR record" means something.
+    assert [rec.levelno for rec in crud_records if "rejected request body" in rec.getMessage()] == [
+        logging.INFO
+    ], crud_records
+    assert not [rec for rec in crud_records if rec.levelno >= logging.ERROR]

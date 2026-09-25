@@ -37,6 +37,15 @@ fn leak_detect_dump() {
     leak_detect::dump_to_stderr();
 }
 
+/// Panics with `message`. PyO3 turns the panic into a `PanicException` in the calling
+/// handler, and the dispatcher that fetches it resumes the panic in Rust, on the path
+/// that ran the handler.
+#[cfg(feature = "fault_injection")]
+#[pyo3::pyfunction]
+fn _fault_panic(message: String) {
+    panic!("{message}");
+}
+
 #[pyo3::pyfunction]
 fn workrequest_counts() -> (u64, u64) {
     (
@@ -51,6 +60,17 @@ fn workrequest_counts() -> (u64, u64) {
 #[pyo3::pyfunction]
 fn _forgotten_workers() -> Vec<String> {
     python::pool::take_forgotten_workers()
+}
+
+/// The parameter names of the route path `path`, in order (`{*rest}` gives `rest`). A path
+/// the router would not take as written (`:name`) raises `ValueError`. The one parser of
+/// route templates: path-param injection in `app.py` reads it, and route registration
+/// runs it again.
+#[pyo3::pyfunction]
+fn _route_params(path: &str) -> PyResult<Vec<String>> {
+    router::template_params(path)
+        .map(|names| names.into_iter().map(str::to_owned).collect())
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("route {path}: {e}")))
 }
 
 /// Whether this code runs in a sub-interpreter worker, i.e. not in the main interpreter
@@ -75,6 +95,10 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<state::SharedState>()?;
     m.add_class::<python::stream::PyronovaStream>()?;
     m.add_class::<python::body_stream::PyronovaBodyStream>()?;
+    m.add(
+        "BodyRejected",
+        m.py().get_type::<python::body_stream::BodyRejected>(),
+    )?;
     db::register(m)?;
     m.add_class::<monitor::Metrics>()?;
     m.add_function(pyo3::wrap_pyfunction!(monitor::get_gil_metrics, m)?)?;
@@ -84,6 +108,7 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(logging::_python_log_level, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(workrequest_counts, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(_in_worker, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(_route_params, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(_forgotten_workers, m)?)?;
     // Called by the async engine in sub-interpreter workers (Layer 2, C5).
     m.add_function(pyo3::wrap_pyfunction!(python::worker_api::_worker_recv, m)?)?;
@@ -107,5 +132,7 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     #[cfg(feature = "leak_detect")]
     m.add_function(pyo3::wrap_pyfunction!(leak_detect_dump, m)?)?;
+    #[cfg(feature = "fault_injection")]
+    m.add_function(pyo3::wrap_pyfunction!(_fault_panic, m)?)?;
     Ok(())
 }

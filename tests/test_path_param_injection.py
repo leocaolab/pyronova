@@ -127,13 +127,15 @@ def test_mismatched_param_raises_at_registration():
         app.get("/items/{item_id}", bad)
 
 
-def test_colon_path_template_supported():
-    """matchit accepts `:name` as well as `{name}`."""
+def test_colon_path_template_is_a_registration_error():
+    """Only `{name}` / `{*name}` are path parameters. matchit 0.8 reads `:name` as
+    literal text, so `/items/:item_id` would register, never match `/items/42`, and
+    injection would pass None; registration refuses it and names the `{item_id}` to
+    write instead (decision Q2)."""
     app = Pyronova()
 
     def h(req, item_id):
         return item_id
 
-    bound = app.get("/items/:item_id", h)
-    assert bound is not h
-    assert bound.__wrapped__ is h
+    with pytest.raises(ValueError, match=r"`:item_id` is not a path parameter; write it as `\{item_id\}`"):
+        app.get("/items/:item_id", h)

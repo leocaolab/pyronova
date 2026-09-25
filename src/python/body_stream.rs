@@ -23,16 +23,20 @@
 //!   * Sync iterator only. `async for chunk in req.stream()` is deferred.
 //!   * `max_body_size` still bounds total ingest even when streaming.
 //!
-//! Error handling: if the client disconnects or sends malformed frames,
-//! the feeder sends an error message on the channel; `__next__` raises
-//! `IOError(msg)` so the handler can terminate cleanly.
+//! Error handling: a body the feeder gives up on (larger than `max_body_size`, too slow,
+//! a failed read) arrives as the same `BodyReject` a buffered body gets; reading it raises
+//! [`BodyRejected`], an `OSError`. A handler that lets it through gets the response a
+//! buffered body would (413 / 408 / 400), logged as a rejection, not a server error.
 
 use std::sync::Mutex;
 
 use bytes::Bytes;
-use pyo3::exceptions::{PyIOError, PyStopIteration};
+use pyo3::exceptions::{PyOSError, PyStopIteration};
+use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+
+use crate::handlers::pipeline::BodyReject;
 
 /// Bounded-channel capacity. Low enough to enforce real backpressure
 /// on a slow consumer, high enough that a steady-state 64 KB-frame
@@ -42,12 +46,22 @@ pub(crate) const CHANNEL_CAPACITY: usize = 8;
 /// A message on the feeder → handler channel.
 pub(crate) enum ChunkMsg {
     Data(Bytes),
-    /// Feeder hit an error (body too large, client disconnected, etc.).
-    /// The handler will raise IOError on next iteration.
-    Err(String),
+    /// The feeder gave up on the body; reading it raises [`BodyRejected`].
+    Err(BodyReject),
     /// End of body — channel sender is dropped after sending this, so
     /// subsequent recv() returns Err immediately.
     Eof,
+}
+
+/// The channel closed without [`ChunkMsg::Eof`]: the feeder stopped (the handler did not
+/// take a chunk within the request budget, or the request was abandoned). Reading on would
+/// silently truncate the body, so it is an error.
+fn cut_off() -> PyErr {
+    PyOSError::new_err(
+        "the request body stream ended before the body did: the server stopped feeding it \
+         (the handler did not read it within the request budget, or the request was \
+         abandoned)",
+    )
 }
 
 /// Standard shape for the per-request body-stream receiver: an Arc'd
@@ -69,6 +83,45 @@ pub(crate) fn empty_body_stream_rx() -> BodyStreamRx {
     EMPTY
         .get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(None)))
         .clone()
+}
+
+pyo3::create_exception!(
+    pyronova.engine,
+    BodyRejected,
+    PyOSError,
+    "A streamed request body was rejected, as a buffered one would be: larger than \
+     max_body_size, too slow, or a failed read. An OSError, so `except OSError` still \
+     catches it; left uncaught, the request gets the buffered body's 413 / 408 / 400."
+);
+
+/// The rejection a `BodyRejected` the server raised stands for, kept on it (as
+/// `_rejection`) so the dispatcher can answer it as what it is.
+#[pyclass(frozen, name = "_BodyRejection", module = "pyronova.engine")]
+struct Rejection(BodyReject);
+
+/// `BodyRejected` for `reject`, carrying it.
+fn body_rejected(py: Python<'_>, reject: BodyReject) -> PyErr {
+    let err = BodyRejected::new_err(reject.to_string());
+    let carried = Bound::new(py, Rejection(reject))
+        .and_then(|r| err.value(py).setattr(intern!(py, "_rejection"), r));
+    match carried {
+        Ok(()) => err,
+        Err(failed) => {
+            failed.set_cause(py, Some(err));
+            failed
+        }
+    }
+}
+
+/// The rejection `err` carries, if it is a `BodyRejected` the server raised (a user's own
+/// `raise BodyRejected(...)` carries none).
+pub(crate) fn rejection_of(py: Python<'_>, err: &PyErr) -> Option<BodyReject> {
+    if !err.is_instance_of::<BodyRejected>(py) {
+        return None;
+    }
+    let carried = err.value(py).getattr(intern!(py, "_rejection")).ok()?;
+    let rejection = carried.cast::<Rejection>().ok()?;
+    Some(rejection.get().0.clone())
 }
 
 /// Python-visible iterator over an incoming body's chunks.
@@ -100,7 +153,7 @@ impl PyronovaBodyStream {
     }
 
     /// Block until the next chunk arrives. Returns `bytes` for data,
-    /// raises `StopIteration` at EOF, `IOError(msg)` on transport error.
+    /// raises `StopIteration` at EOF, [`BodyRejected`] for a rejected body.
     fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyBytes>> {
         // Hold the Mutex guard across the blocking recv(). Concurrent
         // callers (two Python threads iterating the same stream, or an
@@ -134,13 +187,20 @@ impl PyronovaBodyStream {
         let msg = py.detach(|| rx.blocking_recv());
         match msg {
             Some(ChunkMsg::Data(b)) => Ok(PyBytes::new(py, &b).unbind()),
-            Some(ChunkMsg::Eof) | None => {
+            Some(ChunkMsg::Eof) => {
                 // Mark exhausted so subsequent calls fast-path without
                 // touching the receiver.
                 *guard = None;
                 Err(PyStopIteration::new_err(py.None()))
             }
-            Some(ChunkMsg::Err(e)) => Err(PyIOError::new_err(e)),
+            Some(ChunkMsg::Err(reject)) => {
+                *guard = None;
+                Err(body_rejected(py, reject))
+            }
+            None => {
+                *guard = None;
+                Err(cut_off())
+            }
         }
     }
 
@@ -188,7 +248,7 @@ impl PyronovaBodyStream {
     /// allocates a `PyBytes`. For the Arena /upload profile this is
     /// ~50% faster than the iterator path.
     ///
-    /// Returns the raw byte count; raises IOError on transport error.
+    /// Returns the raw byte count; raises [`BodyRejected`] for a rejected body.
     fn drain_count(&self, py: Python<'_>) -> PyResult<u64> {
         // Same serialization guarantee as __next__: hold the Mutex
         // across the drain loop. Concurrent callers (drain_count racing
@@ -202,17 +262,21 @@ impl PyronovaBodyStream {
         let Some(rx) = guard.as_mut() else {
             return Ok(0);
         };
-        let result: Result<u64, String> = py.detach(|| {
+        let result: Result<u64, Option<BodyReject>> = py.detach(|| {
             let mut total: u64 = 0;
             loop {
                 match rx.blocking_recv() {
                     Some(ChunkMsg::Data(b)) => total += b.len() as u64,
-                    Some(ChunkMsg::Eof) | None => return Ok(total),
-                    Some(ChunkMsg::Err(e)) => return Err(e),
+                    Some(ChunkMsg::Eof) => return Ok(total),
+                    Some(ChunkMsg::Err(reject)) => return Err(Some(reject)),
+                    None => return Err(None),
                 }
             }
         });
         *guard = None; // fully consumed (or errored)
-        result.map_err(PyIOError::new_err)
+        result.map_err(|stopped| match stopped {
+            Some(reject) => body_rejected(py, reject),
+            None => cut_off(),
+        })
     }
 }
