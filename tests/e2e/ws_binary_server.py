@@ -9,11 +9,10 @@ def echo(ws):
         msg = ws.recv_message()
         if msg is None:
             break
-        msg_type, data = msg
-        if msg_type == "text":
-            ws.send(f"echo: {data}")
-        elif msg_type == "binary":
-            ws.send_bytes(data)
+        if isinstance(msg, bytes):
+            ws.send_bytes(msg)
+        else:
+            ws.send(f"echo: {msg}")
 
 @app.get("/")
 def index(req):

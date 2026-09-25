@@ -197,8 +197,8 @@ def test_other_database_errors_carry_their_sqlstate(pool):
 
 
 # ---------------------------------------------------------------------------
-# Item 4 — a second connect() to another DSN is an error; other settings are
-# reported, not silently dropped
+# Item 4 — a second connect() asking for another DSN or other settings is an
+# error, not silently dropped
 # ---------------------------------------------------------------------------
 
 
@@ -229,18 +229,18 @@ def test_second_connect_with_another_dsn_raises():
     assert "application_name=other" not in out
 
 
-def test_second_connect_with_other_settings_warns():
+def test_second_connect_with_other_settings_raises():
     out = _run("""
-        import time
-        from pyronova.engine import init_logger
-        init_logger("WARN", False, "text")
         PgPool.connect(DSN, max_connections=2)
-        PgPool.connect(DSN, max_connections=3, acquire_timeout_secs=5)
+        for kwargs in ({"max_connections": 3}, {"acquire_timeout_secs": 5}):
+            try:
+                PgPool.connect(DSN, **kwargs)
+            except ValueError as e:
+                print("REFUSED", e)
         print("STILL_WORKS", PgPool.connect(DSN).fetch_scalar("SELECT 1"))
-        time.sleep(0.3)  # the log writer is a background thread
     """)
-    assert "max_connections=2, not 3; keeping the existing pool" in out, out
-    assert "acquire_timeout_secs=30, not 5; keeping the existing pool" in out, out
+    assert "REFUSED PgPool is already connected with max_connections=2, not 3" in out, out
+    assert "REFUSED PgPool is already connected with acquire_timeout_secs=30, not 5" in out, out
     assert "STILL_WORKS 1" in out
 
 

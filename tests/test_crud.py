@@ -31,7 +31,7 @@ pytestmark = pytest.mark.skipif(
 def client():
     # Rust-side PgPool is a process global, connect() is idempotent — safe
     # to call from every module that uses the pool.
-    pool = PgPool.connect(PG_DSN, max_connections=4)
+    pool = PgPool.connect(PG_DSN)
 
     # Fresh schema per module.
     pool.execute("DROP TABLE IF EXISTS pyronova_crud_items")
