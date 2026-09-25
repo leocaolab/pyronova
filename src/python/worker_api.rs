@@ -1,6 +1,7 @@
 //! The engine functions a sub-interpreter worker's async engine (`_async_engine.py`) calls
-//! (Layer 2, C5): pull the next request, send a response back, turn a handler's return
-//! value into a `Response`, and get the worker app's handlers and hooks.
+//! (Layer 2, C5): pull the next request, answer it (a response, an exception, a timeout),
+//! turn a handler's return value into a `Response`, and get the worker app's handlers and
+//! hooks.
 //!
 //! They replace the `extern "C"` functions that used to be injected into worker globals.
 //! PyO3 does the argument parsing; a Rust panic becomes a `RuntimeError` (not PyO3's
@@ -8,12 +9,14 @@
 //! `Exception`, would die on).
 
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyBaseException, PyRuntimeError};
 use pyo3::prelude::*;
 
-use super::ffi::{get_worker_state, PyObjRef};
-use super::worker::{new_request, worker_response};
+use super::ffi::{get_worker_state, Pending, PyObjRef};
+use super::worker::worker_response;
+use crate::handlers::error::{panic_message, HandlerError, PyException, RequestTag, Stage};
 use crate::types::ResponseData;
 
 /// Runs `f`, turning a Rust panic into a `RuntimeError` naming `context`.
@@ -21,11 +24,7 @@ fn no_panic<T>(context: &'static str, f: impl FnOnce() -> PyResult<T>) -> PyResu
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(result) => result,
         Err(payload) => {
-            let msg = payload
-                .downcast_ref::<&str>()
-                .map(|s| s.to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            let msg = panic_message(&*payload);
             tracing::error!(target: "pyronova::server", context, panic = %msg, "Rust panic in a worker API call");
             Err(PyRuntimeError::new_err(format!(
                 "Rust panic in {context}: {msg}"
@@ -50,31 +49,27 @@ pub(crate) fn _worker_recv(
             Some(s) if s.pool_id == pool_id => s,
             _ => return Ok(None),
         };
-        let wait = std::sync::Arc::clone(&state);
+        let wait = Arc::clone(&state);
         let Some(req) = py.detach(move || wait.rx.recv().ok()) else {
             return Ok(None);
         };
         let req_id = state.next_req_id.fetch_add(1, Ordering::Relaxed);
-        let request = Py::new(
-            py,
-            new_request(
-                &req.method,
-                &req.path,
-                req.params,
-                &req.query,
-                req.body,
-                req.headers,
-                req.client_ip,
-            ),
-        )?;
+        let (route, request, reply) = req.into_request();
+        let pending = Pending {
+            reply,
+            request_id: request.request_id.clone(),
+            method: Arc::clone(&request.method),
+            path: Arc::clone(&request.path),
+        };
+        let request = Py::new(py, request)?;
         // Only now that nothing can fail: a send dropped before this point reaches the
         // waiting caller as an error instead of an orphaned map entry.
         state
             .response_map
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(req_id, req.response_tx);
-        Ok(Some((req_id, req.route.index(), request)))
+            .insert(req_id, pending);
+        Ok(Some((req_id, route.index(), request)))
     })
 }
 
@@ -90,37 +85,90 @@ pub(crate) fn _worker_send(
 ) -> PyResult<()> {
     no_panic("_worker_send", || {
         // SAFETY: attached to `response`'s interpreter (this is a pymethod call).
-        let parsed: Result<ResponseData, String> = unsafe {
+        let parsed = unsafe {
             worker_response(
                 py,
                 PyObjRef::from_borrowed(response.as_ptr())
                     .ok_or_else(|| PyRuntimeError::new_err("_worker_send: null response"))?,
             )
         };
-        // Same pool-id guard as `_worker_recv`: a zombie's result is dropped, and the
-        // caller times out, rather than answering a request of the live pool.
-        let Some(state) = get_worker_state(worker_id).filter(|s| s.pool_id == pool_id) else {
-            return Ok(());
-        };
-        let mut map = state.response_map.lock().unwrap_or_else(|e| e.into_inner());
-        match map.remove(&req_id) {
-            Some(tx) if !tx.is_closed() => {
-                let _ = tx.send(parsed);
-            }
-            Some(_) => {
-                tracing::debug!(target: "pyronova::server", req_id, worker_id, "response_map: receiver gone (client timed out), dropping result");
-            }
-            None => {
-                tracing::debug!(target: "pyronova::server", req_id, worker_id, "response_map miss — client already timed out (504)");
-            }
-        }
-        // Periodic orphan sweep: purge entries whose receivers were dropped (the Rust side
-        // timed out), so handlers that die between recv and send can't grow the map.
-        if map.len() > 64 {
-            map.retain(|_id, tx| !tx.is_closed());
-        }
+        answer(
+            worker_id,
+            pool_id,
+            req_id,
+            parsed.map_err(HandlerError::from),
+        );
         Ok(())
     })
+}
+
+/// Answers request `req_id` of async worker `worker_id` with the exception its task raised
+/// (a hook's or the handler's): logged here with its traceback, a generic 500 for the
+/// client.
+#[pyfunction]
+pub(crate) fn _worker_fail(
+    py: Python<'_>,
+    worker_id: usize,
+    pool_id: u64,
+    req_id: u64,
+    exception: Bound<'_, PyBaseException>,
+) -> PyResult<()> {
+    no_panic("_worker_fail", || {
+        let error = HandlerError::Python {
+            stage: Stage::AsyncTask,
+            exception: PyException::capture(py, &PyErr::from_value(exception.into_any())),
+        };
+        answer(worker_id, pool_id, req_id, Err(error));
+        Ok(())
+    })
+}
+
+/// Answers request `req_id` of async worker `worker_id` with a timeout (504): its task ran
+/// past the request budget and was cancelled.
+#[pyfunction]
+pub(crate) fn _worker_timed_out(worker_id: usize, pool_id: u64, req_id: u64) -> PyResult<()> {
+    no_panic("_worker_timed_out", || {
+        answer(worker_id, pool_id, req_id, Err(HandlerError::Timeout));
+        Ok(())
+    })
+}
+
+/// Sends `result` to the caller waiting for request `req_id`, an error logged first, with
+/// the request it belongs to. A result nobody waits for any more (the caller timed out, or
+/// this is a zombie worker of an earlier pool) is dropped; an error is still logged.
+fn answer(worker_id: usize, pool_id: u64, req_id: u64, result: Result<ResponseData, HandlerError>) {
+    // Same pool-id guard as `_worker_recv`: a zombie's result is dropped rather than
+    // answering a request of the live pool.
+    let pending = get_worker_state(worker_id)
+        .filter(|s| s.pool_id == pool_id)
+        .and_then(|state| {
+            let mut map = state.response_map.lock().unwrap_or_else(|e| e.into_inner());
+            let pending = map.remove(&req_id);
+            // Periodic orphan sweep: purge entries whose receivers were dropped (the Rust
+            // side timed out), so handlers that die between recv and send can't grow it.
+            if map.len() > 64 {
+                map.retain(|_id, p| !p.reply.is_closed());
+            }
+            pending
+        });
+    let Some(pending) = pending else {
+        if let Err(error) = result {
+            tracing::error!(
+                target: "pyronova::handler", worker_id, req_id, error = %error,
+                "async request failed after its caller stopped waiting"
+            );
+        }
+        return;
+    };
+    let tag = RequestTag {
+        id: &pending.request_id,
+        method: &pending.method,
+        path: &pending.path,
+    };
+    let reply = result.map_err(|e| e.log(&tag));
+    if pending.reply.send(reply).is_err() {
+        tracing::debug!(target: "pyronova::server", req_id, worker_id, "the caller timed out (504); dropping the result");
+    }
 }
 
 /// A handler's (or hook's) return value as a `Response`, with the one mapping every
@@ -136,9 +184,12 @@ pub(crate) fn _worker_to_response(py: Python<'_>, value: Bound<'_, PyAny>) -> Py
         let data = unsafe {
             let obj = PyObjRef::from_borrowed(value.as_ptr())
                 .ok_or_else(|| PyRuntimeError::new_err("_worker_to_response: null value"))?;
-            worker_response(py, obj).map_err(PyRuntimeError::new_err)?
+            worker_response(py, obj).map_err(|e| PyRuntimeError::new_err(e.to_string()))?
         };
-        Ok(data.to_py(py)?.into_any().unbind())
+        let response = data
+            .to_py(py)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(response.into_any().unbind())
     })
 }
 

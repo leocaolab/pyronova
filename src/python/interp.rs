@@ -13,7 +13,6 @@
 //!     tstate rebinding, and the async worker-state registry).
 //!   - [`super::worker_api`] — the engine functions the async engine calls
 //!     (`_worker_recv`, `_worker_send`, ...).
-//!   - [`super::convert`] — Python `str`/`dict` conversion helpers.
 //!   - [`super::worker`]  — `SubInterpreterWorker` (owns one sub-interpreter).
 //!   - [`super::pool`]    — `InterpreterPool`, `WorkRequest`, and the per-thread
 //!     worker loops.
@@ -21,11 +20,6 @@
 //! Everything is re-exported here so existing `crate::python::interp::X`
 //! call sites keep compiling unchanged.
 
-// `convert` helpers are consumed by the sibling modules directly rather
-// than through this facade, but they are re-exported here too so the
-// `interp::` namespace stays a complete, symmetric view of the split.
-#[allow(unused_imports)]
-pub(crate) use super::convert::*;
 pub(crate) use super::ffi::*;
 pub(crate) use super::pool::*;
 pub(crate) use super::worker::*;

@@ -14,6 +14,7 @@ mod leak_detect;
 mod logging;
 mod monitor;
 mod python;
+mod request_id;
 mod response;
 mod router;
 mod run_context;
@@ -84,6 +85,11 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Called by the async engine in sub-interpreter workers (Layer 2, C5).
     m.add_function(pyo3::wrap_pyfunction!(python::worker_api::_worker_recv, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(python::worker_api::_worker_send, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(python::worker_api::_worker_fail, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        python::worker_api::_worker_timed_out,
+        m
+    )?)?;
     m.add_function(pyo3::wrap_pyfunction!(
         python::worker_api::_worker_to_response,
         m

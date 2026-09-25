@@ -9,6 +9,8 @@ use hyper::{Response, StatusCode};
 use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList, PyString};
 
+use crate::handlers::error::{Logged, PyException};
+use crate::request_id::RequestId;
 use crate::types::{PyronovaResponse, ResponseData, ResponseHeaders};
 
 pub(crate) const SERVER_HEADER: &str = concat!("Pyronova/", env!("CARGO_PKG_VERSION"));
@@ -44,20 +46,61 @@ fn get_or_init_json_dumps(py: Python<'_>) -> pyo3::PyResult<pyo3::Bound<'_, pyo3
         .map(|f| f.bind(py).clone())
 }
 
-fn json_dumps(py: Python<'_>, obj: &pyo3::Bound<'_, pyo3::PyAny>) -> Result<Bytes, String> {
-    let dumps = get_or_init_json_dumps(py).map_err(|e| format!("json init: {e}"))?;
-    let result = dumps
-        .call1((obj,))
-        .map_err(|e| format!("json error: {e}"))?;
-    let bytes = result
-        .cast::<PyBytes>()
-        .map_err(|e| format!("json error: {e}"))?;
+/// Loads the JSON serializer. isojson is a hard dependency: every interpreter loads it when
+/// the server starts, so a missing one stops the start instead of failing every `dict`.
+pub(crate) fn require_json(py: Python<'_>) -> PyResult<()> {
+    get_or_init_json_dumps(py).map(|_| ())
+}
+
+fn json_dumps(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Result<Bytes, ResponseError> {
+    let json = |e: PyErr| ResponseError::Json(PyException::capture(py, &e));
+    let dumps = get_or_init_json_dumps(py).map_err(json)?;
+    let result = dumps.call1((obj,)).map_err(json)?;
+    let bytes = result.cast::<PyBytes>().map_err(|e| json(e.into()))?;
     Ok(Bytes::copy_from_slice(bytes.as_bytes()))
 }
 
 // ---------------------------------------------------------------------------
 // Handler return value → ResponseData
 // ---------------------------------------------------------------------------
+
+/// Why a handler's return value is not a response.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ResponseError {
+    #[error("the returned value could not be serialized as JSON: {0}")]
+    Json(PyException),
+    #[error("response text is not valid Unicode: {0}")]
+    Text(PyException),
+    #[error("str() of the returned {type_name} raised {exception}")]
+    Str {
+        type_name: String,
+        exception: PyException,
+    },
+    #[error("handler returned invalid HTTP status {0}")]
+    Status(u16),
+    #[error(
+        "a sub-interpreter handler returned a Stream; streaming responses need gil=True, \
+         stream=True on the route"
+    )]
+    StreamInWorker,
+    #[error("the returned Stream was already consumed")]
+    StreamConsumed,
+    #[error("could not build the Response an after_request hook receives: {0}")]
+    ToPy(PyException),
+}
+
+impl ResponseError {
+    /// The Python exception behind this error, if one raised.
+    pub(crate) fn exception(&self) -> Option<&PyException> {
+        match self {
+            ResponseError::Json(e) | ResponseError::Text(e) | ResponseError::ToPy(e) => Some(e),
+            ResponseError::Str { exception, .. } => Some(exception),
+            ResponseError::Status(_)
+            | ResponseError::StreamInWorker
+            | ResponseError::StreamConsumed => None,
+        }
+    }
+}
 
 /// What a handler (or a hook) returned, as a response. The type comes from the value,
 /// never from the text:
@@ -70,12 +113,13 @@ fn json_dumps(py: Python<'_>, obj: &pyo3::Bound<'_, pyo3::PyAny>) -> Result<Byte
 ///   names its `content_type`;
 /// - anything else → `str(value)` as text.
 ///
-/// A value that can't be turned into a body (a `str` that isn't valid Unicode, a failing
-/// `__str__`, an unserializable dict) is an error, never an empty or lossy body.
+/// A value that can't be turned into a response (a `str` that isn't valid Unicode, a
+/// failing `__str__`, an unserializable dict, a status that isn't an HTTP status) is an
+/// error, never an empty or lossy body.
 pub(crate) fn extract_response_data(
     py: Python<'_>,
     obj: Bound<'_, PyAny>,
-) -> Result<ResponseData, String> {
+) -> Result<ResponseData, ResponseError> {
     // The common returns skip the `Response` type lookup.
     if is_json_value(&obj) || obj.cast::<PyString>().is_ok() {
         return plain_response(py, &obj);
@@ -87,24 +131,30 @@ pub(crate) fn extract_response_data(
 }
 
 /// A value that isn't a `Response`: a 200 with the value as its body.
-fn plain_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Result<ResponseData, String> {
+fn plain_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Result<ResponseData, ResponseError> {
     let (body, content_type) = body_of(py, obj)?;
     Ok(ResponseData {
         body,
         content_type,
-        status: 200,
+        status: StatusCode::OK,
         headers: ResponseHeaders::new(),
     })
 }
 
-fn from_response(py: Python<'_>, resp: &PyronovaResponse) -> Result<ResponseData, String> {
+fn from_response(py: Python<'_>, resp: &PyronovaResponse) -> Result<ResponseData, ResponseError> {
+    let status = http_status(resp.status_code)?;
     let (body, derived_type) = body_of(py, resp.body.bind(py))?;
     Ok(ResponseData {
         body,
         content_type: resp.content_type.clone().unwrap_or(derived_type),
-        status: resp.status_code,
+        status,
         headers: resp.headers.clone(),
     })
+}
+
+/// A handler's status code as an HTTP status.
+pub(crate) fn http_status(code: u16) -> Result<StatusCode, ResponseError> {
+    StatusCode::from_u16(code).map_err(|_| ResponseError::Status(code))
 }
 
 fn is_json_value(obj: &Bound<'_, PyAny>) -> bool {
@@ -112,12 +162,12 @@ fn is_json_value(obj: &Bound<'_, PyAny>) -> bool {
 }
 
 /// A value as a body, and the type that body has.
-fn body_of(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Result<(Bytes, HeaderValue), String> {
+fn body_of(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Result<(Bytes, HeaderValue), ResponseError> {
     if is_json_value(obj) {
         return Ok((json_dumps(py, obj)?, JSON));
     }
     if let Ok(s) = obj.cast::<PyString>() {
-        return Ok((text_bytes(s)?, TEXT));
+        return Ok((text_bytes(py, s)?, TEXT));
     }
     if let Ok(b) = obj.cast::<PyBytes>() {
         return Ok((Bytes::copy_from_slice(b.as_bytes()), OCTET_STREAM));
@@ -128,17 +178,18 @@ fn body_of(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Result<(Bytes, HeaderValue
     if obj.is_none() {
         return Ok((Bytes::new(), TEXT));
     }
-    let text = obj
-        .str()
-        .map_err(|e| format!("str() of the returned {} failed: {e}", type_name(obj)))?;
-    Ok((text_bytes(&text)?, TEXT))
+    let text = obj.str().map_err(|e| ResponseError::Str {
+        type_name: type_name(obj),
+        exception: PyException::capture(py, &e),
+    })?;
+    Ok((text_bytes(py, &text)?, TEXT))
 }
 
 /// A `str`'s UTF-8 bytes; a lone surrogate is an error, not a replacement character.
-fn text_bytes(s: &Bound<'_, PyString>) -> Result<Bytes, String> {
+fn text_bytes(py: Python<'_>, s: &Bound<'_, PyString>) -> Result<Bytes, ResponseError> {
     let text = s
         .to_str()
-        .map_err(|e| format!("response text is not valid Unicode: {e}"))?;
+        .map_err(|e| ResponseError::Text(PyException::capture(py, &e)))?;
     Ok(Bytes::copy_from_slice(text.as_bytes()))
 }
 
@@ -152,7 +203,10 @@ fn type_name(obj: &Bound<'_, PyAny>) -> String {
 impl ResponseData {
     /// This response as a `Response`, for an `after_request` hook: a body that is UTF-8
     /// text is a `str`, any other a `bytes`.
-    pub(crate) fn to_py<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyronovaResponse>> {
+    pub(crate) fn to_py<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> Result<Bound<'py, PyronovaResponse>, ResponseError> {
         let body = match std::str::from_utf8(&self.body) {
             Ok(text) => PyString::new(py, text).into_any(),
             Err(_) => PyBytes::new(py, &self.body).into_any(),
@@ -161,11 +215,12 @@ impl ResponseData {
             py,
             PyronovaResponse {
                 body: body.unbind(),
-                status_code: self.status,
+                status_code: self.status.as_u16(),
                 content_type: Some(self.content_type.clone()),
                 headers: self.headers.clone(),
             },
         )
+        .map_err(|e| ResponseError::ToPy(PyException::capture(py, &e)))
     }
 }
 
@@ -173,17 +228,14 @@ impl ResponseData {
 // HTTP response builders
 // ---------------------------------------------------------------------------
 
-/// The HTTP response for a handler's result; an error becomes a logged 500. The headers
-/// were validated when the `Response` was made, so building can't fail: the handler's
-/// header map becomes the response's, and `content-type` / `server` are added only if the
-/// handler didn't set them.
-pub(crate) fn build_response(result: Result<ResponseData, String>) -> Response<Full<Bytes>> {
+/// The HTTP response for a handler's result. An error was logged where it happened and
+/// renders as its own status. The headers were validated when the `Response` was made, so
+/// building can't fail: the handler's header map becomes the response's, and
+/// `content-type` / `server` are added only if the handler didn't set them.
+pub(crate) fn build_response(result: Result<ResponseData, Logged>) -> Response<Full<Bytes>> {
     let data = match result {
         Ok(data) => data,
-        Err(e) => {
-            tracing::error!(target: "pyronova::handler", error = %e, "handler failed; responding 500");
-            return error_response(&e);
-        }
+        Err(logged) => return logged.into_response(),
     };
     let mut headers = data.headers.into_map();
     headers.entry(CONTENT_TYPE).or_insert(data.content_type);
@@ -191,117 +243,105 @@ pub(crate) fn build_response(result: Result<ResponseData, String>) -> Response<F
         .entry(SERVER)
         .or_insert(HeaderValue::from_static(SERVER_HEADER));
     let mut resp = Response::new(Full::new(data.body));
-    *resp.status_mut() = status_or_500(data.status);
+    *resp.status_mut() = data.status;
     *resp.headers_mut() = headers;
     resp
 }
 
-/// A handler's status code, or 500 (logged) if it isn't an HTTP status.
-pub(crate) fn status_or_500(code: u16) -> StatusCode {
-    StatusCode::from_u16(code).unwrap_or_else(|_| {
-        tracing::error!(
-            target: "pyronova::handler",
-            status = code,
-            "handler returned invalid HTTP status {code}; responding 500"
-        );
-        StatusCode::INTERNAL_SERVER_ERROR
-    })
+/// 500 with `msg` (the generic text) and the request id: the client can quote the id to
+/// an operator, who finds the real error on the log line carrying it.
+pub(crate) fn error_response(msg: &str, request_id: &RequestId) -> Response<Full<Bytes>> {
+    json_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        server_error_body(msg, request_id),
+    )
 }
 
-pub(crate) fn error_response(msg: &str) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .header("content-type", "application/json")
-        .header("server", SERVER_HEADER)
-        .body(Full::new(Bytes::from(error_json_body(msg))))
-        .unwrap()
-}
-
-/// Serialize a `{"error": msg}` JSON body via serde_json. Hand-rolling the
-/// escape (only handling `"`) would leak backslashes, control chars, and
-/// newlines into the payload — the classic "minimal escape hides a JSON
-/// injection" bug. `serde_json::to_vec` is the only safe source.
+/// `{"error": msg}` for a 4xx, serialized via serde_json. Hand-rolling the escape (only
+/// handling `"`) would leak backslashes, control chars, and newlines into the payload —
+/// the classic "minimal escape hides a JSON injection" bug.
 fn error_json_body(msg: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({ "error": msg }))
         .unwrap_or_else(|_| br#"{"error":"serialization failed"}"#.to_vec())
 }
 
+/// `{"error": msg, "request_id": id}` for a 5xx.
+fn server_error_body(msg: &str, request_id: &RequestId) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "error": msg,
+        "request_id": request_id.to_string(),
+    }))
+    .unwrap_or_else(|_| br#"{"error":"serialization failed"}"#.to_vec())
+}
+
+/// 503 for a request no queue slot or permit was free for, with `retry-after`.
 #[inline]
-pub(crate) fn overloaded_response(msg: &str) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(StatusCode::SERVICE_UNAVAILABLE)
-        .header("content-type", "application/json")
-        .header("server", SERVER_HEADER)
-        .header("retry-after", "1")
-        .body(Full::new(Bytes::from(error_json_body(msg))))
-        .unwrap()
+pub(crate) fn overloaded_response(msg: &str, request_id: &RequestId) -> Response<Full<Bytes>> {
+    let mut resp = json_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        server_error_body(msg, request_id),
+    );
+    resp.headers_mut()
+        .insert(hyper::header::RETRY_AFTER, HeaderValue::from_static("1"));
+    resp
 }
 
 /// 503 for a request whose workers are gone (the server is shutting down).
 #[inline]
-pub(crate) fn unavailable_response(msg: &str) -> Response<Full<Bytes>> {
-    json_error(StatusCode::SERVICE_UNAVAILABLE, msg)
+pub(crate) fn unavailable_response(msg: &str, request_id: &RequestId) -> Response<Full<Bytes>> {
+    json_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        server_error_body(msg, request_id),
+    )
 }
 
 /// 400 for a request whose body could not be read.
 #[inline]
 pub(crate) fn bad_request_response(msg: &str) -> Response<Full<Bytes>> {
-    json_error(StatusCode::BAD_REQUEST, msg)
+    json_error(StatusCode::BAD_REQUEST, error_json_body(msg))
 }
 
 /// 408 for a request body that did not arrive within the request budget.
 #[inline]
 pub(crate) fn request_timeout_response() -> Response<Full<Bytes>> {
-    json_error(StatusCode::REQUEST_TIMEOUT, "request body timeout")
+    json_error(
+        StatusCode::REQUEST_TIMEOUT,
+        error_json_body("request body timeout"),
+    )
 }
 
-fn json_error(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
-    let mut resp = Response::new(Full::new(Bytes::from(error_json_body(msg))));
+fn json_error(status: StatusCode, body: impl Into<Bytes>) -> Response<Full<Bytes>> {
+    let mut resp = Response::new(Full::new(body.into()));
     *resp.status_mut() = status;
     let headers = resp.headers_mut();
-    headers.insert(
-        hyper::header::CONTENT_TYPE,
-        hyper::header::HeaderValue::from_static("application/json"),
-    );
-    headers.insert(
-        hyper::header::SERVER,
-        hyper::header::HeaderValue::from_static(SERVER_HEADER),
-    );
+    headers.insert(CONTENT_TYPE, JSON);
+    headers.insert(SERVER, HeaderValue::from_static(SERVER_HEADER));
     resp
 }
 
 #[inline]
 pub(crate) fn payload_too_large_response() -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(StatusCode::PAYLOAD_TOO_LARGE)
-        .header("content-type", "application/json")
-        .header("server", SERVER_HEADER)
-        .body(Full::new(Bytes::from_static(
-            b"{\"error\":\"payload too large\"}",
-        )))
-        .unwrap()
+    json_error(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Bytes::from_static(b"{\"error\":\"payload too large\"}"),
+    )
 }
 
+/// 504 for a handler that did not answer within the request budget.
 #[inline]
-pub(crate) fn gateway_timeout_response() -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(StatusCode::GATEWAY_TIMEOUT)
-        .header("content-type", "application/json")
-        .header("server", SERVER_HEADER)
-        .body(Full::new(Bytes::from_static(
-            b"{\"error\":\"request timeout\"}",
-        )))
-        .unwrap()
+pub(crate) fn gateway_timeout_response(request_id: &RequestId) -> Response<Full<Bytes>> {
+    json_error(
+        StatusCode::GATEWAY_TIMEOUT,
+        server_error_body("request timeout", request_id),
+    )
 }
 
 #[inline]
 pub(crate) fn not_found_response() -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(StatusCode::NOT_FOUND)
-        .header("content-type", "application/json")
-        .header("server", SERVER_HEADER)
-        .body(Full::new(Bytes::from_static(b"{\"error\":\"not found\"}")))
-        .unwrap()
+    json_error(
+        StatusCode::NOT_FOUND,
+        Bytes::from_static(b"{\"error\":\"not found\"}"),
+    )
 }
 
 #[cfg(test)]
@@ -330,7 +370,7 @@ mod tests {
 
     #[test]
     fn error_response_500() {
-        let resp = error_response("something broke");
+        let resp = error_response("something broke", &RequestId::mint());
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(resp.headers()["content-type"], "application/json");
         let body = String::from_utf8(body_bytes(resp)).unwrap();
@@ -339,7 +379,7 @@ mod tests {
 
     #[test]
     fn error_response_escapes_quotes() {
-        let resp = error_response(r#"bad "input""#);
+        let resp = error_response(r#"bad "input""#, &RequestId::mint());
         let body = String::from_utf8(body_bytes(resp)).unwrap();
         assert!(body.contains(r#"bad \"input\""#));
     }
@@ -348,7 +388,7 @@ mod tests {
     fn error_response_escapes_control_chars_and_backslashes() {
         // Previously the hand-rolled escape only handled `"`; a backslash
         // or a newline in `msg` produced invalid JSON. serde_json fixes it.
-        let resp = error_response("back\\slash\nnewline\ttab");
+        let resp = error_response("back\\slash\nnewline\ttab", &RequestId::mint());
         let body = String::from_utf8(body_bytes(resp)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("must parse");
         assert_eq!(parsed["error"], "back\\slash\nnewline\ttab");
@@ -356,7 +396,7 @@ mod tests {
 
     #[test]
     fn overloaded_503_with_retry_after() {
-        let resp = overloaded_response("too busy");
+        let resp = overloaded_response("too busy", &RequestId::mint());
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(resp.headers()["retry-after"], "1");
         let body = String::from_utf8(body_bytes(resp)).unwrap();
@@ -373,7 +413,7 @@ mod tests {
 
     #[test]
     fn gateway_timeout_504() {
-        let resp = gateway_timeout_response();
+        let resp = gateway_timeout_response(&RequestId::mint());
         assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
         let body = String::from_utf8(body_bytes(resp)).unwrap();
         assert!(body.contains("request timeout"));
@@ -384,7 +424,7 @@ mod tests {
         let data = ResponseData {
             body: Bytes::from("hello"),
             content_type: HeaderValue::from_static("text/plain"),
-            status: 200,
+            status: StatusCode::OK,
             headers: ResponseHeaders::new(),
         };
         let resp = build_response(Ok(data));
@@ -401,7 +441,7 @@ mod tests {
         let data = ResponseData {
             body: Bytes::from("created"),
             content_type: JSON,
-            status: 201,
+            status: StatusCode::CREATED,
             headers,
         };
         let resp = build_response(Ok(data));
@@ -411,7 +451,14 @@ mod tests {
 
     #[test]
     fn build_response_error_falls_back_to_500() {
-        let resp = build_response(Err("oops".to_string()));
+        let id = RequestId::mint();
+        let tag = crate::handlers::error::RequestTag {
+            id: &id,
+            method: "GET",
+            path: "/",
+        };
+        let oops = crate::handlers::error::HandlerError::WorkerLost("oops").log(&tag);
+        let resp = build_response(Err(oops));
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -424,7 +471,7 @@ mod tests {
         let resp = build_response(Ok(ResponseData {
             body: Bytes::from("a,b"),
             content_type: TEXT,
-            status: 200,
+            status: StatusCode::OK,
             headers,
         }));
         let all = |name| {
@@ -447,10 +494,22 @@ mod tests {
         let resp = build_response(Ok(ResponseData {
             body: Bytes::new(),
             content_type: TEXT,
-            status: 200,
+            status: StatusCode::OK,
             headers,
         }));
         let cookies: Vec<_> = resp.headers().get_all("set-cookie").iter().collect();
         assert_eq!(cookies, ["a=1", "b=2"]);
+    }
+
+    #[test]
+    fn an_invalid_status_is_a_mapping_error() {
+        assert!(matches!(
+            http_status(1000),
+            Err(ResponseError::Status(1000))
+        ));
+        assert!(ResponseError::Status(1000)
+            .to_string()
+            .contains("invalid HTTP status 1000"));
+        assert_eq!(http_status(201).unwrap(), StatusCode::CREATED);
     }
 }

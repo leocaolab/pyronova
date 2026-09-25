@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
@@ -9,6 +9,8 @@ use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString, PyTuple};
+
+use crate::request_id::RequestId;
 
 // ---------------------------------------------------------------------------
 // PyronovaRequest
@@ -29,6 +31,8 @@ pub(crate) struct PyronovaRequest {
     pub(crate) headers: HeaderMap,
     /// Raw IP — zero allocation. `.to_string()` only when Python accesses it.
     pub(crate) client_ip_addr: IpAddr,
+    /// The request's correlation id (`req.request_id`), written once by the pipeline.
+    pub(crate) request_id: RequestId,
     /// Stored as Bytes (ref-counted, zero-copy from hyper).
     pub(crate) body_bytes: Bytes,
     /// For streaming routes (`stream=True`), this holds the feeder channel's
@@ -70,6 +74,7 @@ impl Clone for PyronovaRequest {
             query: self.query.clone(),
             headers: self.headers.clone(),
             client_ip_addr: self.client_ip_addr,
+            request_id: self.request_id.clone(),
             body_bytes: self.body_bytes.clone(),
             body_stream_rx: Arc::clone(&self.body_stream_rx),
             query_cache: OnceLock::new(),
@@ -86,8 +91,9 @@ impl PyronovaRequest {
     /// in `handlers/subinterp.rs`) and never goes through here.
     ///
     /// `params` / `headers` arrive as `dict[str, str]`, `body_bytes` as `bytes`, and
-    /// `client_ip` as a string. A header that is not a valid field is a `ValueError`
-    /// naming it. A malformed `client_ip` falls back to the unspecified address.
+    /// `client_ip` as a string. A header that is not a valid field, or a `client_ip` that
+    /// is not an IP address, is a `ValueError` naming it. The request gets a fresh
+    /// `request_id`.
     #[new]
     fn py_new(
         method: &str,
@@ -102,15 +108,17 @@ impl PyronovaRequest {
             .iter()
             .map(|(name, value)| Ok((header_name(name)?, header_value(name, value)?)))
             .collect::<PyResult<HeaderMap>>()?;
+        let client_ip_addr = client_ip.parse::<IpAddr>().map_err(|e| {
+            PyValueError::new_err(format!("client_ip {client_ip:?} is not an IP address: {e}"))
+        })?;
         Ok(PyronovaRequest {
             method: Arc::from(method),
             path: Arc::from(path),
             params: params.into_iter().collect(),
             query: query.to_string(),
             headers,
-            client_ip_addr: client_ip
-                .parse()
-                .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            client_ip_addr,
+            request_id: RequestId::mint(),
             body_bytes: Bytes::from(body_bytes),
             body_stream_rx: Arc::new(std::sync::Mutex::new(None)),
             query_cache: OnceLock::new(),
@@ -150,6 +158,14 @@ impl PyronovaRequest {
     #[getter]
     fn client_ip(&self) -> String {
         self.client_ip_addr.to_string()
+    }
+
+    /// The request's correlation id: the one a 5xx body reports and the error log line
+    /// carries. The client's own id when the app enabled request ids and the request sent
+    /// one, else minted by the server.
+    #[getter]
+    fn request_id(&self) -> String {
+        self.request_id.to_string()
     }
 
     #[getter]
@@ -630,7 +646,7 @@ pub(crate) struct ResponseData {
     /// The body's type: from `content_type=`, else from what the handler returned. A
     /// `content-type` in `headers` replaces it.
     pub(crate) content_type: HeaderValue,
-    pub(crate) status: u16,
+    pub(crate) status: hyper::StatusCode,
     pub(crate) headers: ResponseHeaders,
 }
 
@@ -690,6 +706,7 @@ mod tests {
             query: "q=hello+world&page=2&lang=en".to_string(),
             headers: HeaderMap::new(),
             client_ip_addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            request_id: crate::request_id::RequestId::mint(),
             body_bytes: Bytes::new(),
             body_stream_rx: Arc::new(std::sync::Mutex::new(None)),
             query_cache: OnceLock::new(),
@@ -710,6 +727,7 @@ mod tests {
             query: "".to_string(),
             headers: HeaderMap::new(),
             client_ip_addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            request_id: crate::request_id::RequestId::mint(),
             body_bytes: Bytes::new(),
             body_stream_rx: Arc::new(std::sync::Mutex::new(None)),
             query_cache: OnceLock::new(),
@@ -727,6 +745,7 @@ mod tests {
             query: "name=%E4%B8%AD%E6%96%87".to_string(),
             headers: HeaderMap::new(),
             client_ip_addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            request_id: crate::request_id::RequestId::mint(),
             body_bytes: Bytes::new(),
             body_stream_rx: Arc::new(std::sync::Mutex::new(None)),
             query_cache: OnceLock::new(),

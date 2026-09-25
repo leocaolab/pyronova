@@ -84,6 +84,15 @@ fn header_value(name: &str, value: &str) -> Result<HeaderValue, FastResponseErro
     })
 }
 
+/// A route the table rejected (a duplicate, a conflicting or malformed path).
+#[derive(Debug, thiserror::Error)]
+#[error("{method} {path}: {source}")]
+pub(crate) struct RouteError {
+    method: String,
+    path: String,
+    source: matchit::InsertError,
+}
+
 /// A registered route's index in its [`RouteTable`]. Only the table hands them out, so an
 /// id always names one of its routes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,7 +195,7 @@ pub(crate) struct Sealed {
 /// C3). Main computes it from its sealed table before creating workers; a worker compares
 /// its own whole table against it. Plain values, so a worker's init, which runs with the
 /// worker's thread state current, never touches main's `Py<T>` handlers (M4 review N3).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RouteSignature {
     /// Per route index: `(METHOD, path, gil)`.
     pub(crate) routes: Vec<(String, String, bool)>,
@@ -304,13 +313,17 @@ impl RouteTable {
         handler: Py<PyAny>,
         name: String,
         dispatch: Dispatch,
-    ) -> Result<(), String> {
+    ) -> Result<(), RouteError> {
         // The fallible router insert goes first, so a rejected route (e.g. a duplicate)
         // leaves the table untouched.
         let id = RouteId(self.routes.len());
         let method = method.to_uppercase();
         let router = self.routers.entry(method.clone()).or_default();
-        router.insert(path, id).map_err(|e| e.to_string())?;
+        router.insert(path, id).map_err(|source| RouteError {
+            method: method.clone(),
+            path: path.to_string(),
+            source,
+        })?;
         self.routes.push(Route {
             handler,
             name,

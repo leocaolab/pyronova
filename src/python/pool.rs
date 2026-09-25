@@ -11,6 +11,12 @@ use pyo3::prelude::*;
 
 use super::ffi::*;
 use super::worker::*;
+use crate::handlers::error::{Logged, RequestTag};
+use crate::request_id::RequestId;
+use crate::types::{PyronovaRequest, ResponseData};
+
+/// What a worker sends back for a request: its response, or its error, logged.
+pub(crate) type WorkReply = tokio::sync::oneshot::Sender<Result<ResponseData, Logged>>;
 
 // ---------------------------------------------------------------------------
 // Work item for channel-based dispatch
@@ -31,7 +37,29 @@ pub(crate) struct WorkRequest {
     pub headers: hyper::HeaderMap,
     /// IpAddr: deferred to_string() to the worker thread.
     pub client_ip: std::net::IpAddr,
-    pub response_tx: tokio::sync::oneshot::Sender<Result<crate::types::ResponseData, String>>,
+    pub request_id: RequestId,
+    pub response_tx: WorkReply,
+}
+
+impl WorkRequest {
+    /// The handler's `Request`, and where its reply goes. The method, path and body move
+    /// in; nothing is copied.
+    pub(crate) fn into_request(self) -> (crate::router::RouteId, PyronovaRequest, WorkReply) {
+        let request = PyronovaRequest {
+            method: self.method,
+            path: self.path,
+            params: self.params,
+            query: self.query,
+            headers: self.headers,
+            client_ip_addr: self.client_ip,
+            request_id: self.request_id,
+            body_bytes: self.body,
+            body_stream_rx: Arc::new(Mutex::new(None)),
+            query_cache: std::sync::OnceLock::new(),
+            query_all_cache: std::sync::OnceLock::new(),
+        };
+        (self.route, request, self.response_tx)
+    }
 }
 
 // Diagnostic: count WorkRequest creates vs worker-completes. Gated
@@ -169,6 +197,26 @@ pub(crate) fn split_workers_for_routes(
 // Channel-based Interpreter Pool
 // ---------------------------------------------------------------------------
 
+/// Why the sub-interpreter pool could not start.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PoolError {
+    #[error("could not read the app script {path}: {source}")]
+    ReadScript {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("sub-interpreter {index}: {source}")]
+    Worker {
+        index: usize,
+        source: WorkerStartError,
+    },
+    #[error("could not spawn the thread of worker {index}: {source}")]
+    Spawn {
+        index: usize,
+        source: std::io::Error,
+    },
+}
+
 /// Worker threads a pool shutdown gave up on (still running after the grace period), each
 /// described with what it was running. Their interpreters are still alive, and finalizing
 /// with a live sub-interpreter aborts, so `Pyronova.run()` checks this and exits non-zero
@@ -238,11 +286,7 @@ impl Drop for InterpreterPool {
                         // A worker thread panicked (e.g. a bounds violation in
                         // the handler dispatch). Surface the payload instead of
                         // swallowing it — a silent Drop makes such bugs invisible.
-                        let msg = panic
-                            .downcast_ref::<&str>()
-                            .map(|s| s.to_string())
-                            .or_else(|| panic.downcast_ref::<String>().cloned())
-                            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                        let msg = crate::handlers::error::panic_message(&*panic);
                         tracing::error!(
                             target: "pyronova::server",
                             "worker thread panicked during shutdown: {msg}",
@@ -291,12 +335,15 @@ impl InterpreterPool {
         script_path: &str,
         expected: &crate::router::RouteSignature,
         shared_state: &crate::state::SharedMap,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, PoolError> {
         let n = split.total();
         let has_any_async = split.async_workers > 0;
 
-        let raw_script = std::fs::read_to_string(script_path)
-            .map_err(|e| format!("Failed to read script: {e}"))?;
+        let raw_script =
+            std::fs::read_to_string(script_path).map_err(|source| PoolError::ReadScript {
+                path: script_path.to_string(),
+                source,
+            })?;
 
         // Create work channels
         // Sync pool: handles def handlers (220k req/s)
@@ -328,10 +375,10 @@ impl InterpreterPool {
                 shared_state,
             ) {
                 Ok(worker) => workers.push(worker),
-                Err(e) => {
+                Err(source) => {
                     // End the workers built so far here, on their creating thread (FR-19).
                     SubInterpreterWorker::end_all(workers);
-                    return Err(format!("sub-interpreter {i}: {e}"));
+                    return Err(PoolError::Worker { index: i, source });
                 }
             }
         }
@@ -373,7 +420,7 @@ impl InterpreterPool {
                     .spawn(move || {
                         worker_thread_loop_async(worker);
                     })
-                    .map_err(|e| format!("failed to spawn async worker {i}: {e}"))
+                    .map_err(|source| PoolError::Spawn { index: i, source })
             } else {
                 // Sync worker
                 let rx = sync_work_rx.clone();
@@ -383,7 +430,7 @@ impl InterpreterPool {
                     .spawn(move || {
                         worker_thread_loop(worker, rx, &current);
                     })
-                    .map_err(|e| format!("failed to spawn worker thread {i}: {e}"))
+                    .map_err(|source| PoolError::Spawn { index: i, source })
             };
 
             match spawned {
@@ -459,7 +506,7 @@ fn worker_thread_loop(
         worker.tstate = rebind_tstate_to_current_thread(worker.tstate);
     }
 
-    while let Ok(mut req) = rx.recv() {
+    while let Ok(req) = rx.recv() {
         // Skip requests whose caller already timed out (504) — avoid wasting
         // CPU on "dead" requests during queue backlog (prevents snowball effect).
         if req.response_tx.is_closed() {
@@ -470,42 +517,26 @@ fn worker_thread_loop(
             continue;
         }
 
-        // Cell lives outside catch_unwind so the guard can write tstate back
-        // even during panic unwind.
-        let tstate_cell = std::cell::Cell::new(worker.tstate);
+        let (route, request, reply) = req.into_request();
+        // The request as its error log line names it; `request` moves into the call.
+        let (id, method, path) = (
+            request.request_id.clone(),
+            Arc::clone(&request.method),
+            Arc::clone(&request.path),
+        );
 
-        // Catch panics to prevent worker thread death.
-        // SubInterpGilGuard ensures GIL is released even if call_handler panics.
-        let headers = std::mem::take(&mut req.headers);
-
-        current_route.store(req.route.index(), Ordering::Relaxed);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            let _guard = SubInterpGilGuard::acquire(tstate_cell.get(), &tstate_cell);
-
-            worker.call_handler(
-                req.route,
-                &req.method,
-                &req.path,
-                &req.params,
-                &req.query,
-                req.body.clone(),
-                headers,
-                req.client_ip,
-            )
-            // _guard drops here → PyEval_SaveThread() → tstate_cell updated
-        }));
-
-        // Recover tstate (updated by guard's Drop, even after panic)
-        worker.tstate = tstate_cell.get();
+        current_route.store(route.index(), Ordering::Relaxed);
+        // SAFETY: on the thread this worker was rebound to, no thread state current.
+        let result = unsafe { worker.serve(route, request) };
         current_route.store(IDLE, Ordering::Relaxed);
 
-        let response = match result {
-            Ok(r) => r,
-            Err(_) => Err("internal error: worker panic".to_string()),
+        let tag = RequestTag {
+            id: &id,
+            method: &method,
+            path: &path,
         };
-
-        // Send response back (ignore error if receiver dropped)
-        let _ = req.response_tx.send(response);
+        // The caller may have given up (504) meanwhile; the error is logged either way.
+        let _ = reply.send(result.map_err(|e| e.log(&tag)));
         WorkRequest::inc_completed();
     }
 

@@ -28,8 +28,10 @@ use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tungstenite::Message;
 
-use crate::handlers::pipeline::{await_reply, finish, refuse, Refusal, RequestLine, Served};
+use crate::handlers::error::{HandlerError, Logged, PyException, RequestTag, Stage};
+use crate::handlers::pipeline::{await_reply, fail, finish, RequestLine, Served};
 use crate::handlers::{full_body, run_before_hooks, BoxBody};
+use crate::request_id::RequestId;
 use crate::site::{SharedSite, Site};
 use crate::types::{PyronovaRequest, ResponseData};
 
@@ -423,15 +425,21 @@ pub(crate) async fn handle_websocket(
     let (parts, _body) = req.into_parts();
     let method: Arc<str> = Arc::from(parts.method.as_str());
     let path: Arc<str> = Arc::from(parts.uri.path());
+    let request_id = RequestId::of(&parts.headers, site.config.request_id_header.as_ref());
+    let tag = RequestTag {
+        id: &request_id,
+        method: &method,
+        path: &path,
+    };
     let handshake = Handshake {
         key: parts
             .headers
             .get("sec-websocket-key")
             .map(|k| k.as_bytes().to_vec()),
-        request: upgrade_request(parts, &method, &path, client_ip),
+        request: upgrade_request(parts, &method, &path, client_ip, request_id.clone()),
         upgrade,
     };
-    let resp = answer_upgrade(&site, handshake).await;
+    let resp = answer_upgrade(&site, handshake, &tag).await;
     let line = RequestLine {
         method: &method,
         path: &path,
@@ -452,6 +460,7 @@ fn upgrade_request(
     method: &Arc<str>,
     path: &Arc<str>,
     client_ip: std::net::IpAddr,
+    request_id: RequestId,
 ) -> PyronovaRequest {
     PyronovaRequest {
         method: Arc::clone(method),
@@ -460,6 +469,7 @@ fn upgrade_request(
         query: parts.uri.query().unwrap_or("").to_string(),
         headers: parts.headers,
         client_ip_addr: client_ip,
+        request_id,
         body_bytes: Bytes::new(),
         body_stream_rx: crate::python::body_stream::empty_body_stream_rx(),
         query_cache: std::sync::OnceLock::new(),
@@ -470,11 +480,15 @@ fn upgrade_request(
 /// What the `before_request` hooks decided about an upgrade.
 enum Verdict {
     Accept,
-    /// A hook returned this response (or raised: `Err`).
-    Reject(Result<ResponseData, String>),
+    /// A hook returned this response (or raised: `Err`, logged).
+    Reject(Result<ResponseData, Logged>),
 }
 
-async fn answer_upgrade(site: &SharedSite, handshake: Handshake) -> Response<BoxBody> {
+async fn answer_upgrade(
+    site: &SharedSite,
+    handshake: Handshake,
+    tag: &RequestTag<'_>,
+) -> Response<BoxBody> {
     let path = Arc::clone(&handshake.request.path);
     // Only check that a handler exists here; no Python on this thread. In TPC mode this
     // runs on a worker's thread, bound to that worker's interpreter; the handler and hooks
@@ -489,7 +503,7 @@ async fn answer_upgrade(site: &SharedSite, handshake: Handshake) -> Response<Box
     let Some(slot) = ConnectionSlot::try_acquire(limits.max_connections) else {
         tracing::debug!(target: "pyronova::server", path = %path, max_connections = limits.max_connections,
             "WebSocket connection limit reached; answered 503");
-        return refuse(Refusal::Overloaded("websocket connection limit reached"));
+        return fail(HandlerError::Overloaded("websocket connections"), tag);
     };
 
     // The hooks run on the connection's thread before the 101; the handler runs there
@@ -503,30 +517,21 @@ async fn answer_upgrade(site: &SharedSite, handshake: Handshake) -> Response<Box
         verdict_tx,
     ) {
         Ok(thread) => thread,
-        Err(e) => {
-            tracing::error!(target: "pyronova::server", error = %e,
-                "WebSocket handler thread could not be spawned");
-            return full_body(crate::response::error_response(
-                "websocket handler thread could not be spawned",
-            ));
-        }
+        Err(e) => return fail(HandlerError::ThreadSpawn(e), tag),
     };
 
-    match await_reply(
-        verdict_rx,
-        "websocket handler thread exited before the upgrade",
-    )
-    .await
-    {
+    let lost =
+        |_| HandlerError::WorkerLost("the websocket handler thread exited before the upgrade");
+    match await_reply(verdict_rx, lost).await {
         Ok(Verdict::Accept) => {}
         Ok(Verdict::Reject(response)) => {
             join_handler_thread(thread).await;
             return full_body(crate::response::build_response(response));
         }
-        Err(refusal) => {
+        Err(e) => {
             // The thread sees the verdict go unread and exits without running the handler.
             tokio::spawn(join_handler_thread(thread));
-            return refuse(refusal);
+            return fail(e, tag);
         }
     }
 
@@ -641,29 +646,34 @@ fn serve_connection(
     else {
         return;
     };
-    let request = match Py::new(py, request) {
-        Ok(r) => r,
-        Err(e) => {
-            // Unread only if the handshake already gave up.
-            let _ = verdict.send(Verdict::Reject(Err(format!(
-                "failed to create Request: {e}"
-            ))));
-            return;
-        }
+    // The request as its error log line names it; `request` moves into its `Request`.
+    let (id, method, path) = (
+        request.request_id.clone(),
+        Arc::clone(&request.method),
+        Arc::clone(&request.path),
+    );
+    let tag = RequestTag {
+        id: &id,
+        method: &method,
+        path: &path,
     };
-    match run_before_hooks(py, &site.routes.before_hooks, &request) {
-        Ok(None) => {}
-        Ok(Some(response)) => {
+    let hooks = Py::new(py, request)
+        .map_err(|e| HandlerError::python(py, Stage::Setup, &e))
+        .and_then(|request| {
+            run_before_hooks(py, &site.routes.before_hooks, &request).map(|r| (request, r))
+        });
+    // A verdict goes unread only if the handshake already gave up.
+    let request = match hooks {
+        Ok((request, None)) => request,
+        Ok((_, Some(response))) => {
             let _ = verdict.send(Verdict::Reject(Ok(response)));
             return;
         }
         Err(e) => {
-            tracing::error!(target: "pyronova::server", error = %e,
-                "before_request hook failed on a WebSocket upgrade; refused it");
-            let _ = verdict.send(Verdict::Reject(Err(e)));
+            let _ = verdict.send(Verdict::Reject(Err(e.log(&tag))));
             return;
         }
-    }
+    };
     if verdict.send(Verdict::Accept).is_err() {
         // The handshake gave up waiting (request budget): no 101 was sent.
         return;
@@ -689,7 +699,9 @@ fn run_handler(py: Python<'_>, handler: &Py<PyAny>, ws: PyronovaWebSocket) {
     let result = match handler.call1(py, (ws_obj,)) {
         Ok(result) => result,
         Err(e) => {
-            tracing::error!(target: "pyronova::server", error = %e, "WebSocket handler error");
+            let exception = PyException::capture(py, &e);
+            tracing::error!(target: "pyronova::server", error = %exception,
+                traceback = exception.traceback(), "WebSocket handler raised");
             return;
         }
     };

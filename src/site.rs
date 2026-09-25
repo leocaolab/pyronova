@@ -22,6 +22,9 @@ pub(crate) struct SiteConfig {
     /// Answer HttpArena's `benchmark.BenchmarkService/GetSum` gRPC method; off unless the
     /// app enables it.
     pub(crate) grpc_benchmark: bool,
+    /// The header a client's request id arrives in (`app.enable_request_id()`); `None`
+    /// means every request id is minted by the server.
+    pub(crate) request_id_header: Option<HeaderName>,
 }
 
 /// CORS response headers, parsed once at configuration. Applied to every response, not

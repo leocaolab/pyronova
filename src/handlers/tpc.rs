@@ -4,7 +4,7 @@
 //! sub-interpreter, with no cross-thread wake. A `gil=True` route or the fallback goes to
 //! the main-interpreter bridge.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -15,17 +15,18 @@ use hyper::http::request::Parts;
 use hyper::{Request, Response};
 
 use crate::bridge::main_bridge::{GilWorkItem, MainInterpBridge, TryDispatchError};
-use crate::python::interp::{self, SubInterpreterWorker};
+use crate::python::interp::SubInterpreterWorker;
+use crate::request_id::RequestId;
 use crate::router::{Call, Params, RequestBody, RouteId, Target};
 use crate::site::Site;
+use crate::types::PyronovaRequest;
 
+use super::error::{HandlerError, RequestTag};
 use super::pipeline::{
-    await_reply, collect_body, finish, preprocess, refuse, AcceptEncoding, Prepared, Preprocessed,
-    Refusal, RequestLine, Served, REQUEST_BUDGET,
+    await_reply, collect_body, fail, finish, preprocess, AcceptEncoding, Prepared, Preprocessed,
+    RequestLine, Served, REQUEST_BUDGET,
 };
-use super::{
-    build_main_http_response, full_body, http_response, max_body_size, stream_body_feeder, BoxBody,
-};
+use super::{build_main_http_response, http_response, max_body_size, stream_body_feeder, BoxBody};
 
 pub(crate) async fn handle_request_tpc_inline(
     req: Request<Incoming>,
@@ -65,6 +66,7 @@ async fn run_inline(
         body,
         params,
         start,
+        request_id,
         ..
     } = prepared;
     let headers = std::mem::take(&mut parts.headers);
@@ -73,18 +75,24 @@ async fn run_inline(
         path: parts.uri.path(),
         start,
     };
+    let tag = RequestTag {
+        id: &request_id,
+        method: parts.method.as_str(),
+        path: parts.uri.path(),
+    };
     let resp = match collect_body(body, max_body_size()).await {
         Ok(body) => {
             let request = InlineRequest {
                 parts: &parts,
                 headers,
-                params: &params,
+                params,
                 body,
                 client_ip: client_ip_addr,
+                request_id: request_id.clone(),
             };
-            call_inline(site, worker, route, request)
+            call_inline(site, worker, route, request, &tag)
         }
-        Err(reject) => reject.into_response(),
+        Err(e) => fail(e, &tag),
     };
     finish(resp, site, &line, Served::Inline)
 }
@@ -93,9 +101,28 @@ async fn run_inline(
 struct InlineRequest<'a> {
     parts: &'a Parts,
     headers: hyper::HeaderMap,
-    params: &'a Params,
+    params: Params,
     body: Bytes,
     client_ip: std::net::IpAddr,
+    request_id: RequestId,
+}
+
+impl InlineRequest<'_> {
+    fn into_request(self) -> PyronovaRequest {
+        PyronovaRequest {
+            method: Arc::from(self.parts.method.as_str()),
+            path: Arc::from(self.parts.uri.path()),
+            params: self.params,
+            query: self.parts.uri.query().unwrap_or("").to_string(),
+            headers: self.headers,
+            client_ip_addr: self.client_ip,
+            request_id: self.request_id,
+            body_bytes: self.body,
+            body_stream_rx: Arc::new(std::sync::Mutex::new(None)),
+            query_cache: std::sync::OnceLock::new(),
+            query_all_cache: std::sync::OnceLock::new(),
+        }
+    }
 }
 
 fn call_inline(
@@ -103,58 +130,28 @@ fn call_inline(
     worker: &Rc<RefCell<SubInterpreterWorker>>,
     route: RouteId,
     request: InlineRequest<'_>,
+    tag: &RequestTag<'_>,
 ) -> Response<BoxBody> {
-    let name = &site.routes.route(route).name;
     let accept_encoding = AcceptEncoding::of(&request.headers);
-    let InlineRequest {
-        parts,
-        headers,
-        params,
-        body,
-        client_ip,
-    } = request;
     let called = Instant::now();
 
-    // Acquire the TPC thread's sub-interp GIL, run the handler, release. Non-Send because
-    // Rc<RefCell<_>> and *mut PyThreadState cross no await.
-    let result = {
-        let mut worker_ref = worker.borrow_mut();
-        let tstate_cell = Cell::new(worker_ref.tstate);
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            let _guard = interp::SubInterpGilGuard::acquire(tstate_cell.get(), &tstate_cell);
-            worker_ref.call_handler(
-                route,
-                parts.method.as_str(),
-                parts.uri.path(),
-                params,
-                parts.uri.query().unwrap_or(""),
-                body,
-                headers,
-                client_ip,
-            )
-        }));
-        worker_ref.tstate = tstate_cell.get();
-        res.unwrap_or_else(|payload| {
-            let msg = payload
-                .downcast_ref::<String>()
-                .map(|s| s.as_str())
-                .or_else(|| payload.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown panic");
-            tracing::error!(target: "pyronova::handler", panic = msg, handler = %name, "TPC handler panicked");
-            Err(format!("internal error: TPC handler panic: {msg}"))
-        })
-    };
+    // Acquire the TPC thread's sub-interp GIL, run the handler, release. A failure is
+    // logged here, on this thread.
+    // SAFETY: this TPC thread is the one its worker was rebound to, and no thread state is
+    // current between requests.
+    let result =
+        unsafe { worker.borrow_mut().serve(route, request.into_request()) }.map_err(|e| e.log(tag));
 
     let took = called.elapsed();
     if took > REQUEST_BUDGET {
         tracing::error!(
             target: "pyronova::handler",
-            handler = %name,
+            handler = %site.routes.route(route).name,
             took_ms = took.as_millis() as u64,
             "handler ran past the {REQUEST_BUDGET:?} request budget, blocking its TPC thread \
              the whole time; answered 504. Use `async def` or gil=True for slow work"
         );
-        return refuse(Refusal::TimedOut);
+        return fail(HandlerError::Timeout, tag);
     }
     http_response(result, accept_encoding.as_str())
 }
@@ -173,6 +170,7 @@ async fn run_on_bridge(
         body: incoming,
         params,
         start,
+        request_id,
         ..
     } = prepared;
     let headers = std::mem::take(&mut parts.headers);
@@ -180,6 +178,11 @@ async fn run_on_bridge(
         method: parts.method.as_str(),
         path: parts.uri.path(),
         start,
+    };
+    let tag = RequestTag {
+        id: &request_id,
+        method: parts.method.as_str(),
+        path: parts.uri.path(),
     };
     let resp = match bridge {
         Some(bridge) => {
@@ -190,12 +193,13 @@ async fn run_on_bridge(
                 headers,
                 client_ip: client_ip_addr,
             };
-            dispatch_to_bridge(&bridge, &parts, incoming, call).await
+            dispatch_to_bridge(&bridge, &parts, incoming, call, &tag).await
         }
         // The bridge is spawned whenever the table has a main-interpreter call.
-        None => full_body(crate::response::error_response(
-            "main-interpreter call requested but the main-interp bridge is not running",
-        )),
+        None => fail(
+            HandlerError::WorkerLost("the main-interpreter bridge is not running"),
+            &tag,
+        ),
     };
     finish(resp, site, &line, Served::Bridge)
 }
@@ -213,6 +217,7 @@ async fn dispatch_to_bridge(
     parts: &Parts,
     incoming: Incoming,
     call: BridgeCall,
+    tag: &RequestTag<'_>,
 ) -> Response<BoxBody> {
     // A streamed body is fed on this thread's LocalSet while the bridge's handler reads it.
     // The feeder's handle is kept so a rejected dispatch can stop it: dropping the receiver
@@ -234,7 +239,7 @@ async fn dispatch_to_bridge(
                 crate::python::body_stream::empty_body_stream_rx(),
                 None,
             ),
-            Err(reject) => return reject.into_response(),
+            Err(e) => return fail(e, tag),
         },
     };
 
@@ -248,6 +253,7 @@ async fn dispatch_to_bridge(
         body: body_bytes,
         headers: call.headers,
         client_ip: call.client_ip,
+        request_id: tag.id.clone(),
         target: call.target,
         body_stream_rx,
         response_tx,
@@ -257,14 +263,16 @@ async fn dispatch_to_bridge(
         if let Some(feeder) = feeder {
             feeder.abort();
         }
-        return refuse(match err {
-            TryDispatchError::Full => Refusal::Overloaded("gil=True bridge queue full"),
-            TryDispatchError::Closed => Refusal::ShuttingDown("gil=True bridge stopped"),
-        });
+        let error = match err {
+            TryDispatchError::Full => HandlerError::Overloaded("gil=True bridge queue"),
+            TryDispatchError::Closed => HandlerError::PoolClosed("gil=True bridge"),
+        };
+        return fail(error, tag);
     }
 
-    match await_reply(response_rx, "gil=True bridge dropped the request").await {
+    let lost = |_| HandlerError::WorkerLost("the gil=True bridge dropped the request");
+    match await_reply(response_rx, lost).await {
         Ok(result) => build_main_http_response(result, accept_encoding.as_str()),
-        Err(refusal) => refuse(refusal),
+        Err(e) => fail(e, tag),
     }
 }

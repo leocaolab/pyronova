@@ -46,37 +46,52 @@ pub(crate) fn setup_tcp_quickack(stream: &tokio::net::TcpStream) {
     }
 }
 
+/// A listening socket that could not be set up: the step that failed, on which address,
+/// with the OS error (`source().kind()` tells e.g. `AddrInUse`).
+#[derive(Debug, thiserror::Error)]
+#[error("{step} for {addr} failed: {source}")]
+pub(crate) struct ListenerError {
+    pub(crate) step: &'static str,
+    pub(crate) addr: SocketAddr,
+    #[source]
+    pub(crate) source: std::io::Error,
+}
+
+/// Backlog of the listening socket: large, to avoid SYN drops at 200k+ QPS.
+const LISTEN_BACKLOG: i32 = 8192;
+
 /// Create a TCP listener with SO_REUSEPORT (kernel load-balanced accept)
-/// and a large backlog (8192) to avoid SYN drops under extreme load.
-pub(crate) fn create_reuseport_listener(addr: SocketAddr) -> Result<std::net::TcpListener, String> {
+/// and a large backlog to avoid SYN drops under extreme load.
+pub(crate) fn create_reuseport_listener(
+    addr: SocketAddr,
+) -> Result<std::net::TcpListener, ListenerError> {
     use socket2::{Domain, Protocol, Socket, Type};
 
+    let failed = |step: &'static str| move |source| ListenerError { step, addr, source };
     let domain = if addr.is_ipv4() {
         Domain::IPV4
     } else {
         Domain::IPV6
     };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
-        .map_err(|e| format!("socket creation error: {e}"))?;
+        .map_err(failed("socket creation"))?;
 
     socket
         .set_reuse_address(true)
-        .map_err(|e| format!("set_reuse_address error: {e}"))?;
+        .map_err(failed("set_reuse_address"))?;
 
     // SO_REUSEPORT: allows multiple listeners on the same port.
     // Kernel distributes incoming connections across all listeners.
     #[cfg(not(windows))]
     socket
         .set_reuse_port(true)
-        .map_err(|e| format!("set_reuse_port error: {e}"))?;
+        .map_err(failed("set_reuse_port"))?;
 
     socket
         .set_nonblocking(true)
-        .map_err(|e| format!("set_nonblocking error: {e}"))?;
+        .map_err(failed("set_nonblocking"))?;
 
-    socket
-        .bind(&addr.into())
-        .map_err(|e| format!("bind error: {e}"))?;
+    socket.bind(&addr.into()).map_err(failed("bind"))?;
 
     // TCP_DEFER_ACCEPT (Linux only): don't wake the accept loop on the
     // bare three-way handshake — wait until the client actually sends
@@ -119,10 +134,7 @@ pub(crate) fn create_reuseport_listener(addr: SocketAddr) -> Result<std::net::Tc
         }
     }
 
-    // Large backlog to avoid SYN drops at 200k+ QPS.
-    socket
-        .listen(8192)
-        .map_err(|e| format!("listen error: {e}"))?;
+    socket.listen(LISTEN_BACKLOG).map_err(failed("listen"))?;
 
     Ok(socket.into())
 }
@@ -179,5 +191,24 @@ fn is_resource_exhaustion(e: &std::io::Error) -> bool {
             }
         }
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_bind_names_the_step_and_keeps_the_os_error() {
+        // TEST-NET-1 (RFC 5737): never an address of this host.
+        let addr: SocketAddr = "192.0.2.1:0".parse().unwrap();
+        let err = create_reuseport_listener(addr).expect_err("not a local address");
+        assert_eq!(err.step, "bind");
+        assert_eq!(err.addr, addr);
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AddrNotAvailable);
+        assert!(
+            err.to_string().starts_with("bind for 192.0.2.1:0 failed: "),
+            "{err}"
+        );
     }
 }

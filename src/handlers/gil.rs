@@ -13,8 +13,9 @@ use crate::router::{Call, RequestBody, Target};
 use crate::site::SharedSite;
 use crate::types::PyronovaRequest;
 
+use super::error::{HandlerError, RequestTag};
 use super::pipeline::{
-    await_reply, collect_body, finish, preprocess, refuse, BodyReject, Prepared, Preprocessed,
+    await_reply, collect_body, fail, finish, preprocess, task_lost, Prepared, Preprocessed,
     RequestLine, Served,
 };
 use super::{
@@ -48,15 +49,21 @@ pub(crate) async fn run_on_main(
     client_ip_addr: std::net::IpAddr,
     served: Served,
 ) -> Response<BoxBody> {
-    // The `Request` takes the method, path and headers; the log line and the response keep
-    // their own copies.
+    // The `Request` takes the method, path, headers and id; the log line and the response
+    // keep their own copies.
     let method: Arc<str> = Arc::from(prepared.parts.method.as_str());
     let path: Arc<str> = Arc::from(prepared.parts.uri.path());
+    let id = prepared.request_id.clone();
     let accept_encoding = prepared.accept_encoding();
     let line = RequestLine {
         method: &method,
         path: &path,
         start: prepared.start,
+    };
+    let tag = RequestTag {
+        id: &id,
+        method: &method,
+        path: &path,
     };
 
     let resp = match main_request(prepared, &method, &path, body, client_ip_addr).await {
@@ -65,12 +72,12 @@ pub(crate) async fn run_on_main(
             let task = tokio::task::spawn_blocking(move || {
                 call_handler_with_hooks(&site_ref, target, sky_req)
             });
-            match await_reply(task, "main-interpreter handler thread panicked").await {
+            match await_reply(task, task_lost).await {
                 Ok(result) => build_main_http_response(result, accept_encoding.as_str()),
-                Err(refusal) => refuse(refusal),
+                Err(e) => fail(e, &tag),
             }
         }
-        Err(reject) => reject.into_response(),
+        Err(e) => fail(e, &tag),
     };
     finish(resp, site, &line, served)
 }
@@ -83,7 +90,7 @@ async fn main_request(
     path: &Arc<str>,
     body: RequestBody,
     client_ip_addr: std::net::IpAddr,
-) -> Result<PyronovaRequest, BodyReject> {
+) -> Result<PyronovaRequest, HandlerError> {
     let query = prepared.query().to_owned();
     let (body_bytes, body_stream_rx) = match body {
         RequestBody::Streamed => {
@@ -91,10 +98,10 @@ async fn main_request(
             tokio::spawn(stream_body_feeder(prepared.body, tx, max_body_size()));
             (Bytes::new(), Arc::new(std::sync::Mutex::new(Some(rx))))
         }
-        RequestBody::Buffered => match collect_body(prepared.body, max_body_size()).await {
-            Ok(bytes) => (bytes, crate::python::body_stream::empty_body_stream_rx()),
-            Err(reject) => return Err(reject),
-        },
+        RequestBody::Buffered => (
+            collect_body(prepared.body, max_body_size()).await?,
+            crate::python::body_stream::empty_body_stream_rx(),
+        ),
     };
     Ok(PyronovaRequest {
         method: Arc::clone(method),
@@ -103,6 +110,7 @@ async fn main_request(
         query,
         headers: prepared.parts.headers,
         client_ip_addr,
+        request_id: prepared.request_id,
         body_bytes,
         body_stream_rx,
         query_cache: std::sync::OnceLock::new(),

@@ -108,14 +108,17 @@ Full migration table + rationale: [CHANGELOG.md#v200](CHANGELOG.md#v200-2026-04-
   (print route table). `python -m pyronova …` works the same way.
 - **Kubernetes health probes** — `app.enable_health_probes()` registers
   `/livez` (always 200) and `/readyz` (runs every
-  `@app.readiness_check("name")`, sync or async; any failure → 503 with
-  JSON diagnostics).
+  `@app.readiness_check("name")`, sync or async; any failure → 503 naming
+  the failing checks and the request id; why a check failed goes to the
+  log, never to the unauthenticated body).
 - **Prometheus metrics** — `app.enable_metrics()` exposes `GET /metrics`
   with RED-style counters. Counters live in `app.state` so they
   aggregate across sub-interpreter workers.
-- **X-Request-ID** — `app.enable_request_id()` mints a UUID if the
-  client didn't send one, echoes it back, pushes it into per-request
-  `ctx`.
+- **X-Request-ID** — every request has an id (`req.request_id`); a 5xx
+  body is `{"error": "Internal Server Error", "request_id": "..."}` and
+  the log line holding the real exception carries the same id.
+  `app.enable_request_id()` takes the id from the client's header when it
+  sends one, echoes it back, pushes it into per-request `ctx`.
 - **Request-scoped context** — `from pyronova.context import ctx`;
   `ContextVar`-backed `ctx.get/set/request_id()`, reset per request.
 - **`Settings`** — thin pydantic-settings base (lazy import, opt-in)

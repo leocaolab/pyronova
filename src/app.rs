@@ -34,6 +34,8 @@ pub(crate) struct PyronovaApp {
     access_log: AccessLog,
     /// Answer the built-in gRPC benchmark method (`enable_grpc_benchmark`).
     grpc_benchmark: bool,
+    /// The header a client's request id arrives in (`set_request_id_header`).
+    request_id_header: Option<hyper::header::HeaderName>,
     /// Opt into Thread-Per-Core mode. See docs/tpc-rearch.md. Can also
     /// be flipped via the `PYRONOVA_TPC=1` env var; either is sufficient.
     tpc: bool,
@@ -50,6 +52,7 @@ impl PyronovaApp {
             cors: None,
             access_log: AccessLog::disabled(),
             grpc_benchmark: false,
+            request_id_header: None,
             tpc: false,
         }
     }
@@ -115,6 +118,19 @@ impl PyronovaApp {
     /// request is routed as usual.
     fn enable_grpc_benchmark(&mut self) {
         self.grpc_benchmark = true;
+    }
+
+    /// Take a request's id from the client's `header` when it sends a usable one (visible
+    /// ASCII, at most 128 bytes); otherwise the server mints one. Either way the id is
+    /// `req.request_id`, and a 5xx reports it.
+    fn set_request_id_header(&mut self, header: &str) -> PyResult<()> {
+        let name = hyper::header::HeaderName::from_bytes(header.as_bytes()).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid request-id header name {header:?}: {e}"
+            ))
+        })?;
+        self.request_id_header = Some(name);
+        Ok(())
     }
 
     /// Enable/disable per-instance request logging.
@@ -423,6 +439,8 @@ impl PyronovaApp {
                  `if not pyronova.engine._in_worker():`",
             ));
         }
+        // isojson is a hard dependency: without it the server doesn't start.
+        crate::response::require_json(py)?;
         // Refresh the metrics kill-switch from the current env every
         // run() — process-level state, but tests / hot-reload may flip
         // PYRONOVA_METRICS between runs and we want each new server to
@@ -477,7 +495,7 @@ impl PyronovaApp {
         let tls_acceptor = match (tls_cert, tls_key) {
             (Some(cert), Some(key)) => Some(
                 crate::tls::build_acceptor(cert, key)
-                    .map_err(pyo3::exceptions::PyValueError::new_err)?,
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?,
             ),
             (None, None) => None,
             _ => {
@@ -553,7 +571,7 @@ impl PyronovaApp {
         // After Phase 3+4+5 TPC covers every route shape:
         //   gil=True        → main-interp bridge
         //   async def       → sub-interp asyncio loop (inline, blocking)
-        //   response stream → main-interp bridge BridgeResponse::Stream
+        //   response stream → main-interp bridge (MainReply::Stream)
         //   stream=True     → body feeder on TPC LocalSet, receiver
         //                     forwarded to bridge via GilWorkItem.body_stream_rx
         //
@@ -790,6 +808,18 @@ pub(crate) struct WorkerRoutes {
     pub(crate) after_hooks: Vec<Py<PyAny>>,
 }
 
+impl WorkerRoutes {
+    /// A script that registered nothing (a main table with no routes either).
+    pub(crate) fn empty() -> Self {
+        WorkerRoutes {
+            signature: crate::router::RouteSignature::default(),
+            handlers: Vec::new(),
+            before_hooks: Vec::new(),
+            after_hooks: Vec::new(),
+        }
+    }
+}
+
 /// The routes of the app this worker's script registered on, or `None` if it registered
 /// none. Meaningful only in a worker, after its script ran.
 pub(crate) fn worker_routes(py: Python<'_>) -> Option<WorkerRoutes> {
@@ -867,6 +897,7 @@ impl PyronovaApp {
                 cors: self.cors.clone(),
                 access_log: self.access_log.clone(),
                 grpc_benchmark: self.grpc_benchmark,
+                request_id_header: self.request_id_header.clone(),
             },
         }
     }
@@ -992,7 +1023,7 @@ impl PyronovaApp {
 
                 for _ in 0..n_accept {
                     let std_listener = create_reuseport_listener(addr).map_err(|e| {
-                        pyo3::exceptions::PyOSError::new_err(e)
+                        pyo3::exceptions::PyOSError::new_err(e.to_string())
                     })?;
                     let listener = TcpListener::from_std(std_listener).map_err(|e| {
                         pyo3::exceptions::PyOSError::new_err(format!("TcpListener::from_std error: {e}"))
@@ -1193,7 +1224,7 @@ impl PyronovaApp {
 
                 for _ in 0..n_accept {
                     let std_listener = create_reuseport_listener(addr).map_err(|e| {
-                        pyo3::exceptions::PyOSError::new_err(e)
+                        pyo3::exceptions::PyOSError::new_err(e.to_string())
                     })?;
                     let listener = TcpListener::from_std(std_listener).map_err(|e| {
                         pyo3::exceptions::PyOSError::new_err(format!("TcpListener::from_std error: {e}"))
@@ -1312,7 +1343,7 @@ impl PyronovaApp {
     ) -> PyResult<()> {
         py.detach(move || -> PyResult<()> {
             crate::tpc::run_tpc_gil(addr, io_workers, num_cpus, routes, tls_acceptor)
-                .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })
     }
 
@@ -1353,7 +1384,7 @@ impl PyronovaApp {
         // stream=True: already gated by gil=True in route registration,
         //   so all stream routes flow through the main-interp bridge.
         //   Phase 5 wires stream responses back through the bridge
-        //   oneshot (BridgeResponse enum).
+        //   oneshot (`MainReply::Stream`).
         let expected = crate::router::RouteSignature::of(&routes.routes);
         let gc_mode = crate::tpc::GcMode::from_env()
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -1408,7 +1439,7 @@ impl PyronovaApp {
             if let Some(bridge) = bridge_to_join {
                 crate::bridge::main_bridge::MainInterpBridge::shutdown_join(bridge);
             }
-            res.map_err(pyo3::exceptions::PyRuntimeError::new_err)
+            res.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })
     }
 

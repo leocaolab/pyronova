@@ -9,16 +9,19 @@ use pyo3::prelude::*;
 
 use crate::python::interp;
 use crate::python::stream::PyronovaStream;
-use crate::response::{extract_response_data, status_or_500};
+use crate::response::{extract_response_data, ResponseError};
 use crate::router::Target;
 use crate::site::Site;
 use crate::types::{PyronovaRequest, ResponseData, ResponseHeaders};
+
+use error::{HandlerError, Logged, RequestTag, Stage};
 
 pub(crate) type SharedPool = Arc<interp::InterpreterPool>;
 
 // Per-dispatch-path handlers live in submodules; the pipeline every path shares
 // (preprocess, collect_body, finish) is `pipeline`; helpers used by several paths stay
 // below.
+pub(crate) mod error;
 pub(crate) mod gil;
 pub(crate) mod pipeline;
 pub(crate) mod subinterp;
@@ -43,16 +46,16 @@ pub(crate) fn max_body_size() -> usize {
     MAX_BODY_SIZE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Result from handler: either a normal response or a stream.
-pub(crate) enum HandlerResult {
-    PyronovaResponse(Result<ResponseData, String>),
-    PyronovaStream(StreamInfo),
+/// What a main-interpreter handler answered: a buffered response, or a stream (SSE).
+pub(crate) enum MainReply {
+    Response(ResponseData),
+    Stream(StreamInfo),
 }
 
 pub(crate) struct StreamInfo {
     rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::convert::Infallible>>,
     content_type: HeaderValue,
-    status: u16,
+    status: hyper::StatusCode,
     headers: ResponseHeaders,
 }
 
@@ -119,7 +122,13 @@ pub(crate) fn close_thread_event_loop(py: Python<'_>) {
 ///
 /// Uses thread_local to cache event loop per spawn_blocking thread —
 /// avoids asyncio.run() overhead of creating/destroying loop per request.
-fn resolve_coroutine(py: Python<'_>, obj: Py<PyAny>) -> Result<Py<PyAny>, String> {
+///
+/// An exception the awaitable raises is `stage`'s; one creating the loop is setup's.
+fn resolve_coroutine(
+    py: Python<'_>,
+    obj: Py<PyAny>,
+    stage: Stage,
+) -> Result<Py<PyAny>, HandlerError> {
     let bound = obj.bind(py);
     // Awaitable detection via C-level type slot probe.
     //
@@ -155,20 +164,14 @@ fn resolve_coroutine(py: Python<'_>, obj: Py<PyAny>) -> Result<Py<PyAny>, String
     LOOP.with(|tl| {
         let mut guard = tl.borrow_mut();
 
-        if guard.0.is_none() {
-            let asyncio = py
-                .import("asyncio")
-                .map_err(|e| format!("import asyncio: {e}"))?;
-            let new_loop = asyncio
-                .call_method0("new_event_loop")
-                .map_err(|e| format!("new_event_loop: {e}"))?;
-            asyncio
-                .call_method1("set_event_loop", (&new_loop,))
-                .map_err(|e| format!("set_event_loop: {e}"))?;
-            guard.0 = Some((new_loop.unbind(), crate::run_context::Interp::current(py)));
-        }
-
-        let (loop_obj, loop_interp) = guard.0.as_ref().unwrap();
+        let (loop_obj, loop_interp) = match &mut guard.0 {
+            Some(existing) => &*existing,
+            empty @ None => {
+                let new_loop =
+                    new_event_loop(py).map_err(|e| HandlerError::python(py, Stage::Setup, &e))?;
+                &*empty.insert((new_loop.unbind(), crate::run_context::Interp::current(py)))
+            }
+        };
         // R-4: the loop belongs to the interpreter that created it. Only main-side threads
         // reach this path; one arriving from another interpreter is a bug.
         debug_assert_eq!(
@@ -179,9 +182,17 @@ fn resolve_coroutine(py: Python<'_>, obj: Py<PyAny>) -> Result<Py<PyAny>, String
         let event_loop = loop_obj.bind(py);
         let result = event_loop
             .call_method1("run_until_complete", (bound,))
-            .map_err(|e| format!("run_until_complete error: {e}"))?;
+            .map_err(|e| HandlerError::python(py, stage, &e))?;
         Ok(result.unbind())
     })
+}
+
+/// A new asyncio event loop, set as this thread's current one.
+fn new_event_loop(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    let asyncio = py.import("asyncio")?;
+    let new_loop = asyncio.call_method0("new_event_loop")?;
+    asyncio.call_method1("set_event_loop", (&new_loop,))?;
+    Ok(new_loop)
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +212,7 @@ pub(crate) fn full_body(resp: Response<Full<Bytes>>) -> Response<BoxBody> {
 /// A handler's result as a hyper response, compressed if the client accepts it. Every
 /// interpreter's handlers (main, pool workers, TPC inline) end here.
 pub(crate) fn http_response(
-    mut result: Result<ResponseData, String>,
+    mut result: Result<ResponseData, Logged>,
     accept_encoding: &str,
 ) -> Response<BoxBody> {
     if let Ok(data) = result.as_mut() {
@@ -213,12 +224,13 @@ pub(crate) fn http_response(
 /// A main-interpreter handler result (GIL mode, the pool's `gil=True` routes, the TPC
 /// bridge) as a hyper response: a buffered response, or an SSE stream.
 pub(crate) fn build_main_http_response(
-    result: HandlerResult,
+    result: Result<MainReply, Logged>,
     accept_encoding: &str,
 ) -> Response<BoxBody> {
     match result {
-        HandlerResult::PyronovaResponse(result) => http_response(result, accept_encoding),
-        HandlerResult::PyronovaStream(info) => build_stream_response(info),
+        Ok(MainReply::Response(data)) => http_response(Ok(data), accept_encoding),
+        Ok(MainReply::Stream(info)) => build_stream_response(info),
+        Err(logged) => http_response(Err(logged), accept_encoding),
     }
 }
 
@@ -291,12 +303,13 @@ pub(crate) async fn stream_body_feeder(
 // ---------------------------------------------------------------------------
 
 /// Runs `target`'s handler on the main interpreter with the before/after hooks, all in one
-/// fresh `contextvars.Context` (see `python::request_context`).
+/// fresh `contextvars.Context` (see `python::request_context`). A failure is logged here,
+/// on the thread that ran it.
 pub(crate) fn call_handler_with_hooks(
     site: &Site,
     target: Target,
     sky_req: PyronovaRequest,
-) -> HandlerResult {
+) -> Result<MainReply, Logged> {
     use std::sync::atomic::Ordering::Relaxed;
 
     // Track GIL queue: +1 before acquiring, -1 after acquiring
@@ -307,6 +320,18 @@ pub(crate) fn call_handler_with_hooks(
     // measures real request latency instead of artificial contention.
     let gil_wait_start = std::time::Instant::now();
 
+    // The request as its error log line names it; `sky_req` moves into its `Request`.
+    let (id, method, path) = (
+        sky_req.request_id.clone(),
+        Arc::clone(&sky_req.method),
+        Arc::clone(&sky_req.path),
+    );
+    let tag = RequestTag {
+        id: &id,
+        method: &method,
+        path: &path,
+    };
+
     crate::run_context::main_attach(|py| {
         crate::monitor::GIL_QUEUE_LENGTH.fetch_sub(1, Relaxed);
         crate::monitor::record_gil_wait(gil_wait_start.elapsed().as_micros() as u64);
@@ -315,15 +340,11 @@ pub(crate) fn call_handler_with_hooks(
         let result = crate::python::request_context::in_request_context(py, || {
             run_with_hooks(py, site, target, sky_req)
         })
-        .unwrap_or_else(|e| {
-            HandlerResult::PyronovaResponse(Err(format!(
-                "could not enter the request's contextvars.Context: {e}"
-            )))
-        });
+        .unwrap_or_else(|e| Err(HandlerError::python(py, Stage::Setup, &e)));
 
         // Record GIL hold time before releasing GIL
         crate::monitor::GIL_HOLD_MAX_US.fetch_max(hold_start.elapsed().as_micros() as u64, Relaxed);
-        result
+        result.map_err(|e| e.log(&tag))
     })
 }
 
@@ -332,67 +353,47 @@ fn run_with_hooks(
     site: &Site,
     target: Target,
     sky_req: PyronovaRequest,
-) -> HandlerResult {
+) -> Result<MainReply, HandlerError> {
     let routes = &site.routes;
     // One `Request` object for the hooks and the handler.
-    let req = match Py::new(py, sky_req) {
-        Ok(r) => r,
-        Err(e) => {
-            return HandlerResult::PyronovaResponse(Err(format!("failed to create Request: {e}")))
-        }
-    };
+    let req = Py::new(py, sky_req).map_err(|e| HandlerError::python(py, Stage::Setup, &e))?;
 
-    match run_before_hooks(py, &routes.before_hooks, &req) {
-        Ok(None) => {}
-        Ok(Some(short_circuit)) => return HandlerResult::PyronovaResponse(Ok(short_circuit)),
-        Err(e) => return HandlerResult::PyronovaResponse(Err(e)),
+    if let Some(short_circuit) = run_before_hooks(py, &routes.before_hooks, &req)? {
+        return Ok(MainReply::Response(short_circuit));
     }
 
-    let obj = match routes.handler(target).call1(py, (req.clone_ref(py),)) {
-        Ok(obj) => obj,
-        Err(e) => {
-            // Log the full PyErr (traceback via the Python logging bridge) server-side;
-            // the client gets a generic 500.
-            e.display(py);
-            tracing::error!(
-                target: "pyronova::server",
-                error = %e,
-                "handler raised an exception",
-            );
-            return HandlerResult::PyronovaResponse(Err("handler error".to_string()));
-        }
-    };
+    let obj = routes
+        .handler(target)
+        .call1(py, (req.clone_ref(py),))
+        .map_err(|e| HandlerError::python(py, Stage::Handler, &e))?;
     // If handler returned a coroutine (async def), run it via asyncio
-    let obj = match resolve_coroutine(py, obj) {
-        Ok(o) => o,
-        Err(e) => return HandlerResult::PyronovaResponse(Err(e)),
-    };
+    let obj = resolve_coroutine(py, obj, Stage::Handler)?;
 
     // A `Stream` (SSE) goes out as a streaming body. `is_instance_of` is a single C
     // pointer compare, no string alloc.
     let bound = obj.bind(py);
     if bound.is_instance_of::<PyronovaStream>() {
-        return stream_result(bound);
+        return Ok(MainReply::Stream(stream_info(bound)?));
     }
 
-    let resp = extract_response_data(py, bound.clone())
-        .and_then(|data| run_after_hooks(py, &routes.after_hooks, &req, data));
-    HandlerResult::PyronovaResponse(resp)
+    let data = extract_response_data(py, bound.clone())?;
+    let data = run_after_hooks(py, &routes.after_hooks, &req, data)?;
+    Ok(MainReply::Response(data))
 }
 
-fn stream_result(bound: &Bound<'_, PyAny>) -> HandlerResult {
-    let stream_ref = match bound.cast::<PyronovaStream>() {
-        Ok(s) => s.get(),
-        Err(e) => return HandlerResult::PyronovaResponse(Err(e.to_string())),
-    };
-    let Some(rx) = stream_ref.take_rx() else {
-        return HandlerResult::PyronovaResponse(Err("PyronovaStream already consumed".to_string()));
-    };
-    HandlerResult::PyronovaStream(StreamInfo {
+/// A `Stream` a handler returned, taken for sending. `bound` is a `Stream` instance.
+fn stream_info(bound: &Bound<'_, PyAny>) -> Result<StreamInfo, ResponseError> {
+    let stream = bound
+        .cast::<PyronovaStream>()
+        .map_err(|_| ResponseError::StreamConsumed)?
+        .get();
+    let status = crate::response::http_status(stream.status_code)?;
+    let rx = stream.take_rx().ok_or(ResponseError::StreamConsumed)?;
+    Ok(StreamInfo {
         rx,
-        content_type: stream_ref.content_type.clone(),
-        status: stream_ref.status_code,
-        headers: stream_ref.headers.clone(),
+        content_type: stream.content_type.clone(),
+        status,
+        headers: stream.headers.clone(),
     })
 }
 
@@ -403,16 +404,15 @@ pub(crate) fn run_before_hooks(
     py: Python<'_>,
     hooks: &[Py<PyAny>],
     req: &Py<PyronovaRequest>,
-) -> Result<Option<ResponseData>, String> {
+) -> Result<Option<ResponseData>, HandlerError> {
     for hook in hooks {
         let result = hook
             .call1(py, (req.clone_ref(py),))
-            .map_err(|e| format!("before_request hook error: {e}"))?;
-        let result =
-            resolve_coroutine(py, result).map_err(|e| format!("before_request hook error: {e}"))?;
+            .map_err(|e| HandlerError::python(py, Stage::BeforeHook, &e))?;
+        let result = resolve_coroutine(py, result, Stage::BeforeHook)?;
         let bound = result.bind(py);
         if !bound.is_none() {
-            return extract_response_data(py, bound.clone()).map(Some);
+            return Ok(Some(extract_response_data(py, bound.clone())?));
         }
     }
     Ok(None)
@@ -425,16 +425,13 @@ fn run_after_hooks(
     hooks: &[Py<PyAny>],
     req: &Py<PyronovaRequest>,
     mut resp_data: ResponseData,
-) -> Result<ResponseData, String> {
+) -> Result<ResponseData, HandlerError> {
     for hook in hooks {
-        let current_resp = resp_data
-            .to_py(py)
-            .map_err(|e| format!("failed to create Response: {e}"))?;
+        let current_resp = resp_data.to_py(py)?;
         let result = hook
             .call1(py, (req.clone_ref(py), current_resp))
-            .map_err(|e| format!("after_request hook error: {e}"))?;
-        let result =
-            resolve_coroutine(py, result).map_err(|e| format!("after_request hook error: {e}"))?;
+            .map_err(|e| HandlerError::python(py, Stage::AfterHook, &e))?;
+        let result = resolve_coroutine(py, result, Stage::AfterHook)?;
         let bound = result.bind(py);
         if !bound.is_none() {
             resp_data = extract_response_data(py, bound.clone())?;
@@ -472,7 +469,7 @@ pub(crate) fn build_stream_response(info: StreamInfo) -> Response<BoxBody> {
         .entry(SERVER)
         .or_insert(HeaderValue::from_static(crate::response::SERVER_HEADER));
     let mut resp = Response::new(boxed);
-    *resp.status_mut() = status_or_500(info.status);
+    *resp.status_mut() = info.status;
     *resp.headers_mut() = headers;
     resp
 }

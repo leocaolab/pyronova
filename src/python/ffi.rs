@@ -14,12 +14,19 @@ use super::pool::*;
 // Global worker state for the async engine (`worker_api.rs`)
 // ---------------------------------------------------------------------------
 
+/// A request the async engine is running: where its reply goes, and the request as its
+/// error log line names it.
+pub(crate) struct Pending {
+    pub(crate) reply: WorkReply,
+    pub(crate) request_id: crate::request_id::RequestId,
+    pub(crate) method: Arc<str>,
+    pub(crate) path: Arc<str>,
+}
+
 /// Per-async-worker state, reached by `_worker_recv` / `_worker_send` through `WORKER_ID`.
 pub(crate) struct WorkerState {
     pub(crate) rx: crossbeam_channel::Receiver<WorkRequest>,
-    pub(crate) response_map: Mutex<
-        HashMap<u64, tokio::sync::oneshot::Sender<Result<crate::types::ResponseData, String>>>,
-    >,
+    pub(crate) response_map: Mutex<HashMap<u64, Pending>>,
     pub(crate) next_req_id: AtomicU64,
     /// Identifier for the `InterpreterPool` instance that created this
     /// state. A zombie worker from a prior pool (test / hot-reload)

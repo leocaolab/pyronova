@@ -15,7 +15,9 @@ use hyper::http::request::Parts;
 use hyper::{Request, Response};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use super::error::{HandlerError, RequestTag};
 use super::{full_body, BoxBody};
+use crate::request_id::RequestId;
 use crate::router::{Call, Params};
 use crate::site::Site;
 
@@ -89,6 +91,10 @@ pub(crate) fn finish(
 
 // ─────────────────────────── preprocessing ───────────────────────────
 
+/// What preprocessing decided. A return value moved once per request and never stored,
+/// so the size gap between the variants costs nothing; boxing `Prepared` would cost an
+/// allocation on every dispatched request.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Preprocessed {
     /// Answered without a handler (gRPC, fast path, static file, 404), already finished.
     Respond(Response<BoxBody>),
@@ -104,6 +110,8 @@ pub(crate) struct Prepared {
     pub(crate) call: Call,
     pub(crate) params: Params,
     pub(crate) start: Instant,
+    /// Written here, once; the handler's `Request`, the error log and a 5xx body read it.
+    pub(crate) request_id: RequestId,
 }
 
 impl Prepared {
@@ -183,12 +191,14 @@ pub(crate) async fn preprocess(
             }
         },
     };
+    let request_id = RequestId::of(&parts.headers, site.config.request_id_header.as_ref());
     Ok(Preprocessed::Dispatch(Prepared {
         parts,
         body,
         call,
         params,
         start,
+        request_id,
     }))
 }
 
@@ -231,33 +241,15 @@ async fn grpc_get_sum(
 
 // ─────────────────────────── body collection ───────────────────────────
 
-/// Why a request body was not collected.
-#[derive(Debug)]
+/// Why a request body was not collected: the client's doing (a 4xx).
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum BodyReject {
-    /// Over `max_body_size`.
+    #[error("request body is larger than max_body_size")]
     TooLarge,
-    /// It needed an admission permit and none was free.
-    Overloaded,
-    /// Not complete within [`REQUEST_BUDGET`].
+    #[error("request body did not arrive within {REQUEST_BUDGET:?}")]
     TimedOut,
-    /// The connection failed while reading it.
-    Read(hyper::Error),
-}
-
-impl BodyReject {
-    pub(crate) fn into_response(self) -> Response<BoxBody> {
-        match self {
-            BodyReject::TooLarge => full_body(crate::response::payload_too_large_response()),
-            BodyReject::Overloaded => refuse(Refusal::Overloaded("server overloaded")),
-            BodyReject::TimedOut => full_body(crate::response::request_timeout_response()),
-            BodyReject::Read(e) => {
-                tracing::warn!(target: "pyronova::server", error = %e, "request body read failed");
-                full_body(crate::response::bad_request_response(&format!(
-                    "request body read failed: {e}"
-                )))
-            }
-        }
-    }
+    #[error("request body read failed: {0}")]
+    Read(#[source] hyper::Error),
 }
 
 /// The sub-interpreter pool's admission gate: a body past `skip_bytes` needs a permit.
@@ -279,24 +271,28 @@ pub(crate) struct Admitted {
 }
 
 /// The whole body, at most `max` bytes, within [`REQUEST_BUDGET`].
-pub(crate) async fn collect_body(body: Incoming, max: usize) -> Result<Bytes, BodyReject> {
+pub(crate) async fn collect_body(body: Incoming, max: usize) -> Result<Bytes, HandlerError> {
     collect(body, max, None).await.map(|admitted| admitted.body)
 }
 
-/// [`collect_body`], passing the pool's admission gate.
+/// [`collect_body`], passing the pool's admission gate: a body that needs a permit when
+/// none is free is [`HandlerError::Overloaded`].
 pub(crate) async fn collect_body_with_admission(
     body: Incoming,
     max: usize,
     admission: Admission<'_>,
-) -> Result<Admitted, BodyReject> {
+) -> Result<Admitted, HandlerError> {
     collect(body, max, Some(admission)).await
 }
+
+/// No admission permit was free.
+pub(crate) const OVERLOADED: HandlerError = HandlerError::Overloaded("admission permits");
 
 async fn collect(
     mut body: Incoming,
     max: usize,
     mut admission: Option<Admission<'_>>,
-) -> Result<Admitted, BodyReject> {
+) -> Result<Admitted, HandlerError> {
     let read = async {
         let mut buf = BodyBuf::Empty;
         while let Some(frame) = body.frame().await {
@@ -305,7 +301,7 @@ async fn collect(
                 continue;
             };
             if buf.len().saturating_add(data.len()) > max {
-                return Err(BodyReject::TooLarge);
+                return Err(HandlerError::from(BodyReject::TooLarge));
             }
             buf = buf.push(data);
             if let Some(gate) = admission.as_mut() {
@@ -314,12 +310,12 @@ async fn collect(
                         .semaphore
                         .clone()
                         .try_acquire_owned()
-                        .map_err(|_| BodyReject::Overloaded)?;
+                        .map_err(|_| OVERLOADED)?;
                     gate.permit = Some(permit);
                 }
             }
         }
-        Ok(buf.freeze())
+        Ok::<_, HandlerError>(buf.freeze())
     };
     let body = tokio::time::timeout(REQUEST_BUDGET, read)
         .await
@@ -374,39 +370,29 @@ impl BodyBuf {
 
 // ─────────────────────────── giving up ───────────────────────────
 
-/// A request the server accepted but gave up on. Each one is counted in
-/// `DROPPED_REQUESTS`, on every path.
-pub(crate) enum Refusal {
-    /// A queue or permit budget is full (503, retry).
-    Overloaded(&'static str),
-    /// The workers that would run it are gone: the server is shutting down (503).
-    ShuttingDown(&'static str),
-    /// The worker running it dropped its reply: it panicked or exited (500).
-    WorkerLost(&'static str),
-    /// The handler did not answer within [`REQUEST_BUDGET`] (504).
-    TimedOut,
+/// The response for an error that happened here, at the edge (no reply, no body, no
+/// capacity): logged now, then rendered.
+pub(crate) fn fail(error: HandlerError, request: &RequestTag<'_>) -> Response<BoxBody> {
+    full_body(error.log(request).into_response())
 }
 
-pub(crate) fn refuse(refusal: Refusal) -> Response<BoxBody> {
-    crate::monitor::DROPPED_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let resp = match refusal {
-        Refusal::Overloaded(why) => crate::response::overloaded_response(why),
-        Refusal::ShuttingDown(why) => crate::response::unavailable_response(why),
-        Refusal::WorkerLost(why) => crate::response::error_response(why),
-        Refusal::TimedOut => crate::response::gateway_timeout_response(),
-    };
-    full_body(resp)
-}
-
-/// Waits for a handler's reply for at most [`REQUEST_BUDGET`]. A reply channel closed
-/// without an answer means the worker was lost (`lost` says which).
+/// Waits for a handler's reply for at most [`REQUEST_BUDGET`]. A reply that ends without
+/// an answer is `lost`'s error (a closed channel, a panicked task).
 pub(crate) async fn await_reply<T, E>(
     reply: impl std::future::Future<Output = Result<T, E>>,
-    lost: &'static str,
-) -> Result<T, Refusal> {
+    lost: impl FnOnce(E) -> HandlerError,
+) -> Result<T, HandlerError> {
     match tokio::time::timeout(REQUEST_BUDGET, reply).await {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(_)) => Err(Refusal::WorkerLost(lost)),
-        Err(_) => Err(Refusal::TimedOut),
+        Ok(Err(e)) => Err(lost(e)),
+        Err(_) => Err(HandlerError::Timeout),
+    }
+}
+
+/// A blocking task that ended without a reply: its panic, with the payload.
+pub(crate) fn task_lost(e: tokio::task::JoinError) -> HandlerError {
+    match e.try_into_panic() {
+        Ok(payload) => HandlerError::panic(payload),
+        Err(_) => HandlerError::WorkerLost("the handler's task was cancelled"),
     }
 }
