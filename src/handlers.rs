@@ -304,7 +304,8 @@ pub(crate) async fn stream_body_feeder(
 
 /// Runs `target`'s handler on the main interpreter with the before/after hooks, all in one
 /// fresh `contextvars.Context` (see `python::request_context`). A failure is logged here,
-/// on the thread that ran it.
+/// on the thread that ran it; a panic is such a failure, so the thread (a bridge worker,
+/// a blocking-pool thread) survives it.
 pub(crate) fn call_handler_with_hooks(
     site: &Site,
     target: Target,
@@ -337,10 +338,12 @@ pub(crate) fn call_handler_with_hooks(
         crate::monitor::record_gil_wait(gil_wait_start.elapsed().as_micros() as u64);
         let hold_start = std::time::Instant::now();
 
-        let result = crate::python::request_context::in_request_context(py, || {
-            run_with_hooks(py, site, target, sky_req)
-        })
-        .unwrap_or_else(|e| Err(HandlerError::python(py, Stage::Setup, &e)));
+        let result = error::catch_panic(|| {
+            crate::python::request_context::in_request_context(py, || {
+                run_with_hooks(py, site, target, sky_req)
+            })
+            .unwrap_or_else(|e| Err(HandlerError::python(py, Stage::Setup, &e)))
+        });
 
         // Record GIL hold time before releasing GIL
         crate::monitor::GIL_HOLD_MAX_US.fetch_max(hold_start.elapsed().as_micros() as u64, Relaxed);

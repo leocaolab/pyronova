@@ -36,6 +36,15 @@ fn leak_detect_dump() {
     leak_detect::dump_to_stderr();
 }
 
+/// Panics with `message`. PyO3 turns the panic into a `PanicException` in the calling
+/// handler, and the dispatcher that fetches it resumes the panic in Rust, on the path
+/// that ran the handler.
+#[cfg(feature = "fault_injection")]
+#[pyo3::pyfunction]
+fn _fault_panic(message: String) {
+    panic!("{message}");
+}
+
 #[pyo3::pyfunction]
 fn workrequest_counts() -> (u64, u64) {
     (
@@ -104,5 +113,7 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     #[cfg(feature = "leak_detect")]
     m.add_function(pyo3::wrap_pyfunction!(leak_detect_dump, m)?)?;
+    #[cfg(feature = "fault_injection")]
+    m.add_function(pyo3::wrap_pyfunction!(_fault_panic, m)?)?;
     Ok(())
 }
