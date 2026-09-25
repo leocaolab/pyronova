@@ -4,10 +4,12 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod app;
 #[cfg(feature = "bench")]
 mod bench;
+mod body;
 mod bridge;
 mod compression;
 mod config;
 mod db;
+mod error;
 mod grpc;
 mod handlers;
 mod json;
@@ -16,6 +18,7 @@ mod leak_detect;
 mod logging;
 mod monitor;
 mod python;
+mod request_head;
 mod request_id;
 mod response;
 mod router;
@@ -45,6 +48,16 @@ fn leak_detect_dump() {
 #[pyo3::pyfunction]
 fn _fault_panic(message: String) {
     panic!("{message}");
+}
+
+/// Makes the spawn of main-interpreter bridge thread `thread` fail, for every server this
+/// process starts afterwards. Set once per process.
+#[cfg(feature = "fault_injection")]
+#[pyo3::pyfunction]
+fn _fault_fail_bridge_spawn(thread: usize) -> pyo3::PyResult<()> {
+    bridge::main_bridge::FAIL_SPAWN_OF
+        .set(thread)
+        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("already set"))
 }
 
 #[pyo3::pyfunction]
@@ -142,5 +155,7 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(leak_detect_dump, m)?)?;
     #[cfg(feature = "fault_injection")]
     m.add_function(pyo3::wrap_pyfunction!(_fault_panic, m)?)?;
+    #[cfg(feature = "fault_injection")]
+    m.add_function(pyo3::wrap_pyfunction!(_fault_fail_bridge_spawn, m)?)?;
     Ok(())
 }

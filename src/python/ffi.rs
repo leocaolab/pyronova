@@ -18,9 +18,8 @@ use super::pool::*;
 /// error log line names it.
 pub(crate) struct Pending {
     pub(crate) reply: WorkReply,
-    pub(crate) request_id: crate::request_id::RequestId,
-    pub(crate) method: Arc<str>,
-    pub(crate) path: Arc<str>,
+    /// The request as its error log line names it.
+    pub(crate) label: crate::error::RequestLabel,
 }
 
 /// Per-async-worker state, reached by `_worker_recv` / `_worker_send` through `WORKER_ID`.

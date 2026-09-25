@@ -428,14 +428,38 @@ impl RouteTable {
         }
     }
 
-    /// The route `(method, path)` matches, where it runs, and its path parameters.
+    /// The route `(method, path)` matches, where it runs, and its path parameters. A
+    /// `HEAD` with no `HEAD` route runs the `GET` route (RFC 9110 §9.3.2); the pipeline
+    /// drops the body.
     pub(crate) fn resolve(&self, method: &str, path: &str) -> Option<(Call, Params)> {
-        let (id, params) = self.lookup(method, path)?;
+        let (id, params) = self.lookup(method, path).or_else(|| {
+            method
+                .eq_ignore_ascii_case("HEAD")
+                .then(|| self.lookup("GET", path))
+                .flatten()
+        })?;
         let call = match self.route(id).dispatch {
             Dispatch::Worker(kind) => Call::Worker(id, kind),
             Dispatch::Main(body) => Call::Main(Target::Route(id), body),
         };
         Some((call, params))
+    }
+
+    /// The methods that have a route for `path`, as an `Allow` value, or `None` if no
+    /// method has one. Only a request that matched no route asks, so the scan over the
+    /// per-method routers is off the hot path.
+    pub(crate) fn allowed_methods(&self, path: &str) -> Option<HeaderValue> {
+        let routed = self
+            .routers
+            .iter()
+            .filter(|(_, router)| router.at(path).is_ok())
+            .map(|(method, _)| method.as_str());
+        let prebuilt = self
+            .fast_responses
+            .iter()
+            .filter(|(_, paths)| paths.contains_key(path))
+            .map(|(method, _)| method.as_str());
+        allow_value(routed.chain(prebuilt))
     }
 
     /// The fallback handler's call, for a request no route (and no static file) matched.
@@ -445,13 +469,15 @@ impl RouteTable {
             .map(|_| Call::Main(Target::Fallback, RequestBody::Buffered))
     }
 
-    /// The pre-built response registered for exactly `(method, path)`.
+    /// The pre-built response registered for exactly `(method, path)`; for a `HEAD` with
+    /// none, the `GET` one (the pipeline drops the body).
     #[inline]
     pub(crate) fn fast_response(&self, method: &str, path: &str) -> Option<&FastResponse> {
         if self.fast_responses.is_empty() {
             return None;
         }
-        self.fast_responses.get(method)?.get(path)
+        let registered = |method: &str| self.fast_responses.get(method)?.get(path);
+        registered(method).or_else(|| (method == "HEAD").then(|| registered("GET"))?)
     }
 
     fn lookup(&self, method: &str, path: &str) -> Option<(RouteId, Params)> {
@@ -479,6 +505,22 @@ impl RouteTable {
             .collect();
         Some((*matched.value, params))
     }
+}
+
+/// `methods` as an `Allow` field value, sorted, with `HEAD` wherever `GET` is (it is
+/// served by the `GET` route); `None` for no methods. Route methods are HTTP tokens
+/// (registration uppercases them), so the list is a valid field value.
+fn allow_value<'a>(methods: impl Iterator<Item = &'a str>) -> Option<HeaderValue> {
+    let mut methods: Vec<&str> = methods.collect();
+    if methods.contains(&"GET") && !methods.contains(&"HEAD") {
+        methods.push("HEAD");
+    }
+    if methods.is_empty() {
+        return None;
+    }
+    methods.sort_unstable();
+    methods.dedup();
+    HeaderValue::from_str(&methods.join(", ")).ok()
 }
 
 /// Per route (registration order): whether it runs on main, and whether it is `async def`
@@ -522,6 +564,22 @@ impl RouteShape {
 
 /// Mutable during registration (before run).
 pub(crate) type MutableRoutes = Arc<RwLock<RouteTable>>;
+
+#[cfg(test)]
+mod allow_tests {
+    use super::*;
+
+    #[test]
+    fn allow_lists_sorted_methods_with_head_for_get() {
+        let allow = |m: &[&str]| allow_value(m.iter().copied());
+        assert_eq!(allow(&["POST", "GET"]).unwrap(), "GET, HEAD, POST");
+        assert_eq!(allow(&["GET", "HEAD"]).unwrap(), "GET, HEAD");
+        assert_eq!(allow(&["DELETE"]).unwrap(), "DELETE");
+        // A route and a pre-built response for the same method list it once.
+        assert_eq!(allow(&["GET", "GET"]).unwrap(), "GET, HEAD");
+        assert!(allow(&[]).is_none());
+    }
+}
 
 #[cfg(test)]
 mod template_tests {

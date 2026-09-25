@@ -45,42 +45,44 @@
 //! → handler → after hooks → response extraction. Coroutines and
 //! streams fall through the same logic.
 
-use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::OnceLock;
 
-use bytes::Bytes;
 use crossbeam_channel as cbc;
+use pyo3::prelude::*;
 use tokio::sync::oneshot;
 
-use crate::handlers::error::Logged;
+use crate::error::Logged;
 use crate::handlers::{call_handler_with_hooks, MainReply};
-use crate::request_id::RequestId;
 use crate::router::Target;
 use crate::site::SharedSite;
 use crate::types::PyronovaRequest;
 
-/// Work request for the main-interp bridge. Carries everything a GIL
-/// handler needs plus the oneshot reply channel. The reply is a buffered response or a
-/// stream (SSE): tokio's mpsc receiver inside a stream is `Send`, so it crosses back to
-/// the TPC thread, whose hyper body writer drives it.
+/// Work request for the main-interp bridge: the handler's `Request` (built on the TPC
+/// thread) plus the oneshot reply channel. The reply is a buffered response or a stream
+/// (SSE): tokio's mpsc receiver inside a stream is `Send`, so it crosses back to the TPC
+/// thread, whose hyper body writer drives it. A `stream=True` route's `Request` carries
+/// the receiver the feeder on the TPC thread's LocalSet pushes body frames into.
 pub(crate) struct GilWorkItem {
-    pub method: Arc<str>,
-    pub path: Arc<str>,
-    pub params: Vec<(String, String)>,
-    pub query: String,
-    pub body: Bytes,
-    pub headers: hyper::HeaderMap,
-    pub client_ip: IpAddr,
-    pub request_id: RequestId,
     pub target: Target,
-    /// Body-stream receiver for `stream=True` routes. The feeder task
-    /// running on the TPC thread's LocalSet pushes body frames into
-    /// this receiver; the bridge thread's handler pulls them. Buffered
-    /// routes share the [`crate::python::body_stream::empty_body_stream_rx`]
-    /// singleton — `body` carries the collected bytes there.
-    pub body_stream_rx: crate::python::body_stream::BodyStreamRx,
+    pub request: PyronovaRequest,
     pub response_tx: oneshot::Sender<Result<MainReply, Logged>>,
+}
+
+/// A bridge thread the OS would not start. Serving `gil=True` routes with fewer threads
+/// than configured would be a silent capacity cut, so it fails the server's start.
+#[derive(Debug, thiserror::Error)]
+#[error("could not start main-interpreter bridge thread {worker} of {requested}: {source}")]
+pub(crate) struct BridgeSpawnError {
+    worker: usize,
+    requested: usize,
+    #[source]
+    source: std::io::Error,
+}
+
+impl From<BridgeSpawnError> for PyErr {
+    fn from(e: BridgeSpawnError) -> Self {
+        pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+    }
 }
 
 /// Handle returned to callers. Cheap to Arc-share across all TPC
@@ -102,7 +104,15 @@ impl MainInterpBridge {
     /// model — "how many requests can queue before 503" — stays simple.
     /// Both are positive (`config::BridgeConfig`): a zero-capacity channel is a
     /// rendezvous, which `try_dispatch` would answer 503 on every request.
-    pub(crate) fn spawn(site: SharedSite, config: crate::config::BridgeConfig) -> Arc<Self> {
+    ///
+    /// A thread that fails to start fails the whole spawn: the threads already started
+    /// are stopped and joined (with the GIL released, since they attach to main on their
+    /// way out) before the error returns.
+    pub(crate) fn spawn(
+        py: Python<'_>,
+        site: SharedSite,
+        config: crate::config::BridgeConfig,
+    ) -> Result<Arc<Self>, BridgeSpawnError> {
         let workers = config.workers.get();
         let (tx, rx) = cbc::bounded::<GilWorkItem>(config.capacity.get());
 
@@ -114,88 +124,37 @@ impl MainInterpBridge {
         // context. Plain std::threads with crossbeam recv() keep us
         // outside of any runtime, so the downstream Python-side
         // blocking_recv works correctly.
-        // Spawn workers best-effort: a thread spawn can fail under OS
-        // resource exhaustion (ulimit -u, ENOMEM). Panicking here would
-        // abort the whole server process — turning a recoverable
-        // partial-capacity situation into a total outage. Instead we log
-        // and continue with however many workers did start. The channel
-        // back-pressure (try_dispatch → 503) and disconnect handling
-        // (→ 500) already degrade gracefully when capacity is reduced or
-        // zero, so the rest of the fleet (sub-interp routes) keeps
-        // serving regardless.
         let mut handles = Vec::with_capacity(workers);
         for i in 0..workers {
-            let rx = rx.clone();
-            let site = Arc::clone(&site);
-            let res = std::thread::Builder::new()
-                .name(format!("pyronova-main-bridge-{i}"))
-                .stack_size(crate::python::PYTHON_THREAD_STACK)
-                .spawn(move || {
-                    // Each request attaches through `main_attach`, which gives this
-                    // thread one main thread state for its life (released by a
-                    // thread-local destructor before `join` returns).
-                    loop {
-                        // crossbeam recv: blocks until item or all
-                        // Senders drop. Disconnected → server shutdown
-                        // → worker exit.
-                        let item = match rx.recv() {
-                            Ok(i) => i,
-                            Err(_) => break,
-                        };
-                        dispatch_one(&site, item);
-                    }
-                    // Everything this thread owns that holds Python objects goes while
-                    // attached, before the thread state does.
-                    crate::run_context::main_attach(move |py| {
-                        crate::handlers::close_thread_event_loop(py);
-                        drop(site);
-                    });
-                    tracing::info!(
-                        target: "pyronova::server",
-                        worker = i,
-                        "main-interp bridge worker exiting (channel closed)"
-                    );
-                });
-            match res {
+            let (rx, site) = (rx.clone(), Arc::clone(&site));
+            let spawned = match injected_spawn_failure(i) {
+                Some(injected) => Err(injected),
+                None => std::thread::Builder::new()
+                    .name(format!("pyronova-main-bridge-{i}"))
+                    .stack_size(crate::python::PYTHON_THREAD_STACK)
+                    .spawn(move || serve(i, rx, site)),
+            };
+            match spawned {
                 Ok(handle) => handles.push(handle),
-                Err(e) => {
-                    tracing::error!(
-                        target: "pyronova::server",
-                        worker = i,
-                        error = %e,
-                        "failed to spawn main-interp bridge worker; \
-                         continuing with fewer workers"
-                    );
+                Err(source) => {
+                    let started = MainInterpBridge { tx, handles };
+                    py.detach(|| started.join_all());
+                    return Err(BridgeSpawnError {
+                        worker: i,
+                        requested: workers,
+                        source,
+                    });
                 }
             }
         }
 
-        let spawned = handles.len();
-        if spawned == 0 {
-            tracing::error!(
-                target: "pyronova::server",
-                requested = workers,
-                "no main-interp bridge workers could be spawned; \
-                 gil=True routes will respond 500 until resources free up"
-            );
-        } else if spawned < workers {
-            tracing::warn!(
-                target: "pyronova::server",
-                spawned,
-                requested = workers,
-                "main-interp bridge started with reduced worker count"
-            );
-        }
-
         tracing::info!(
             target: "pyronova::server",
-            spawned,
-            requested = workers,
+            workers,
             capacity = config.capacity.get(),
             "main-interp bridge spawned"
         );
-
-        Arc::new(MainInterpBridge { tx, handles })
+        Ok(Arc::new(MainInterpBridge { tx, handles }))
     }
 
     /// Close the channel and wait for every bridge thread to exit. Call it with the GIL
@@ -203,18 +162,7 @@ impl MainInterpBridge {
     /// the bridge is gone, i.e. after the TPC threads have been joined.
     pub(crate) fn shutdown_join(bridge: Arc<Self>) {
         match Arc::try_unwrap(bridge) {
-            Ok(MainInterpBridge { tx, handles }) => {
-                drop(tx);
-                for (i, h) in handles.into_iter().enumerate() {
-                    if h.join().is_err() {
-                        tracing::error!(
-                            target: "pyronova::server",
-                            worker = i,
-                            "main-interp bridge worker panicked"
-                        );
-                    }
-                }
-            }
+            Ok(bridge) => bridge.join_all(),
             Err(still_shared) => {
                 // Joining now would wait forever on a Sender someone else still holds.
                 tracing::error!(
@@ -227,24 +175,30 @@ impl MainInterpBridge {
         }
     }
 
-    /// Non-blocking dispatch. Returns Err with the original work item
-    /// when the channel is full (caller should respond 503) or when
-    /// all bridge workers have exited (caller should respond 500).
-    ///
-    /// `clippy::result_large_err`: the Err variant carries the unsent
-    /// `GilWorkItem` back so the caller can drain it / respond. Boxing
-    /// would only move bytes around; this is a cold path (only fires on
-    /// 503 / shutdown). Allowed deliberately.
-    #[allow(clippy::result_large_err)]
-    pub(crate) fn try_dispatch(
-        &self,
-        item: GilWorkItem,
-    ) -> Result<(), (GilWorkItem, TryDispatchError)> {
-        match self.tx.try_send(item) {
-            Ok(()) => Ok(()),
-            Err(cbc::TrySendError::Full(item)) => Err((item, TryDispatchError::Full)),
-            Err(cbc::TrySendError::Disconnected(item)) => Err((item, TryDispatchError::Closed)),
+    /// Closes the channel and joins every thread. Call it with the GIL released.
+    fn join_all(self) {
+        let MainInterpBridge { tx, handles } = self;
+        drop(tx);
+        for (i, h) in handles.into_iter().enumerate() {
+            if let Err(payload) = h.join() {
+                tracing::error!(
+                    target: "pyronova::server",
+                    worker = i,
+                    panic = %crate::error::panic_message(&*payload),
+                    "main-interp bridge worker panicked"
+                );
+            }
         }
+    }
+
+    /// Non-blocking dispatch: `Full` when the queue is (the caller answers 503), `Closed`
+    /// when every bridge thread has exited. A refused item is dropped here; its reply
+    /// channel closing is what the caller's feeder, if any, is stopped for.
+    pub(crate) fn try_dispatch(&self, item: GilWorkItem) -> Result<(), TryDispatchError> {
+        self.tx.try_send(item).map_err(|e| match e {
+            cbc::TrySendError::Full(_) => TryDispatchError::Full,
+            cbc::TrySendError::Disconnected(_) => TryDispatchError::Closed,
+        })
     }
 }
 
@@ -253,18 +207,47 @@ pub(crate) enum TryDispatchError {
     Closed,
 }
 
+/// The bridge thread whose spawn fails, for the fault-injection build's tests
+/// (`pyronova.engine._fault_fail_bridge_spawn`). Set once per process.
+#[cfg(feature = "fault_injection")]
+pub(crate) static FAIL_SPAWN_OF: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+#[cfg(feature = "fault_injection")]
+fn injected_spawn_failure(worker: usize) -> Option<std::io::Error> {
+    (FAIL_SPAWN_OF.get() == Some(&worker))
+        .then(|| std::io::Error::other("injected spawn failure (fault_injection build)"))
+}
+
+#[cfg(not(feature = "fault_injection"))]
+fn injected_spawn_failure(_worker: usize) -> Option<std::io::Error> {
+    None
+}
+
+/// One bridge thread: runs work items until every sender is gone.
+fn serve(worker: usize, rx: cbc::Receiver<GilWorkItem>, site: SharedSite) {
+    // Each request attaches through `main_attach`, which gives this thread one main thread
+    // state for its life (released by a thread-local destructor before `join` returns).
+    // `recv` fails once every sender is gone: the server is shutting down.
+    while let Ok(item) = rx.recv() {
+        dispatch_one(&site, item);
+    }
+    // Everything this thread owns that holds Python objects goes while attached, before
+    // the thread state does.
+    crate::run_context::main_attach(move |py| {
+        crate::handlers::close_thread_event_loop(py);
+        drop(site);
+    });
+    tracing::info!(
+        target: "pyronova::server",
+        worker,
+        "main-interp bridge worker exiting (channel closed)"
+    );
+}
+
 fn dispatch_one(site: &SharedSite, item: GilWorkItem) {
     let GilWorkItem {
-        method,
-        path,
-        params,
-        query,
-        body,
-        headers,
-        client_ip,
-        request_id,
         target,
-        body_stream_rx,
+        request,
         response_tx,
     } = item;
 
@@ -275,21 +258,7 @@ fn dispatch_one(site: &SharedSite, item: GilWorkItem) {
         return;
     }
 
-    let sky_req = PyronovaRequest {
-        method,
-        path,
-        params,
-        query,
-        headers,
-        query_cache: OnceLock::new(),
-        query_all_cache: OnceLock::new(),
-        client_ip_addr: client_ip,
-        request_id,
-        body_bytes: body,
-        body_stream_rx,
-    };
-
-    let result = call_handler_with_hooks(site, target, sky_req);
+    let result = call_handler_with_hooks(site, target, request);
     // The caller gave up (504) while the handler ran: nobody reads this reply.
     let _ = response_tx.send(result);
 }

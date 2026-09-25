@@ -2,22 +2,17 @@
 //! as they arrive, without buffering the whole body in memory.
 //!
 //! Opt-in per route via `@app.post("/path", gil=True, stream=True)`. The
-//! accept loop skips `Limited::new().collect()` and instead spawns a feeder
-//! task that pushes each body frame into a **bounded** channel; the
-//! handler sees `req.stream` as a Python iterator yielding `bytes` chunks
-//! and terminating with `StopIteration` on EOF.
+//! dispatcher skips collecting the body and instead spawns a feeder task
+//! (`body::stream_body_feeder`) that pushes each body frame into a **bounded**
+//! channel; the handler sees `req.stream` as a Python iterator yielding `bytes`
+//! chunks and terminating with `StopIteration` at the body's end.
 //!
-//! The channel is `tokio::sync::mpsc` with capacity 8 rather than
-//! `std::sync::mpsc` unbounded — the bound propagates backpressure all
-//! the way to the TCP stack. If the Python handler is slow (say parsing
-//! a 10 GB upload line-by-line), the feeder `.send().await` suspends,
-//! which in turn stops `poll_frame` from being driven, and eventually
-//! the TCP receive window closes on the client side. No OOM, no silent
-//! space leak. The crossover point for "full" is ~8 × typical frame
-//! size (~64 KB each) = ~512 KB in flight per connection, which is
-//! deliberately modest.
+//! The bound propagates backpressure all the way to the TCP stack: if the Python
+//! handler is slow, the feeder's send waits, which stops `poll_frame` from being
+//! driven, and eventually the TCP receive window closes on the client side. The
+//! whole body arrives within the request budget, as a buffered one does.
 //!
-//! Scope (v1):
+//! Scope:
 //!   * Only `gil=True` routes. Sub-interpreter request streaming is
 //!     deferred.
 //!   * Sync iterator only. `async for chunk in req.stream()` is deferred.
@@ -27,63 +22,16 @@
 //! a failed read) arrives as the same `BodyReject` a buffered body gets; reading it raises
 //! [`BodyRejected`], an `OSError`. A handler that lets it through gets the response a
 //! buffered body would (413 / 408 / 400), logged as a rejection, not a server error.
+//! A stream that failed keeps failing: every later read raises the same error.
 
 use std::sync::Mutex;
 
-use bytes::Bytes;
-use pyo3::exceptions::{PyOSError, PyStopIteration};
+use pyo3::exceptions::{PyOSError, PyRuntimeError, PyStopIteration};
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-use crate::handlers::pipeline::BodyReject;
-
-/// Bounded-channel capacity. Low enough to enforce real backpressure
-/// on a slow consumer, high enough that a steady-state 64 KB-frame
-/// stream never stalls on round-trip scheduling latency.
-pub(crate) const CHANNEL_CAPACITY: usize = 8;
-
-/// A message on the feeder → handler channel.
-pub(crate) enum ChunkMsg {
-    Data(Bytes),
-    /// The feeder gave up on the body; reading it raises [`BodyRejected`].
-    Err(BodyReject),
-    /// End of body — channel sender is dropped after sending this, so
-    /// subsequent recv() returns Err immediately.
-    Eof,
-}
-
-/// The channel closed without [`ChunkMsg::Eof`]: the feeder stopped (the handler did not
-/// take a chunk within the request budget, or the request was abandoned). Reading on would
-/// silently truncate the body, so it is an error.
-fn cut_off() -> PyErr {
-    PyOSError::new_err(
-        "the request body stream ended before the body did: the server stopped feeding it \
-         (the handler did not read it within the request budget, or the request was \
-         abandoned)",
-    )
-}
-
-/// Standard shape for the per-request body-stream receiver: an Arc'd
-/// Mutex that holds `Some(Receiver)` until the handler takes it out
-/// with `.stream`, then holds `None`. For non-streaming routes the
-/// slot is permanently `None` — use [`empty_body_stream_rx`] to avoid
-/// allocating a fresh Mutex on every buffered request.
-pub(crate) type BodyStreamRx =
-    std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ChunkMsg>>>>;
-
-/// Shared empty body-stream slot for non-streaming routes. All handlers
-/// hold a clone of the same Arc; no writes ever target this slot (the
-/// only operation is `take()` on `None`, which is a no-op), so sharing
-/// is race-free. Saves one Arc + Mutex heap alloc per buffered request
-/// on the hot path.
-pub(crate) fn empty_body_stream_rx() -> BodyStreamRx {
-    use std::sync::OnceLock;
-    static EMPTY: OnceLock<BodyStreamRx> = OnceLock::new();
-    EMPTY
-        .get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(None)))
-        .clone()
-}
+use crate::body::{BodyReceiver, BodyReject, ChunkMsg};
 
 pyo3::create_exception!(
     pyronova.engine,
@@ -124,25 +72,78 @@ pub(crate) fn rejection_of(py: Python<'_>, err: &PyErr) -> Option<BodyReject> {
     Some(rejection.get().0.clone())
 }
 
+/// Where reading a body stream stands.
+enum StreamState {
+    /// Chunks may still arrive.
+    Open(BodyReceiver),
+    /// The whole body was read.
+    Finished,
+    /// The body will never arrive in full; every read raises this.
+    Failed(StreamFailure),
+}
+
+#[derive(Clone)]
+enum StreamFailure {
+    /// The server rejected the body (too large, too slow, a failed read).
+    Rejected(BodyReject),
+    /// The channel closed without the body's end: the feeder stopped (the handler did not
+    /// take a chunk within the request budget, or the request was abandoned). Reading on
+    /// would silently truncate the body.
+    CutOff,
+}
+
+impl StreamFailure {
+    fn to_py(&self, py: Python<'_>) -> PyErr {
+        match self {
+            StreamFailure::Rejected(reject) => body_rejected(py, reject.clone()),
+            StreamFailure::CutOff => PyOSError::new_err(
+                "the request body stream ended before the body did: the server stopped \
+                 feeding it (the handler did not read it within the request budget, or the \
+                 request was abandoned)",
+            ),
+        }
+    }
+}
+
+/// What one receive from the channel means for the stream.
+enum Received {
+    Chunk(bytes::Bytes),
+    End,
+    Failed(StreamFailure),
+}
+
+impl Received {
+    fn of(msg: Option<ChunkMsg>) -> Self {
+        match msg {
+            Some(ChunkMsg::Data(chunk)) => Received::Chunk(chunk),
+            Some(ChunkMsg::Eof) => Received::End,
+            Some(ChunkMsg::Err(reject)) => Received::Failed(StreamFailure::Rejected(reject)),
+            None => Received::Failed(StreamFailure::CutOff),
+        }
+    }
+}
+
 /// Python-visible iterator over an incoming body's chunks.
 ///
-/// The receiver is wrapped in `Mutex<Option<...>>` so that:
-///   * iteration is thread-safe (Python's GIL doesn't cover Rust channels)
-///   * we can drop the receiver on EOF/error to free resources promptly
-///
-/// Only one logical iterator should consume a given stream — attempting to
-/// call `next()` on a stream that's already been drained yields
-/// `StopIteration` immediately.
+/// The state is behind a `Mutex` held across each blocking receive, so concurrent
+/// readers (two threads, or `drain_count` racing `__next__`) take chunks one at a time in
+/// order instead of one of them seeing a spurious end.
 #[pyclass(name = "BodyStream", module = "pyronova.engine")]
 pub(crate) struct PyronovaBodyStream {
-    rx: Mutex<Option<tokio::sync::mpsc::Receiver<ChunkMsg>>>,
+    state: Mutex<StreamState>,
 }
 
 impl PyronovaBodyStream {
-    pub(crate) fn new(rx: tokio::sync::mpsc::Receiver<ChunkMsg>) -> Self {
+    pub(crate) fn new(rx: BodyReceiver) -> Self {
         PyronovaBodyStream {
-            rx: Mutex::new(Some(rx)),
+            state: Mutex::new(StreamState::Open(rx)),
         }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, StreamState> {
+        // A panic while the lock was held left the state whole (each transition is one
+        // assignment), and unwinding into Python must not happen.
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -152,54 +153,27 @@ impl PyronovaBodyStream {
         slf
     }
 
-    /// Block until the next chunk arrives. Returns `bytes` for data,
-    /// raises `StopIteration` at EOF, [`BodyRejected`] for a rejected body.
+    /// Block until the next chunk arrives. Returns `bytes` for data, raises
+    /// `StopIteration` at the body's end, [`BodyRejected`] for a rejected body — and the
+    /// same error again on every read after one.
     fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyBytes>> {
-        // Hold the Mutex guard across the blocking recv(). Concurrent
-        // callers (two Python threads iterating the same stream, or an
-        // asyncio.gather(...) that races __next__ against drain_count)
-        // will serialize on this lock — exactly the semantics a single-
-        // owner byte stream demands. Each waiter receives the NEXT
-        // chunk in FIFO order once the earlier call completes.
-        //
-        // The previous implementation `take()`'d the receiver out of
-        // the Mutex to avoid holding the guard across the blocking
-        // call — on the theory that a held guard would freeze other
-        // Python threads. It did freeze them, but the alternative was
-        // worse: the second concurrent __next__ observed `None` in
-        // the slot and raised a spurious StopIteration, silently
-        // truncating the request body without any error. Data loss in
-        // a body stream is strictly worse than brief contention.
-        //
-        // GIL: released across blocking_recv() so unrelated Python
-        // threads (different stream objects, ordinary app code)
-        // continue to run.
-        //
-        // Recover from a poisoned lock rather than `unwrap()`-panicking:
-        // an unwinding panic across the PyO3 FFI boundary can abort the
-        // whole Python process. The guarded value is just
-        // `Option<Receiver>`, which stays structurally valid even if a
-        // prior holder panicked, so `into_inner()` is safe.
-        let mut guard = self.rx.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(rx) = guard.as_mut() else {
-            return Err(PyStopIteration::new_err("stream exhausted"));
+        let mut state = self.lock();
+        let rx = match &mut *state {
+            StreamState::Open(rx) => rx,
+            StreamState::Finished => return Err(PyStopIteration::new_err(py.None())),
+            StreamState::Failed(failure) => return Err(failure.to_py(py)),
         };
-        let msg = py.detach(|| rx.blocking_recv());
-        match msg {
-            Some(ChunkMsg::Data(b)) => Ok(PyBytes::new(py, &b).unbind()),
-            Some(ChunkMsg::Eof) => {
-                // Mark exhausted so subsequent calls fast-path without
-                // touching the receiver.
-                *guard = None;
+        // GIL released across the wait so unrelated Python threads keep running.
+        match Received::of(py.detach(|| rx.blocking_recv())) {
+            Received::Chunk(chunk) => Ok(PyBytes::new(py, &chunk).unbind()),
+            Received::End => {
+                *state = StreamState::Finished;
                 Err(PyStopIteration::new_err(py.None()))
             }
-            Some(ChunkMsg::Err(reject)) => {
-                *guard = None;
-                Err(body_rejected(py, reject))
-            }
-            None => {
-                *guard = None;
-                Err(cut_off())
+            Received::Failed(failure) => {
+                let err = failure.to_py(py);
+                *state = StreamState::Failed(failure);
+                Err(err)
             }
         }
     }
@@ -233,50 +207,46 @@ impl PyronovaBodyStream {
         Ok(PyBytes::new(py, &buf).unbind())
     }
 
-    /// Consume the entire stream in Rust and return the total byte count.
+    /// Consume the rest of the stream in Rust and return its byte count.
     ///
-    /// Motivation: handlers that only need the upload size (progress
-    /// meters, auditing, "reject if too big" middleware) would otherwise
-    /// iterate every chunk through Python's `for chunk in req.stream:`
-    /// loop. On a 25 MB upload split into ~1600 16 KB hyper frames,
-    /// the Python-side iteration overhead (GIL release/reacquire + a
-    /// PyBytes allocation per frame) dominates — ~1.8μs × 1600 ≈ 3ms
-    /// per request of pure Python-loop cost.
+    /// For handlers that only need the upload size: the whole consume loop runs under a
+    /// single `py.detach()` and never allocates a `PyBytes` per chunk, where iterating in
+    /// Python pays a GIL round trip and a `bytes` object per frame.
     ///
-    /// `drain_count()` runs the whole consume loop under a single
-    /// `py.detach()` (GIL released once, not 1600 times) and never
-    /// allocates a `PyBytes`. For the Arena /upload profile this is
-    /// ~50% faster than the iterator path.
-    ///
-    /// Returns the raw byte count; raises [`BodyRejected`] for a rejected body.
+    /// Raises [`BodyRejected`] for a rejected body, and `RuntimeError` on a stream already
+    /// read to its end: there is nothing left to count, and `0` would read as an empty
+    /// body.
     fn drain_count(&self, py: Python<'_>) -> PyResult<u64> {
-        // Same serialization guarantee as __next__: hold the Mutex
-        // across the drain loop. Concurrent callers (drain_count racing
-        // __next__ or drain_count racing drain_count) block on the
-        // lock and then observe `None` — returning 0 — because the
-        // first caller marked the stream exhausted.
-        //
-        // Recover from poison instead of panicking across the FFI
-        // boundary (see __next__ for rationale).
-        let mut guard = self.rx.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(rx) = guard.as_mut() else {
-            return Ok(0);
+        let mut state = self.lock();
+        let rx = match &mut *state {
+            StreamState::Open(rx) => rx,
+            StreamState::Finished => {
+                return Err(PyRuntimeError::new_err(
+                    "the request body stream was already read to its end",
+                ))
+            }
+            StreamState::Failed(failure) => return Err(failure.to_py(py)),
         };
-        let result: Result<u64, Option<BodyReject>> = py.detach(|| {
+        let drained: Result<u64, StreamFailure> = py.detach(|| {
             let mut total: u64 = 0;
             loop {
-                match rx.blocking_recv() {
-                    Some(ChunkMsg::Data(b)) => total += b.len() as u64,
-                    Some(ChunkMsg::Eof) => return Ok(total),
-                    Some(ChunkMsg::Err(reject)) => return Err(Some(reject)),
-                    None => return Err(None),
+                match Received::of(rx.blocking_recv()) {
+                    Received::Chunk(chunk) => total += chunk.len() as u64,
+                    Received::End => return Ok(total),
+                    Received::Failed(failure) => return Err(failure),
                 }
             }
         });
-        *guard = None; // fully consumed (or errored)
-        result.map_err(|stopped| match stopped {
-            Some(reject) => body_rejected(py, reject),
-            None => cut_off(),
-        })
+        match drained {
+            Ok(total) => {
+                *state = StreamState::Finished;
+                Ok(total)
+            }
+            Err(failure) => {
+                let err = failure.to_py(py);
+                *state = StreamState::Failed(failure);
+                Err(err)
+            }
+        }
     }
 }

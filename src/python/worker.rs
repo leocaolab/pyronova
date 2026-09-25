@@ -16,9 +16,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyString;
 
 use super::ffi::*;
-use super::request_context::{in_request_context, RequestContext, Returned};
-use crate::handlers::error::{catch_panic, HandlerError, PyException, Stage};
-use crate::response::ResponseError;
+use super::request_context::{in_request_context, Awaitable, RequestContext};
+use crate::error::{catch_panic, HandlerError, PyException, ResponseError, Stage};
 use crate::router::{RouteId, RouteSignature};
 use crate::types::{PyronovaRequest, ResponseData};
 
@@ -631,8 +630,9 @@ impl SubInterpreterWorker {
     }
 
     /// Runs what a hook or handler returned to a value: an awaitable is driven to
-    /// completion on this interpreter's persistent event loop, an `async def` coroutine in
-    /// the request's own context (`rc`). A plain value is returned unchanged.
+    /// completion on this interpreter's persistent event loop, in the request's own
+    /// context (`rc`) unless it is a `Future`, which runs in its own. A plain value is
+    /// returned unchanged.
     ///
     /// An exception the awaitable raises is `stage`'s.
     ///
@@ -646,18 +646,18 @@ impl SubInterpreterWorker {
         stage: Stage,
     ) -> Result<PyObjRef, HandlerError> {
         let ptr = obj.as_ptr();
-        match Returned::of(&Bound::from_borrowed_ptr(py, ptr)) {
-            Returned::Value => Ok(obj),
-            Returned::Coroutine => {
+        match Awaitable::of(&Bound::from_borrowed_ptr(py, ptr)) {
+            None => Ok(obj),
+            Some(Awaitable::InTask) => {
                 let event_loop = Bound::from_borrowed_ptr(py, self.asyncio_loop);
-                let coro = Bound::from_borrowed_ptr(py, ptr);
+                let awaitable = Bound::from_borrowed_ptr(py, ptr);
                 let result = rc
-                    .run_coroutine(&event_loop, &coro)
+                    .run_in_task(&event_loop, &awaitable)
                     .map_err(|e| HandlerError::python(py, stage, &e))?;
                 PyObjRef::from_owned(result.into_ptr()).ok_or_else(|| raised(py, stage))
             }
-            // loop.run_until_complete(awaitable)
-            Returned::OtherAwaitable => {
+            // loop.run_until_complete(future)
+            Some(Awaitable::Future) => {
                 PyObjRef::from_owned(ffi::PyObject_CallOneArg(self.loop_run_func, ptr))
                     .ok_or_else(|| raised(py, stage))
             }

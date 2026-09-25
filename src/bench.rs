@@ -28,7 +28,7 @@ use tokio::task::{JoinHandle, LocalSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::GcConfig;
-use crate::handlers::error::panic_message;
+use crate::error::panic_message;
 use crate::python::interp::SubInterpreterWorker;
 use crate::server::cpu::{elevate_thread_qos_macos, try_pin_current};
 use crate::server::listener::{BoundListeners, ListenerSpec};

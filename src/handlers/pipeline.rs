@@ -1,29 +1,27 @@
 //! The request pipeline every serving path shares: preprocessing (fast path, route
-//! resolution, static files, fallback, 404), body collection under one budget, and one
-//! `finish` that applies CORS and writes the access-log line for every response.
+//! resolution, static files, fallback, 405, 404), body collection under one budget, and
+//! one `finish` that applies CORS and writes the access-log line for every response.
 //!
 //! The paths (GIL, sub-interpreter pool, TPC inline + bridge) differ only in where the
 //! handler runs; everything before and after that is here.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use bytes::{Bytes, BytesMut};
-use http_body_util::BodyExt;
-use hyper::body::Incoming;
+use bytes::Bytes;
+use http_body_util::{BodyExt, Empty};
+use hyper::body::{Body as _, Incoming};
+use hyper::header::{HeaderValue, CONTENT_LENGTH};
 use hyper::http::request::Parts;
-use hyper::{Request, Response};
+use hyper::{Method, Request, Response};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use super::error::{HandlerError, RequestTag};
-use super::{full_body, BoxBody};
+use crate::body::{collect, full_body, BodyGate, BoxBody, REQUEST_BUDGET};
+use crate::error::{refuse, HandlerError, Refusal, RequestLabel, RequestTag};
+use crate::request_head::RequestHead;
 use crate::request_id::RequestId;
 use crate::router::{Call, Params};
 use crate::site::Site;
-
-/// How long the server waits for one step of a request — reading its body, or a handler
-/// producing its response — before it gives up on it.
-pub(crate) const REQUEST_BUDGET: Duration = Duration::from_secs(30);
 
 /// Where a response came from, as the access log's `mode` field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,13 +55,23 @@ impl Served {
 
 /// The request as the access log names it.
 pub(crate) struct RequestLine<'a> {
-    pub(crate) method: &'a str,
+    pub(crate) method: &'a Method,
     pub(crate) path: &'a str,
     pub(crate) start: Instant,
 }
 
-/// Applies CORS and writes the access-log line. Every response of every path goes through
-/// here exactly once.
+impl<'a> RequestLine<'a> {
+    pub(crate) fn of(label: &'a RequestLabel, start: Instant) -> Self {
+        RequestLine {
+            method: &label.method,
+            path: label.uri.path(),
+            start,
+        }
+    }
+}
+
+/// Applies CORS, drops the body of a `HEAD` response, and writes the access-log line.
+/// Every response of every path goes through here exactly once.
 #[inline]
 pub(crate) fn finish(
     mut resp: Response<BoxBody>,
@@ -74,11 +82,14 @@ pub(crate) fn finish(
     if let Some(cors) = &site.config.cors {
         cors.apply(resp.headers_mut());
     }
+    if *line.method == Method::HEAD {
+        resp = without_body(resp);
+    }
     let status = resp.status();
     if site.config.access_log.samples(status) {
         tracing::info!(
             target: "pyronova::access",
-            method = line.method,
+            method = line.method.as_str(),
             path = line.path,
             status = status.as_u16(),
             latency_us = line.start.elapsed().as_micros() as u64,
@@ -89,6 +100,20 @@ pub(crate) fn finish(
     resp
 }
 
+/// A `HEAD` response: the headers a `GET` would get, with its length, and no body.
+/// (HTTP/1.1 would drop the body itself; HTTP/2 would send it.)
+fn without_body(resp: Response<BoxBody>) -> Response<BoxBody> {
+    let (mut parts, body) = resp.into_parts();
+    if let Some(len) = body.size_hint().exact() {
+        parts
+            .headers
+            .entry(CONTENT_LENGTH)
+            .or_insert_with(|| HeaderValue::from(len));
+    }
+    let empty = Empty::<Bytes>::new().map_err(|e| match e {}).boxed();
+    Response::from_parts(parts, empty)
+}
+
 // ─────────────────────────── preprocessing ───────────────────────────
 
 /// What preprocessing decided. A return value moved once per request and never stored,
@@ -96,55 +121,49 @@ pub(crate) fn finish(
 /// allocation on every dispatched request.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Preprocessed {
-    /// Answered without a handler (gRPC, fast path, static file, 404), already finished.
+    /// Answered without a handler (gRPC, fast path, static file, 405, 404), already
+    /// finished.
     Respond(Response<BoxBody>),
     /// A handler runs it.
     Dispatch(Prepared),
 }
 
-/// A request resolved to a handler. `parts` is moved out of hyper's request, not copied:
-/// the TPC inline path borrows method, path and headers from it without allocating.
+/// A request resolved to a handler. Its head is moved out of hyper's request, not copied:
+/// the handler's `Request` takes the method, URI and headers as they are.
 pub(crate) struct Prepared {
-    pub(crate) parts: Parts,
+    pub(crate) head: RequestHead,
     pub(crate) body: Incoming,
     pub(crate) call: Call,
-    pub(crate) params: Params,
     pub(crate) start: Instant,
-    /// Written here, once; the handler's `Request`, the error log and a 5xx body read it.
-    pub(crate) request_id: RequestId,
-}
-
-impl Prepared {
-    pub(crate) fn query(&self) -> &str {
-        self.parts.uri.query().unwrap_or("")
-    }
-
-    pub(crate) fn accept_encoding(&self) -> AcceptEncoding {
-        AcceptEncoding::of(&self.parts.headers)
-    }
 }
 
 /// The request's `Accept-Encoding`, kept for the response after the headers move into the
 /// handler's `Request`. A refcount copy of the field, no allocation.
-pub(crate) struct AcceptEncoding(Option<hyper::header::HeaderValue>);
+pub(crate) struct AcceptEncoding(Option<HeaderValue>);
 
 impl AcceptEncoding {
-    pub(crate) fn of(headers: &hyper::HeaderMap) -> Self {
-        Self(headers.get(hyper::header::ACCEPT_ENCODING).cloned())
+    pub(crate) fn of(head: &RequestHead) -> Self {
+        Self(
+            head.parts
+                .headers
+                .get(hyper::header::ACCEPT_ENCODING)
+                .cloned(),
+        )
     }
 
-    /// The codings the client accepts; `""` (none) when it sent no `Accept-Encoding` or
-    /// one that isn't plain text.
-    pub(crate) fn as_str(&self) -> &str {
-        self.0.as_ref().and_then(|v| v.to_str().ok()).unwrap_or("")
+    /// The codings the client accepts; `None` when it sent no `Accept-Encoding`, or one
+    /// that isn't visible ASCII (then nothing is known to be accepted).
+    pub(crate) fn as_str(&self) -> Option<&str> {
+        self.0.as_ref().and_then(|v| v.to_str().ok())
     }
 }
 
 /// gRPC benchmark method (when enabled), fast path, route resolution, then static file,
-/// fallback or 404.
+/// fallback, 405 or 404.
 pub(crate) async fn preprocess(
     req: Request<Incoming>,
     site: &Site,
+    client_ip: std::net::IpAddr,
 ) -> Result<Preprocessed, hyper::Error> {
     crate::monitor::count_request();
     if site.config.grpc_benchmark && crate::grpc::is_get_sum_call(&req) {
@@ -157,7 +176,7 @@ pub(crate) async fn preprocess(
         .fast_response(req.method().as_str(), req.uri().path())
     {
         let line = RequestLine {
-            method: req.method().as_str(),
+            method: req.method(),
             path: req.uri().path(),
             start,
         };
@@ -178,7 +197,7 @@ pub(crate) async fn preprocess(
             Unrouted::Fallback(call) => (call, Params::new()),
             Unrouted::Respond(resp) => {
                 let line = RequestLine {
-                    method: parts.method.as_str(),
+                    method: &parts.method,
                     path: parts.uri.path(),
                     start,
                 };
@@ -193,12 +212,15 @@ pub(crate) async fn preprocess(
     };
     let request_id = RequestId::of(&parts.headers, site.config.request_id_header.as_ref());
     Ok(Preprocessed::Dispatch(Prepared {
-        parts,
+        head: RequestHead {
+            parts,
+            params,
+            client_ip,
+            request_id,
+        },
         body,
         call,
-        params,
         start,
-        request_id,
     }))
 }
 
@@ -207,20 +229,25 @@ enum Unrouted {
     Respond(Response<BoxBody>),
 }
 
-/// No route matched: a static file (GET/HEAD), else the fallback handler, else 404.
+/// No route matched: a static file (GET/HEAD), else the fallback handler, else 405 when
+/// the path has routes for other methods, else 404.
 async fn unrouted(parts: &Parts, site: &Site) -> Unrouted {
     let method = &parts.method;
-    if method == hyper::Method::GET || method == hyper::Method::HEAD {
-        if let Some(resp) =
-            crate::static_fs::try_static_file(parts.uri.path(), &site.routes.static_dirs).await
+    let path = parts.uri.path();
+    if method == Method::GET || method == Method::HEAD {
+        if let Some(resp) = crate::static_fs::try_static_file(path, &site.routes.static_dirs).await
         {
             return Unrouted::Respond(full_body(resp));
         }
     }
-    match site.routes.fallback_call() {
-        Some(call) => Unrouted::Fallback(call),
-        None => Unrouted::Respond(full_body(crate::response::not_found_response())),
+    if let Some(call) = site.routes.fallback_call() {
+        return Unrouted::Fallback(call);
     }
+    let resp = match site.routes.allowed_methods(path) {
+        Some(allow) => crate::response::method_not_allowed_response(allow),
+        None => crate::response::not_found_response(),
+    };
+    Unrouted::Respond(full_body(resp))
 }
 
 /// gRPC needs HTTP/2 trailers (`grpc-status`) the normal response path can't model, so the
@@ -232,7 +259,7 @@ async fn grpc_get_sum(
     let start = Instant::now();
     let resp = crate::grpc::handle_get_sum(req, site.config.limits.max_body_bytes).await?;
     let line = RequestLine {
-        method: "POST",
+        method: &Method::POST,
         path: crate::grpc::GET_SUM_PATH,
         start,
     };
@@ -240,19 +267,6 @@ async fn grpc_get_sum(
 }
 
 // ─────────────────────────── body collection ───────────────────────────
-
-/// Why a request body was not read, buffered or streamed: the client's doing (a 4xx).
-/// `Clone` (the read error is shared) so a streamed body's rejection can travel through the
-/// handler as a Python exception and back (`python::body_stream::BodyRejected`).
-#[derive(Debug, Clone, thiserror::Error)]
-pub(crate) enum BodyReject {
-    #[error("request body is larger than max_body_size")]
-    TooLarge,
-    #[error("request body did not arrive within {REQUEST_BUDGET:?}")]
-    TimedOut,
-    #[error("request body read failed: {0}")]
-    Read(#[source] Arc<hyper::Error>),
-}
 
 /// The sub-interpreter pool's admission gate: a body past `skip_bytes` needs a permit.
 /// The upfront decision keys off `Content-Length`, which the client controls (chunked and
@@ -272,18 +286,14 @@ pub(crate) struct Admitted {
     pub(crate) permit: Option<OwnedSemaphorePermit>,
 }
 
-/// The whole body, at most `max` bytes, within [`REQUEST_BUDGET`].
-pub(crate) async fn read_body(body: Incoming, max: usize) -> Result<Bytes, BodyReject> {
-    collect(body, max, &mut Ungated).await
-}
-
-/// [`read_body`], for a handler's request.
+/// The whole body for a handler's request: at most `max` bytes, within
+/// [`REQUEST_BUDGET`].
 pub(crate) async fn collect_body(body: Incoming, max: usize) -> Result<Bytes, HandlerError> {
-    Ok(read_body(body, max).await?)
+    Ok(crate::body::read_body(body, max).await?)
 }
 
 /// [`collect_body`], passing the pool's admission gate: a body that needs a permit when
-/// none is free is [`HandlerError::Overloaded`].
+/// none is free is refused as overloaded.
 pub(crate) async fn collect_body_with_admission(
     body: Incoming,
     max: usize,
@@ -297,24 +307,8 @@ pub(crate) async fn collect_body_with_admission(
 }
 
 /// No admission permit was free.
-pub(crate) const OVERLOADED: HandlerError = HandlerError::Overloaded("admission permits");
-
-/// What a body must pass, besides the size cap, as it is buffered; its error type says
-/// what refusing it means.
-trait BodyGate {
-    type Error: From<BodyReject>;
-    /// Called with the bytes buffered so far, after each frame.
-    fn admit(&mut self, buffered: usize) -> Result<(), Self::Error>;
-}
-
-/// No gate: only the size cap and the budget.
-struct Ungated;
-
-impl BodyGate for Ungated {
-    type Error = BodyReject;
-    fn admit(&mut self, _buffered: usize) -> Result<(), BodyReject> {
-        Ok(())
-    }
+pub(crate) fn overloaded() -> HandlerError {
+    refuse(Refusal::Overloaded("admission permits"))
 }
 
 impl BodyGate for Admission<'_> {
@@ -325,80 +319,10 @@ impl BodyGate for Admission<'_> {
                 .semaphore
                 .clone()
                 .try_acquire_owned()
-                .map_err(|_| OVERLOADED)?;
+                .map_err(|_| overloaded())?;
             self.permit = Some(permit);
         }
         Ok(())
-    }
-}
-
-async fn collect<G: BodyGate>(
-    mut body: Incoming,
-    max: usize,
-    gate: &mut G,
-) -> Result<Bytes, G::Error> {
-    let read = async {
-        let mut buf = BodyBuf::Empty;
-        while let Some(frame) = body.frame().await {
-            // Trailer frames carry no body bytes.
-            let Ok(data) = frame
-                .map_err(|e| BodyReject::Read(Arc::new(e)))?
-                .into_data()
-            else {
-                continue;
-            };
-            if buf.len().saturating_add(data.len()) > max {
-                return Err(BodyReject::TooLarge.into());
-            }
-            buf = buf.push(data);
-            gate.admit(buf.len())?;
-        }
-        Ok::<_, G::Error>(buf.freeze())
-    };
-    tokio::time::timeout(REQUEST_BUDGET, read)
-        .await
-        .map_err(|_| BodyReject::TimedOut)?
-}
-
-/// Body bytes as they arrive. A one-frame body (the common case) is kept as hyper handed
-/// it over, with no copy.
-enum BodyBuf {
-    Empty,
-    One(Bytes),
-    Many(BytesMut),
-}
-
-impl BodyBuf {
-    fn len(&self) -> usize {
-        match self {
-            BodyBuf::Empty => 0,
-            BodyBuf::One(b) => b.len(),
-            BodyBuf::Many(b) => b.len(),
-        }
-    }
-
-    fn push(self, data: Bytes) -> Self {
-        match self {
-            BodyBuf::Empty => BodyBuf::One(data),
-            BodyBuf::One(first) => {
-                let mut joined = BytesMut::with_capacity(first.len() + data.len());
-                joined.extend_from_slice(&first);
-                joined.extend_from_slice(&data);
-                BodyBuf::Many(joined)
-            }
-            BodyBuf::Many(mut joined) => {
-                joined.extend_from_slice(&data);
-                BodyBuf::Many(joined)
-            }
-        }
-    }
-
-    fn freeze(self) -> Bytes {
-        match self {
-            BodyBuf::Empty => Bytes::new(),
-            BodyBuf::One(b) => b,
-            BodyBuf::Many(b) => b.freeze(),
-        }
     }
 }
 
@@ -419,15 +343,15 @@ pub(crate) async fn await_reply<T, E>(
     match tokio::time::timeout(REQUEST_BUDGET, reply).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(e)) => Err(lost(e)),
-        Err(_) => Err(HandlerError::Timeout),
+        Err(_) => Err(refuse(Refusal::Timeout)),
     }
 }
 
 /// [`await_reply`] for a request whose body is streamed to its handler: the budget starts
 /// once the body has been read (`body_read`, the feeder, ends), as a buffered request's
-/// starts once its body is in. Until then the feeder's own per-step budget bounds the
-/// wait, so an upload that keeps moving is not cut off, and a client that stalls is
-/// answered 408 by the body's budget, not 504 by the handler's.
+/// starts once its body is in. Until then the feeder's own deadline bounds the wait (the
+/// whole body within [`REQUEST_BUDGET`]), so a client that stalls is answered 408 by the
+/// body's budget, not 504 by the handler's.
 pub(crate) async fn await_streamed_reply<T, E>(
     body_read: &mut (impl std::future::Future + Unpin),
     reply: impl std::future::Future<Output = Result<T, E>>,
@@ -445,6 +369,51 @@ pub(crate) async fn await_streamed_reply<T, E>(
 pub(crate) fn task_lost(e: tokio::task::JoinError) -> HandlerError {
     match e.try_into_panic() {
         Ok(payload) => HandlerError::panic(payload),
-        Err(_) => HandlerError::WorkerLost("the handler's task was cancelled"),
+        Err(_) => refuse(Refusal::WorkerLost("the handler's task was cancelled")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn head_with(accept_encoding: Option<&[u8]>) -> RequestHead {
+        let (mut parts, ()) = Request::new(()).into_parts();
+        if let Some(value) = accept_encoding {
+            parts.headers.insert(
+                hyper::header::ACCEPT_ENCODING,
+                HeaderValue::from_bytes(value).unwrap(),
+            );
+        }
+        RequestHead {
+            parts,
+            params: Params::new(),
+            client_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            request_id: RequestId::mint(),
+        }
+    }
+
+    #[test]
+    fn accept_encoding_is_absent_not_empty() {
+        assert_eq!(AcceptEncoding::of(&head_with(None)).as_str(), None);
+        assert_eq!(
+            AcceptEncoding::of(&head_with(Some(b"gzip, br"))).as_str(),
+            Some("gzip, br")
+        );
+        // Not visible ASCII: nothing is known to be accepted.
+        assert_eq!(
+            AcceptEncoding::of(&head_with(Some(b"gzip\xff"))).as_str(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_head_response_keeps_the_length_and_drops_the_body() {
+        let resp = full_body(Response::new(http_body_util::Full::new(
+            Bytes::from_static(b"hello"),
+        )));
+        let resp = without_body(resp);
+        assert_eq!(resp.headers()[CONTENT_LENGTH], "5");
+        assert_eq!(resp.body().size_hint().exact(), Some(0));
     }
 }

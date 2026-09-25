@@ -39,8 +39,7 @@ use hyper::header::{HeaderValue, InvalidHeaderValue};
 use hyper::{HeaderMap, Request, Response};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 
-use crate::handlers::pipeline::{read_body, BodyReject, REQUEST_BUDGET};
-use crate::handlers::BoxBody;
+use crate::body::{read_body, BodyReject, BoxBody, REQUEST_BUDGET};
 
 /// The canonical gRPC status codes this server emits
 /// (https://grpc.github.io/grpc/core/md_doc_statuscodes.html).
