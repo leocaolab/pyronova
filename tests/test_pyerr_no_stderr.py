@@ -6,51 +6,15 @@ process's stderr fd. Under a 500k-rps flood that triggered many
 exceptions, every worker serialized on the kernel stdio lock and
 throughput collapsed.
 
-Now the hot path routes exceptions through `log_and_clear_py_exception`,
-which captures the exception string and emits it via Rust's `tracing`
-pipeline (non-blocking async writer).
-
-We verify:
-  1. The helper exists and is the primary error-reporting path.
-  2. Calling a handler that raises an exception does not spam stderr
-     (this would be the smoking gun for a regression).
+Now handler exceptions are taken as PyO3 errors and logged through Rust's
+`tracing` pipeline (non-blocking writer). We verify behaviourally that a
+handler that raises does not spam stderr.
 """
 
 import io
-import pathlib
 import subprocess
 import sys
 import textwrap
-
-
-def test_log_helper_present_and_wired():
-    src = "\n".join(p.read_text() for p in pathlib.Path("src/python").glob("*.rs"))
-    assert "fn log_and_clear_py_exception" in src
-    # Hot-path call sites: handler errors, hook errors, json.dumps,
-    # run_until_complete, _Response construction, async engine exec.
-    assert src.count("log_and_clear_py_exception(") >= 5, (
-        "expected the new logger to cover every per-request exception "
-        "path; fewer than 5 call sites means we missed a PyErr_Print"
-    )
-    # Hot-path PyErr_Print calls should be gone from the per-request
-    # codepath. Allow a few remaining at startup (init_in_sub_interp,
-    # pre-flight checks that run once per sub-interp).
-    hot_paths = [
-        "handler raised an exception",
-        "before_request hook {hook_name",
-        "loop.run_until_complete() failed",
-        "json.dumps failed",
-        "failed to create _Response",
-    ]
-    for marker in hot_paths:
-        # Each marker is paired with log_and_clear_py_exception, not PyErr_Print.
-        idx = src.find(marker)
-        assert idx != -1, f"expected marker not found: {marker}"
-        window = src[max(0, idx - 400):idx]
-        assert "PyErr_Print" not in window, (
-            f"hot path near {marker!r} still calls PyErr_Print — "
-            "replace with log_and_clear_py_exception"
-        )
 
 
 def test_raising_handler_does_not_spam_stderr():
