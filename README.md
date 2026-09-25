@@ -196,6 +196,8 @@ This matters for AI:
 
 Benchmarked on Linux (AMD Ryzen 7 7840HS, 8C/16T), Python 3.12, wrk -t4 -c100 -d10s.
 
+These figures were measured on an earlier release under Python 3.12; current releases require Python 3.14+ (see [Python 3.14+ required](#python-314-required)).
+
 Full report: [benchmarks/benchmark-14-linux.md](benchmarks/benchmark-14-linux.md)
 
 ### Throughput (requests/sec)
