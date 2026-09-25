@@ -372,22 +372,9 @@ impl PyronovaApp {
     }
 
     fn static_dir(&mut self, prefix: &str, directory: &str) -> PyResult<()> {
-        let prefix = if prefix.ends_with('/') {
-            prefix.to_string()
-        } else {
-            format!("{prefix}/")
-        };
-        let dir = std::path::Path::new(directory)
-            .canonicalize()
-            .map_err(|e| {
-                pyo3::exceptions::PyValueError::new_err(format!(
-                    "static directory '{directory}' not found: {e}"
-                ))
-            })?
-            .to_string_lossy()
-            .to_string();
-        let mut routes = self.routes.write();
-        routes.static_dirs.push((prefix, dir));
+        let mount = crate::static_fs::StaticMount::new(prefix, directory)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.routes.write().static_dirs.push(mount);
         Ok(())
     }
 

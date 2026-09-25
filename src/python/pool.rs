@@ -134,7 +134,7 @@ pub(crate) struct InterpreterPool {
     routers: HashMap<String, Router<usize>>,
     pub(crate) requires_gil: Vec<bool>,
     pub(crate) is_async_handler: Vec<bool>,
-    pub(crate) static_dirs: Vec<(String, String)>,
+    pub(crate) static_dirs: Vec<crate::static_fs::StaticMount>,
     /// Per-instance CORS configuration (None = disabled).
     pub(crate) cors_config: Option<crate::router::CorsConfig>,
     /// Per-instance request logging flag, shared with worker threads.
@@ -229,7 +229,7 @@ impl InterpreterPool {
         script_path: &str,
         expected: &crate::router::RouteSignature,
         routers: HashMap<String, Router<usize>>,
-        static_dirs: Vec<(String, String)>,
+        static_dirs: Vec<crate::static_fs::StaticMount>,
         requires_gil: Vec<bool>,
         is_async_handler: Vec<bool>,
         cors_config: Option<crate::router::CorsConfig>,
