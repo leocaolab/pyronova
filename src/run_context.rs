@@ -14,7 +14,7 @@
 //!
 //! Invariant: no Python-level operation on a main-interpreter object (attach, clone_ref,
 //! `Py<T>` drop) happens on a thread bound to a sub-interpreter (TPC threads, pool
-//! workers). `Arc<RouteTable>` clones may pass through those threads as plain Rust values:
+//! workers). `Arc<Site>` clones may pass through those threads as plain Rust values:
 //! `PyronovaApp::run` keeps the last clone and drops it on main, attached.
 
 use std::sync::OnceLock;

@@ -37,6 +37,7 @@ pub(crate) mod convert;
 pub(crate) mod ffi;
 pub(crate) mod interp;
 pub(crate) mod pool;
+pub(crate) mod request_context;
 pub(crate) mod stream;
 pub(crate) mod worker;
 pub(crate) mod worker_api;

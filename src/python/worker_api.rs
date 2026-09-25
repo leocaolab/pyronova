@@ -75,7 +75,7 @@ pub(crate) fn _worker_recv(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(req_id, req.response_tx);
-        Ok(Some((req_id, req.handler_idx, request)))
+        Ok(Some((req_id, req.route.index(), request)))
     })
 }
 

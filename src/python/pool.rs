@@ -4,10 +4,9 @@
 //! `SubInterpreterWorker`s.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use matchit::Router;
 use pyo3::ffi;
 use pyo3::prelude::*;
 
@@ -32,7 +31,9 @@ pub(crate) struct SubInterpResponse {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct WorkRequest {
-    pub handler_idx: usize,
+    pub route: crate::router::RouteId,
+    /// Which worker kind runs it: the sync pool or the async engine's.
+    pub kind: crate::router::HandlerKind,
     /// Arc<str>: zero-cost clone of the value already Arc'd in handle_request_subinterp.
     pub method: Arc<str>,
     /// Arc<str>: same — avoids String alloc + memcpy on the Tokio thread.
@@ -216,15 +217,6 @@ pub(crate) struct InterpreterPool {
     current_route: Vec<Arc<AtomicUsize>>,
     /// `METHOD path` per route index, for naming an abandoned worker's route.
     route_names: Vec<String>,
-    routers: HashMap<String, Router<usize>>,
-    pub(crate) requires_gil: Vec<bool>,
-    pub(crate) is_async_handler: Vec<bool>,
-    pub(crate) static_dirs: Vec<crate::static_fs::StaticMount>,
-    /// Per-instance CORS configuration (None = disabled).
-    pub(crate) cors_config: Option<crate::router::CorsConfig>,
-    /// Per-instance request logging flag, shared with worker threads.
-    /// Read via Arc clone in worker_thread_loop, not directly from the struct.
-    _request_logging: Arc<AtomicBool>,
 }
 
 impl Drop for InterpreterPool {
@@ -308,18 +300,11 @@ impl InterpreterPool {
     /// channels: the first `split.sync_workers` serve `def` handlers, the rest `async def`.
     ///
     /// Must be called with the main interpreter's GIL held (before `py.detach()`).
-    #[allow(clippy::too_many_arguments)]
     pub unsafe fn new(
         split: WorkerSplit,
         _py: Python<'_>,
         script_path: &str,
         expected: &crate::router::RouteSignature,
-        routers: HashMap<String, Router<usize>>,
-        static_dirs: Vec<crate::static_fs::StaticMount>,
-        requires_gil: Vec<bool>,
-        is_async_handler: Vec<bool>,
-        cors_config: Option<crate::router::CorsConfig>,
-        request_logging: bool,
         shared_state: &crate::state::SharedMap,
     ) -> Result<Self, String> {
         let n = split.total();
@@ -387,14 +372,12 @@ impl InterpreterPool {
             }
         }
 
-        let logging_flag = Arc::new(AtomicBool::new(request_logging));
         let current_route: Vec<Arc<AtomicUsize>> =
             (0..n).map(|_| Arc::new(AtomicUsize::new(IDLE))).collect();
 
         // Spawn workers: the first `split.sync_workers` as sync, the rest as async.
         let mut pending = workers.into_iter().enumerate();
         while let Some((i, worker)) = pending.next() {
-            let logging = Arc::clone(&logging_flag);
             let current = Arc::clone(&current_route[i]);
 
             let spawned = if i >= split.sync_workers {
@@ -413,7 +396,7 @@ impl InterpreterPool {
                     .name(format!("pyronova-worker-{i}"))
                     .stack_size(crate::python::PYTHON_THREAD_STACK)
                     .spawn(move || {
-                        worker_thread_loop(worker, rx, &logging, &current);
+                        worker_thread_loop(worker, rx, &current);
                     })
                     .map_err(|e| format!("failed to spawn worker thread {i}: {e}"))
             };
@@ -449,76 +432,39 @@ impl InterpreterPool {
                 .iter()
                 .map(|(method, path, _)| format!("{method} {path}"))
                 .collect(),
-            routers,
-            requires_gil,
-            is_async_handler: is_async_handler.clone(),
-            static_dirs,
-            cors_config,
-            _request_logging: logging_flag,
             submit_semaphore,
         })
     }
 
-    /// Look up a route. Case-insensitive on method per RFC 9110 §9.1 —
-    /// matches the sibling `RouteTable::lookup` in src/router.rs. Without
-    /// this normalization, lowercase / mixed-case HTTP verbs from the
-    /// wire (hyper accepts them) silently fell through to 404 in
-    /// sub-interpreter mode.
-    pub fn lookup(&self, method: &str, path: &str) -> Option<(usize, Vec<(String, String)>)> {
-        let router = if method.bytes().any(|b| b.is_ascii_lowercase()) {
-            self.routers.get(&method.to_ascii_uppercase())?
-        } else {
-            self.routers.get(method)?
-        };
-        let matched = router.at(path).ok()?;
-        // Decode percent-encoded path params — see router.rs for rationale.
-        let params: Vec<(String, String)> = matched
-            .params
-            .iter()
-            .map(|(k, v)| {
-                let decoded = percent_encoding::percent_decode_str(v)
-                    .decode_utf8()
-                    .map(|c| c.into_owned())
-                    .unwrap_or_else(|_| v.to_string());
-                (k.to_string(), decoded)
-            })
-            .collect();
-        Some((*matched.value, params))
-    }
-
-    /// Get handler name by index.
-    /// Submit a work request. Routes to sync or async pool based on handler type.
-    pub fn submit(&self, req: WorkRequest) -> Result<(), String> {
-        // Route to async pool if handler is async and pool exists.
-        // `async_work_tx.is_some()` is the single source of truth for
-        // "async workers exist" — set iff `has_any_async` at construction.
-        let tx = match self.async_work_tx.as_ref() {
-            Some(tx)
-                if self
-                    .is_async_handler
-                    .get(req.handler_idx)
-                    .copied()
-                    .unwrap_or(false) =>
-            {
-                tx
-            }
+    /// Queue a request on the worker kind that runs it. Never waits: a full queue is an
+    /// error the caller answers with 503.
+    pub fn submit(&self, req: WorkRequest) -> Result<(), SubmitError> {
+        // `async_work_tx` is set iff the split has async workers, which it has whenever a
+        // pooled route is `async def` (`split_workers_for_routes`).
+        let tx = match (req.kind, self.async_work_tx.as_ref()) {
+            (crate::router::HandlerKind::Async, Some(tx)) => tx,
             _ => &self.sync_work_tx,
         };
-
         tx.try_send(req).map_err(|e| match e {
-            crossbeam_channel::TrySendError::Full(_) => "server overloaded".to_string(),
-            crossbeam_channel::TrySendError::Disconnected(_) => {
-                "worker pool channel closed".to_string()
-            }
+            crossbeam_channel::TrySendError::Full(_) => SubmitError::Full,
+            crossbeam_channel::TrySendError::Disconnected(_) => SubmitError::Closed,
         })
     }
+}
+
+/// Why [`InterpreterPool::submit`] could not queue a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SubmitError {
+    /// Every queue slot is taken.
+    Full,
+    /// The workers are gone (shutdown).
+    Closed,
 }
 
 /// Main loop for each worker OS thread.
 fn worker_thread_loop(
     mut worker: SubInterpreterWorker,
     rx: crossbeam_channel::Receiver<WorkRequest>,
-    request_logging: &AtomicBool,
     current_route: &AtomicUsize,
 ) {
     // Rebind the sub-interp tstate to this OS thread (fixes the
@@ -548,17 +494,17 @@ fn worker_thread_loop(
         // Deferred conversions: moved off Tokio thread.
         let headers_map = crate::types::extract_headers(&req.headers);
 
-        current_route.store(req.handler_idx, Ordering::Relaxed);
+        current_route.store(req.route.index(), Ordering::Relaxed);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let _guard = SubInterpGilGuard::acquire(tstate_cell.get(), &tstate_cell);
 
             worker.call_handler(
-                req.handler_idx,
+                req.route,
                 &req.method,
                 &req.path,
                 &req.params,
                 &req.query,
-                &req.body,
+                req.body.clone(),
                 &headers_map,
                 req.client_ip,
             )
@@ -573,39 +519,6 @@ fn worker_thread_loop(
             Ok(r) => r,
             Err(_) => Err("internal error: worker panic".to_string()),
         };
-
-        // Log request via tracing (zero-cost when access log is filtered off)
-        if request_logging.load(Ordering::Relaxed) {
-            let status = match &response {
-                Ok(r) => r.status,
-                Err(_) => 500,
-            };
-            if status >= 500 {
-                tracing::error!(
-                    target: "pyronova::access",
-                    method = %req.method,
-                    path = %req.path,
-                    status,
-                    "PyronovaRequest failed"
-                );
-            } else if status >= 400 {
-                tracing::warn!(
-                    target: "pyronova::access",
-                    method = %req.method,
-                    path = %req.path,
-                    status,
-                    "Client error"
-                );
-            } else {
-                tracing::info!(
-                    target: "pyronova::access",
-                    method = %req.method,
-                    path = %req.path,
-                    status,
-                    "PyronovaRequest handled"
-                );
-            }
-        }
 
         // Send response back (ignore error if receiver dropped)
         let _ = req.response_tx.send(response);

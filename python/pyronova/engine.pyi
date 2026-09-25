@@ -110,7 +110,14 @@ class WebSocket:
 
     Every receive returns ``None`` once the connection has ended (the peer
     closed it, or it was dropped after a read error, which the server logs).
+
+    The ``before_request`` hooks run on the upgrade request before the 101 is
+    sent; a hook that returns a response refuses the upgrade with it.
     """
+
+    request: Request
+    """The upgrade request (method, path, query, headers such as ``Origin``
+    and ``Cookie``, client IP); the object the ``before_request`` hooks saw."""
 
     def recv_message(self) -> Optional[str | bytes]:
         """Receive the next message: ``str`` for text, ``bytes`` for binary."""
@@ -221,7 +228,9 @@ class PyronovaApp:
         logged and answered 500.
         """
         ...
-    def set_cors_origin(self, origin: str) -> None: ...
+    def set_cors_origin(self, origin: str) -> None:
+        """:raises ValueError: ``origin`` is not a valid header value."""
+        ...
     def set_cors_config(
         self,
         origin: str,
@@ -229,7 +238,13 @@ class PyronovaApp:
         headers: str,
         expose_headers: Optional[str] = None,
         allow_credentials: bool = False,
-    ) -> None: ...
+    ) -> None:
+        """Apply these CORS headers to every response.
+
+        :raises ValueError: a value is not a valid header value (e.g. contains
+            a newline).
+        """
+        ...
     def enable_request_logging(self, enabled: bool) -> None: ...
     @property
     def state(self) -> SharedState: ...

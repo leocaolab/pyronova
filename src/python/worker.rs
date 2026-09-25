@@ -441,7 +441,7 @@ impl SubInterpreterWorker {
         path: &str,
         params: &[(String, String)],
         query: &str,
-        body: &[u8],
+        body: bytes::Bytes,
         headers: &HashMap<String, String>,
         client_ip: std::net::IpAddr,
     ) -> Result<*mut ffi::PyObject, String> {
@@ -457,7 +457,7 @@ impl SubInterpreterWorker {
             path,
             params.to_vec(),
             query,
-            bytes::Bytes::copy_from_slice(body),
+            body,
             headers.clone(),
             client_ip,
         );
@@ -525,28 +525,36 @@ impl SubInterpreterWorker {
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn call_handler(
         &mut self,
-        handler_idx: usize,
+        route: crate::router::RouteId,
         method: &str,
         path: &str,
         params: &[(String, String)],
         query: &str,
-        body: &[u8],
+        body: bytes::Bytes,
         headers: &HashMap<String, String>,
         client_ip: std::net::IpAddr,
     ) -> Result<SubInterpResponse, String> {
         self.attached(|worker, py| {
             worker.requests_served += 1;
-            let response = worker.call_handler_attached(
-                py,
-                handler_idx,
-                method,
-                path,
-                params,
-                query,
-                body,
-                headers,
-                client_ip,
-            );
+            // The hooks and the handler share one fresh `contextvars.Context`.
+            let response = crate::python::request_context::in_request_context(py, || {
+                worker.call_handler_attached(
+                    py,
+                    route.index(),
+                    method,
+                    path,
+                    params,
+                    query,
+                    body,
+                    headers,
+                    client_ip,
+                )
+            })
+            .unwrap_or_else(|e| {
+                Err(format!(
+                    "could not enter the request's contextvars.Context: {e}"
+                ))
+            });
             if worker.gc_threshold > 0 && worker.requests_since_collect() >= worker.gc_threshold {
                 worker.collect_garbage(py);
             }
@@ -628,7 +636,7 @@ impl SubInterpreterWorker {
         path: &str,
         params: &[(String, String)],
         query: &str,
-        body: &[u8],
+        body: bytes::Bytes,
         headers: &HashMap<String, String>,
         client_ip: std::net::IpAddr,
     ) -> Result<SubInterpResponse, String> {

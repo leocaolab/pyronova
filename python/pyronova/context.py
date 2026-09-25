@@ -13,17 +13,13 @@ Usage::
         return {"user": ctx.get("user_id"), "trace": ctx.request_id()}
 
 The context is a per-request dictionary. Values set during the request
-are visible to every hook and helper called from the same thread or
-awaited coroutine, and cleared before the next request begins.
+are visible to the request's hooks, its handler, and everything they call
+or await; the next request starts empty.
 
-Under the hood:
-
-- Backed by a ``ContextVar[dict]`` so async handlers inherit the scope
-  across ``await`` boundaries without extra plumbing.
-- Each before-request hook (installed by ``reset_context_on_request``,
-  which Pyronova wires automatically when you enable request-id or metrics)
-  replaces the stored dict, so leftover keys from a recycled worker
-  thread never leak.
+Under the hood it is a ``ContextVar[dict]``, and the server runs each
+request's before-hooks, handler and after-hooks inside a fresh
+``contextvars.Context`` (an ``async def`` handler's task runs in a copy of
+it), so nothing set by one request is visible to another, on any thread.
 
 ``request_id()`` is a dedicated accessor because it's the canonical
 correlation ID everyone needs and we don't want every caller to know
@@ -95,12 +91,6 @@ class _Ctx:
 
 
 ctx = _Ctx()
-
-
-def _reset_for_new_request() -> None:
-    """Called by Pyronova's internal before-request hook to start each
-    request with a fresh (unset) scope."""
-    _current.set(_UNSET)
 
 
 __all__ = ["ctx"]

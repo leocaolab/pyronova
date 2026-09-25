@@ -13,8 +13,9 @@ use tokio::signal;
 
 use crate::handlers::{handle_request, handle_request_subinterp};
 use crate::python::interp;
-use crate::router::{FrozenRoutes, MutableRoutes, RouteTable, Sealed};
+use crate::router::{Dispatch, HandlerKind, MutableRoutes, RequestBody, RouteTable, Sealed};
 use crate::server::listener::{create_reuseport_listener, handle_accept_error, setup_tcp_quickack};
+use crate::site::{AccessLog, Cors, CorsSpec, SharedSite, Site, SiteConfig};
 use crate::state::SharedState;
 use crate::websocket;
 
@@ -27,16 +28,10 @@ pub(crate) struct PyronovaApp {
     routes: MutableRoutes,
     script_path: Option<String>,
     shared_state: Arc<dashmap::DashMap<String, bytes::Bytes>>,
-    /// Per-instance CORS configuration (None = disabled).
-    cors_config: Option<crate::router::CorsConfig>,
-    /// Per-instance request logging flag.
-    request_logging: bool,
-    /// Per-instance access-log sampling. See RouteTable for semantics.
-    request_log_sample_n: u64,
-    request_log_always_status: u16,
-    /// Shared counter for sampled-request rolls. Cloned (Arc) into every
-    /// RouteTable snapshot so all worker copies share the same roll.
-    request_log_counter: Arc<std::sync::atomic::AtomicU64>,
+    /// Per-instance CORS configuration (None = disabled), parsed when it is set.
+    cors: Option<Cors>,
+    /// Per-instance access log. Its sampling counter is shared by every copy served.
+    access_log: AccessLog,
     /// Opt into Thread-Per-Core mode. See docs/tpc-rearch.md. Can also
     /// be flipped via the `PYRONOVA_TPC=1` env var; either is sufficient.
     tpc: bool,
@@ -50,11 +45,8 @@ impl PyronovaApp {
             routes: Arc::new(parking_lot::RwLock::new(RouteTable::new())),
             script_path: None,
             shared_state: crate::state::map_for_new(py),
-            cors_config: None,
-            request_logging: false,
-            request_log_sample_n: 1,
-            request_log_always_status: 0,
-            request_log_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            cors: None,
+            access_log: AccessLog::disabled(),
             tpc: false,
         }
     }
@@ -67,14 +59,15 @@ impl PyronovaApp {
     /// Set per-instance CORS origin (legacy setter — disables advanced CORS
     /// features. Prefer `set_cors_config` which propagates credentials and
     /// expose-headers to every response per W3C CORS spec.)
-    fn set_cors_origin(&mut self, origin: String) {
-        self.cors_config = Some(crate::router::CorsConfig {
-            origin,
-            methods: "GET, POST, PUT, DELETE, PATCH, OPTIONS".to_string(),
-            headers: "*".to_string(),
+    fn set_cors_origin(&mut self, origin: String) -> PyResult<()> {
+        self.cors = Some(parse_cors(&CorsSpec {
+            origin: &origin,
+            methods: "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+            headers: "*",
             expose_headers: None,
             allow_credentials: false,
-        });
+        })?);
+        Ok(())
     }
 
     /// Set full per-instance CORS configuration. All fields are applied to
@@ -87,7 +80,7 @@ impl PyronovaApp {
         headers: String,
         expose_headers: Option<String>,
         allow_credentials: bool,
-    ) {
+    ) -> PyResult<()> {
         // W3C Fetch / CORS forbids `Access-Control-Allow-Origin: *`
         // together with `Access-Control-Allow-Credentials: true` —
         // browsers reject the response client-side regardless of
@@ -104,18 +97,19 @@ impl PyronovaApp {
                  when credentials are enabled."
             );
         }
-        self.cors_config = Some(crate::router::CorsConfig {
-            origin,
-            methods,
-            headers,
-            expose_headers: expose_headers.filter(|s| !s.is_empty()),
+        self.cors = Some(parse_cors(&CorsSpec {
+            origin: &origin,
+            methods: &methods,
+            headers: &headers,
+            expose_headers: expose_headers.as_deref().filter(|s| !s.is_empty()),
             allow_credentials,
-        });
+        })?);
+        Ok(())
     }
 
     /// Enable/disable per-instance request logging.
     fn enable_request_logging(&mut self, enabled: bool) {
-        self.request_logging = enabled;
+        self.access_log.enabled = enabled;
     }
 
     /// Configure access-log sampling. `sample_n=1` (default) logs every
@@ -127,8 +121,8 @@ impl PyronovaApp {
     /// Has no effect unless `enable_request_logging(True)` is also set.
     #[pyo3(signature = (sample_n=1, always_status=0))]
     fn set_request_log_sampling(&mut self, sample_n: u64, always_status: u16) {
-        self.request_log_sample_n = sample_n.max(1);
-        self.request_log_always_status = always_status;
+        self.access_log.sample_n = sample_n.max(1);
+        self.access_log.always_status = always_status;
     }
 
     /// Set max request body size in bytes. Default: 10 MB.
@@ -202,12 +196,17 @@ impl PyronovaApp {
     ) -> PyResult<()> {
         let method_key = method.to_ascii_uppercase();
         let path_key = path.to_string();
-        let resp = crate::router::FastResponse {
-            body: bytes::Bytes::from(body),
-            content_type,
-            status: status_code,
-            headers: headers.unwrap_or_default(),
-        };
+        let resp = crate::router::FastResponse::parse(
+            bytes::Bytes::from(body),
+            &content_type,
+            status_code,
+            &headers.unwrap_or_default(),
+        )
+        .map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "fast response {method_key} {path_key}: {e}"
+            ))
+        })?;
         let mut routes = self.routes.write();
         let bucket = routes.fast_responses.entry(method_key.clone()).or_default();
         // Reject duplicate (method, path) registrations instead of silently
@@ -355,35 +354,20 @@ impl PyronovaApp {
     }
 
     fn before_request(slf: &Bound<'_, Self>, handler: Py<PyAny>) -> PyResult<()> {
-        let py = slf.py();
-        let name = handler.getattr(py, "__name__")?.extract::<String>(py)?;
         Self::serve_in_worker(slf)?;
-        let this = slf.borrow();
-        let mut routes = this.routes.write();
-        routes.before_hooks.push(handler);
-        routes.before_hook_names.push(name);
+        slf.borrow().routes.write().before_hooks.push(handler);
         Ok(())
     }
 
     fn after_request(slf: &Bound<'_, Self>, handler: Py<PyAny>) -> PyResult<()> {
-        let py = slf.py();
-        let name = handler.getattr(py, "__name__")?.extract::<String>(py)?;
         Self::serve_in_worker(slf)?;
-        let this = slf.borrow();
-        let mut routes = this.routes.write();
-        routes.after_hooks.push(handler);
-        routes.after_hook_names.push(name);
+        slf.borrow().routes.write().after_hooks.push(handler);
         Ok(())
     }
 
     fn fallback(slf: &Bound<'_, Self>, handler: Py<PyAny>) -> PyResult<()> {
-        let py = slf.py();
-        let name = handler.getattr(py, "__name__")?.extract::<String>(py)?;
         Self::serve_in_worker(slf)?;
-        let this = slf.borrow();
-        let mut routes = this.routes.write();
-        routes.fallback_handler = Some(handler);
-        routes.fallback_handler_name = Some(name);
+        slf.borrow().routes.write().set_fallback(handler);
         Ok(())
     }
 
@@ -471,7 +455,7 @@ impl PyronovaApp {
         self.seal_if_unsealed();
         // Freeze route table: extract from RwLock into read-only Arc.
         // After this point, no more route registration — zero-lock reads.
-        let frozen: FrozenRoutes = Arc::new(self.snapshot(py));
+        let frozen: SharedSite = Arc::new(self.snapshot(py));
 
         // The route table holds main-interpreter `Py<T>`s. Worker, bridge and Tokio threads
         // hold clones and may drop theirs anywhere, including at runtime shutdown; this one
@@ -759,7 +743,11 @@ pub(crate) fn worker_routes(py: Python<'_>) -> Option<WorkerRoutes> {
     let table = app.routes.read();
     Some(WorkerRoutes {
         signature: crate::router::RouteSignature::of(&table),
-        handlers: table.handlers.iter().map(|h| h.clone_ref(py)).collect(),
+        handlers: table
+            .routes()
+            .iter()
+            .map(|r| r.handler.clone_ref(py))
+            .collect(),
         before_hooks: table.before_hooks.iter().map(|h| h.clone_ref(py)).collect(),
         after_hooks: table.after_hooks.iter().map(|h| h.clone_ref(py)).collect(),
     })
@@ -809,44 +797,22 @@ impl PyronovaApp {
         let mut routes = self.routes.write();
         if routes.sealed.is_none() {
             routes.sealed = Some(Sealed {
-                routes: routes.handlers.len(),
+                routes: routes.routes().len(),
                 before_hooks: routes.before_hooks.len(),
                 after_hooks: routes.after_hooks.len(),
             });
         }
     }
 
-    /// A copy of the route table for serving, with this app's CORS and logging settings.
-    /// Each copy holds its own references to the handlers.
-    fn snapshot(&self, py: Python<'_>) -> RouteTable {
-        let table = self.routes.read();
-        RouteTable {
-            handlers: table.handlers.iter().map(|h| h.clone_ref(py)).collect(),
-            handler_names: table.handler_names.clone(),
-            requires_gil: table.requires_gil.clone(),
-            is_async: table.is_async.clone(),
-            is_stream: table.is_stream.clone(),
-            routers: table.routers.clone(),
-            ws_handlers: table
-                .ws_handlers
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone_ref(py)))
-                .collect(),
-            before_hooks: table.before_hooks.iter().map(|h| h.clone_ref(py)).collect(),
-            after_hooks: table.after_hooks.iter().map(|h| h.clone_ref(py)).collect(),
-            before_hook_names: table.before_hook_names.clone(),
-            after_hook_names: table.after_hook_names.clone(),
-            fallback_handler: table.fallback_handler.as_ref().map(|h| h.clone_ref(py)),
-            fallback_handler_name: table.fallback_handler_name.clone(),
-            static_dirs: table.static_dirs.clone(),
-            cors_config: self.cors_config.clone(),
-            request_logging: self.request_logging,
-            request_log_sample_n: self.request_log_sample_n,
-            request_log_always_status: self.request_log_always_status,
-            request_log_counter: Arc::clone(&self.request_log_counter),
-            fast_responses: table.fast_responses.clone(),
-            route_keys: table.route_keys.clone(),
-            sealed: table.sealed,
+    /// What a server run serves: a copy of the route table (holding its own references to
+    /// the handlers) with this app's CORS and access-log settings.
+    fn snapshot(&self, py: Python<'_>) -> Site {
+        Site {
+            routes: self.routes.read().clone_ref(py),
+            config: SiteConfig {
+                cors: self.cors.clone(),
+                access_log: self.access_log.clone(),
+            },
         }
     }
 
@@ -901,8 +867,14 @@ impl PyronovaApp {
                 method.to_uppercase()
             )));
         }
+        let dispatch = match (gil, stream, is_async) {
+            (true, true, _) => Dispatch::Main(RequestBody::Streamed),
+            (true, false, _) => Dispatch::Main(RequestBody::Buffered),
+            (false, _, false) => Dispatch::Worker(HandlerKind::Sync),
+            (false, _, true) => Dispatch::Worker(HandlerKind::Async),
+        };
         routes
-            .insert(method, path, handler, handler_name, gil, is_async, stream)
+            .insert(method, path, handler, handler_name, dispatch)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("route error: {e}")))?;
         Ok(())
     }
@@ -913,7 +885,7 @@ impl PyronovaApp {
         addr: SocketAddr,
         io_workers: usize,
         num_cpus: usize,
-        routes: FrozenRoutes,
+        routes: SharedSite,
         tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     ) -> PyResult<()> {
         let scheme = if tls_acceptor.is_some() {
@@ -1013,7 +985,7 @@ impl PyronovaApp {
                                             let client_ip_addr = remote_addr.ip();
                                             async move {
                                                 if websocket::is_websocket_upgrade(&req) {
-                                                    websocket::handle_websocket(req, routes).await
+                                                    websocket::handle_websocket(req, routes, client_ip_addr).await
                                                 } else {
                                                     handle_request(req, routes, client_ip_addr).await
                                                 }
@@ -1081,7 +1053,7 @@ impl PyronovaApp {
         workers: usize,
         io_workers: usize,
         num_cpus: usize,
-        routes: FrozenRoutes,
+        routes: SharedSite,
         tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     ) -> PyResult<()> {
         let script_path = if let Some(ref p) = self.script_path {
@@ -1091,25 +1063,20 @@ impl PyronovaApp {
             main_mod.getattr("__file__")?.extract::<String>()?
         };
 
-        let (routers, static_dirs, requires_gil) = (
-            routes.routers.clone(),
-            routes.static_dirs.clone(),
-            routes.requires_gil.clone(),
-        );
         // What every worker's script must register (Layer 2, C3), as plain values.
-        let expected = crate::router::RouteSignature::of(&routes);
+        let expected = crate::router::RouteSignature::of(&routes.routes);
+        let shape = crate::router::RouteShape::of(&routes.routes);
 
         // The pool's workers keep their `PYRONOVA_GC_THRESHOLD` count trigger: count mode only.
         crate::tpc::GcMode::from_env()
             .and_then(|mode| mode.supported_by(crate::tpc::GcServer::SubInterpreterPool))
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        let split = interp::split_workers_for_routes(workers, &requires_gil, &routes.is_async)
+        let split = interp::split_workers_for_routes(workers, &shape.gil, &shape.is_async)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
-        let gil_count = requires_gil.iter().filter(|&&g| g).count();
-        let subinterp_count = requires_gil.len() - gil_count;
-
-        let async_count_routes = routes.is_async.iter().filter(|&&a| a).count();
+        let gil_count = shape.gil_count();
+        let async_count_routes = shape.async_count();
+        let subinterp_count = shape.gil.len() - gil_count;
         let has_async = async_count_routes > 0;
         let mode_label = if has_async { "hybrid-async" } else { "hybrid" };
         tracing::info!(
@@ -1147,24 +1114,12 @@ impl PyronovaApp {
         println!("  Script: {script_path}\n");
 
         let pool = unsafe {
-            interp::InterpreterPool::new(
-                split,
-                py,
-                &script_path,
-                &expected,
-                routers,
-                static_dirs,
-                requires_gil,
-                routes.is_async.clone(),
-                self.cors_config.clone(),
-                self.request_logging,
-                &self.shared_state,
-            )
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "sub-interpreter pool error: {e}"
-                ))
-            })?
+            interp::InterpreterPool::new(split, py, &script_path, &expected, &self.shared_state)
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "sub-interpreter pool error: {e}"
+                    ))
+                })?
         };
         let pool = Arc::new(pool);
 
@@ -1235,7 +1190,7 @@ impl PyronovaApp {
                                             let client_ip_addr = remote_addr.ip();
                                             async move {
                                                 if websocket::is_websocket_upgrade(&req) {
-                                                    websocket::handle_websocket(req, routes).await
+                                                    websocket::handle_websocket(req, routes, client_ip_addr).await
                                                 } else {
                                                     handle_request_subinterp(req, pool, routes, client_ip_addr).await
                                                 }
@@ -1302,7 +1257,7 @@ impl PyronovaApp {
         addr: SocketAddr,
         io_workers: usize,
         num_cpus: usize,
-        routes: FrozenRoutes,
+        routes: SharedSite,
         tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     ) -> PyResult<()> {
         py.detach(move || -> PyResult<()> {
@@ -1327,7 +1282,7 @@ impl PyronovaApp {
         workers: usize,
         _io_workers: usize,
         num_cpus: usize,
-        routes: FrozenRoutes,
+        routes: SharedSite,
         tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
         extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
     ) -> PyResult<()> {
@@ -1349,10 +1304,6 @@ impl PyronovaApp {
         //   so all stream routes flow through the main-interp bridge.
         //   Phase 5 wires stream responses back through the bridge
         //   oneshot (BridgeResponse enum).
-        let gil_count = routes.requires_gil.iter().filter(|&&g| g).count();
-        let _async_count = routes.is_async.iter().filter(|&&a| a).count();
-        let _stream_count = routes.is_stream.iter().filter(|&&s| s).count();
-
         let script_path = if let Some(ref p) = self.script_path {
             p.clone()
         } else {
@@ -1361,7 +1312,7 @@ impl PyronovaApp {
         };
 
         // What every worker's script must register (Layer 2, C3), as plain values.
-        let expected = crate::router::RouteSignature::of(&routes);
+        let expected = crate::router::RouteSignature::of(&routes.routes);
 
         let gc_mode = crate::tpc::GcMode::from_env()
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -1406,11 +1357,9 @@ impl PyronovaApp {
             }
         }
 
-        // Phase 3 gil=True bridge: spawn a dedicated main-interp thread
-        // when at least one route is gil=True. The bridge serves those
-        // routes on a single MPSC-fed worker with the main GIL, while
-        // TPC threads handle the rest inline. See src/main_bridge.rs.
-        let main_bridge = if gil_count > 0 {
+        // The main-interp bridge serves `gil=True` routes and the fallback with the main
+        // GIL, while TPC threads handle the rest inline. See src/bridge/main_bridge.rs.
+        let main_bridge = if routes.routes.uses_main() {
             // 4 workers default — handlers mix CPU + I/O. Pure-CPU
             // (numpy) workloads serialize on the GIL anyway so extra
             // workers cost only thread-stack memory; I/O-bound (DB,
@@ -1478,28 +1427,18 @@ impl PyronovaApp {
         // Seal first, so the tables below carry the boundary workers compare against
         // (Layer 2, FR-2).
         self.seal_if_unsealed();
-        let build_one = |py: Python<'_>| -> FrozenRoutes { Arc::new(self.snapshot(py)) };
+        let build_one = |py: Python<'_>| -> SharedSite { Arc::new(self.snapshot(py)) };
 
         // Route-shape validation uses one sample.
         let sample = build_one(py);
-        if sample.requires_gil.iter().any(|&g| g) {
+        if !crate::router::RouteShape::of(&sample.routes).all_inline_sync() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "bench_inmem does not support gil=True routes",
+                "bench_inmem supports only sync, non-GIL, non-stream routes",
             ));
         }
-        if sample.is_async.iter().any(|&a| a) {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "bench_inmem does not support async def routes",
-            ));
-        }
-        if sample.is_stream.iter().any(|&s| s) {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "bench_inmem does not support stream=True routes",
-            ));
-        }
-        let expected = crate::router::RouteSignature::of(&sample);
+        let expected = crate::router::RouteSignature::of(&sample.routes);
 
-        let mut per_worker_routes: Vec<FrozenRoutes> = Vec::with_capacity(n_threads);
+        let mut per_worker_routes: Vec<SharedSite> = Vec::with_capacity(n_threads);
         per_worker_routes.push(sample);
         for _ in 1..n_threads {
             per_worker_routes.push(build_one(py));
@@ -1559,12 +1498,9 @@ impl PyronovaApp {
         client_conns: usize,
     ) -> PyResult<(u64, f64, u16)> {
         self.seal_if_unsealed(); // see __bench_inmem_impl
-        let routes: FrozenRoutes = Arc::new(self.snapshot(py));
+        let routes: SharedSite = Arc::new(self.snapshot(py));
 
-        if routes.requires_gil.iter().any(|&g| g)
-            || routes.is_async.iter().any(|&a| a)
-            || routes.is_stream.iter().any(|&s| s)
-        {
+        if !crate::router::RouteShape::of(&routes.routes).all_inline_sync() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "bench_loopback requires all routes to be sync, non-GIL, non-stream",
             ));
@@ -1577,7 +1513,7 @@ impl PyronovaApp {
             let main_mod = py.import("__main__")?;
             main_mod.getattr("__file__")?.extract::<String>()?
         };
-        let expected = crate::router::RouteSignature::of(&routes);
+        let expected = crate::router::RouteSignature::of(&routes.routes);
         let gc_mode = crate::tpc::GcMode::from_env()
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
@@ -1619,4 +1555,8 @@ impl PyronovaApp {
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)
         })
     }
+}
+
+fn parse_cors(spec: &CorsSpec<'_>) -> PyResult<Cors> {
+    Cors::parse(spec).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
