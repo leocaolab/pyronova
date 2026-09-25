@@ -186,9 +186,9 @@ History / WHAT comments, stale "Phase 1 / old pool" docs, misplaced doc comments
 
 ---
 
-## Decisions for the human
+## Decisions (human, 2026-09-25)
 
-- **D1** built-in gRPC benchmark handler: delete / opt-in / keep?
-- **D2** `bench.rs` + `bench_*` methods: cargo feature / separate crate / keep?
-- **D3** WS handler access to the request: `ws.request` attribute (non-breaking) vs `handler(ws, req)` (breaking); run `before_request` before the 101?
-- **D4** exception text exposed to clients (rpc / health / mcp / hook errors / 500 bodies): one policy — which?
+- **D1** built-in gRPC benchmark handler → **explicit opt-in.** Not registered by default; enabled by an explicit call (e.g. `app.enable_grpc_benchmark()`) so HttpArena can still turn it on. User `application/grpc*` routes are never intercepted when it's off. (M6)
+- **D2** `bench.rs` + `bench_*` → **behind a `bench` cargo feature**, off by default; `benchmarks/` builds with `--features bench`. Also fix the leaks / Ok-after-panic. (M6)
+- **D3** WebSocket → **`ws.request` attribute** (a `Request`; handler signature unchanged) **and run `before_request` before replying 101**; a hook returning a response rejects the upgrade with that response. (M1d item 2, dispatched after M2 so it reuses the unified pipeline)
+- **D4** client-facing error text → **4xx carry the reason; 5xx carry a generic message + request id**, full exception + traceback go to the log. Applies to rpc / health / mcp / hook errors / handler 500 bodies. (M1a item 9, M4)
