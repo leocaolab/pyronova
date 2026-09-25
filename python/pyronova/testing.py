@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from http.cookiejar import CookieJar
 from typing import Any, Iterator
 
-from pyronova.app import _WORKER_MODES, _ServeSettings
+from pyronova.app import _WORKER_MODES, Pyronova, _ServeSettings
 
 _logger = _logging.getLogger("pyronova.testing")
 
@@ -171,7 +171,7 @@ class TestClient:
 
     def __init__(
         self,
-        app: Any,
+        app: Pyronova,
         host: str = "127.0.0.1",
         port: int | None = None,
         *,
