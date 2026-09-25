@@ -334,3 +334,60 @@ def test_async_hook_and_handler_ctx_writes_reach_the_rest_of_the_request(path):
                 # async handler → after-hook
                 expected = "h" + route if route.startswith("/async") else "None"
                 assert r.headers["x-handler"] == expected, (path, route, r.headers)
+
+
+# ---------------------------------------------------------------------------
+# R3 / Q2: route templates take only `{name}` / `{*name}`
+# ---------------------------------------------------------------------------
+
+
+def test_colon_param_is_refused_whatever_the_handler_takes():
+    from pyronova import Pyronova
+    from pyronova.engine import PyronovaApp
+
+    app = Pyronova()
+    # A handler that takes only the request gets no injection, but the route would still
+    # never match: refused all the same.
+    with pytest.raises(ValueError, match=r"write it as `\{id\}`"):
+        app.get("/users/:id", lambda req: "x")
+    # The engine's own registration refuses it too.
+    with pytest.raises(ValueError, match=r"GET /users/:id: .*write it as `\{id\}`"):
+        PyronovaApp().get("/users/:id", lambda req: "x")
+    # A colon inside a segment is literal text.
+    app.get("/v1/items:batchGet", lambda req: "x")
+
+
+def test_route_params_is_the_one_template_parser():
+    from pyronova.engine import _route_params
+
+    assert _route_params("/a/{x}/img{y}.png/{*rest}") == ["x", "y", "rest"]
+    assert _route_params("/{{literal}}/{z}") == ["z"]
+
+
+TEMPLATE_SCRIPT = """
+from pyronova import Pyronova
+app = Pyronova()
+
+@app.get("/items/{item_id}")
+def item(req, item_id):
+    return {"item_id": item_id}
+
+@app.get("/files/{*rest}")
+def files(req, rest):
+    return {"rest": rest}
+
+@app.get("/gil-files/{*rest}", gil=True)
+async def gil_files(req, rest):
+    return {"rest": rest}
+""" + RUN
+
+
+@pytest.mark.parametrize("path", ["tpc", "pool", "gil"])
+def test_brace_params_and_catch_all_are_injected(path):
+    with serve(TEMPLATE_SCRIPT, path) as srv:
+        r = srv.get("/items/42")
+        assert (r.status, r.json()) == (200, {"item_id": "42"})
+        r = srv.get("/files/a/b%20c.txt")
+        assert (r.status, r.json()) == (200, {"rest": "a/b c.txt"})
+        r = srv.get("/gil-files/x/y")
+        assert (r.status, r.json()) == (200, {"rest": "x/y"})

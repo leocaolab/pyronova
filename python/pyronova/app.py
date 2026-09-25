@@ -11,7 +11,7 @@ import json as _json_module
 
 import os
 
-from pyronova.engine import PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log, _in_worker, _forgotten_workers
+from pyronova.engine import PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log, _in_worker, _forgotten_workers, _route_params
 from pyronova.mcp import MCPServer
 from pyronova import _reload
 import logging as _logging
@@ -1178,33 +1178,37 @@ def _bind_handler(fn: Callable, path: str, model: type | None) -> Callable:
     """The callable the engine dispatches for a route: ``fn`` itself when it
     takes only the request, else a wrapper that validates the body against
     ``model`` and injects the path params ``fn`` declares. Signature mistakes
-    raise here, at registration, not on every request."""
+    and a path the router would not take as written (``:name``) raise here, at
+    registration, not on every request."""
+    template = frozenset(_route_params(path))
     if model is None:
-        return _bind_path_params(fn, path)
-    return _bind_model(fn, path, model)
+        return _bind_path_params(fn, path, template)
+    return _bind_model(fn, path, template, model)
 
 
-def _bind_path_params(fn: Callable, path: str) -> Callable:
+def _bind_path_params(fn: Callable, path: str, template: frozenset[str]) -> Callable:
     try:
         sig = inspect.signature(fn)
     except (TypeError, ValueError):
         return fn  # a builtin/C callable: nothing to inject
-    names = _path_param_names(fn, sig, path, leading=1)
+    names = _path_param_names(fn, sig, path, template, leading=1)
     if not names:
         return fn  # hot path — the handler is registered as is
 
+    # Every name is in the template, so the router always fills it: `p[n]`, never a
+    # silent None.
     if inspect.iscoroutinefunction(fn):
         async def bound(req):
             p = req.params
-            return await fn(req, **{n: p.get(n) for n in names})
+            return await fn(req, **{n: p[n] for n in names})
     else:
         def bound(req):
             p = req.params
-            return fn(req, **{n: p.get(n) for n in names})
+            return fn(req, **{n: p[n] for n in names})
     return _named_like(bound, fn)
 
 
-def _bind_model(fn: Callable, path: str, model: type) -> Callable:
+def _bind_model(fn: Callable, path: str, template: frozenset[str], model: type) -> Callable:
     """``fn(req, body, **path_params)`` or ``fn(body, **path_params)``."""
     # Imported here, only for routes that declare model=: importing pydantic at
     # module level would load pydantic_core in every worker of every app. If it
@@ -1218,15 +1222,15 @@ def _bind_model(fn: Callable, path: str, model: type) -> Callable:
         p for p in sig.parameters.values()
         if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
     ]
-    takes_request = len(positional) >= 2 and positional[1].name not in _path_template_names(path)
-    names = _path_param_names(fn, sig, path, leading=2 if takes_request else 1)
+    takes_request = len(positional) >= 2 and positional[1].name not in template
+    names = _path_param_names(fn, sig, path, template, leading=2 if takes_request else 1)
 
     def args(req, body):
         return (req, body) if takes_request else (body,)
 
     def kwargs(req):
         p = req.params
-        return {n: p.get(n) for n in names}
+        return {n: p[n] for n in names}
 
     if inspect.iscoroutinefunction(fn):
         async def bound(req):
@@ -1256,47 +1260,24 @@ def _validation_error_response(e) -> Response:
     )
 
 
-def _path_param_names(fn: Callable, sig: inspect.Signature, path: str, leading: int) -> tuple[str, ...]:
+def _path_param_names(
+    fn: Callable, sig: inspect.Signature, path: str, template: frozenset[str], leading: int
+) -> tuple[str, ...]:
     """The parameters after the ``leading`` ones the dispatcher fills (request,
     body), each of which must name a param in the URL template."""
     names = tuple(
         p.name for p in list(sig.parameters.values())[leading:]
         if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
     )
-    template = _path_template_names(path)
     missing = [n for n in names if n not in template]
     if missing:
         raise ValueError(
             f"handler {fn.__name__!r} declares parameter(s) {missing!r} "
             f"that are not in the URL template {path!r}. Path-param "
             f"injection only fills names that appear as `{{name}}` "
-            f"or `:name` in the route path."
+            f"or `{{*name}}` in the route path."
         )
     return names
-
-
-def _path_template_names(path: str) -> frozenset[str]:
-    """Param names in a route template; matchit accepts both ``{id}`` and ``:id``."""
-    names = set()
-    i = 0
-    while i < len(path):
-        ch = path[i]
-        if ch == "{":
-            end = path.find("}", i + 1)
-            if end == -1:
-                break
-            names.add(path[i + 1 : end].split(":")[0])
-            i = end + 1
-        elif ch == ":":
-            j = i + 1
-            while j < len(path) and (path[j].isalnum() or path[j] == "_"):
-                j += 1
-            if j > i + 1:
-                names.add(path[i + 1 : j])
-            i = j
-        else:
-            i += 1
-    return frozenset(names)
 
 
 def _named_like(wrapper: Callable, fn: Callable) -> Callable:

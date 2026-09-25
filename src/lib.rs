@@ -61,6 +61,17 @@ fn _forgotten_workers() -> Vec<String> {
     python::pool::take_forgotten_workers()
 }
 
+/// The parameter names of the route path `path`, in order (`{*rest}` gives `rest`). A path
+/// the router would not take as written (`:name`) raises `ValueError`. The one parser of
+/// route templates: path-param injection in `app.py` reads it, and route registration
+/// runs it again.
+#[pyo3::pyfunction]
+fn _route_params(path: &str) -> PyResult<Vec<String>> {
+    router::template_params(path)
+        .map(|names| names.into_iter().map(str::to_owned).collect())
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("route {path}: {e}")))
+}
+
 /// Whether this code runs in a sub-interpreter worker, i.e. not in the main interpreter
 /// (Layer 2, FR-15). Replaces a process-wide environment variable, which leaked into
 /// child processes.
@@ -90,6 +101,7 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(logging::emit_python_log, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(workrequest_counts, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(_in_worker, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(_route_params, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(_forgotten_workers, m)?)?;
     // Called by the async engine in sub-interpreter workers (Layer 2, C5).
     m.add_function(pyo3::wrap_pyfunction!(python::worker_api::_worker_recv, m)?)?;

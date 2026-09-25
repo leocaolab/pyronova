@@ -398,6 +398,11 @@ def _in_worker() -> bool:
     """Whether this code runs in a sub-interpreter worker (not the main interpreter)."""
     ...
 
+def _route_params(path: str) -> List[str]:
+    """The parameter names of a route path, in order (``{*rest}`` gives ``rest``).
+    ``ValueError`` for a ``:name`` segment, which the router would take literally."""
+    ...
+
 
 # Called by the async engine in sub-interpreter workers (Layer 2, C5); not a
 # public API.
