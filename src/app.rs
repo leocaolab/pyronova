@@ -1056,8 +1056,7 @@ impl PyronovaApp {
             io_workers,
             num_cpus,
         } = run;
-        let script_path = self.worker_script_path(py)?;
-        let import_path = interp::main_import_path(py)?;
+        let program = self.worker_program(py)?;
 
         // What every worker's script must register (Layer 2, C3), as plain values.
         let expected = crate::router::RouteSignature::of(&routes.routes);
@@ -1099,20 +1098,18 @@ impl PyronovaApp {
         println!(
             "  Routes: {subinterp_count} sub-interp + {gil_count} GIL + {async_count_routes} async"
         );
-        println!("  Script: {script_path}\n");
+        println!("  Script: {}\n", program.script_path);
 
+        let spec = interp::WorkerSpec {
+            program: &program,
+            expected: &expected,
+            pool_id: interp::next_pool_id(),
+            shared_state: &self.shared_state,
+            gc_threshold: env.gc.threshold,
+            limits: routes.config.limits,
+        };
         let pool = unsafe {
-            interp::InterpreterPool::new(
-                split,
-                py,
-                &script_path,
-                &import_path,
-                &expected,
-                &self.shared_state,
-                env.gc.threshold,
-                routes.config.limits,
-            )
-            .map_err(|e| {
+            interp::InterpreterPool::new(split, py, &spec).map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "sub-interpreter pool error: {e}"
                 ))
@@ -1198,12 +1195,14 @@ impl PyronovaApp {
         .map_err(PyErr::from)
     }
 
-    /// The script workers execute: `set_script_path`'s, else `__main__.__file__`.
-    fn worker_script_path(&self, py: Python<'_>) -> PyResult<String> {
-        match &self.script_path {
-            Some(path) => Ok(path.clone()),
-            None => py.import("__main__")?.getattr("__file__")?.extract(),
-        }
+    /// The program workers run: the script `set_script_path` named, else
+    /// `__main__.__file__`, with main's `sys.path` as it is now.
+    fn worker_program(&self, py: Python<'_>) -> PyResult<interp::WorkerProgram> {
+        let script_path = match &self.script_path {
+            Some(path) => path.clone(),
+            None => py.import("__main__")?.getattr("__file__")?.extract()?,
+        };
+        interp::WorkerProgram::read(py, script_path)
     }
 
     /// Builds `n` TPC sub-interpreter workers, in order, on the main thread: each runs the
@@ -1223,22 +1222,14 @@ impl PyronovaApp {
                 "sub-interpreter workers are built on the main interpreter only",
             ));
         }
-        let script_path = self.worker_script_path(py)?;
-        let script = std::fs::read_to_string(&script_path).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("read script '{script_path}': {e}"))
-        })?;
-        // Each worker gets it as `POOL_ID` (the async engine's zombie guard).
-        let pool_id = interp::next_pool_id();
-
-        let import_path = interp::main_import_path(py)?;
+        let program = self.worker_program(py)?;
 
         let expected = crate::router::RouteSignature::of(&site.routes);
         let spec = interp::WorkerSpec {
-            script: &script,
-            script_path: &script_path,
-            import_path: &import_path,
+            program: &program,
             expected: &expected,
-            pool_id,
+            // Each worker gets it as `POOL_ID` (the async engine's zombie guard).
+            pool_id: interp::next_pool_id(),
             shared_state: &self.shared_state,
             gc_threshold,
             limits: site.config.limits,

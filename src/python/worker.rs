@@ -167,17 +167,38 @@ impl Drop for SubInterpreterWorker {
     }
 }
 
+/// The program every worker of one server runs, read on main when the workers are built.
+pub(crate) struct WorkerProgram {
+    pub(crate) script_path: String,
+    /// The app's script (`script_path`'s text), which each worker executes.
+    pub(crate) script: String,
+    /// Main's `sys.path`. A new interpreter's own `sys.path` is only what the process
+    /// started with; whatever main added since (the CLI's working directory, a test
+    /// runner's root, the program's own inserts) would be missing, and the script's
+    /// imports would not resolve as they do on main.
+    pub(crate) import_path: Vec<String>,
+}
+
+impl WorkerProgram {
+    /// Reads `script_path` and main's `sys.path` now. An unreadable script, or a
+    /// `sys.path` entry that is not a `str`, is an error.
+    pub(crate) fn read(py: Python<'_>, script_path: String) -> PyResult<Self> {
+        let script = std::fs::read_to_string(&script_path).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("read script '{script_path}': {e}"))
+        })?;
+        let import_path = py.import("sys")?.getattr("path")?.extract()?;
+        Ok(WorkerProgram {
+            script_path,
+            script,
+            import_path,
+        })
+    }
+}
+
 /// What every worker of one server is built from.
 #[derive(Clone, Copy)]
 pub(crate) struct WorkerSpec<'a> {
-    /// The app's script (`script_path`'s text), which each worker executes.
-    pub(crate) script: &'a str,
-    pub(crate) script_path: &'a str,
-    /// Main's `sys.path` when the workers are built ([`main_import_path`]). A new
-    /// interpreter's own `sys.path` is only what the process started with; whatever main
-    /// added since (the CLI's working directory, a test runner's root, the program's own
-    /// inserts) would be missing, and the script's imports would not resolve as on main.
-    pub(crate) import_path: &'a [String],
+    pub(crate) program: &'a WorkerProgram,
     /// The routes the script must register: main's table up to its seal.
     pub(crate) expected: &'a RouteSignature,
     /// See `SubInterpreterWorker::pool_id`.
@@ -301,14 +322,17 @@ impl SubInterpreterWorker {
         spec: &WorkerSpec<'_>,
     ) -> Result<Serving<'py>, WorkerStartError> {
         let WorkerSpec {
-            script,
-            script_path,
-            import_path,
+            program,
             expected,
             pool_id,
             shared_state,
             ..
         } = *spec;
+        let WorkerProgram {
+            script_path,
+            script,
+            import_path,
+        } = program;
         let setup = |step: &'static str| {
             move |e: PyErr| WorkerStartError::Setup {
                 worker: worker_id,
@@ -342,7 +366,7 @@ impl SubInterpreterWorker {
         // 2. The user's script as a real module, compiled with its own path so tracebacks
         //    point at it, `from __future__` imports work, and `typing.get_type_hints` finds
         //    the module in `sys.modules` (FR-20).
-        let script_module = new_module(py, SCRIPT_MODULE, Some(script_path), None)
+        let script_module = new_module(py, SCRIPT_MODULE, Some(script_path.as_str()), None)
             .map_err(setup("creating the script module"))?;
         exec_in(py, script, script_path, &script_module, worker_id)?;
 
@@ -768,12 +792,6 @@ fn new_event_loop(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
 // ---------------------------------------------------------------------------
 // Worker init helpers
 // ---------------------------------------------------------------------------
-
-/// Main's `sys.path` now, for [`WorkerSpec::import_path`]. An entry that is not a `str`
-/// is an error: a worker's copy is rebuilt from the text.
-pub(crate) fn main_import_path(py: Python<'_>) -> PyResult<Vec<String>> {
-    py.import("sys")?.getattr("path")?.extract()
-}
 
 /// A new module named `name`, registered in `sys.modules`, with builtins, `__file__` and,
 /// for the bootstrap and async engine, `WORKER_ID` / `POOL_ID`.

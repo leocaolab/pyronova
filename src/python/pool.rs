@@ -200,11 +200,6 @@ pub(crate) fn split_workers_for_routes(
 /// Why the sub-interpreter pool could not start.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PoolError {
-    #[error("could not read the app script {path}: {source}")]
-    ReadScript {
-        path: String,
-        source: std::io::Error,
-    },
     #[error("sub-interpreter {index}: {source}")]
     Worker {
         index: usize,
@@ -332,21 +327,13 @@ impl InterpreterPool {
     pub unsafe fn new(
         split: WorkerSplit,
         _py: Python<'_>,
-        script_path: &str,
-        import_path: &[String],
-        expected: &crate::router::RouteSignature,
-        shared_state: &crate::state::SharedMap,
-        gc_threshold: u64,
-        limits: crate::site::Limits,
+        spec: &WorkerSpec<'_>,
     ) -> Result<Self, PoolError> {
         let n = split.total();
         let has_any_async = split.async_workers > 0;
-
-        let raw_script =
-            std::fs::read_to_string(script_path).map_err(|source| PoolError::ReadScript {
-                path: script_path.to_string(),
-                source,
-            })?;
+        // Every WorkerState created below carries it; `_worker_recv` / `_worker_send`
+        // reject zombies whose pool_id mismatches.
+        let pool_id = spec.pool_id;
 
         // Create work channels
         // Sync pool: handles def handlers (220k req/s)
@@ -359,27 +346,12 @@ impl InterpreterPool {
             (None, None)
         };
 
-        // Allocate a fresh pool_id for this InterpreterPool instance.
-        // All WorkerStates created below carry this id; `_worker_recv` /
-        // `_worker_send` reject zombies whose pool_id mismatches.
-        let pool_id = POOL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-
         // Create sub-interpreters and spawn worker threads
         let mut workers = Vec::new();
         let mut threads = Vec::new();
 
-        let spec = WorkerSpec {
-            script: &raw_script,
-            script_path,
-            import_path,
-            expected,
-            pool_id,
-            shared_state,
-            gc_threshold,
-            limits,
-        };
         for i in 0..n {
-            match SubInterpreterWorker::new(i, &spec) {
+            match SubInterpreterWorker::new(i, spec) {
                 Ok(worker) => workers.push(worker),
                 Err(source) => {
                     // End the workers built so far here, on their creating thread (FR-19).
@@ -465,7 +437,8 @@ impl InterpreterPool {
             async_work_tx,
             worker_threads: Some(threads),
             current_route,
-            route_names: expected
+            route_names: spec
+                .expected
                 .routes
                 .iter()
                 .map(|(method, path, _)| format!("{method} {path}"))
