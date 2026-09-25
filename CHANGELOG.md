@@ -1,12 +1,14 @@
 # Changelog
 
-## Unreleased
+## v2.9.0 (2026-09-25) — Python 3.14; isojson 0.2 (native datetime and numpy)
 
 ### Changed
 
 - **Python 3.14+ required** (`requires-python = ">=3.14"`; CI and wheels on 3.14 only).
   3.13 is no longer supported: its own `_datetime` crashes under concurrent strict
   sub-interpreters with no Pyronova or isojson code involved (measured 2026-09-24).
+- **isojson ≥ 0.2** (was ≥ 0.1). Handler return values containing `datetime` / `date` /
+  `time` now serialize natively (`isoformat()`; they raised `TypeError` with 0.1).
 
 ### Fixed
 
@@ -21,14 +23,7 @@
   isojson E2E-3). Four workers each clone numpy (declared and reactive), serialize a
   seeded numpy payload with `isojson.dumps(..., option=OPT_SERIALIZE_NUMPY)`, and every
   response equals orjson 3.12.0's bytes for the same payload; SIGINT exits cleanly. Run
-  under both dispatch paths: TPC (the default) and the pool (`PYRONOVA_TPC=0`). CI's
-  integration job installs isojson from its numpy commit.
-
-### Note
-
-- With isojson ≥ 0.2 installed, handler return values containing `datetime` / `date` /
-  `time` serialize natively (they raised `TypeError` with 0.1). Pyronova's dependency
-  stays `isojson>=0.1`.
+  under both dispatch paths: TPC (the default) and the pool (`PYRONOVA_TPC=0`).
 
 ## v2.8.0 (2026-09-24) — Real pyronova in every worker (Layer 2); shared-extension isolation
 
