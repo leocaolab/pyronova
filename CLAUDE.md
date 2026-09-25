@@ -11,7 +11,7 @@ High-performance Python web framework powered by Rust. Per-Interpreter GIL (PEP 
   - `types.rs` — `Request`, `Response`, `extract_headers`
   - `app.rs` — `PyronovaApp` with `run_gil()` / `run_subinterp()`, graceful shutdown
   - `handlers.rs` — GIL handler, sub-interp handler (30s zombie timeout), streaming
-  - `router.rs` — `RouteTable`, `MutableRoutes`, `FrozenRoutes`
+  - `router.rs` — `RouteTable` (`Vec<Route>`, `Target`, `Call`), `MutableRoutes`; `site.rs` — `Site` (frozen table + CORS/access-log config) served by a run
   - `response.rs` — response builders (200/404/413/500/503/504)
   - `json.rs` — Rust-side `py_to_json_value` serializer
   - `static_fs.rs` — async static file serving + MIME detection + path traversal protection
@@ -60,7 +60,7 @@ bash benchmarks/run_bench.sh
 
 ## Key Design Decisions
 
-- Route table uses index-based lookup (`Vec<Py<PyAny>>` + `Router<usize>`) to avoid `Py<PyAny>` Clone issues in PyO3 0.28
+- Route table is `Vec<Route { handler, name, key, dispatch }>` + `Router<RouteId>`; every serving path runs one pipeline (`handlers/pipeline.rs`: `preprocess` → dispatch → `finish`, which applies CORS and writes the access log for every response)
 - GIL released via `py.detach()` during Tokio event loop, reacquired via `Python::attach()` per-request
 - `#[pyclass(frozen)]` on Request/Response for thread safety
 - `Pyronova` Python wrapper provides decorator syntax; `PyronovaApp` is the raw Rust engine
@@ -89,7 +89,8 @@ src/
   types.rs            # Request, Response, extract_headers
   app.rs              # PyronovaApp — route registration + server startup
   handlers.rs         # handle_request (GIL), handle_request_subinterp (channel)
-  router.rs           # RouteTable, MutableRoutes, FrozenRoutes
+  router.rs           # RouteTable, MutableRoutes
+  site.rs             # Site: frozen RouteTable + CORS / access-log config
   response.rs         # Response builders, extract_response_data
   json.rs             # py_to_json_value
   static_fs.rs        # try_static_file, mime_from_ext

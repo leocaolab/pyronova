@@ -341,6 +341,9 @@ class Pyronova:
                                   content_type="application/json")
             app.add_fast_response("GET", "/robots.txt",
                                   b"User-agent: *\\nDisallow: /\\n")
+
+        :raises ValueError: ``status_code`` is not an HTTP status (100-999),
+            or a header name or value (``content_type`` included) is invalid.
         """
         if isinstance(body, str):
             body = body.encode("utf-8")

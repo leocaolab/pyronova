@@ -52,14 +52,11 @@ _metrics_start_ns: ContextVar[int | None] = ContextVar("pyronova_obs_metrics_sta
 
 
 def install_request_id(app: "Pyronova", header: str) -> None:
-    from pyronova.context import ctx, _reset_for_new_request
+    from pyronova.context import ctx
 
     header_lower = header.lower()
 
     def _before(req):
-        # Fresh context per request — prevents leftover keys from a
-        # recycled worker thread from leaking into the next caller.
-        _reset_for_new_request()
         # Stash the incoming id (or a freshly-minted one) for this request so
         # the after-hook can echo it back without mutating the frozen req.
         headers = req.headers
@@ -117,7 +114,6 @@ def install_metrics(app: "Pyronova", path: str) -> None:
                 state.incr(f"_m:req:method:{method}", 1)
 
             start = _metrics_start_ns.get()
-            _metrics_start_ns.set(None)
             if start is not None:
                 elapsed_us = max(0, (time.monotonic_ns() - start) // 1000)
                 state.incr("_m:lat:sum_us", int(elapsed_us))
