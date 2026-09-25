@@ -8,12 +8,12 @@ High-performance Python web framework powered by Rust. Per-Interpreter GIL (PEP 
 
 - **Rust core** (`src/`): 12 modules
   - `lib.rs` — module declarations, `#[pymodule]`, mimalloc global allocator
-  - `types.rs` — `Request`, `Headers` (the request-header view), `Response`, `ResponseHeaders`, `ResponseData`
+  - `types/` — `request.rs`: `Request`, `Headers` (the request-header view); `response.rs`: `Response`, `ResponseHeaders`, `ResponseData`
   - `app.rs` — `PyronovaApp` with `run_gil()` / `run_subinterp()`, graceful shutdown
   - `handlers.rs` — GIL handler, sub-interp handler (30s zombie timeout), streaming
   - `router.rs` — `RouteTable` (`Vec<Route>`, `Target`, `Call`), `MutableRoutes`; `site.rs` — `Site` (frozen table + CORS/access-log config) served by a run
   - `response.rs` — the one handler-result → `ResponseData` mapping every interpreter uses (type from the value, never sniffed from the text), response builders (200/404/413/500/503/504)
-  - `json.rs` — Rust-side `py_to_json_value` serializer
+  - `json.rs` — JSON text → Python value with isojson (`req.json()`, `json`/`jsonb` columns); integers wider than 64 bits decode exactly
   - `static_fs.rs` — async static file serving + MIME detection + path traversal protection
   - `python/` — sub-interpreter workers: `worker.rs` (`SubInterpreterWorker`, runs the real `pyronova` package + engine), `pool.rs` (dual worker pool, sync+async), `worker_api.rs` (`_worker_recv`/`_worker_send` pyfunctions for the async engine), `ffi.rs` (`PyObjRef` RAII, tstate helpers)
   - `run_context.rs` — explicit-interpreter attach (`main_attach`/`attach_to`) for every Rust thread that enters Python
@@ -90,13 +90,13 @@ bash benchmarks/run_bench.sh
 src/
   lib.rs              # Module declarations + #[pymodule] + mimalloc
   logging.rs          # Rust tracing engine + Python logging bridge
-  types.rs            # Request, Headers, Response, ResponseHeaders, ResponseData
+  types/              # request.rs (Request, Headers), response.rs (Response, ResponseHeaders, ResponseData)
   app.rs              # PyronovaApp — route registration + server startup
   handlers.rs         # handle_request (GIL), handle_request_subinterp (channel)
   router.rs           # RouteTable, MutableRoutes
   site.rs             # Site: frozen RouteTable + CORS / access-log config
   response.rs         # the one handler-result → response mapping + builders
-  json.rs             # py_to_json_value
+  json.rs             # JSON decode (isojson; exact wide integers)
   static_fs.rs        # try_static_file, mime_from_ext
   run_context.rs      # main_attach / attach_to: explicit-interpreter attach
   python/             # worker.rs, pool.rs, worker_api.rs, ffi.rs: sub-interpreter workers

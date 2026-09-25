@@ -1,3 +1,6 @@
+//! `Request` (what a handler receives) and `Headers`, its read-only view of the header
+//! fields.
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -5,11 +8,12 @@ use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use hyper::header::{HeaderMap, HeaderName, HeaderValue};
-use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyString, PyTuple};
+use pyo3::types::{PyDict, PyList, PyString};
 
+use super::response::{header_name, header_value};
 use crate::request_id::RequestId;
 
 // ---------------------------------------------------------------------------
@@ -136,10 +140,14 @@ impl PyronovaRequest {
         &self.path
     }
 
-    /// Converts Vec<(String, String)> → Python dict on access.
+    /// A new `dict` of the path params on every access.
     #[getter]
-    fn params(&self) -> HashMap<String, String> {
-        self.params.iter().cloned().collect()
+    fn params<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        for (name, value) in &self.params {
+            dict.set_item(name, value)?;
+        }
+        Ok(dict)
     }
 
     /// The request's headers as a read-only, case-insensitive mapping (`Headers`). No
@@ -211,66 +219,46 @@ impl PyronovaRequest {
         Ok(pyo3::types::PyString::new(py, s))
     }
 
-    fn json<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::PyAny>> {
-        let parsed: serde_json::Value = serde_json::from_slice(&self.body_bytes).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("JSON parse error: {e}"))
-        })?;
-        pythonize::pythonize(py, &parsed)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("pythonize error: {e}")))
+    /// The body decoded as JSON, with the codec responses use (see `crate::json`): an
+    /// integer of any size stays an exact `int`, a float reads back as the value sent. A
+    /// body that isn't JSON raises `ValueError`.
+    fn json<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        crate::json::loads(py, &self.body_bytes)
     }
 
-    /// Look up a single query parameter by name without cloning the full map.
+    /// Look up a single query parameter by name without building the full map.
     ///
     /// Uses the already-computed cache when available. On a cold cache this
     /// scans the raw query string once — cheaper than building a HashMap for
     /// a single lookup. First-wins on duplicate keys (same policy as
     /// `query_params`).
-    fn query_param(&self, key: &str) -> Option<String> {
+    fn query_param(&self, key: &str) -> Option<Cow<'_, str>> {
         if let Some(cache) = self.query_cache.get() {
-            return cache.get(key).cloned();
+            return cache.get(key).map(|v| Cow::Borrowed(v.as_str()));
         }
         form_urlencoded::parse(self.query.as_bytes())
             .find(|(k, _)| k == key)
-            .map(|(_, v)| v.into_owned())
+            .map(|(_, v)| Cow::Owned(v.into_owned()))
     }
 
-    #[getter]
-    fn query_params(&self) -> HashMap<String, String> {
-        // Parse once, reuse on subsequent accesses. On duplicate keys
-        // (`?a=1&a=2`) we keep the FIRST value, not the last. Rationale:
-        // HTTP parameter pollution (HPP). WAFs, rate limiters, and
-        // reverse proxies almost always inspect the first occurrence of
-        // a duplicated param; a web framework that then silently picks
-        // the last one opens a classic security-policy bypass
-        // (`?role=user&role=admin` reaches business logic as admin
-        // while the WAF approved it as user). First-wins lines up
-        // with those upstream components.
-        //
-        // If a handler legitimately needs all values, use
-        // `query_params_all()` which returns Dict[str, List[str]].
-        self.query_cache
-            .get_or_init(|| {
-                let mut map: HashMap<String, String> = HashMap::new();
-                for (k, v) in form_urlencoded::parse(self.query.as_bytes()) {
-                    map.entry(k.into_owned()).or_insert_with(|| v.into_owned());
-                }
-                map
-            })
-            .clone()
+    /// A new `dict` on every access, built from the parse cached on the first.
+    #[getter(query_params)]
+    fn py_query_params<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        for (key, value) in self.query_params() {
+            dict.set_item(key, value)?;
+        }
+        Ok(dict)
     }
 
-    /// Full query-parameter access preserving duplicate keys.
-    /// Returns Dict[str, List[str]] in insertion order.
-    fn query_params_all(&self) -> HashMap<String, Vec<String>> {
-        self.query_all_cache
-            .get_or_init(|| {
-                let mut map: HashMap<String, Vec<String>> = HashMap::new();
-                for (k, v) in form_urlencoded::parse(self.query.as_bytes()) {
-                    map.entry(k.into_owned()).or_default().push(v.into_owned());
-                }
-                map
-            })
-            .clone()
+    /// Full query-parameter access preserving duplicate keys: a new
+    /// `dict[str, list[str]]` on every call.
+    fn query_params_all<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        for (key, values) in self.query_params_all_map() {
+            dict.set_item(key, PyList::new(py, values)?)?;
+        }
+        Ok(dict)
     }
 
     // ── Buffer protocol: zero-copy `memoryview(req)` into the body ──────
@@ -339,6 +327,33 @@ impl PyronovaRequest {
         // Nothing to free: the buffer points into `self.body_bytes`, owned
         // by this instance. CPython's PyBuffer_Release DECREFs `view.obj`
         // (the ref we handed out) on its own; we must not double-free it.
+    }
+}
+
+impl PyronovaRequest {
+    /// The query string's parameters, parsed on the first access. On duplicate keys
+    /// (`?a=1&a=2`) the FIRST value wins: WAFs, rate limiters and proxies inspect the first
+    /// occurrence, so taking the last would let `?role=user&role=admin` reach the handler
+    /// as the value the WAF never approved (HTTP parameter pollution). All values:
+    /// `query_params_all()`.
+    pub(crate) fn query_params(&self) -> &HashMap<String, String> {
+        self.query_cache.get_or_init(|| {
+            let mut map: HashMap<String, String> = HashMap::new();
+            for (k, v) in form_urlencoded::parse(self.query.as_bytes()) {
+                map.entry(k.into_owned()).or_insert_with(|| v.into_owned());
+            }
+            map
+        })
+    }
+
+    fn query_params_all_map(&self) -> &HashMap<String, Vec<String>> {
+        self.query_all_cache.get_or_init(|| {
+            let mut map: HashMap<String, Vec<String>> = HashMap::new();
+            for (k, v) in form_urlencoded::parse(self.query.as_bytes()) {
+                map.entry(k.into_owned()).or_default().push(v.into_owned());
+            }
+            map
+        })
     }
 }
 
@@ -459,195 +474,6 @@ pub(crate) fn joined_fields(map: &HeaderMap) -> Vec<(String, String)> {
             Some((name.as_str().to_string(), value))
         })
         .collect()
-}
-
-// ---------------------------------------------------------------------------
-// ResponseHeaders
-// ---------------------------------------------------------------------------
-
-/// A response's header lines: a real multimap, one entry per line sent, names and values
-/// already validated. Built once, from the handler's `headers=`; the HTTP response takes
-/// the map as is. `content-type` and `server` here replace the defaults.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ResponseHeaders(HeaderMap);
-
-impl ResponseHeaders {
-    pub(crate) fn new() -> Self {
-        Self(HeaderMap::new())
-    }
-
-    /// `{name: str | list[str]}` as header lines, a list giving one line per item. A
-    /// non-`str` name or value is a `TypeError`, an invalid one a `ValueError`; each names
-    /// the header.
-    pub(crate) fn from_py(dict: &Bound<'_, PyDict>) -> PyResult<Self> {
-        let mut map = HeaderMap::with_capacity(dict.len());
-        for (key, value) in dict.iter() {
-            let key = key.cast::<PyString>().map_err(|_| {
-                PyTypeError::new_err(format!(
-                    "response header name must be str, got {}",
-                    type_name(&key)
-                ))
-            })?;
-            let key = key.to_str()?;
-            let name = header_name(key)?;
-            for item in header_items(key, &value)? {
-                map.append(name.clone(), header_value(key, str_item(key, &item)?)?);
-            }
-        }
-        Ok(Self(map))
-    }
-
-    /// `{name: str}`, or `{name: [str, ...]}` for a name with several lines.
-    pub(crate) fn to_py<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let dict = PyDict::new(py);
-        for name in self.0.keys() {
-            let lines = self
-                .0
-                .get_all(name)
-                .iter()
-                .map(header_text)
-                .collect::<PyResult<Vec<_>>>()?;
-            match lines.as_slice() {
-                [one] => dict.set_item(name.as_str(), *one)?,
-                many => dict.set_item(name.as_str(), many)?,
-            }
-        }
-        Ok(dict)
-    }
-
-    /// The first line named `name`, as text.
-    pub(crate) fn get(&self, name: &str) -> Option<&str> {
-        self.0.get(name).and_then(|v| v.to_str().ok())
-    }
-
-    pub(crate) fn contains_key(&self, name: &str) -> bool {
-        self.0.contains_key(name)
-    }
-
-    pub(crate) fn as_map_mut(&mut self) -> &mut HeaderMap {
-        &mut self.0
-    }
-
-    pub(crate) fn into_map(self) -> HeaderMap {
-        self.0
-    }
-}
-
-/// The lines of header `key`: the items of a list or tuple, else the value itself.
-fn header_items<'py>(key: &str, value: &Bound<'py, PyAny>) -> PyResult<Vec<Bound<'py, PyAny>>> {
-    if let Ok(list) = value.cast::<PyList>() {
-        return Ok(list.iter().collect());
-    }
-    if let Ok(tuple) = value.cast::<PyTuple>() {
-        return Ok(tuple.iter().collect());
-    }
-    str_item(key, value)?;
-    Ok(vec![value.clone()])
-}
-
-fn str_item<'a>(key: &str, item: &'a Bound<'_, PyAny>) -> PyResult<&'a str> {
-    let text = item.cast::<PyString>().map_err(|_| {
-        PyTypeError::new_err(format!(
-            "response header {key:?}: value must be str or a list of str, got {}",
-            type_name(item)
-        ))
-    })?;
-    text.to_str()
-}
-
-fn type_name(obj: &Bound<'_, PyAny>) -> String {
-    match obj.get_type().name() {
-        Ok(name) => name.to_string(),
-        Err(e) => format!("<type name unavailable: {e}>"),
-    }
-}
-
-/// `name` as a header name; an invalid one is a `ValueError` naming it.
-pub(crate) fn header_name(name: &str) -> PyResult<HeaderName> {
-    HeaderName::from_bytes(name.as_bytes())
-        .map_err(|e| PyValueError::new_err(format!("invalid header name {name:?}: {e}")))
-}
-
-/// `value` as the value of header `name`; an invalid one (CR, LF, NUL, other controls) is
-/// a `ValueError` naming the header.
-pub(crate) fn header_value(name: &str, value: &str) -> PyResult<HeaderValue> {
-    HeaderValue::from_str(value).map_err(|e| {
-        PyValueError::new_err(format!("header {name:?}: invalid value {value:?}: {e}"))
-    })
-}
-
-/// A header value Rust built from a `&str`, as text again.
-pub(crate) fn header_text(value: &HeaderValue) -> PyResult<&str> {
-    std::str::from_utf8(value.as_bytes())
-        .map_err(|e| PyValueError::new_err(format!("header value is not UTF-8: {e}")))
-}
-
-// ---------------------------------------------------------------------------
-// PyronovaResponse
-// ---------------------------------------------------------------------------
-
-#[pyclass(frozen, name = "Response", module = "pyronova.engine")]
-pub(crate) struct PyronovaResponse {
-    #[pyo3(get)]
-    pub(crate) body: Py<PyAny>,
-    #[pyo3(get)]
-    pub(crate) status_code: u16,
-    /// `content_type=`, validated; `None` = derived from the body.
-    pub(crate) content_type: Option<HeaderValue>,
-    pub(crate) headers: ResponseHeaders,
-}
-
-#[pymethods]
-impl PyronovaResponse {
-    /// `headers` maps a name to a `str`, or to a list of `str` for a header sent on
-    /// several lines (e.g. `Set-Cookie`). A `Content-Type` or `Server` in it replaces the
-    /// default one.
-    #[new]
-    #[pyo3(signature = (body, status_code=200, content_type=None, headers=None))]
-    fn new(
-        body: Py<PyAny>,
-        status_code: u16,
-        content_type: Option<&str>,
-        headers: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<Self> {
-        Ok(PyronovaResponse {
-            body,
-            status_code,
-            content_type: content_type
-                .map(|ct| header_value("content_type", ct))
-                .transpose()?,
-            headers: headers
-                .map(ResponseHeaders::from_py)
-                .transpose()?
-                .unwrap_or_default(),
-        })
-    }
-
-    #[getter]
-    fn content_type(&self) -> PyResult<Option<&str>> {
-        self.content_type.as_ref().map(header_text).transpose()
-    }
-
-    /// `{name: str}`, or `{name: [str, ...]}` for a header on several lines; names are
-    /// lower-case, as they go out on the wire.
-    #[getter]
-    fn headers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        self.headers.to_py(py)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ResponseData (Rust-internal, not exposed to Python)
-// ---------------------------------------------------------------------------
-
-/// A handler's result as the HTTP layer sends it.
-pub(crate) struct ResponseData {
-    pub(crate) body: Bytes,
-    /// The body's type: from `content_type=`, else from what the handler returned. A
-    /// `content-type` in `headers` replaces it.
-    pub(crate) content_type: HeaderValue,
-    pub(crate) status: hyper::StatusCode,
-    pub(crate) headers: ResponseHeaders,
 }
 
 #[cfg(test)]
