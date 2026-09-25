@@ -1,6 +1,6 @@
 """Type stubs for pyronova.engine (Rust extension module)."""
 
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 def init_logger(level: str, access_log: bool, format: str) -> None:
     """Initialize the Rust tracing engine. Call once at startup.
@@ -182,6 +182,52 @@ class PyronovaApp:
         workers: Optional[int] = None,
         mode: Optional[str] = None,
     ) -> None: ...
+
+# --- Postgres (see pyronova.db) ---------------------------------------------
+
+class DatabaseError(RuntimeError):
+    """A query failed. ``sqlstate`` is the server's SQLSTATE code, or None when the
+    server never reported one (pool timeout, dropped connection)."""
+
+    sqlstate: Optional[str]
+
+class IntegrityError(DatabaseError):
+    """An integrity constraint was violated (SQLSTATE class 23)."""
+
+class UniqueViolation(IntegrityError):
+    """A unique or primary-key constraint was violated (SQLSTATE 23505)."""
+
+class PgCursor:
+    """Streaming result set from ``PgPool.fetch_iter``; yields one dict per row."""
+
+    def __iter__(self) -> "PgCursor": ...
+    def __next__(self) -> Dict[str, Any]: ...
+    def to_list(self) -> List[Dict[str, Any]]: ...
+
+class PgPool:
+    """The process's Postgres pool. Parameters are encoded as the statement declares
+    them; a query failure raises ``DatabaseError``."""
+
+    @classmethod
+    def connect(
+        cls,
+        dsn: str,
+        max_connections: Optional[int] = None,
+        acquire_timeout_secs: Optional[int] = None,
+    ) -> "PgPool":
+        """Open the pool, or return the open one. Raises ``ValueError`` if it is open
+        with another DSN; settings that differ from the open pool are logged as a
+        warning and the pool is kept. Defaults on the first call: 10 connections, 30 s."""
+        ...
+    def fetch_one(self, sql: str, *params: Any) -> Optional[Dict[str, Any]]: ...
+    def fetch_all(self, sql: str, *params: Any) -> List[Dict[str, Any]]: ...
+    def fetch_scalar(self, sql: str, *params: Any) -> Any: ...
+    def execute(self, sql: str, *params: Any) -> int: ...
+    def fetch_iter(self, sql: str, *params: Any) -> PgCursor: ...
+    def fetch_one_async(self, sql: str, *params: Any) -> Awaitable[Optional[Dict[str, Any]]]: ...
+    def fetch_all_async(self, sql: str, *params: Any) -> Awaitable[List[Dict[str, Any]]]: ...
+    def fetch_scalar_async(self, sql: str, *params: Any) -> Awaitable[Any]: ...
+    def execute_async(self, sql: str, *params: Any) -> Awaitable[int]: ...
 
 def _in_worker() -> bool:
     """Whether this code runs in a sub-interpreter worker (not the main interpreter)."""
