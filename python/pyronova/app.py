@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import sys
+from dataclasses import dataclass
 from typing import Callable, TypedDict
 import inspect
 import json as _json_module
@@ -221,7 +222,9 @@ class Pyronova:
                 "access_log": user.get("access_log", False),
                 "format": user.get("format", "json"),
             }
-        self._logger_initialized = False
+        # Set by the first server's _prepare(); later servers reuse it.
+        self._prepared = False
+        self._defined_in = _defining_module_file(self)
         # Guards the idempotency check-then-set in the enable_* helpers so
         # concurrent startup hooks/threads can't both pass the "already
         # enabled?" check and double-register routes/hooks (arc findings
@@ -911,104 +914,29 @@ class Pyronova:
         # In a worker the script only registers routes; the server runs on main.
         if _is_worker():
             return
-        # Everything registered from here on (/mcp, logging hooks, startup hooks) exists
-        # only on main. Idempotent: TestClient may call run() again.
-        self._engine._seal_registrations()
-
-        # Priority: param > env var > default
-        host = host or os.environ.get("PYRONOVA_HOST", "127.0.0.1")
-
-        # Env-var int parsing surfaces actionable errors. Bare int()
-        # raises "invalid literal for int()" — opaque about which env
-        # var was bad (arc findings app-1, app-7).
-        def _env_int(name: str, default: str | None = None) -> int | None:
-            v = os.environ.get(name, default)
-            if v is None:
-                return None
-            try:
-                return int(v)
-            except ValueError:
-                raise ValueError(
-                    f"environment variable {name}={v!r} is not a valid integer"
-                ) from None
-
-        if port is None:
-            port = _env_int("PYRONOVA_PORT", "8000")
-        if workers is None:
-            workers = _env_int("PYRONOVA_WORKERS")
-        if io_workers is None:
-            io_workers = _env_int("PYRONOVA_IO_WORKERS")
-        if workers is not None and workers < 1:
-            raise ValueError(f"workers must be >= 1, got {workers}")
-        if io_workers is not None and io_workers < 1:
-            raise ValueError(f"io_workers must be >= 1, got {io_workers}")
-        tls_cert = tls_cert or os.environ.get("PYRONOVA_TLS_CERT")
-        tls_key = tls_key or os.environ.get("PYRONOVA_TLS_KEY")
-        if bool(tls_cert) != bool(tls_key):
-            raise ValueError(
-                f"tls_cert and tls_key must be provided together: "
-                f"tls_cert={'set' if tls_cert else 'missing'}, "
-                f"tls_key={'set' if tls_key else 'missing'}"
-            )
-        if extra_tls_ports is None:
-            _ep = os.environ.get("PYRONOVA_TLS_PORTS")
-            if _ep:
-                # Surface bad entries with the offending value, not a
-                # bare "invalid literal for int()" (arc app-7).
-                parsed = []
-                for p in _ep.split(","):
-                    p = p.strip()
-                    if not p:
-                        continue
-                    try:
-                        parsed.append(int(p))
-                    except ValueError:
-                        raise ValueError(
-                            f"PYRONOVA_TLS_PORTS contains non-integer port {p!r}"
-                        ) from None
-                extra_tls_ports = parsed
+        settings = _ServeSettings.resolve(
+            host=host,
+            port=port,
+            workers=workers,
+            mode=mode,
+            io_workers=io_workers,
+            tls_cert=tls_cert,
+            tls_key=tls_key,
+            extra_tls_ports=extra_tls_ports,
+        )
 
         reload = reload or os.environ.get("PYRONOVA_RELOAD") == "1"
         if reload and not _reload.is_reload_child():
             _reload.run_with_reload(_reload.ReloadTarget.of_this_process(self._app_file()))
             return
 
-        # Auto-enable logging if PYRONOVA_LOG=1 or debug=True.
-        # enable_logging() is itself idempotent + lock-guarded, so no
-        # external lock or flag bookkeeping is needed here.
-        if os.environ.get("PYRONOVA_LOG") == "1" or self.debug:
-            self.enable_logging()
+        self._serve(settings, self._start)
 
-        # Initialize Rust tracing engine (deferred from __init__ so
-        # enable_logging() can adjust the config first)
-        if not self._logger_initialized:
-            self._logger_initialized = True
-            # Expose level to sub-interpreter bootstrap via env var
-            os.environ["PYRONOVA_LOG_LEVEL"] = self._log_config["level"]
-            init_logger(
-                self._log_config["level"],
-                self._log_config["access_log"],
-                self._log_config["format"],
-            )
-            _setup_python_logging_bridge(self._log_config["level"])
-        # Auto-register /mcp endpoint if any MCP handlers exist
-        if not self._mcp.is_empty():
-            mcp = self._mcp
-
-            def _mcp_handler(req):
-                return Response(body=mcp.handle_request(req.body), content_type="application/json")
-
-            self._route("POST", "/mcp", _mcp_handler, gil=True)
-            print(f"  MCP: {len(mcp._tools)} tools, {len(mcp._resources)} resources, {len(mcp._prompts)} prompts → POST /mcp")
-
-        # Auto-detect best mode if not explicitly set
-        if mode is None:
-            mode = "subinterp"
-
-        if mode in ("subinterp", "auto") and workers != 1:
-            print(f"  BLAS: {_limit_blas_threads()} (override: set OPENBLAS_NUM_THREADS)", flush=True)
-
-        import threading
+    def _serve(self, settings: _ServeSettings, start: Callable[[_ServeSettings], None]) -> None:
+        """One server's lifetime: prepare the app (once), run the startup hooks, ``start``
+        it (bind and serve until it stops), run the shutdown hooks. ``start`` may retry
+        its bind; everything else here happens once per server."""
+        self._prepare(settings)
 
         graceful = False
         run_error = None
@@ -1016,18 +944,8 @@ class Pyronova:
             # Run startup hooks inside the try so shutdown hooks still run on failure
             for hook in self._startup_hooks:
                 hook()
-
-            self._engine.run(
-                host=host,
-                port=port,
-                workers=workers,
-                mode=mode,
-                io_workers=io_workers,
-                tls_cert=tls_cert,
-                tls_key=tls_key,
-                extra_tls_ports=extra_tls_ports,
-            )
-            graceful = True  # engine returned after its own SIGINT drain
+            start(settings)
+            graceful = True  # engine returned after its own drain (SIGINT or _stop())
         except KeyboardInterrupt:
             # SIGINT reaches BOTH Rust (which drains connections and returns) and
             # Python's main thread (which raises KeyboardInterrupt — here, or a
@@ -1085,6 +1003,164 @@ class Pyronova:
         # Not a graceful stop (real startup/run error): surface it normally.
         if run_error is not None:
             raise run_error
+
+    def _prepare(self, settings: _ServeSettings) -> None:
+        """What every server of this app shares, done by the first one: seal the script's
+        registrations, then set up logging, the ``/mcp`` route and the BLAS thread limit.
+        Everything registered here exists only on main."""
+        if self._prepared:
+            return
+        self._engine._seal_registrations()
+
+        # enable_logging() is itself idempotent + lock-guarded.
+        if os.environ.get("PYRONOVA_LOG") == "1" or self.debug:
+            self.enable_logging()
+        # Deferred from __init__ so enable_logging() can adjust the config first.
+        # Sub-interpreter bootstrap reads the level from the environment.
+        os.environ["PYRONOVA_LOG_LEVEL"] = self._log_config["level"]
+        init_logger(
+            self._log_config["level"],
+            self._log_config["access_log"],
+            self._log_config["format"],
+        )
+        _setup_python_logging_bridge(self._log_config["level"])
+
+        if not self._mcp.is_empty():
+            mcp = self._mcp
+
+            def _mcp_handler(req):
+                return Response(body=mcp.handle_request(req.body), content_type="application/json")
+
+            self._route("POST", "/mcp", _mcp_handler, gil=True)
+            print(f"  MCP: {len(mcp._tools)} tools, {len(mcp._resources)} resources, {len(mcp._prompts)} prompts → POST /mcp")
+
+        if settings.mode in _WORKER_MODES and settings.workers != 1:
+            print(f"  BLAS: {_limit_blas_threads()} (override: set OPENBLAS_NUM_THREADS)", flush=True)
+        self._prepared = True
+
+    def _start(self, settings: _ServeSettings) -> None:
+        """Bind and serve until the server stops (SIGINT or ``_stop()``)."""
+        self._engine.run(
+            host=settings.host,
+            port=settings.port,
+            workers=settings.workers,
+            mode=settings.mode,
+            io_workers=settings.io_workers,
+            tls_cert=settings.tls_cert,
+            tls_key=settings.tls_key,
+            extra_tls_ports=settings.extra_tls_ports,
+        )
+
+    def _stop(self) -> None:
+        """Stop the server this app is serving, as SIGINT does: ``_start`` drains and
+        returns. A no-op while nothing is serving."""
+        self._engine.shutdown()
+
+
+# Modes whose non-``gil=True`` routes run in sub-interpreter workers.
+_WORKER_MODES = ("subinterp", "auto")
+
+
+@dataclass(frozen=True)
+class _ServeSettings:
+    """Where and how one server runs, resolved once: explicit argument, else environment
+    variable, else default."""
+
+    host: str
+    port: int
+    mode: str
+    workers: int | None
+    io_workers: int | None
+    tls_cert: str | None
+    tls_key: str | None
+    extra_tls_ports: list[int] | None
+
+    @classmethod
+    def resolve(
+        cls,
+        *,
+        host: str | None = None,
+        port: int | None = None,
+        workers: int | None = None,
+        mode: str | None = None,
+        io_workers: int | None = None,
+        tls_cert: str | None = None,
+        tls_key: str | None = None,
+        extra_tls_ports: list[int] | None = None,
+    ) -> _ServeSettings:
+        if port is None:
+            port = _env_int("PYRONOVA_PORT", "8000")
+        if workers is None:
+            workers = _env_int("PYRONOVA_WORKERS")
+        if io_workers is None:
+            io_workers = _env_int("PYRONOVA_IO_WORKERS")
+        if workers is not None and workers < 1:
+            raise ValueError(f"workers must be >= 1, got {workers}")
+        if io_workers is not None and io_workers < 1:
+            raise ValueError(f"io_workers must be >= 1, got {io_workers}")
+        tls_cert = tls_cert or os.environ.get("PYRONOVA_TLS_CERT")
+        tls_key = tls_key or os.environ.get("PYRONOVA_TLS_KEY")
+        if bool(tls_cert) != bool(tls_key):
+            raise ValueError(
+                f"tls_cert and tls_key must be provided together: "
+                f"tls_cert={'set' if tls_cert else 'missing'}, "
+                f"tls_key={'set' if tls_key else 'missing'}"
+            )
+        if extra_tls_ports is None:
+            extra_tls_ports = _env_ports("PYRONOVA_TLS_PORTS")
+        return cls(
+            host=host or os.environ.get("PYRONOVA_HOST", "127.0.0.1"),
+            port=port,
+            mode=mode or "subinterp",
+            workers=workers,
+            io_workers=io_workers,
+            tls_cert=tls_cert,
+            tls_key=tls_key,
+            extra_tls_ports=extra_tls_ports,
+        )
+
+
+def _env_int(name: str, default: str | None = None) -> int | None:
+    """An integer environment variable; the error names the variable (arc app-1, app-7)."""
+    v = os.environ.get(name, default)
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        raise ValueError(
+            f"environment variable {name}={v!r} is not a valid integer"
+        ) from None
+
+
+def _env_ports(name: str) -> list[int] | None:
+    """A comma-separated port list environment variable; a bad entry is named (arc app-7)."""
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    ports = []
+    for p in raw.split(","):
+        p = p.strip()
+        if not p:
+            continue
+        try:
+            ports.append(int(p))
+        except ValueError:
+            raise ValueError(f"{name} contains non-integer port {p!r}") from None
+    return ports
+
+
+def _defining_module_file(app: object) -> str | None:
+    """The file whose module-level code created ``app`` — the script sub-interpreter
+    workers can execute to rebuild it — or None when a function created it."""
+    frame = sys._getframe(1)
+    # Step out of Pyronova.__init__ and any subclass __init__ that called it.
+    while frame is not None and frame.f_locals.get("self") is app:
+        frame = frame.f_back
+    if frame is None or frame.f_code.co_name != "<module>":
+        return None
+    file = frame.f_globals.get("__file__")
+    return os.path.abspath(file) if file else None
 
 
 def _bind_handler(fn: Callable, path: str, model: type | None) -> Callable:

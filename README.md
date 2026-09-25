@@ -769,11 +769,18 @@ PYRONOVA_METRICS=1 python app.py   # Enable GIL watchdog
 ```python
 from pyronova.testing import TestClient
 
-client = TestClient(app)
-resp = client.get("/")
-assert resp.status_code == 200
-assert resp.json()["hello"] == "world"
+with TestClient(app) as client:
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert resp.json()["hello"] == "world"
 ```
+
+`TestClient` serves in the mode `app.run()` uses by default, so non-`gil=True`
+routes run in sub-interpreter workers, as in production. Workers rebuild the app by
+executing the module that created it: define `app` at module level. An app built
+inside a function or fixture can only be served with `TestClient(app, mode="gil")`.
+Leaving the `with` block (or `client.close()`) stops the server and runs the
+shutdown hooks.
 
 ## Architecture
 
