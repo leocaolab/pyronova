@@ -277,3 +277,60 @@ def test_panic_is_a_logged_500_and_the_thread_survives(path, route, healthy):
             _assert_panic_logged_once(srv, f"ra-panic {n}", body["request_id"])
         r = srv.get(healthy)
         assert (r.status, r.body) == (200, b"fine")
+
+
+# ---------------------------------------------------------------------------
+# R4: a ContextVar written by an `async def` hook or handler is seen by the rest of the
+# request on every path (the awaitable used to run in a copy of the request's context).
+# ---------------------------------------------------------------------------
+
+CTX_SCRIPT = """
+from pyronova import Pyronova, Response
+from pyronova.context import ctx
+app = Pyronova()
+
+@app.before_request
+async def tag(req):
+    ctx.set("user", "u" + req.path)
+
+@app.after_request
+def expose(req, resp):
+    headers = dict(resp.headers)
+    headers["x-handler"] = str(ctx.get("handler"))
+    headers["x-user"] = str(ctx.get("user"))
+    return Response(resp.body, status_code=resp.status_code,
+                    content_type=resp.content_type, headers=headers)
+
+def sync_probe(req):
+    return {"user": ctx.get("user")}
+
+async def async_probe(req):
+    ctx.set("handler", "h" + req.path)
+    return {"user": ctx.get("user")}
+
+app.get("/sync")(sync_probe)
+app.get("/sync-gil", gil=True)(sync_probe)
+app.get("/async")(async_probe)
+app.get("/async-gil", gil=True)(async_probe)
+""" + RUN
+
+# TPC: inline sub-interpreter (def and async def) and the bridge (gil=True); pool: sync
+# worker, async engine and main-interpreter dispatch; GIL mode: every route on main.
+CTX_ROUTES = ["/sync", "/async", "/sync-gil", "/async-gil"]
+
+
+@pytest.mark.parametrize("path", ["tpc", "pool", "gil"])
+def test_async_hook_and_handler_ctx_writes_reach_the_rest_of_the_request(path):
+    with serve(CTX_SCRIPT, path, workers=2) as srv:
+        for route in CTX_ROUTES:
+            # Twice: the second request runs on a thread that already served one.
+            for _ in range(2):
+                r = srv.get(route)
+                assert r.status == 200, (route, r.status, r.body)
+                # async before_request → sync or async handler
+                assert r.json() == {"user": "u" + route}, (path, route, r.body)
+                # before-hook → after-hook
+                assert r.headers["x-user"] == "u" + route, (path, route, r.headers)
+                # async handler → after-hook
+                expected = "h" + route if route.startswith("/async") else "None"
+                assert r.headers["x-handler"] == expected, (path, route, r.headers)

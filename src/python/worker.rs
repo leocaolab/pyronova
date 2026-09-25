@@ -15,6 +15,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyString;
 
 use super::ffi::*;
+use super::request_context::{in_request_context, RequestContext, Returned};
 use crate::handlers::error::{catch_panic, HandlerError, PyException, Stage};
 use crate::response::ResponseError;
 use crate::router::{RouteId, RouteSignature};
@@ -535,47 +536,38 @@ impl SubInterpreterWorker {
         result
     }
 
-    /// If obj is awaitable (coroutine / Task / Future / custom __await__),
-    /// drive it via the persistent event loop. Otherwise return unchanged.
-    ///
-    /// Detection is a C-level type-slot probe:
-    ///   1. Fast path `PyCoro_CheckExact` — one tag compare, catches
-    ///      the common `async def` case.
-    ///   2. Fallback: read `Py_TYPE(obj)->tp_as_async->am_await` —
-    ///      any real awaitable (Task, Future, user class with
-    ///      `__await__`) has this slot populated. One pointer chase +
-    ///      null check. Nanoseconds, L1-resident.
-    ///
-    /// We avoid `PyObject_HasAttrString(obj, "__await__")` here: that
-    /// path would intern the string, walk the MRO, and potentially
-    /// trigger descriptor protocol — μs-level, and at 400k rps on the
-    /// hot hook path it showed up as a measurable 5% throughput loss.
+    /// Runs what a hook or handler returned to a value: an awaitable is driven to
+    /// completion on this interpreter's persistent event loop, an `async def` coroutine in
+    /// the request's own context (`rc`). A plain value is returned unchanged.
     ///
     /// An exception the awaitable raises is `stage`'s.
+    ///
+    /// # Safety
+    /// Must be called with this sub-interpreter's GIL held.
     unsafe fn resolve_coroutine(
         &self,
         py: Python<'_>,
+        rc: &RequestContext<'_>,
         obj: PyObjRef,
         stage: Stage,
     ) -> Result<PyObjRef, HandlerError> {
         let ptr = obj.as_ptr();
-        let is_awaitable = if ffi::PyCoro_CheckExact(ptr) == 1 {
-            true
-        } else {
-            let tp = ffi::Py_TYPE(ptr);
-            if tp.is_null() {
-                false
-            } else {
-                let async_slots = (*tp).tp_as_async;
-                !async_slots.is_null() && (*async_slots).am_await.is_some()
+        match Returned::of(&Bound::from_borrowed_ptr(py, ptr)) {
+            Returned::Value => Ok(obj),
+            Returned::Coroutine => {
+                let event_loop = Bound::from_borrowed_ptr(py, self.asyncio_loop);
+                let coro = Bound::from_borrowed_ptr(py, ptr);
+                let result = rc
+                    .run_coroutine(&event_loop, &coro)
+                    .map_err(|e| HandlerError::python(py, stage, &e))?;
+                PyObjRef::from_owned(result.into_ptr()).ok_or_else(|| raised(py, stage))
             }
-        };
-        if !is_awaitable {
-            return Ok(obj); // Plain value — pass through
+            // loop.run_until_complete(awaitable)
+            Returned::OtherAwaitable => {
+                PyObjRef::from_owned(ffi::PyObject_CallOneArg(self.loop_run_func, ptr))
+                    .ok_or_else(|| raised(py, stage))
+            }
         }
-        // loop.run_until_complete(awaitable)
-        PyObjRef::from_owned(ffi::PyObject_CallOneArg(self.loop_run_func, ptr))
-            .ok_or_else(|| raised(py, stage))
     }
 
     /// Runs the hooks and the handler for one request, in its own `contextvars.Context`.
@@ -590,8 +582,8 @@ impl SubInterpreterWorker {
         self.attached(|worker, py| {
             worker.requests_served += 1;
             // The hooks and the handler share one fresh `contextvars.Context`.
-            let response = crate::python::request_context::in_request_context(py, || {
-                worker.call_handler_attached(py, route.index(), request)
+            let response = in_request_context(py, |rc| {
+                worker.call_handler_attached(py, rc, route.index(), request)
             })
             .unwrap_or_else(|e| Err(HandlerError::python(py, Stage::Setup, &e)));
             if worker.gc_threshold > 0 && worker.requests_since_collect() >= worker.gc_threshold {
@@ -663,6 +655,7 @@ impl SubInterpreterWorker {
     unsafe fn call_handler_attached(
         &mut self,
         py: Python<'_>,
+        rc: &RequestContext<'_>,
         handler_idx: usize,
         request: PyronovaRequest,
     ) -> Result<ResponseData, HandlerError> {
@@ -723,7 +716,7 @@ impl SubInterpreterWorker {
                     .ok_or_else(|| raised(py, Stage::BeforeHook))?;
             // Drive async hooks through the event loop so `async def` middleware doesn't
             // leak a bare coroutine object as a "short-circuit response".
-            let resolved = self.resolve_coroutine(py, hook_result, Stage::BeforeHook)?;
+            let resolved = self.resolve_coroutine(py, rc, hook_result, Stage::BeforeHook)?;
             if resolved.as_ptr() != ffi::Py_None() {
                 return Ok(worker_response(py, resolved)?);
             }
@@ -738,7 +731,7 @@ impl SubInterpreterWorker {
             std::ptr::null_mut(),
         ))
         .ok_or_else(|| raised(py, Stage::Handler))?;
-        let resolved = self.resolve_coroutine(py, result_obj, Stage::Handler)?;
+        let resolved = self.resolve_coroutine(py, rc, result_obj, Stage::Handler)?;
         let mut response = worker_response(py, resolved)?;
 
         // Run after_request hooks: hook(request, response) → response. One that raises
@@ -755,7 +748,7 @@ impl SubInterpreterWorker {
             ))
             .ok_or_else(|| raised(py, Stage::AfterHook))?;
             // Drive async after_hooks through the event loop.
-            let resolved = self.resolve_coroutine(py, hook_result, Stage::AfterHook)?;
+            let resolved = self.resolve_coroutine(py, rc, hook_result, Stage::AfterHook)?;
             if resolved.as_ptr() != ffi::Py_None() {
                 response = worker_response(py, resolved)?;
             }

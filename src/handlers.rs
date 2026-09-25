@@ -8,6 +8,7 @@ use hyper::Response;
 use pyo3::prelude::*;
 
 use crate::python::interp;
+use crate::python::request_context::{in_request_context, RequestContext, Returned};
 use crate::python::stream::PyronovaStream;
 use crate::response::{extract_response_data, ResponseError};
 use crate::router::Target;
@@ -117,47 +118,21 @@ pub(crate) fn close_thread_event_loop(py: Python<'_>) {
     }
 }
 
-/// If `obj` is a coroutine (from `async def`), execute it via a thread-local
-/// persistent asyncio event loop. Otherwise return it unchanged.
-///
-/// Uses thread_local to cache event loop per spawn_blocking thread —
-/// avoids asyncio.run() overhead of creating/destroying loop per request.
+/// Runs what a hook or handler returned to a value: an awaitable is driven to completion
+/// on this thread's persistent asyncio event loop (cached per thread, so no loop is made
+/// and torn down per request), an `async def` coroutine in the request's own context
+/// (`rc`). A plain value is returned unchanged.
 ///
 /// An exception the awaitable raises is `stage`'s; one creating the loop is setup's.
 fn resolve_coroutine(
     py: Python<'_>,
+    rc: &RequestContext<'_>,
     obj: Py<PyAny>,
     stage: Stage,
 ) -> Result<Py<PyAny>, HandlerError> {
     let bound = obj.bind(py);
-    // Awaitable detection via C-level type slot probe.
-    //
-    // The canonical Python way — `inspect.isawaitable(obj)` — dispatches
-    // through the inspect module, costing ~μs per call (import + attr
-    // lookup + method call + refcount dance). On a hot per-request
-    // middleware path at 400k rps that's measurable — Pyronova v1.4.5
-    // bench saw ~5% throughput loss from this single check.
-    //
-    // Instead, read the type's `tp_as_async->am_await` slot directly.
-    // Any awaitable (native coroutine, asyncio.Task, asyncio.Future,
-    // user classes implementing __await__ via PyType_FromSpec with
-    // Py_am_await) has am_await populated. Cost: one pointer chase +
-    // one null check. Nanoseconds, L1-resident.
-    let is_awaitable = unsafe {
-        let ptr = bound.as_ptr();
-        if pyo3::ffi::PyCoro_CheckExact(ptr) == 1 {
-            true
-        } else {
-            let tp = pyo3::ffi::Py_TYPE(ptr);
-            if tp.is_null() {
-                false
-            } else {
-                let async_slots = (*tp).tp_as_async;
-                !async_slots.is_null() && (*async_slots).am_await.is_some()
-            }
-        }
-    };
-    if !is_awaitable {
+    let returned = Returned::of(bound);
+    if returned == Returned::Value {
         return Ok(obj);
     }
 
@@ -180,10 +155,13 @@ fn resolve_coroutine(
             "thread-local event loop reused from a different interpreter"
         );
         let event_loop = loop_obj.bind(py);
-        let result = event_loop
-            .call_method1("run_until_complete", (bound,))
-            .map_err(|e| HandlerError::python(py, stage, &e))?;
-        Ok(result.unbind())
+        let result = match returned {
+            Returned::Coroutine => rc.run_coroutine(event_loop, bound),
+            _ => event_loop.call_method1("run_until_complete", (bound,)),
+        };
+        Ok(result
+            .map_err(|e| HandlerError::python(py, stage, &e))?
+            .unbind())
     })
 }
 
@@ -339,10 +317,8 @@ pub(crate) fn call_handler_with_hooks(
         let hold_start = std::time::Instant::now();
 
         let result = error::catch_panic(|| {
-            crate::python::request_context::in_request_context(py, || {
-                run_with_hooks(py, site, target, sky_req)
-            })
-            .unwrap_or_else(|e| Err(HandlerError::python(py, Stage::Setup, &e)))
+            in_request_context(py, |rc| run_with_hooks(py, rc, site, target, sky_req))
+                .unwrap_or_else(|e| Err(HandlerError::python(py, Stage::Setup, &e)))
         });
 
         // Record GIL hold time before releasing GIL
@@ -353,6 +329,7 @@ pub(crate) fn call_handler_with_hooks(
 
 fn run_with_hooks(
     py: Python<'_>,
+    rc: &RequestContext<'_>,
     site: &Site,
     target: Target,
     sky_req: PyronovaRequest,
@@ -361,7 +338,7 @@ fn run_with_hooks(
     // One `Request` object for the hooks and the handler.
     let req = Py::new(py, sky_req).map_err(|e| HandlerError::python(py, Stage::Setup, &e))?;
 
-    if let Some(short_circuit) = run_before_hooks(py, &routes.before_hooks, &req)? {
+    if let Some(short_circuit) = run_before_hooks(py, rc, &routes.before_hooks, &req)? {
         return Ok(MainReply::Response(short_circuit));
     }
 
@@ -370,7 +347,7 @@ fn run_with_hooks(
         .call1(py, (req.clone_ref(py),))
         .map_err(|e| HandlerError::python(py, Stage::Handler, &e))?;
     // If handler returned a coroutine (async def), run it via asyncio
-    let obj = resolve_coroutine(py, obj, Stage::Handler)?;
+    let obj = resolve_coroutine(py, rc, obj, Stage::Handler)?;
 
     // A `Stream` (SSE) goes out as a streaming body. `is_instance_of` is a single C
     // pointer compare, no string alloc.
@@ -380,7 +357,7 @@ fn run_with_hooks(
     }
 
     let data = extract_response_data(py, bound.clone())?;
-    let data = run_after_hooks(py, &routes.after_hooks, &req, data)?;
+    let data = run_after_hooks(py, rc, &routes.after_hooks, &req, data)?;
     Ok(MainReply::Response(data))
 }
 
@@ -405,6 +382,7 @@ fn stream_info(bound: &Bound<'_, PyAny>) -> Result<StreamInfo, ResponseError> {
 /// taken for a response.
 pub(crate) fn run_before_hooks(
     py: Python<'_>,
+    rc: &RequestContext<'_>,
     hooks: &[Py<PyAny>],
     req: &Py<PyronovaRequest>,
 ) -> Result<Option<ResponseData>, HandlerError> {
@@ -412,7 +390,7 @@ pub(crate) fn run_before_hooks(
         let result = hook
             .call1(py, (req.clone_ref(py),))
             .map_err(|e| HandlerError::python(py, Stage::BeforeHook, &e))?;
-        let result = resolve_coroutine(py, result, Stage::BeforeHook)?;
+        let result = resolve_coroutine(py, rc, result, Stage::BeforeHook)?;
         let bound = result.bind(py);
         if !bound.is_none() {
             return Ok(Some(extract_response_data(py, bound.clone())?));
@@ -425,6 +403,7 @@ pub(crate) fn run_before_hooks(
 /// One that raises fails the request (500), on every interpreter.
 fn run_after_hooks(
     py: Python<'_>,
+    rc: &RequestContext<'_>,
     hooks: &[Py<PyAny>],
     req: &Py<PyronovaRequest>,
     mut resp_data: ResponseData,
@@ -434,7 +413,7 @@ fn run_after_hooks(
         let result = hook
             .call1(py, (req.clone_ref(py), current_resp))
             .map_err(|e| HandlerError::python(py, Stage::AfterHook, &e))?;
-        let result = resolve_coroutine(py, result, Stage::AfterHook)?;
+        let result = resolve_coroutine(py, rc, result, Stage::AfterHook)?;
         let bound = result.bind(py);
         if !bound.is_none() {
             resp_data = extract_response_data(py, bound.clone())?;
