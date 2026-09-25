@@ -76,6 +76,8 @@ app.run(host="127.0.0.1", port=9876)
         "pyronova::access",
         "Request handled",
         '"method":"GET"',
+        '"path":"/"',
+        '"status":200',
     ])
 
 
