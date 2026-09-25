@@ -51,8 +51,8 @@ class Metrics:
     rss_bytes: Optional[int]
     """Process RSS; ``None`` until the sampler (``PYRONOVA_METRICS=1``) reads one."""
     dropped_requests: int
-    total_requests: int
-    """Counted only while ``PYRONOVA_METRICS=1``."""
+    total_requests: Optional[int]
+    """Requests counted; ``None`` while hot-path metrics are off (``PYRONOVA_METRICS`` unset)."""
 
 def get_gil_metrics() -> Metrics:
     """Read every counter. Has no side effect."""

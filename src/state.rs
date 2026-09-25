@@ -9,6 +9,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use dashmap::DashMap;
 use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyString};
 
 /// High-concurrency shared key-value store backed by DashMap.
 ///
@@ -37,14 +38,17 @@ pub(crate) fn hand_to_worker(py: Python<'_>, map: &SharedMap) -> Result<(), Stat
         .map_err(|_| StateError::AlreadyHanded)
 }
 
-/// A stored value as text. Values set with `set_bytes` need not be UTF-8; reading one as
-/// text is a `TypeError` naming the key, on every read (`[]`, `get`, `values`, `items`).
-fn text(key: &str, value: &Bytes) -> PyResult<String> {
-    std::str::from_utf8(value).map(str::to_owned).map_err(|_| {
-        pyo3::exceptions::PyTypeError::new_err(format!(
-            "state[{key:?}]: value is not valid UTF-8; use get_bytes() for raw access"
-        ))
-    })
+/// A stored value as a Python `str`, copied once from the map. Values set with `set_bytes`
+/// need not be UTF-8; reading one as text is a `TypeError` naming the key, on every read
+/// (`[]`, `get`, `values`, `items`).
+fn text<'py>(py: Python<'py>, key: &str, value: &Bytes) -> PyResult<Bound<'py, PyString>> {
+    std::str::from_utf8(value)
+        .map(|s| PyString::new(py, s))
+        .map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(format!(
+                "state[{key:?}]: value is not valid UTF-8; use get_bytes() for raw access"
+            ))
+        })
 }
 
 /// The map a new `PyronovaApp` or `SharedState` uses: in a worker the running app's, so every
@@ -86,9 +90,14 @@ impl SharedState {
     /// Get a string value. Returns ``default`` (None) if the key doesn't exist; raises
     /// ``TypeError`` if its value isn't UTF-8 text (use ``get_bytes``).
     #[pyo3(signature = (key, default=None))]
-    fn get(&self, key: &str, default: Option<String>) -> PyResult<Option<String>> {
+    fn get<'py>(
+        &self,
+        py: Python<'py>,
+        key: &str,
+        default: Option<Bound<'py, PyString>>,
+    ) -> PyResult<Option<Bound<'py, PyString>>> {
         match self.inner.get(key) {
-            Some(v) => text(key, v.value()).map(Some),
+            Some(v) => text(py, key, v.value()).map(Some),
             None => Ok(default),
         }
     }
@@ -98,10 +107,9 @@ impl SharedState {
         self.inner.insert(key, Bytes::from(value));
     }
 
-    /// Get raw bytes value. Copies the stored bytes into a new ``Vec<u8>``
-    /// (required since the value is handed to Python as a ``bytes`` object).
-    fn get_bytes(&self, key: &str) -> Option<Vec<u8>> {
-        self.inner.get(key).map(|v| v.value().to_vec())
+    /// Get raw bytes value: one copy, into the ``bytes`` object handed to Python.
+    fn get_bytes<'py>(&self, py: Python<'py>, key: &str) -> Option<Bound<'py, PyBytes>> {
+        self.inner.get(key).map(|v| PyBytes::new(py, v.value()))
     }
 
     /// Delete a key. Returns True if it existed.
@@ -115,19 +123,22 @@ impl SharedState {
     }
 
     /// Get all string values; raises ``TypeError`` naming a key whose value isn't UTF-8.
-    fn values(&self) -> PyResult<Vec<String>> {
+    fn values<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyString>>> {
         self.inner
             .iter()
-            .map(|e| text(e.key(), e.value()))
+            .map(|e| text(py, e.key(), e.value()))
             .collect()
     }
 
     /// Get all (key, value) pairs as a list of tuples; raises ``TypeError`` naming a key
     /// whose value isn't UTF-8.
-    fn items(&self) -> PyResult<Vec<(String, String)>> {
+    fn items<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Vec<(Bound<'py, PyString>, Bound<'py, PyString>)>> {
         self.inner
             .iter()
-            .map(|e| Ok((e.key().clone(), text(e.key(), e.value())?)))
+            .map(|e| Ok((PyString::new(py, e.key()), text(py, e.key(), e.value())?)))
             .collect()
     }
 
@@ -153,10 +164,10 @@ impl SharedState {
     /// exists but holds non-UTF-8 bytes (e.g. via `set_bytes`) this raises
     /// `TypeError` instead, as every other text read does: the value is present
     /// but not decodable as a string. Use `get_bytes` for raw access.
-    fn __getitem__(&self, key: &str) -> PyResult<String> {
+    fn __getitem__<'py>(&self, py: Python<'py>, key: &str) -> PyResult<Bound<'py, PyString>> {
         match self.inner.get(key) {
             None => Err(pyo3::exceptions::PyKeyError::new_err(key.to_string())),
-            Some(v) => text(key, v.value()),
+            Some(v) => text(py, key, v.value()),
         }
     }
 
