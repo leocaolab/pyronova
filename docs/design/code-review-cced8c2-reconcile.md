@@ -60,3 +60,7 @@ Python: `os._exit(1)` reachable from a TestClient thread; `_prepare` unlocked an
 - **R-b** (after M5 merges): Q1, R2, R5; §2 rows: TPC zero-alloc + one `PyronovaRequest` constructor, inline-timeout double log, CORS parse test, WS cap on the pool path, bridge panic on TPC-bridge fault injection, pool worker spawn failure; §4 core + pipeline rows; `os._exit` from TestClient, `_prepare` lock.
 - **R-milestone** (after M5 merges, before M7): R1–R5, every §2 row, and the §4 rows outside M7/M9 scope. Same rules: repro test first, no existing-test edits without approval.
 - §4 FFI rows join M7; hygiene rows join M9.
+
+## 7. Test ports (human decision, 2026-09-25)
+
+No test binds a fixed port. Every test server binds port 0 and reads the bound port back (TestClient's `port`, or the server's startup output for subprocess servers), so full suites can run concurrently without collisions. Approved: edit the existing tests that hardcode ports — port handling only, assertions unchanged. Scheduled after R-a and the M5 follow-up merge, in parallel with the final rubric review.
