@@ -327,8 +327,8 @@ pub struct Metrics {
     rss_bytes: Option<u64>,
     /// Requests refused with 503 because the server was overloaded.
     dropped_requests: u64,
-    /// Requests counted (only while `PYRONOVA_METRICS=1`).
-    total_requests: u64,
+    /// Requests counted; `None` while hot-path metrics are off (`PYRONOVA_METRICS` unset).
+    total_requests: Option<u64>,
 }
 
 #[pymethods]
@@ -350,7 +350,7 @@ pub fn get_gil_metrics() -> Metrics {
         gil_hold_peak_us: GIL_HOLD_MAX_US.load(Ordering::Relaxed),
         rss_bytes: *MEMORY_RSS_BYTES.lock(),
         dropped_requests: DROPPED_REQUESTS.load(Ordering::Relaxed),
-        total_requests: TOTAL_REQUESTS.load(Ordering::Relaxed),
+        total_requests: metrics_enabled().then(|| TOTAL_REQUESTS.load(Ordering::Relaxed)),
     }
 }
 

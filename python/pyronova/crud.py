@@ -213,15 +213,11 @@ def register_crud(
             return _Rejected(Response(body={"error": "missing id"}, status_code=400))
         try:
             return id_type(raw_id)
-        except Exception:
-            # id_type is user-supplied and coerces an attacker-controlled
-            # path segment. A custom converter may raise something other
-            # than TypeError/ValueError (RuntimeError, OSError, KeyError);
-            # any failure here means "this id string is unacceptable" → 400,
-            # never a 500 (arc finding crud-83). Log so a genuinely broken
-            # converter is still diagnosable.
-            _log.warning("id_type(%r) raised; treating as invalid id", raw_id, exc_info=True)
-            return _Rejected(Response(body={"error": "invalid id"}, status_code=400))
+        except (TypeError, ValueError) as e:
+            # A converter's way of saying "not an id" (`int("abc")`, `UUID("x")`): the
+            # client's error. Anything else it raises is a bug in the converter and takes
+            # the 500 path, logged with the request id.
+            return _Rejected(Response(body={"error": f"invalid id: {e}"}, status_code=400))
 
     # --- GET /prefix --------------------------------------------------------
     # All routes pinned to gil=True. The original reason is gone: workers now

@@ -10,8 +10,10 @@ import json
 import logging
 import inspect
 import urllib.parse
-from typing import Callable
+from enum import Enum, auto
+from typing import Callable, NamedTuple
 
+from pyronova import _csrf
 from pyronova._errors import log_server_error, server_error_body
 
 _log = logging.getLogger("pyronova.rpc")
@@ -90,7 +92,12 @@ class RPCClient:
                     f"RPC {method_name} at {self.base_url}: HTTP {resp.status_code} {err}{where}"
                 )
 
-            return data.get("result", data)
+            if "result" not in data:
+                raise RuntimeError(
+                    f"RPC {method_name} at {self.base_url}: the reply says ok but has no "
+                    f"'result': {data!r}"
+                )
+            return data["result"]
 
         return remote_call
 
@@ -104,17 +111,63 @@ class RPCClient:
         self.close()
 
 
+class _Codec(Enum):
+    """The body encodings an RPC endpoint speaks."""
+
+    JSON = auto()
+    MSGPACK = auto()
+    PROTOBUF = auto()
+
+
+_MEDIA_TYPES = {
+    "application/json": _Codec.JSON,
+    "application/msgpack": _Codec.MSGPACK,
+    "application/x-msgpack": _Codec.MSGPACK,
+    "application/protobuf": _Codec.PROTOBUF,
+    "application/x-protobuf": _Codec.PROTOBUF,
+}
+
+
+def _accepted_media_types(proto_model) -> dict[str, _Codec]:
+    """The request body types this endpoint decodes: JSON always, MsgPack when msgpack is
+    installed, Protobuf when the endpoint has a ``proto_model``."""
+    available = {_Codec.JSON}
+    if HAS_MSGPACK:
+        available.add(_Codec.MSGPACK)
+    if proto_model is not None:
+        available.add(_Codec.PROTOBUF)
+    return {media: codec for media, codec in _MEDIA_TYPES.items() if codec in available}
+
+
+def _reply_codec(req, request_codec: _Codec) -> _Codec:
+    """MsgPack when the client asks for it (``Accept``, else the request's own type) and
+    msgpack is installed; JSON otherwise."""
+    accept = req.headers.get("accept")
+    if accept is None:
+        wanted = {request_codec}
+    else:
+        wanted = {_MEDIA_TYPES.get(_csrf.media_type(part)) for part in accept.split(",")}
+    return _Codec.MSGPACK if HAS_MSGPACK and _Codec.MSGPACK in wanted else _Codec.JSON
+
+
+class _Admitted(NamedTuple):
+    """A request an endpoint takes: its body's codec and the decoded body."""
+
+    codec: _Codec
+    data: object
+
+
 class _MalformedBody(Exception):
     """The request body could not be decoded: the client's error (400)."""
 
 
-def _client_error(reason: Exception):
-    """400 envelope carrying the reason the body was rejected."""
+def _client_error(status: int, reason: object):
+    """4xx envelope carrying the reason the request was rejected."""
     from pyronova.engine import Response
 
     return Response(
         body=json.dumps({"ok": False, "error": str(reason)}),
-        status_code=400,
+        status_code=status,
         content_type="application/json",
     )
 
@@ -135,41 +188,54 @@ def _server_error(fn: Callable, req):
 def rpc_decorator(app, path: str, proto_model=None):
     """Create an RPC endpoint with content negotiation.
 
-    Supports MsgPack, JSON, and optional Protobuf.
-    Auto-wraps response in {"ok": true, "result": ...} envelope. A body that can't be
-    decoded answers 400 ``{"ok": false, "error": <reason>}``; a handler that raises
-    answers 500 ``{"ok": false, "error": "Internal Server Error", "request_id": ...}``.
+    Supports MsgPack, JSON, and optional Protobuf; the ``Content-Type`` must name one of
+    them (415 otherwise), and a browser request from another site is refused 403 unless
+    ``app.trusted_origins`` lists it (CSRF). Auto-wraps response in
+    {"ok": true, "result": ...} envelope. A body that can't be decoded answers 400
+    ``{"ok": false, "error": <reason>}``; a handler that raises answers 500
+    ``{"ok": false, "error": "Internal Server Error", "request_id": ...}``.
     """
+    accepted = _accepted_media_types(proto_model)
 
     def decorator(fn: Callable) -> Callable:
         is_async = inspect.iscoroutinefunction(fn)
 
-        def _decode_request(req):
+        def _decode_request(req, codec: _Codec):
             if not req.body:
                 return {}
-            ct = req.headers.get("content-type", "application/json").lower()
             try:
-                if HAS_MSGPACK and "msgpack" in ct:
-                    return msgpack.unpackb(req.body, raw=False)
-                elif "protobuf" in ct and proto_model:
-                    return proto_model().parse(req.body)
-                else:
-                    return json.loads(req.text())
+                match codec:
+                    case _Codec.JSON:
+                        return req.json()
+                    case _Codec.MSGPACK:
+                        return msgpack.unpackb(req.body, raw=False)
+                    case _Codec.PROTOBUF:
+                        return proto_model().parse(req.body)
             except ValueError as e:
                 # JSONDecodeError, UnicodeDecodeError and msgpack's decode errors are
                 # all ValueErrors.
                 raise _MalformedBody(e) from e
 
-        def _encode_response(result, req):
-            accept = req.headers.get("accept", req.headers.get("content-type", "")).lower()
+        def _encode_response(result, req, codec: _Codec):
             envelope = {"ok": True, "result": result}
+            match _reply_codec(req, codec):
+                case _Codec.MSGPACK:
+                    from pyronova.engine import Response
+                    body = msgpack.packb(envelope, use_bin_type=True)
+                    return Response(body=body, content_type="application/msgpack")
+                case _:
+                    return envelope  # Framework auto-serializes dict as JSON
 
-            if HAS_MSGPACK and "msgpack" in accept:
-                from pyronova.engine import Response
-                body = msgpack.packb(envelope, use_bin_type=True)
-                return Response(body=body, content_type="application/msgpack")
-            else:
-                return envelope  # Framework auto-serializes dict as JSON
+        def _admit(req):
+            """The request's codec and decoded body (`_Admitted`), or the 4xx response
+            refusing it."""
+            codec = _csrf.check(req, app._origin_policy, accepted)
+            if isinstance(codec, _csrf.Refused):
+                return _client_error(codec.status, codec.reason)
+            try:
+                return _Admitted(codec, _decode_request(req, codec))
+            except _MalformedBody as e:
+                return _client_error(400, e.__cause__)
 
         # Check if handler takes 2 args (req, data) or 1 (data).
         # arc finding rpc-1: pre-fix the `>= 2` check failed for
@@ -211,24 +277,24 @@ def rpc_decorator(app, path: str, proto_model=None):
         # traceback on the log line with the same id.
 
         def sync_wrapper(req):
-            try:
-                data = _decode_request(req)
-            except _MalformedBody as e:
-                return _client_error(e.__cause__)
+            admitted = _admit(req)
+            if not isinstance(admitted, _Admitted):
+                return admitted
+            codec, data = admitted
             try:
                 result = fn(req, data) if takes_data else fn(data)
-                return _encode_response(result, req)
+                return _encode_response(result, req, codec)
             except Exception:
                 return _server_error(fn, req)
 
         async def async_wrapper(req):
-            try:
-                data = _decode_request(req)
-            except _MalformedBody as e:
-                return _client_error(e.__cause__)
+            admitted = _admit(req)
+            if not isinstance(admitted, _Admitted):
+                return admitted
+            codec, data = admitted
             try:
                 result = await (fn(req, data) if takes_data else fn(data))
-                return _encode_response(result, req)
+                return _encode_response(result, req, codec)
             except Exception:
                 return _server_error(fn, req)
 

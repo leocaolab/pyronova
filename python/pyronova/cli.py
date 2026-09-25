@@ -111,38 +111,16 @@ def _cmd_routes(args: argparse.Namespace) -> None:
     app = _load_app(args.target)
     rows: list[tuple[str, str, str, str]] = []
     for r in app.routes:
-        flags = []
-        if r.get("gil"):
-            flags.append("gil")
-        if r.get("stream"):
-            flags.append("stream")
-        if r.get("async"):
-            flags.append("async")
-        if r.get("model"):
-            flags.append(f"model={r['model']}")
-        rows.append((
-            r.get("method", "?"),
-            r.get("path", "?"),
-            r.get("handler", "?"),
-            ",".join(flags),
-        ))
+        flags = [name for name, on in (("gil", r.gil), ("stream", r.stream), ("async", r.is_async)) if on]
+        if r.model is not None:
+            flags.append(f"model={r.model}")
+        rows.append((r.method, r.path, r.handler, ",".join(flags)))
     for r in app.fast_routes:
-        rows.append((
-            r.get("method", "?"),
-            r.get("path", "?"),
-            f"<fast:{r.get('bytes', '?')}B>",
-            f"status={r.get('status_code', '?')}",
-        ))
+        rows.append((r.method, r.path, f"<fast:{r.body_bytes}B>", f"status={r.status_code}"))
 
     if not rows:
         print("(no routes registered)")
         return
-
-    # Coerce every cell to str up front: a route dict may carry non-string
-    # values (e.g. an int method/handler from a misbehaving registration),
-    # and both len() and the {:<w} format spec raise on non-str — turning a
-    # diagnostic command into a crash (arc finding cli-20).
-    rows = [tuple(str(c) for c in row) for row in rows]
 
     widths = [max(len(r[i]) for r in rows) for i in range(4)]
     header = ("METHOD", "PATH", "HANDLER", "FLAGS")

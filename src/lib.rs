@@ -10,6 +10,7 @@ mod config;
 mod db;
 mod grpc;
 mod handlers;
+mod json;
 #[cfg(feature = "leak_detect")]
 mod leak_detect;
 mod logging;
@@ -93,6 +94,8 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.py().get_type::<app::RegistrationSealed>(),
     )?;
     m.add_class::<config::Mode>()?;
+    m.add_class::<logging::LogLevel>()?;
+    m.add_class::<compression::Settings>()?;
     m.add_class::<types::PyronovaRequest>()?;
     m.add_class::<types::PyronovaResponse>()?;
     m.add_class::<types::PyronovaHeaders>()?;

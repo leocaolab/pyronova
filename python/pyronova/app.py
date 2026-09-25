@@ -6,29 +6,75 @@ import time
 import sys
 import threading
 from dataclasses import dataclass
-from typing import Callable, TypedDict
+from typing import TYPE_CHECKING, Callable, Literal, TypedDict
 import inspect
 import json as _json_module
 
 import os
 
-from pyronova.engine import Mode, PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log, _in_worker, _forgotten_workers, _route_params
+from pyronova.engine import Compression, LogLevel, Mode, PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log, _in_worker, _forgotten_workers, _python_log_level, _route_params
+from pyronova._log_bridge import RustLogHandler, root_level
+from pyronova import _csrf
+from pyronova._csrf import OriginPolicy
 from pyronova.mcp import MCPServer
 from pyronova import _reload
 import logging as _logging
+
+if TYPE_CHECKING:
+    from pyronova.health import ReadinessCheck
+
+
+# A level by name, in either case; `LogLevel.parse` reads it.
+LogLevelName = Literal[
+    "off", "error", "warn", "warning", "info", "debug", "trace",
+    "OFF", "ERROR", "WARN", "WARNING", "INFO", "DEBUG", "TRACE",
+]
 
 
 class LogConfig(TypedDict, total=False):
     """Logging configuration dictionary.
 
     Keys:
-        level: "OFF", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"
+        level: a ``LogLevel``, or its name ("OFF", "ERROR", "WARN", "INFO", "DEBUG",
+            "TRACE"); an unknown name raises ``ValueError`` in ``Pyronova()``
         access_log: Whether to log every HTTP request (method, path, status, latency)
         format: "text" (human-readable) or "json" (structured, for ELK/Datadog)
     """
-    level: str
+    level: LogLevel | LogLevelName
     access_log: bool
-    format: str
+    format: Literal["text", "json"]
+
+
+# `/mcp` takes a JSON-RPC body only (MCP's HTTP transport).
+_MCP_BODY_TYPES = {"application/json": "application/json"}
+
+
+def _log_level(level: LogLevel | LogLevelName) -> LogLevel:
+    return level if isinstance(level, LogLevel) else LogLevel.parse(level)
+
+@dataclass(frozen=True)
+class RouteInfo:
+    """A registered route, as ``app.routes`` lists it."""
+
+    method: str
+    path: str
+    handler: str  # the handler's qualified name
+    gil: bool
+    stream: bool
+    model: str | None  # the ``model=`` class's name
+    is_async: bool
+
+
+@dataclass(frozen=True)
+class FastRouteInfo:
+    """A route registered with ``add_fast_response``, as ``app.fast_routes`` lists it."""
+
+    method: str
+    path: str
+    status_code: int
+    content_type: str
+    body_bytes: int
+
 
 def _is_worker() -> bool:
     """Whether this code runs in a sub-interpreter worker (not the main interpreter)."""
@@ -79,60 +125,17 @@ def _limit_blas_threads() -> str:
     return "1 thread per worker"
 
 
-# Formats a record's exception (`logger.exception`) as its traceback. A `Handler`
-# has no `formatException`; that is a `Formatter` method.
-_TRACEBACK_FORMAT = _logging.Formatter()
-
-
-class _PyronovaRustHandler(_logging.Handler):
-    """logging.Handler that bridges to Rust tracing via FFI.
-
-    Defined at module level so the isinstance() dedup check in
-    _setup_python_logging_bridge works across repeated calls.
-    """
-
-    def emit(self, record: _logging.LogRecord) -> None:
-        try:
-            msg = record.getMessage()
-            # Preserve exception tracebacks (logger.exception / exc_info=True).
-            # Use a local variable rather than mutating record.exc_text so the
-            # same LogRecord can safely be routed to multiple handlers.
-            if record.exc_info:
-                exc_text = record.exc_text or _TRACEBACK_FORMAT.formatException(record.exc_info)
-                msg = f"{msg}\n{exc_text}"
-            emit_python_log(
-                levelno=record.levelno,
-                name=record.name,
-                message=msg,
-                pathname=record.pathname or "",
-                lineno=record.lineno or 0,
-            )
-        except Exception:
-            # Fallback to Python's built-in error handler — prints to stderr
-            self.handleError(record)
-
-
-_LOGGING_LEVEL_MAP = {
-    "TRACE": _logging.DEBUG,
-    "DEBUG": _logging.DEBUG,
-    "INFO": _logging.INFO,
-    "WARN": _logging.WARNING,
-    "WARNING": _logging.WARNING,
-    "ERROR": _logging.ERROR,
-    "CRITICAL": _logging.CRITICAL,
-    "OFF": _logging.CRITICAL + 10,  # above CRITICAL — blocks everything
-}
-
-
-def _level_with_access_log(current: str, requested: str | None, pinned: bool) -> str:
+def _level_with_access_log(
+    current: LogLevel, requested: LogLevel | None, pinned: bool
+) -> LogLevel:
     """The log level once the access log is on: the level asked for; else the current
     one, raised to INFO when it would hide the access lines (ERROR, OFF), unless an
     explicit ``enable_logging(level=...)`` chose it."""
     if requested is not None:
-        return requested.upper()
-    if pinned or current not in ("ERROR", "OFF"):
+        return requested
+    if pinned or current not in (LogLevel.Error, LogLevel.Off):
         return current
-    return "INFO"
+    return LogLevel.Info
 
 
 def _require_int(name: str, value: object) -> None:
@@ -141,34 +144,18 @@ def _require_int(name: str, value: object) -> None:
         raise TypeError(f"{name} must be int, got {type(value).__name__}")
 
 
-def _setup_python_logging_bridge(rust_level: str = "DEBUG") -> None:
-    """Hijack Python's root logger to route all logs through Rust tracing.
+def _setup_python_logging_bridge() -> None:
+    """Route the root logger through Rust tracing, gated at the level ``init_logger``
+    applied (``_python_log_level()``, the same source every worker reads).
 
-    Replaces default StreamHandler (synchronous, GIL-blocking I/O) with a
-    lightweight handler that crosses FFI into Rust's tracing system.
-    The actual filtering, formatting, and I/O happen in Rust — Python only
-    does the minimal work of extracting the log record fields.
-
-    The ``rust_level`` parameter syncs Rust's EnvFilter level to Python's
-    root logger, so calls below the threshold (e.g. logger.debug() when
-    level=ERROR) are rejected by Python's own level check *before* any
-    getMessage() formatting or FFI crossing occurs.
+    Adds the one ``RustLogHandler`` (not twice), and keeps the user's other handlers
+    (Sentry, DataDog...). Filtering, formatting and I/O happen in Rust; a record below
+    the level is rejected by Python before ``getMessage()`` or the FFI call.
     """
     root = _logging.getLogger()
-    # Don't clear existing handlers — user may have Sentry, DataDog, etc.
-    # Only add Pyronova bridge if not already present.
-    if not any(isinstance(h, _PyronovaRustHandler) for h in root.handlers):
-        root.addHandler(_PyronovaRustHandler())
-    # Sync Python's level gate with Rust's EnvFilter — avoids wasted
-    # getMessage() + FFI calls for records that Rust would discard anyway
-    level_key = rust_level.upper()
-    if level_key not in _LOGGING_LEVEL_MAP:
-        import sys
-        print(
-            f"pyronova: unrecognized log level {rust_level!r}, defaulting to DEBUG",
-            file=sys.stderr,
-        )
-    root.setLevel(_LOGGING_LEVEL_MAP.get(level_key, _logging.DEBUG))
+    if not any(isinstance(h, RustLogHandler) for h in root.handlers):
+        root.addHandler(RustLogHandler(None, emit_python_log))
+    root.setLevel(root_level(_python_log_level()))
 
 
 class Pyronova:
@@ -217,11 +204,12 @@ class Pyronova:
         self.debug = debug
         self._startup_hooks: list[Callable] = []
         self._shutdown_hooks: list[Callable] = []
-        self._routes_meta: list[dict] = []
-        self._fast_routes_meta: list[dict] = []
-        self._readiness_checks: list[tuple[str, Callable]] = []
+        self._routes_meta: list[RouteInfo] = []
+        self._fast_routes_meta: list[FastRouteInfo] = []
+        self._readiness_checks: list[ReadinessCheck] = []
         self._health_probes_enabled: bool = False
         self._app_file_path: str | None = None
+        self._origin_policy = OriginPolicy()
 
         # Resolve final logging config: debug mode defaults vs production defaults.
         # Actual init_logger call is deferred to run() so enable_logging() can
@@ -229,13 +217,13 @@ class Pyronova:
         user = log_config or {}
         if self.debug:
             self._log_config: LogConfig = {
-                "level": user.get("level", "DEBUG"),
+                "level": _log_level(user.get("level", LogLevel.Debug)),
                 "access_log": user.get("access_log", True),
                 "format": user.get("format", "text"),
             }
         else:
             self._log_config: LogConfig = {
-                "level": user.get("level", "ERROR"),
+                "level": _log_level(user.get("level", LogLevel.Error)),
                 "access_log": user.get("access_log", False),
                 "format": user.get("format", "json"),
             }
@@ -282,6 +270,25 @@ class Pyronova:
         self._engine.set_max_body_size(size)
 
     @property
+    def trusted_origins(self) -> list[str]:
+        """Other sites whose pages may call ``/mcp`` and ``@app.rpc`` endpoints from a
+        browser, as ``scheme://host[:port]``. Default: none.
+
+        Those endpoints act on a JSON (or MsgPack / Protobuf) POST, so they refuse a
+        request whose ``Origin`` is another site with 403, and any other body type with
+        415: a page can't make a visitor's browser call them (CSRF). Requests without an
+        ``Origin`` (curl, SDKs, servers) and from this server's own host are always
+        admitted. A bad entry raises ``ValueError``.
+        """
+        return sorted(
+            f"{o.scheme}://{o.host}:{o.port}" for o in self._origin_policy.trusted
+        )
+
+    @trusted_origins.setter
+    def trusted_origins(self, origins: list[str]) -> None:
+        self._origin_policy = OriginPolicy.of(origins)
+
+    @property
     def max_websocket_message_size(self) -> int:
         """Largest WebSocket message, in bytes, in either direction. Default: 1 MiB.
 
@@ -318,13 +325,14 @@ class Pyronova:
         gzip_level: int = 6,
         brotli_quality: int = 4,
     ) -> None:
-        """Enable gzip / brotli response compression.
+        """Enable gzip / brotli response compression for this app.
 
-        Disabled by default; call once at startup to turn on. The server
-        negotiates with the client's ``Accept-Encoding`` header and prefers
-        brotli when both are enabled. Skips responses under ``min_size``,
-        non-text content types (images, octet-stream), streaming responses
-        (SSE), and responses that set ``Content-Encoding`` explicitly.
+        Disabled by default; call once at startup to turn on. Per app: another app in
+        the same process keeps its own setting. The server negotiates with the client's
+        ``Accept-Encoding`` header and prefers brotli when both are enabled. Skips
+        responses under ``min_size``, non-text content types (images, octet-stream),
+        streaming responses (SSE), and responses that set ``Content-Encoding``
+        explicitly. A large body is compressed off the I/O threads.
 
         Args:
             min_size: minimum body size (bytes) to compress. Default 512.
@@ -332,14 +340,24 @@ class Pyronova:
             brotli: enable brotli (``Content-Encoding: br``). Default True.
             gzip_level: 1..=9, default 6 (balanced speed/ratio).
             brotli_quality: 0..=11, default 4 (production sweet spot).
+
+        :raises ValueError: a level out of its range, a negative ``min_size``, or
+            ``gzip=False, brotli=False`` (nothing to enable; use
+            ``disable_compression()``).
         """
         self._engine.configure_compression(
-            True, min_size, gzip, brotli, gzip_level, brotli_quality
+            Compression(
+                min_size=min_size,
+                gzip=gzip,
+                brotli=brotli,
+                gzip_level=gzip_level,
+                brotli_quality=brotli_quality,
+            )
         )
 
     def disable_compression(self) -> None:
         """Disable response compression. No-op if already disabled."""
-        self._engine.configure_compression(False)
+        self._engine.configure_compression(None)
 
     def enable_grpc_benchmark(self) -> None:
         """Serve HttpArena's ``benchmark.BenchmarkService/GetSum`` gRPC method.
@@ -392,13 +410,13 @@ class Pyronova:
             status_code=status_code,
             headers=headers,
         )
-        self._fast_routes_meta.append({
-            "method": method.upper(),
-            "path": path,
-            "status_code": status_code,
-            "content_type": content_type,
-            "bytes": len(body),
-        })
+        self._fast_routes_meta.append(FastRouteInfo(
+            method=method.upper(),
+            path=path,
+            status_code=status_code,
+            content_type=content_type,
+            body_bytes=len(body),
+        ))
 
     @property
     def state(self) -> SharedState:
@@ -480,15 +498,15 @@ class Pyronova:
         def register(fn: Callable) -> Callable:
             bound = _bind_handler(fn, path, model)
             self._engine.route(method, path, bound, gil, stream)
-            self._routes_meta.append({
-                "method": method,
-                "path": path,
-                "handler": getattr(fn, "__qualname__", getattr(fn, "__name__", repr(fn))),
-                "gil": gil,
-                "stream": stream,
-                "model": model.__name__ if model is not None else None,
-                "async": inspect.iscoroutinefunction(fn),
-            })
+            self._routes_meta.append(RouteInfo(
+                method=method,
+                path=path,
+                handler=getattr(fn, "__qualname__", getattr(fn, "__name__", repr(fn))),
+                gil=gil,
+                stream=stream,
+                model=model.__name__ if model is not None else None,
+                is_async=inspect.iscoroutinefunction(fn),
+            ))
             # The bound callable, not fn: sub-interp workers find a route's
             # handler by its module-global name, which must be what the route calls.
             return bound
@@ -772,12 +790,14 @@ class Pyronova:
             def _db_ready():
                 pool.fetch_scalar("SELECT 1")
 
-        A check passes when it returns any value that isn't ``False`` and
-        doesn't raise. ``False`` or an exception → the check is reported
-        as failing in ``/readyz`` and the whole probe returns 503.
+        A check fails when it raises, takes longer than the probe timeout (10 s),
+        or returns ``False``; any other value, ``None`` included, passes. A failing
+        check is reported in ``/readyz`` and the whole probe returns 503.
         """
+        from pyronova.health import ReadinessCheck
+
         def decorator(fn: Callable) -> Callable:
-            self._readiness_checks.append((name, fn))
+            self._readiness_checks.append(ReadinessCheck.of(name, fn))
             return fn
 
         return decorator
@@ -845,7 +865,7 @@ class Pyronova:
 
     def enable_logging(
         self,
-        level: str | None = None,
+        level: LogLevel | LogLevelName | None = None,
         sample: int = 1,
         always_log_status: int | None = None,
     ) -> None:
@@ -857,12 +877,12 @@ class Pyronova:
 
             INFO  pyronova::access Request handled method=GET path=/ status=200 latency_us=198 mode="gil"
 
-        :param level: minimum log level — "debug" / "info" / "warn" / "error".
-            Given, it is the level, whatever ``log_config`` or ``debug=True`` set,
-            and a later call without one (``PYRONOVA_LOG=1``, ``debug=True`` at
-            ``run()``) keeps it. Left out, the level stays as configured, raised
-            to "info" when it is "error" or "off" (the access lines are INFO).
-            An unknown level raises ``ValueError`` when the server starts.
+        :param level: minimum log level — a ``LogLevel``, or its name ("debug" /
+            "info" / "warn" / "error" / ...). Given, it is the level, whatever
+            ``log_config`` or ``debug=True`` set, and a later call without one
+            (``PYRONOVA_LOG=1``, ``debug=True`` at ``run()``) keeps it. Left out, the
+            level stays as configured, raised to "info" when it is "error" or "off"
+            (the access lines are INFO). An unknown name raises ``ValueError`` here.
         :param sample: log 1 in every ``sample`` requests. ``1`` (default)
             logs every request. ``100`` keeps roughly 1% — production knob
             to recover the 25-30% throughput tax of full access logging
@@ -877,13 +897,14 @@ class Pyronova:
         raises ``ValueError``.
         """
         # Validated first, so a bad value leaves the logging settings as they were.
+        requested = None if level is None else _log_level(level)
         self._engine.set_request_log_sampling(sample, always_log_status)
         self._engine.enable_request_logging(True)
 
-        # The deferred init_logger picks these up (and validates the level).
-        self._log_level_pinned = self._log_level_pinned or level is not None
+        # The deferred init_logger picks these up.
+        self._log_level_pinned = self._log_level_pinned or requested is not None
         self._log_config["level"] = _level_with_access_log(
-            self._log_config["level"], level, self._log_level_pinned
+            self._log_config["level"], requested, self._log_level_pinned
         )
         self._log_config["access_log"] = True
 
@@ -909,8 +930,8 @@ class Pyronova:
         return os.path.abspath(main_file)
 
     @property
-    def routes(self) -> list[dict]:
-        """List of registered routes (dicts with method/path/handler/gil/stream/async/model).
+    def routes(self) -> list[RouteInfo]:
+        """The registered routes, in registration order.
 
         Populated as routes are registered via decorators or direct calls.
         Fast-path routes (``add_fast_response``) appear in ``fast_routes``.
@@ -918,7 +939,7 @@ class Pyronova:
         return list(self._routes_meta)
 
     @property
-    def fast_routes(self) -> list[dict]:
+    def fast_routes(self) -> list[FastRouteInfo]:
         """Routes registered via ``add_fast_response``."""
         return list(self._fast_routes_meta)
 
@@ -1059,19 +1080,27 @@ class Pyronova:
                 if os.environ.get("PYRONOVA_LOG") == "1" or self.debug:
                     self.enable_logging()
                 # Deferred from __init__ so enable_logging() can adjust the config first.
-                # Workers take the level the engine parsed here (`_python_log_level`).
+                # Main and every worker gate Python logging on the level applied here
+                # (`_python_log_level`).
                 init_logger(
                     self._log_config["level"],
                     self._log_config["access_log"],
                     self._log_config["format"],
                 )
-                _setup_python_logging_bridge(self._log_config["level"])
+                _setup_python_logging_bridge()
                 self._prepared = True
 
             if not self._mcp_route_registered and not self._mcp.is_empty():
                 mcp = self._mcp
 
                 def _mcp_handler(req):
+                    refused = _csrf.check(req, self._origin_policy, _MCP_BODY_TYPES)
+                    if isinstance(refused, _csrf.Refused):
+                        return Response(
+                            body=mcp.refusal(refused.reason),
+                            status_code=refused.status,
+                            content_type="application/json",
+                        )
                     return Response(
                         body=mcp.handle_request(req.body, request_id=req.request_id),
                         content_type="application/json",
@@ -1285,6 +1314,7 @@ def _bind_path_params(fn: Callable, path: str, template: frozenset[str]) -> Call
     names = _path_param_names(fn, sig, path, template, leading=1)
     if not names:
         return fn  # hot path — the handler is registered as is
+    _require_accepts(fn, leading=1, names=names)
 
     # Every name is in the template, so the router always fills it: `p[n]`, never a
     # silent None.
@@ -1312,6 +1342,8 @@ def _bind_model(fn: Callable, path: str, template: frozenset[str], model: type) 
     sig = inspect.signature(fn)
     takes_request = _model_takes_request(fn, sig, template, model)
     names = _path_param_names(fn, sig, path, template, leading=2 if takes_request else 1)
+    if names:
+        _require_accepts(fn, leading=2 if takes_request else 1, names=names)
 
     def args(req, body):
         return (req, body) if takes_request else (body,)
@@ -1406,6 +1438,26 @@ def _path_param_names(
             f"or `{{*name}}` in the route path."
         )
     return names
+
+
+def _require_accepts(fn: Callable, leading: int, names: tuple[str, ...]) -> None:
+    """The path params are read off ``inspect.signature(fn)``, which follows a decorator's
+    ``__wrapped__`` to the function it wraps. The call goes to ``fn`` itself, so it must take
+    them too: a wrapper that doesn't (``def wrapper(req)``) is a registration error here,
+    not a TypeError on every request."""
+    try:
+        own = inspect.signature(fn, follow_wrapped=False)
+    except (TypeError, ValueError):
+        return  # a builtin/C callable: its signature can't be read
+    try:
+        own.bind(*([None] * leading), **dict.fromkeys(names))
+    except TypeError as e:
+        raise TypeError(
+            f"handler {getattr(fn, '__qualname__', fn)!r} declares path param(s) "
+            f"{list(names)!r} through __wrapped__, but the wrapper the route calls has "
+            f"signature {own} and can't take them ({e}); have the wrapper accept and pass "
+            "them on (e.g. **path_params)"
+        ) from None
 
 
 def _named_like(wrapper: Callable, fn: Callable) -> Callable:

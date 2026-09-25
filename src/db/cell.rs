@@ -77,10 +77,9 @@ fn wire_error(e: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(format!("undecodable value: {e}"))
 }
 
+/// A `json`/`jsonb` value with the codec `req.json()` uses, so a wide integer stays exact.
 fn json<'py>(py: Python<'py>, text: &[u8]) -> PyResult<Bound<'py, PyAny>> {
-    let value: serde_json::Value = serde_json::from_slice(text).map_err(wire_error)?;
-    pythonize::pythonize(py, &value)
-        .map_err(|e| PyRuntimeError::new_err(format!("pythonize json: {e}")))
+    crate::json::loads(py, text).map_err(wire_error)
 }
 
 fn date(py: Python<'_>, days: i32) -> PyResult<Bound<'_, PyAny>> {

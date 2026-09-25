@@ -73,6 +73,7 @@ pub(crate) async fn serve_on_pool(
         path: Arc::clone(&path),
         client_ip: client_ip_addr,
         max_body: site.config.limits.max_body_bytes,
+        compression: site.config.compression,
     };
     let resp = run_on_pool(pool, prepared, work, &tag).await;
     let line = RequestLine {
@@ -92,6 +93,8 @@ struct PoolWork {
     client_ip: std::net::IpAddr,
     /// The app's `max_body_size`.
     max_body: usize,
+    /// The app's compression settings; `None` = off.
+    compression: Option<crate::compression::Settings>,
 }
 
 async fn run_on_pool(
@@ -157,7 +160,9 @@ async fn run_on_pool(
 
     let lost = |_| HandlerError::WorkerLost("the sub-interpreter worker dropped the request");
     match await_reply(response_rx, lost).await {
-        Ok(result) => http_response(result, accept_encoding.as_str()),
+        Ok(result) => {
+            http_response(result, accept_encoding.as_str(), work.compression.as_ref()).await
+        }
         Err(e) => fail(e, tag),
     }
 }

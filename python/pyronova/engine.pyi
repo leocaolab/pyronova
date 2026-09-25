@@ -2,11 +2,25 @@
 
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
-def init_logger(level: str, access_log: bool, format: str) -> None:
+class LogLevel:
+    """The minimum level of what is logged."""
+
+    Off: LogLevel
+    Error: LogLevel
+    Warn: LogLevel
+    Info: LogLevel
+    Debug: LogLevel
+    Trace: LogLevel
+    @staticmethod
+    def parse(name: str) -> LogLevel:
+        """``"OFF" | "ERROR" | "WARN" | "WARNING" | "INFO" | "DEBUG" | "TRACE"``, in any
+        case; anything else raises ``ValueError``."""
+        ...
+
+def init_logger(level: LogLevel | str, access_log: bool, format: str) -> None:
     """Install the Rust tracing engine, or reconfigure it if already installed.
 
-    :param level: ``"OFF" | "ERROR" | "WARN" | "WARNING" | "INFO" | "DEBUG" |
-        "TRACE"`` (case-insensitive).
+    :param level: a ``LogLevel``, or its name (see ``LogLevel.parse``).
     :param format: ``"text"`` (human-readable) or ``"json"`` (structured).
     :raises ValueError: on an unknown level or format.
     :raises RuntimeError: if the subscriber cannot be installed because a
@@ -34,7 +48,7 @@ def emit_python_log(
 
 def _python_log_level() -> Optional[int]:
     """The Python ``logging`` level matching the level ``init_logger`` applied, or
-    ``None`` before any ``init_logger``. Workers gate their root logger on it."""
+    ``None`` before any ``init_logger``. Every interpreter gates its root logger on it."""
     ...
 
 class Metrics:
@@ -51,8 +65,8 @@ class Metrics:
     rss_bytes: Optional[int]
     """Process RSS; ``None`` until the sampler (``PYRONOVA_METRICS=1``) reads one."""
     dropped_requests: int
-    total_requests: int
-    """Counted only while ``PYRONOVA_METRICS=1``."""
+    total_requests: Optional[int]
+    """Requests counted; ``None`` while hot-path metrics are off (``PYRONOVA_METRICS`` unset)."""
 
 def get_gil_metrics() -> Metrics:
     """Read every counter. Has no side effect."""
@@ -255,6 +269,32 @@ class Mode:
     @property
     def uses_workers(self) -> bool: ...
 
+class Compression:
+    """An app's response-compression settings, validated when made."""
+
+    def __init__(
+        self,
+        *,
+        min_size: int = 512,
+        gzip: bool = True,
+        brotli: bool = True,
+        gzip_level: int = 6,
+        brotli_quality: int = 4,
+    ) -> None:
+        """:raises ValueError: ``gzip_level`` outside 1..=9, ``brotli_quality`` outside
+        0..=11, a negative ``min_size``, or neither algorithm enabled."""
+        ...
+    @property
+    def min_size(self) -> int: ...
+    @property
+    def gzip(self) -> bool: ...
+    @property
+    def brotli(self) -> bool: ...
+    @property
+    def gzip_level(self) -> int: ...
+    @property
+    def brotli_quality(self) -> int: ...
+
 class PyronovaApp:
     def __init__(self) -> None: ...
     def get(self, path: str, handler: Callable[..., Any], gil: bool = False) -> None: ...
@@ -276,6 +316,9 @@ class PyronovaApp:
         ...
     def set_max_body_size(self, size: int) -> None:
         """This app's largest request body, in bytes (413 above it). Per app."""
+        ...
+    def configure_compression(self, settings: Compression | None) -> None:
+        """This app's response compression; ``None`` turns it off. Per app."""
         ...
     def max_body_size(self) -> int: ...
     def set_max_websocket_message_size(self, size: int) -> None:
@@ -450,7 +493,9 @@ class PgPool:
     ) -> "PgPool":
         """Open the pool, or return the open one. Raises ``ValueError`` if it is open
         with another DSN or with settings that differ from the ones asked for; settings
-        left out match the open pool. Defaults on the first call: 10 connections, 30 s."""
+        left out match the open pool. Defaults on the first call: 10 connections, 30 s.
+        A failed connect raises ``ConnectionError`` with ``.sqlstate``: the server's code
+        when it answered (``28P01`` bad password, ``3D000`` no such database), else ``None``."""
         ...
     def fetch_one(self, sql: str, *params: Any) -> Optional[Dict[str, Any]]: ...
     def fetch_all(self, sql: str, *params: Any) -> List[Dict[str, Any]]: ...
