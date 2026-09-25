@@ -71,7 +71,9 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<python::body_stream::PyronovaBodyStream>()?;
     m.add_class::<db::PgPool>()?;
     m.add_class::<db::PgCursor>()?;
+    m.add_class::<monitor::Metrics>()?;
     m.add_function(pyo3::wrap_pyfunction!(monitor::get_gil_metrics, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(monitor::reset_peaks, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(logging::init_logger, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(logging::emit_python_log, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(workrequest_counts, m)?)?;

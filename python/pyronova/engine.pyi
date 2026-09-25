@@ -32,6 +32,31 @@ def emit_python_log(
     """
     ...
 
+class Metrics:
+    """Snapshot of the engine counters. Times are in microseconds."""
+
+    gil_wait_last_us: int
+    gil_wait_peak_us: int
+    """Longest GIL acquisition wait since the last ``reset_peaks()``."""
+    gil_wait_count: int
+    gil_wait_total_us: int
+    gil_queue_length: int
+    gil_hold_peak_us: int
+    """Longest handler GIL hold since the last ``reset_peaks()``."""
+    rss_bytes: Optional[int]
+    """Process RSS; ``None`` until the sampler (``PYRONOVA_METRICS=1``) reads one."""
+    dropped_requests: int
+    total_requests: int
+    """Counted only while ``PYRONOVA_METRICS=1``."""
+
+def get_gil_metrics() -> Metrics:
+    """Read every counter. Has no side effect."""
+    ...
+
+def reset_peaks() -> None:
+    """Clear ``gil_wait_peak_us`` and ``gil_hold_peak_us``."""
+    ...
+
 class Request:
     method: str
     path: str

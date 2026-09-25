@@ -1,6 +1,6 @@
 """Pyronova — A high-performance Python web framework powered by Rust."""
 
-from pyronova.engine import PyronovaApp, Request, Response, WebSocket, SharedState, Stream, get_gil_metrics, init_logger, emit_python_log
+from pyronova.engine import PyronovaApp, Request, Response, WebSocket, SharedState, Stream, Metrics, get_gil_metrics, reset_peaks, init_logger, emit_python_log
 from pyronova.app import Pyronova
 from pyronova.rpc import RPCClient
 from pyronova.cookies import get_cookies, get_cookie, set_cookie, delete_cookie
@@ -46,7 +46,7 @@ def redirect(url: str, status_code: int = 302) -> Response:
 
 __all__ = [
     "Pyronova", "PyronovaApp", "Request", "Response", "WebSocket", "SharedState", "Stream",
-    "get_gil_metrics", "init_logger", "emit_python_log",
+    "Metrics", "get_gil_metrics", "reset_peaks", "init_logger", "emit_python_log",
     "redirect", "RPCClient",
     "get_cookies", "get_cookie", "set_cookie", "delete_cookie",
     "parse_multipart", "UploadFile",

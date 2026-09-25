@@ -270,8 +270,12 @@ del app.state["key"]
 # 启用 (环境变量)
 # PYRONOVA_METRICS=1 python app.py
 
-from pyronova import get_gil_metrics
-last, peak, probes, total, rss, queue, hold, dropped, total_req = get_gil_metrics()
+from pyronova import get_gil_metrics, reset_peaks
+m = get_gil_metrics()          # Metrics 快照；读取不会清零
+m.gil_wait_peak_us, m.gil_hold_peak_us, m.gil_queue_length
+m.rss_bytes                    # 采样器还没读到时为 None
+m.dropped_requests, m.total_requests
+reset_peaks()                  # 显式开始新的峰值窗口
 ```
 
 ## IDE 支持
