@@ -313,6 +313,8 @@ pub(crate) async fn try_static_file(
 async fn serve(root: &Path, rel: &str) -> Result<Option<Response<Full<Bytes>>>, StaticError> {
     let candidate = candidate_path(root, rel)?;
     let Some(path) = canonical_within(root, &candidate).await? else {
+        // Gone: its entry is keyed by the candidate itself unless a symlink led to it.
+        cache_remove(&candidate);
         return Ok(None);
     };
 
