@@ -26,6 +26,7 @@ import sys
 import tempfile
 import textwrap
 import time
+from typing import Literal, Optional
 
 import pytest
 
@@ -596,3 +597,131 @@ def test_slow_streamed_body_is_408_like_a_buffered_one():
     finally:
         for srv in servers.values():
             srv.stop()
+
+
+# ---------------------------------------------------------------------------
+# MCP: argument values are checked against the tool schema; hints map to real schemas
+# or fail registration; non-str results are JSON
+# ---------------------------------------------------------------------------
+
+
+def _mcp_call(server, name: str, arguments: dict) -> dict:
+    body = json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
+    })
+    return json.loads(server.handle_request(body))
+
+
+def test_mcp_wrong_argument_type_is_32602_with_the_reason():
+    from pyronova.mcp import MCPServer
+
+    mcp = MCPServer()
+
+    @mcp.tool()
+    def add(a: int, b: int) -> int:
+        return a + b
+
+    @mcp.tool()
+    def pick(tags: list[str], mode: Literal["fast", "slow"], limit: int | None = None) -> str:
+        return f"{tags} {mode} {limit}"
+
+    resp = _mcp_call(mcp, "add", {"a": 1, "b": "2"})
+    assert resp["error"]["code"] == -32602, resp
+    assert resp["error"]["message"] == "invalid params: argument 'b': expected integer, got string"
+
+    # bool is not an integer in JSON Schema terms
+    resp = _mcp_call(mcp, "add", {"a": True, "b": 2})
+    assert resp["error"]["code"] == -32602, resp
+    assert "argument 'a': expected integer, got boolean" in resp["error"]["message"]
+
+    resp = _mcp_call(mcp, "pick", {"tags": ["x", 3], "mode": "fast"})
+    assert resp["error"]["code"] == -32602, resp
+    assert "argument 'tags'[1]: expected string, got integer" in resp["error"]["message"]
+
+    resp = _mcp_call(mcp, "pick", {"tags": [], "mode": "medium"})
+    assert resp["error"]["code"] == -32602, resp
+    assert "'medium' is not one of ['fast', 'slow']" in resp["error"]["message"]
+
+    resp = _mcp_call(mcp, "pick", {"tags": ["x"], "mode": "slow", "limit": None})
+    assert resp["result"]["content"][0]["text"] == "['x'] slow None"
+    assert _mcp_call(mcp, "add", {"a": 2, "b": 3})["result"]["content"][0]["text"] == "5"
+
+
+def test_mcp_schema_maps_common_hints():
+    from pyronova.mcp import _extract_schema
+
+    def tool(
+        a: list[int],
+        b: dict[str, float],
+        c: int | None,
+        d: Optional[str],
+        e: Literal["x", "y"],
+        f: bool,
+        g,
+        h: list,
+    ):
+        pass
+
+    props = _extract_schema(tool)["properties"]
+    assert props["a"] == {"type": "array", "items": {"type": "integer"}}
+    assert props["b"] == {"type": "object", "additionalProperties": {"type": "number"}}
+    assert props["c"] == {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+    assert props["d"] == {"anyOf": [{"type": "string"}, {"type": "null"}]}
+    assert props["e"] == {"enum": ["x", "y"]}
+    assert props["f"] == {"type": "boolean"}
+    assert props["g"] == {}  # no hint: any JSON value, not "string"
+    assert props["h"] == {"type": "array"}
+
+
+class Point:
+    """A class with no JSON form (module level: this file's annotations are strings,
+    resolved against its globals)."""
+
+
+def test_mcp_unmappable_hint_is_a_registration_error_naming_the_parameter():
+    from pyronova.mcp import MCPServer
+
+    mcp = MCPServer()
+    with pytest.raises(TypeError, match=r"parameter 'where' is annotated .*Point.*input_schema="):
+        @mcp.tool()
+        def locate(name: str, where: Point) -> str:
+            return name
+
+    with pytest.raises(TypeError, match=r"parameter 'ids'"):
+        @mcp.tool()
+        def lookup(ids: set[int]) -> str:
+            return ""
+
+    # An explicit schema is the way out, and is what gets checked.
+    @mcp.tool(input_schema={"type": "object", "properties": {"where": {"type": "object"}}})
+    def locate2(where: Point) -> str:
+        return "ok"
+
+    assert _mcp_call(mcp, "locate2", {"where": [1]})["error"]["code"] == -32602
+
+
+def test_mcp_non_str_results_are_json():
+    from pyronova.mcp import MCPServer
+
+    mcp = MCPServer()
+
+    @mcp.tool()
+    def items() -> list:
+        return [{"id": 1, "ok": True}, None]
+
+    @mcp.tool()
+    def ratio() -> float:
+        return 0.5
+
+    @mcp.tool()
+    def nothing() -> None:
+        return None
+
+    def text(name):
+        return _mcp_call(mcp, name, {})["result"]["content"][0]["text"]
+
+    assert json.loads(text("items")) == [{"id": 1, "ok": True}, None]
+    assert text("items") != str([{"id": 1, "ok": True}, None])
+    assert text("ratio") == "0.5"
+    assert text("nothing") == "null"

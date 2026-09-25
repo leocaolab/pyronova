@@ -31,10 +31,11 @@ import asyncio
 import inspect
 import json
 import logging
+import types
 import typing
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any, Callable
+from typing import Any, Callable, Literal, Union
 
 from pyronova._errors import log_server_error
 
@@ -89,34 +90,25 @@ def _resolve(result):
 
 
 def _extract_schema(fn: Callable) -> dict:
-    """Auto-generate JSON schema from function signature."""
+    """The JSON Schema of ``fn``'s arguments, from its type hints (see ``_hint_schema``).
+    A parameter without a hint accepts any JSON value; one whose hint has no JSON form
+    is a registration error naming it."""
     sig = inspect.signature(fn)
     # NOTE: cannot use `fn.__annotations__` directly — this module (and any
     # user module handling mcp.tool) commonly has `from __future__ import
-    # annotations`, which stores annotations as *strings* (`'int'`). A
-    # lookup keyed by the `int` type object then silently misses and every
-    # argument falls back to "string", breaking the tool schema. Use
+    # annotations`, which stores annotations as *strings* (`'int'`). Use
     # typing.get_type_hints to evaluate the strings into real type objects.
     try:
         hints = typing.get_type_hints(fn)
     except NameError as e:
         # A forward ref that doesn't resolve (a TYPE_CHECKING-only import):
-        # without the real type the schema would claim "string" for it.
+        # without the real type there is no schema for it.
         raise TypeError(
             f"MCP tool {fn.__qualname__}: cannot resolve a parameter's type hint "
             f"({e}); import the type at runtime or pass input_schema="
         ) from e
     properties = {}
     required = []
-
-    type_map = {
-        int: "integer",
-        float: "number",
-        str: "string",
-        bool: "boolean",
-        list: "array",
-        dict: "object",
-    }
 
     for name, param in sig.parameters.items():
         if name in ("self", "cls"):
@@ -126,9 +118,15 @@ def _extract_schema(fn: Callable) -> dict:
             inspect.Parameter.VAR_KEYWORD,
         ):
             continue
-        hint = hints.get(name)
-        prop = {"type": type_map.get(hint, "string")}
-        properties[name] = prop
+        try:
+            properties[name] = _hint_schema(hints[name]) if name in hints else {}
+        except _NoJsonForm as e:
+            raise TypeError(
+                f"MCP tool {fn.__qualname__}: parameter {name!r} is annotated {e.hint!r}, "
+                "which has no JSON Schema form (supported: bool, int, float, str, None, "
+                "Any, list[T], dict[str, T], T | U, Optional[T], Literal[...]); change the "
+                "hint or pass input_schema="
+            ) from None
         if param.default is inspect.Parameter.empty:
             required.append(name)
 
@@ -136,6 +134,121 @@ def _extract_schema(fn: Callable) -> dict:
     if required:
         schema["required"] = required
     return schema
+
+
+_SCALAR_TYPES = {bool: "boolean", int: "integer", float: "number", str: "string", type(None): "null"}
+
+
+class _NoJsonForm(Exception):
+    def __init__(self, hint: object) -> None:
+        super().__init__(repr(hint))
+        self.hint = hint
+
+
+def _hint_schema(hint: object) -> dict:
+    """The JSON Schema a type hint stands for. ``_NoJsonForm`` for a hint that has none
+    (a class, ``set[int]``, ``tuple``, ``dict[int, str]``…)."""
+    if hint is Any:
+        return {}
+    if hint in _SCALAR_TYPES:
+        return {"type": _SCALAR_TYPES[hint]}
+    origin, args = typing.get_origin(hint), typing.get_args(hint)
+    if hint is list or origin is list:
+        return {"type": "array", **({"items": _hint_schema(args[0])} if args else {})}
+    if hint is dict or origin is dict:
+        if not args:
+            return {"type": "object"}
+        if args[0] is not str:
+            raise _NoJsonForm(hint)
+        return {"type": "object", "additionalProperties": _hint_schema(args[1])}
+    if origin in (Union, types.UnionType):
+        return {"anyOf": [_hint_schema(a) for a in args]}
+    if origin is Literal:
+        if not all(type(v) in _SCALAR_TYPES for v in args):
+            raise _NoJsonForm(hint)
+        return {"enum": list(args)}
+    raise _NoJsonForm(hint)
+
+
+# JSON Schema's primitive types, as checks on the Python value json.loads produced.
+_JSON_TYPE_CHECKS: dict[str, Callable[[object], bool]] = {
+    "null": lambda v: v is None,
+    "boolean": lambda v: isinstance(v, bool),
+    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+    "string": lambda v: isinstance(v, str),
+    "array": lambda v: isinstance(v, list),
+    "object": lambda v: isinstance(v, dict),
+}
+
+
+def _json_type_name(value: object) -> str:
+    return next(
+        (name for name in ("null", "boolean", "integer", "number", "string", "array", "object")
+         if _JSON_TYPE_CHECKS[name](value)),
+        type(value).__name__,
+    )
+
+
+class _Invalid(Exception):
+    """An argument value its schema does not accept, with where and why."""
+
+
+def _check_value(schema: dict, value: object, where: str) -> None:
+    """Checks ``value`` against ``schema``: ``type``, ``enum``, ``const``, ``anyOf``,
+    ``items``, ``properties``, ``required`` and ``additionalProperties``. Other keywords
+    (``format``, ``minimum``…) are annotations here and are not checked."""
+    expected = schema.get("type")
+    if expected is not None:
+        names = expected if isinstance(expected, list) else [expected]
+        if not any(_JSON_TYPE_CHECKS[n](value) for n in names):
+            raise _Invalid(f"{where}: expected {' or '.join(names)}, got {_json_type_name(value)}")
+    if "enum" in schema and value not in schema["enum"]:
+        raise _Invalid(f"{where}: {value!r} is not one of {schema['enum']!r}")
+    if "const" in schema and value != schema["const"]:
+        raise _Invalid(f"{where}: must be {schema['const']!r}, got {value!r}")
+    if "anyOf" in schema:
+        reasons = []
+        for option in schema["anyOf"]:
+            try:
+                _check_value(option, value, where)
+                break
+            except _Invalid as e:
+                reasons.append(str(e))
+        else:
+            raise _Invalid(" / ".join(reasons))
+    if isinstance(value, list) and "items" in schema:
+        for i, item in enumerate(value):
+            _check_value(schema["items"], item, f"{where}[{i}]")
+    if isinstance(value, dict):
+        _check_object(schema, value, where)
+
+
+def _check_object(schema: dict, value: dict, where: str) -> None:
+    missing = [k for k in schema.get("required", ()) if k not in value]
+    if missing:
+        raise _Invalid(f"{where}: missing required key(s) {missing}")
+    properties = schema.get("properties", {})
+    extra = schema.get("additionalProperties", True)
+    for key, item in value.items():
+        if key in properties:
+            _check_value(properties[key], item, f"{where}.{key}")
+        elif extra is False:
+            raise _Invalid(f"{where}: unexpected key {key!r}")
+        elif isinstance(extra, dict):
+            _check_value(extra, item, f"{where}.{key}")
+
+
+def _check_arguments(schema: dict, arguments: dict) -> None:
+    """Every argument value against its property in the tool's input schema; -32602 with
+    the reason for one it does not accept."""
+    properties = schema.get("properties", {})
+    try:
+        for name, value in arguments.items():
+            if name in properties:
+                _check_value(properties[name], value, f"argument {name!r}")
+    except _Invalid as e:
+        raise JsonRpcError(JsonRpcCode.INVALID_PARAMS, f"invalid params: {e}") from None
 
 
 class JsonRpcCode(IntEnum):
@@ -439,18 +552,15 @@ class MCPServer:
         if missing:
             raise JsonRpcError(JsonRpcCode.INVALID_PARAMS, f"missing required argument(s): {missing}")
         tool.params.check(arguments)
+        _check_arguments(tool.input_schema, arguments)
 
         # _resolve awaits a coroutine result on a fresh loop with a timeout
         # (safe — this handler runs on a blocking Tokio thread, never inside
         # an asyncio loop).
         result = _resolve(tool.handler(**arguments))
 
-        if isinstance(result, str):
-            text = result
-        elif isinstance(result, dict):
-            text = json.dumps(result)
-        else:
-            text = str(result)
+        # Text as is; any other result as JSON (a list, a number, None), never its repr.
+        text = result if isinstance(result, str) else json.dumps(result)
         return {"content": [{"type": "text", "text": text}], "isError": False}
 
     def _handle_resources_list(self, params: dict) -> dict:
