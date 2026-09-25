@@ -403,134 +403,9 @@ class Pyronova:
         return self._route(method.upper(), path, handler, gil=gil, model=model, stream=stream)
 
     def _route(self, method: str, path: str, handler: Callable | None, *, gil: bool = False, model: type | None = None, stream: bool = False) -> Callable:
-        def _maybe_inject_path_params(fn: Callable) -> Callable:
-            """Wrap *fn* so path-template params land in matching kwargs.
-
-            Hot path stays untouched: handlers whose signature is exactly
-            ``(req)`` are returned unchanged — no shim, no extra frame, no
-            new code path. Only when the signature declares additional
-            parameters do we build a wrapper that pulls them from
-            ``req.params``.
-            """
-            try:
-                sig = inspect.signature(fn)
-            except (TypeError, ValueError):
-                return fn
-            params = list(sig.parameters.values())
-            # First positional param is always the request — skip it.
-            extras = [
-                p for p in params[1:]
-                if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-            ]
-            if not extras:
-                return fn  # hot path — byte-identical to today
-            names = tuple(p.name for p in extras)
-            # Cross-check against the URL template so a typo'd kwarg fails
-            # loudly at registration instead of silently injecting None at
-            # request time. matchit accepts both `{id}` and `:id`; we strip
-            # the wrappers and collect param names from the path.
-            template_names = set()
-            i = 0
-            while i < len(path):
-                ch = path[i]
-                if ch == "{":
-                    end = path.find("}", i + 1)
-                    if end == -1:
-                        break
-                    template_names.add(path[i + 1 : end].split(":")[0])
-                    i = end + 1
-                elif ch == ":":
-                    j = i + 1
-                    while j < len(path) and (path[j].isalnum() or path[j] == "_"):
-                        j += 1
-                    if j > i + 1:
-                        template_names.add(path[i + 1 : j])
-                    i = j
-                else:
-                    i += 1
-            missing = [n for n in names if n not in template_names]
-            if missing:
-                raise ValueError(
-                    f"handler {fn.__name__!r} declares parameter(s) {missing!r} "
-                    f"that are not in the URL template {path!r}. Path-param "
-                    f"injection only fills names that appear as `{{name}}` "
-                    f"or `:name` in the route path."
-                )
-
-            is_async = inspect.iscoroutinefunction(fn)
-            if is_async:
-                async def shim(req):
-                    p = req.params
-                    return await fn(req, **{n: p.get(n) for n in names})
-            else:
-                def shim(req):
-                    p = req.params
-                    return fn(req, **{n: p.get(n) for n in names})
-            shim.__name__ = fn.__name__
-            shim.__qualname__ = fn.__qualname__
-            shim.__wrapped__ = fn  # Pylance / static analyzers see original sig
-            return shim
-
-        def _wrap_with_model(fn: Callable, mdl: type) -> Callable:
-            """Wrap handler to auto-validate request body with Pydantic model."""
-            # Imported here, only for routes that declare model=: importing pydantic at
-            # module level would load pydantic_core in every worker of every app. If it
-            # can't be imported, route registration fails with the ImportError.
-            from pydantic import ValidationError
-            import inspect
-            sig = inspect.signature(fn)
-            params = list(sig.parameters.values())
-            is_async = inspect.iscoroutinefunction(fn)
-
-            import logging as _logging
-            _vlog = _logging.getLogger("pyronova.validation")
-
-            def _validation_error_response(e: Exception) -> "Response":
-                _vlog.warning("request body validation failed: %s", type(e).__name__, exc_info=True)
-                if hasattr(e, "errors"):
-                    import json as _json
-                    try:
-                        errs = e.errors(include_url=False, include_input=False)
-                    except TypeError:
-                        errs = e.errors()
-                    return Response(
-                        body=_json.dumps({"detail": errs}),
-                        status_code=422,
-                        content_type="application/json",
-                    )
-                return Response(body="Request body validation failed", status_code=422, content_type="text/plain")
-
-            # model_validate_json raises ValidationError for schema
-            # mismatches, but malformed JSON syntax (or a non-decodable
-            # body) surfaces as json.JSONDecodeError / ValueError / TypeError.
-            # All of these are client-side "bad body" → 422, never 500.
-            # _validation_error_response degrades to a generic 422 for the
-            # non-pydantic cases via its hasattr(e, "errors") guard.
-            _BODY_ERRORS = (ValidationError, ValueError, TypeError)
-            if is_async:
-                async def wrapper(req):
-                    try:
-                        validated = mdl.model_validate_json(req.body)
-                    except _BODY_ERRORS as e:
-                        return _validation_error_response(e)
-                    if len(params) >= 2:
-                        return await fn(req, validated)
-                    return await fn(validated)
-            else:
-                def wrapper(req):
-                    try:
-                        validated = mdl.model_validate_json(req.body)
-                    except _BODY_ERRORS as e:
-                        return _validation_error_response(e)
-                    if len(params) >= 2:
-                        return fn(req, validated)
-                    return fn(validated)
-
-            wrapper.__name__ = fn.__name__
-            wrapper.__qualname__ = fn.__qualname__
-            return wrapper
-
-        def _record(fn: Callable) -> None:
+        def register(fn: Callable) -> Callable:
+            bound = _bind_handler(fn, path, model)
+            self._engine.route(method, path, bound, gil, stream)
             self._routes_meta.append({
                 "method": method,
                 "path": path,
@@ -540,29 +415,11 @@ class Pyronova:
                 "model": model.__name__ if model is not None else None,
                 "async": inspect.iscoroutinefunction(fn),
             })
+            # The bound callable, not fn: sub-interp workers find a route's
+            # handler by its module-global name, which must be what the route calls.
+            return bound
 
-        if handler is not None:
-            if model is not None:
-                handler = _wrap_with_model(handler, model)
-            else:
-                handler = _maybe_inject_path_params(handler)
-            self._engine.route(method, path, handler, gil, stream)
-            _record(handler)
-            return handler
-
-        def decorator(fn: Callable) -> Callable:
-            if model is not None:
-                wrapped = _wrap_with_model(fn, model)
-            else:
-                wrapped = _maybe_inject_path_params(fn)
-            self._engine.route(method, path, wrapped, gil, stream)
-            _record(fn)
-            # When wrapping was a no-op `wrapped is fn` — return fn for
-            # type hints. When we injected a shim, return the shim, so the
-            # module-global name refers to what the route calls.
-            return fn if wrapped is fn else wrapped
-
-        return decorator
+        return register(handler) if handler is not None else register
 
     # ------------------------------------------------------------------
     # Middleware
@@ -1272,3 +1129,135 @@ class Pyronova:
         # Not a graceful stop (real startup/run error): surface it normally.
         if run_error is not None:
             raise run_error
+
+
+def _bind_handler(fn: Callable, path: str, model: type | None) -> Callable:
+    """The callable the engine dispatches for a route: ``fn`` itself when it
+    takes only the request, else a wrapper that validates the body against
+    ``model`` and injects the path params ``fn`` declares. Signature mistakes
+    raise here, at registration, not on every request."""
+    if model is None:
+        return _bind_path_params(fn, path)
+    return _bind_model(fn, path, model)
+
+
+def _bind_path_params(fn: Callable, path: str) -> Callable:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn  # a builtin/C callable: nothing to inject
+    names = _path_param_names(fn, sig, path, leading=1)
+    if not names:
+        return fn  # hot path — the handler is registered as is
+
+    if inspect.iscoroutinefunction(fn):
+        async def bound(req):
+            p = req.params
+            return await fn(req, **{n: p.get(n) for n in names})
+    else:
+        def bound(req):
+            p = req.params
+            return fn(req, **{n: p.get(n) for n in names})
+    return _named_like(bound, fn)
+
+
+def _bind_model(fn: Callable, path: str, model: type) -> Callable:
+    """``fn(req, body, **path_params)`` or ``fn(body, **path_params)``."""
+    # Imported here, only for routes that declare model=: importing pydantic at
+    # module level would load pydantic_core in every worker of every app. If it
+    # can't be imported, route registration fails with the ImportError.
+    from pydantic import BaseModel, ValidationError
+
+    if not (isinstance(model, type) and issubclass(model, BaseModel)):
+        raise TypeError(f"model= must be a pydantic BaseModel subclass, got {model!r}")
+    sig = inspect.signature(fn)
+    positional = [
+        p for p in sig.parameters.values()
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    takes_request = len(positional) >= 2 and positional[1].name not in _path_template_names(path)
+    names = _path_param_names(fn, sig, path, leading=2 if takes_request else 1)
+
+    def args(req, body):
+        return (req, body) if takes_request else (body,)
+
+    def kwargs(req):
+        p = req.params
+        return {n: p.get(n) for n in names}
+
+    if inspect.iscoroutinefunction(fn):
+        async def bound(req):
+            try:
+                body = model.model_validate_json(req.body)
+            except ValidationError as e:
+                return _validation_error_response(e)
+            return await fn(*args(req, body), **kwargs(req))
+    else:
+        def bound(req):
+            try:
+                body = model.model_validate_json(req.body)
+            except ValidationError as e:
+                return _validation_error_response(e)
+            return fn(*args(req, body), **kwargs(req))
+    return _named_like(bound, fn)
+
+
+def _validation_error_response(e) -> Response:
+    _logging.getLogger("pyronova.validation").warning(
+        "request body validation failed: %s", type(e).__name__, exc_info=True
+    )
+    return Response(
+        body=_json_module.dumps({"detail": e.errors(include_url=False, include_input=False)}),
+        status_code=422,
+        content_type="application/json",
+    )
+
+
+def _path_param_names(fn: Callable, sig: inspect.Signature, path: str, leading: int) -> tuple[str, ...]:
+    """The parameters after the ``leading`` ones the dispatcher fills (request,
+    body), each of which must name a param in the URL template."""
+    names = tuple(
+        p.name for p in list(sig.parameters.values())[leading:]
+        if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    )
+    template = _path_template_names(path)
+    missing = [n for n in names if n not in template]
+    if missing:
+        raise ValueError(
+            f"handler {fn.__name__!r} declares parameter(s) {missing!r} "
+            f"that are not in the URL template {path!r}. Path-param "
+            f"injection only fills names that appear as `{{name}}` "
+            f"or `:name` in the route path."
+        )
+    return names
+
+
+def _path_template_names(path: str) -> frozenset[str]:
+    """Param names in a route template; matchit accepts both ``{id}`` and ``:id``."""
+    names = set()
+    i = 0
+    while i < len(path):
+        ch = path[i]
+        if ch == "{":
+            end = path.find("}", i + 1)
+            if end == -1:
+                break
+            names.add(path[i + 1 : end].split(":")[0])
+            i = end + 1
+        elif ch == ":":
+            j = i + 1
+            while j < len(path) and (path[j].isalnum() or path[j] == "_"):
+                j += 1
+            if j > i + 1:
+                names.add(path[i + 1 : j])
+            i = j
+        else:
+            i += 1
+    return frozenset(names)
+
+
+def _named_like(wrapper: Callable, fn: Callable) -> Callable:
+    wrapper.__name__ = fn.__name__
+    wrapper.__qualname__ = fn.__qualname__
+    wrapper.__wrapped__ = fn  # Pylance / static analyzers see the original signature
+    return wrapper
