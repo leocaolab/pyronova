@@ -73,7 +73,7 @@ def _load_app(target: str) -> "Pyronova":
     # `__main__` is this file, so point them at the app's module instead.
     module_file = getattr(module, "__file__", None)
     if module_file:
-        app._engine.set_script_path(os.path.abspath(module_file))
+        app._set_app_file(os.path.abspath(module_file))
     return app
 
 
@@ -99,7 +99,6 @@ def _cmd_run(args: argparse.Namespace) -> None:
 def _cmd_dev(args: argparse.Namespace) -> None:
     os.environ.setdefault("PYRONOVA_LOG", "1")
     app = _load_app(args.target)
-    # Dev defaults: bind all interfaces so LAN clients can probe.
     app.run(
         host=args.host,
         port=args.port,

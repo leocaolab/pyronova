@@ -12,6 +12,7 @@ import os
 
 from pyronova.engine import PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log, _in_worker, _forgotten_workers
 from pyronova.mcp import MCPServer
+from pyronova import _reload
 import logging as _logging
 
 
@@ -196,6 +197,7 @@ class Pyronova:
         self._fast_routes_meta: list[dict] = []
         self._readiness_checks: list[tuple[str, Callable]] = []
         self._health_probes_enabled: bool = False
+        self._app_file_path: str | None = None
 
         # Resolve final logging config: debug mode defaults vs production defaults.
         # Actual init_logger call is deferred to run() so enable_logging() can
@@ -1020,6 +1022,23 @@ class Pyronova:
     # Run
     # ------------------------------------------------------------------
 
+    def _set_app_file(self, path: str) -> None:
+        """The source file that defines this app: workers execute it, and the
+        reloader watches its directory. Defaults to ``__main__``'s file."""
+        self._app_file_path = path
+        self._engine.set_script_path(path)
+
+    def _app_file(self) -> str:
+        if self._app_file_path is not None:
+            return self._app_file_path
+        main_file = getattr(sys.modules["__main__"], "__file__", None)
+        if main_file is None:
+            raise RuntimeError(
+                "reload needs the app's source file, but __main__ has no __file__ "
+                "(interactive session?); start the app from a file or with `pyronova dev`"
+            )
+        return os.path.abspath(main_file)
+
     @property
     def routes(self) -> list[dict]:
         """List of registered routes (dicts with method/path/handler/gil/stream/async/model).
@@ -1123,10 +1142,9 @@ class Pyronova:
                         ) from None
                 extra_tls_ports = parsed
 
-        # Hot reload: watch .py files, restart on change
         reload = reload or os.environ.get("PYRONOVA_RELOAD") == "1"
-        if reload and os.environ.get("_PYRONOVA_RELOAD_CHILD") != "1":
-            self._run_with_reload()
+        if reload and not _reload.is_reload_child():
+            _reload.run_with_reload(_reload.ReloadTarget.of_this_process(self._app_file()))
             return
 
         # Auto-enable logging if PYRONOVA_LOG=1 or debug=True.
@@ -1254,113 +1272,3 @@ class Pyronova:
         # Not a graceful stop (real startup/run error): surface it normally.
         if run_error is not None:
             raise run_error
-
-    def _run_with_reload(self):
-        """Watch .py files and restart server on changes using OS-native events."""
-        import subprocess
-
-        script = sys.argv[0] if sys.argv else None
-        if not script:
-            print("  [reload] Cannot determine script path, running without reload")
-            return
-
-        watch_dir = os.path.dirname(os.path.abspath(script)) or "."
-
-        try:
-            import watchfiles
-        except ImportError:
-            print("  [reload] Install 'watchfiles' for efficient file watching:")
-            print("           pip install watchfiles")
-            print("  [reload] Falling back to polling mode...")
-            return self._run_with_reload_poll(watch_dir, script)
-
-        print(f"  [reload] Watching {watch_dir} for .py changes (watchfiles)...")
-
-        while True:
-            env = {**os.environ, "_PYRONOVA_RELOAD_CHILD": "1"}
-            proc = subprocess.Popen([sys.executable, script], env=env)
-
-            try:
-                for changes in watchfiles.watch(
-                    watch_dir,
-                    watch_filter=watchfiles.PythonFilter(),
-                    stop_event=None,
-                    debounce=500,  # 500ms debounce — wait for IDE to finish writing
-                ):
-                    changed = [os.path.basename(c[1]) for c in list(changes)[:3]]
-                    print(f"\n  [reload] File changed: {', '.join(changed)}")
-                    print(f"  [reload] Restarting...\n")
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                    break
-                else:
-                    break
-            except KeyboardInterrupt:
-                proc.terminate()
-                # Bound the wait so a child that ignores SIGTERM can't hang
-                # the reloader forever — escalate to SIGKILL like the
-                # file-change branch above (arc finding app-42).
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                break
-
-    def _run_with_reload_poll(self, watch_dir: str, script: str):
-        """Fallback polling watcher when watchfiles is not installed."""
-        import subprocess
-        import hashlib
-        import glob
-
-        print(f"  [reload] Watching {watch_dir} for .py changes (polling)...")
-
-        def _snapshot():
-            files = {}
-            for f in glob.glob(os.path.join(watch_dir, "**/*.py"), recursive=True):
-                # Skip common large directories
-                if "/.venv/" in f or "/node_modules/" in f or "/__pycache__/" in f:
-                    continue
-                try:
-                    with open(f, "rb") as fh:
-                        files[f] = hashlib.md5(fh.read()).hexdigest()
-                except Exception:
-                    pass
-            return files
-
-        while True:
-            env = {**os.environ, "_PYRONOVA_RELOAD_CHILD": "1"}
-            proc = subprocess.Popen([sys.executable, script], env=env)
-            snap = _snapshot()
-
-            try:
-                while proc.poll() is None:
-                    time.sleep(1)
-                    current = _snapshot()
-                    if current != snap:
-                        # Debounce: wait 0.5s for IDE to finish writing all files
-                        time.sleep(0.5)
-                        snap = _snapshot()  # Re-snapshot after debounce
-                        changed = [f for f in snap if snap.get(f) != current.get(f)]
-                        print(f"\n  [reload] File changed: {', '.join(os.path.basename(f) for f in changed[:3])}")
-                        print(f"  [reload] Restarting...\n")
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=3)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
-                        break
-                else:
-                    break
-            except KeyboardInterrupt:
-                proc.terminate()
-                # Bound the wait so a child that ignores SIGTERM can't hang
-                # the reloader forever — escalate to SIGKILL like the
-                # file-change branch above (arc finding app-42).
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                break
