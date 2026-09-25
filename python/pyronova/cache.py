@@ -27,6 +27,10 @@ window; within the window every subsequent hit is a pure dict lookup.
 For cross-worker shared caching back this with ``app.state`` manually —
 a few extra Bytes copies, but one miss per TTL across the whole fleet.
 
+A handler with path params works as usual (``def item(req, item_id)``): the
+wrapper passes them on, and the default key, the path, already tells
+``/item/1`` from ``/item/2``.
+
 Cache key is the request path only. Query strings are ignored. If you
 need query-aware caching, pre-compose the key yourself:
 
@@ -116,14 +120,14 @@ def cached_json(ttl: float, key: Callable | None = None):
 
         if _is_async:
             @functools.wraps(handler)
-            async def async_wrapper(req):
+            async def async_wrapper(req, **path_params):
                 now = time.monotonic()
                 k, ok = _safe_key(req)
                 if ok:
                     cached = _hit(k, now)
                     if cached is not None:
                         return cached
-                result = await handler(req)
+                result = await handler(req, **path_params)
                 if isinstance(result, Response):
                     return result
                 # A non-serializable handler result must fall back to the
@@ -140,14 +144,14 @@ def cached_json(ttl: float, key: Callable | None = None):
             return async_wrapper
 
         @functools.wraps(handler)
-        def wrapper(req):
+        def wrapper(req, **path_params):
             now = time.monotonic()
             k, ok = _safe_key(req)
             if ok:
                 cached = _hit(k, now)
                 if cached is not None:
                     return cached
-            result = handler(req)
+            result = handler(req, **path_params)
             # Handler returned an explicit Response — user is signalling
             # a custom status / headers; don't cache, don't rewrap.
             if isinstance(result, Response):

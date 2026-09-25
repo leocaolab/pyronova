@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 import sys
 from dataclasses import dataclass
-from typing import Callable, Literal, TypedDict
+from typing import TYPE_CHECKING, Callable, Literal, TypedDict
 import inspect
 import json as _json_module
 
@@ -13,9 +13,14 @@ import os
 
 from pyronova.engine import Compression, LogLevel, Mode, PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log, _in_worker, _forgotten_workers, _python_log_level, _route_params
 from pyronova._log_bridge import RustLogHandler, root_level
+from pyronova import _csrf
+from pyronova._csrf import OriginPolicy
 from pyronova.mcp import MCPServer
 from pyronova import _reload
 import logging as _logging
+
+if TYPE_CHECKING:
+    from pyronova.health import ReadinessCheck
 
 
 # A level by name, in either case; `LogLevel.parse` reads it.
@@ -39,8 +44,36 @@ class LogConfig(TypedDict, total=False):
     format: Literal["text", "json"]
 
 
+# `/mcp` takes a JSON-RPC body only (MCP's HTTP transport).
+_MCP_BODY_TYPES = {"application/json": "application/json"}
+
+
 def _log_level(level: LogLevel | LogLevelName) -> LogLevel:
     return level if isinstance(level, LogLevel) else LogLevel.parse(level)
+
+@dataclass(frozen=True)
+class RouteInfo:
+    """A registered route, as ``app.routes`` lists it."""
+
+    method: str
+    path: str
+    handler: str  # the handler's qualified name
+    gil: bool
+    stream: bool
+    model: str | None  # the ``model=`` class's name
+    is_async: bool
+
+
+@dataclass(frozen=True)
+class FastRouteInfo:
+    """A route registered with ``add_fast_response``, as ``app.fast_routes`` lists it."""
+
+    method: str
+    path: str
+    status_code: int
+    content_type: str
+    body_bytes: int
+
 
 def _is_worker() -> bool:
     """Whether this code runs in a sub-interpreter worker (not the main interpreter)."""
@@ -170,11 +203,12 @@ class Pyronova:
         self.debug = debug
         self._startup_hooks: list[Callable] = []
         self._shutdown_hooks: list[Callable] = []
-        self._routes_meta: list[dict] = []
-        self._fast_routes_meta: list[dict] = []
-        self._readiness_checks: list[tuple[str, Callable]] = []
+        self._routes_meta: list[RouteInfo] = []
+        self._fast_routes_meta: list[FastRouteInfo] = []
+        self._readiness_checks: list[ReadinessCheck] = []
         self._health_probes_enabled: bool = False
         self._app_file_path: str | None = None
+        self._origin_policy = OriginPolicy()
 
         # Resolve final logging config: debug mode defaults vs production defaults.
         # Actual init_logger call is deferred to run() so enable_logging() can
@@ -228,6 +262,25 @@ class Pyronova:
         if size < 0:
             raise ValueError(f"max_body_size must be non-negative, got {size}")
         self._engine.set_max_body_size(size)
+
+    @property
+    def trusted_origins(self) -> list[str]:
+        """Other sites whose pages may call ``/mcp`` and ``@app.rpc`` endpoints from a
+        browser, as ``scheme://host[:port]``. Default: none.
+
+        Those endpoints act on a JSON (or MsgPack / Protobuf) POST, so they refuse a
+        request whose ``Origin`` is another site with 403, and any other body type with
+        415: a page can't make a visitor's browser call them (CSRF). Requests without an
+        ``Origin`` (curl, SDKs, servers) and from this server's own host are always
+        admitted. A bad entry raises ``ValueError``.
+        """
+        return sorted(
+            f"{o.scheme}://{o.host}:{o.port}" for o in self._origin_policy.trusted
+        )
+
+    @trusted_origins.setter
+    def trusted_origins(self, origins: list[str]) -> None:
+        self._origin_policy = OriginPolicy.of(origins)
 
     @property
     def max_websocket_message_size(self) -> int:
@@ -351,13 +404,13 @@ class Pyronova:
             status_code=status_code,
             headers=headers,
         )
-        self._fast_routes_meta.append({
-            "method": method.upper(),
-            "path": path,
-            "status_code": status_code,
-            "content_type": content_type,
-            "bytes": len(body),
-        })
+        self._fast_routes_meta.append(FastRouteInfo(
+            method=method.upper(),
+            path=path,
+            status_code=status_code,
+            content_type=content_type,
+            body_bytes=len(body),
+        ))
 
     @property
     def state(self) -> SharedState:
@@ -439,15 +492,15 @@ class Pyronova:
         def register(fn: Callable) -> Callable:
             bound = _bind_handler(fn, path, model)
             self._engine.route(method, path, bound, gil, stream)
-            self._routes_meta.append({
-                "method": method,
-                "path": path,
-                "handler": getattr(fn, "__qualname__", getattr(fn, "__name__", repr(fn))),
-                "gil": gil,
-                "stream": stream,
-                "model": model.__name__ if model is not None else None,
-                "async": inspect.iscoroutinefunction(fn),
-            })
+            self._routes_meta.append(RouteInfo(
+                method=method,
+                path=path,
+                handler=getattr(fn, "__qualname__", getattr(fn, "__name__", repr(fn))),
+                gil=gil,
+                stream=stream,
+                model=model.__name__ if model is not None else None,
+                is_async=inspect.iscoroutinefunction(fn),
+            ))
             # The bound callable, not fn: sub-interp workers find a route's
             # handler by its module-global name, which must be what the route calls.
             return bound
@@ -731,12 +784,14 @@ class Pyronova:
             def _db_ready():
                 pool.fetch_scalar("SELECT 1")
 
-        A check passes when it returns any value that isn't ``False`` and
-        doesn't raise. ``False`` or an exception → the check is reported
-        as failing in ``/readyz`` and the whole probe returns 503.
+        A check fails when it raises, takes longer than the probe timeout (10 s),
+        or returns ``False``; any other value, ``None`` included, passes. A failing
+        check is reported in ``/readyz`` and the whole probe returns 503.
         """
+        from pyronova.health import ReadinessCheck
+
         def decorator(fn: Callable) -> Callable:
-            self._readiness_checks.append((name, fn))
+            self._readiness_checks.append(ReadinessCheck.of(name, fn))
             return fn
 
         return decorator
@@ -869,8 +924,8 @@ class Pyronova:
         return os.path.abspath(main_file)
 
     @property
-    def routes(self) -> list[dict]:
-        """List of registered routes (dicts with method/path/handler/gil/stream/async/model).
+    def routes(self) -> list[RouteInfo]:
+        """The registered routes, in registration order.
 
         Populated as routes are registered via decorators or direct calls.
         Fast-path routes (``add_fast_response``) appear in ``fast_routes``.
@@ -878,7 +933,7 @@ class Pyronova:
         return list(self._routes_meta)
 
     @property
-    def fast_routes(self) -> list[dict]:
+    def fast_routes(self) -> list[FastRouteInfo]:
         """Routes registered via ``add_fast_response``."""
         return list(self._fast_routes_meta)
 
@@ -1028,6 +1083,13 @@ class Pyronova:
             mcp = self._mcp
 
             def _mcp_handler(req):
+                refused = _csrf.check(req, self._origin_policy, _MCP_BODY_TYPES)
+                if isinstance(refused, _csrf.Refused):
+                    return Response(
+                        body=mcp.refusal(refused.reason),
+                        status_code=refused.status,
+                        content_type="application/json",
+                    )
                 return Response(
                     body=mcp.handle_request(req.body, request_id=req.request_id),
                     content_type="application/json",
@@ -1194,6 +1256,7 @@ def _bind_path_params(fn: Callable, path: str, template: frozenset[str]) -> Call
     names = _path_param_names(fn, sig, path, template, leading=1)
     if not names:
         return fn  # hot path — the handler is registered as is
+    _require_accepts(fn, leading=1, names=names)
 
     # Every name is in the template, so the router always fills it: `p[n]`, never a
     # silent None.
@@ -1221,6 +1284,8 @@ def _bind_model(fn: Callable, path: str, template: frozenset[str], model: type) 
     sig = inspect.signature(fn)
     takes_request = _model_takes_request(fn, sig, template, model)
     names = _path_param_names(fn, sig, path, template, leading=2 if takes_request else 1)
+    if names:
+        _require_accepts(fn, leading=2 if takes_request else 1, names=names)
 
     def args(req, body):
         return (req, body) if takes_request else (body,)
@@ -1315,6 +1380,26 @@ def _path_param_names(
             f"or `{{*name}}` in the route path."
         )
     return names
+
+
+def _require_accepts(fn: Callable, leading: int, names: tuple[str, ...]) -> None:
+    """The path params are read off ``inspect.signature(fn)``, which follows a decorator's
+    ``__wrapped__`` to the function it wraps. The call goes to ``fn`` itself, so it must take
+    them too: a wrapper that doesn't (``def wrapper(req)``) is a registration error here,
+    not a TypeError on every request."""
+    try:
+        own = inspect.signature(fn, follow_wrapped=False)
+    except (TypeError, ValueError):
+        return  # a builtin/C callable: its signature can't be read
+    try:
+        own.bind(*([None] * leading), **dict.fromkeys(names))
+    except TypeError as e:
+        raise TypeError(
+            f"handler {getattr(fn, '__qualname__', fn)!r} declares path param(s) "
+            f"{list(names)!r} through __wrapped__, but the wrapper the route calls has "
+            f"signature {own} and can't take them ({e}); have the wrapper accept and pass "
+            "them on (e.g. **path_params)"
+        ) from None
 
 
 def _named_like(wrapper: Callable, fn: Callable) -> Callable:

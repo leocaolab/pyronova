@@ -27,7 +27,6 @@ Usage::
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 import json
 import logging
@@ -37,56 +36,26 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Callable, Literal, Union
 
+from pyronova._bounded import call_with_timeout
 from pyronova._errors import log_server_error
 
 _log = logging.getLogger(__name__)
 
-# Upper bound on how long a single async tool/resource/prompt handler may
-# run before it is abandoned with a timeout error. Without this an
-# indefinitely-hanging coroutine blocks the dispatching thread forever
-# (arc finding mcp-61).
-_ASYNC_HANDLER_TIMEOUT_S = 30.0
+# Upper bound on how long a tool/resource/prompt handler, sync or async, may run before
+# it is abandoned with an internal error: a hung handler must not hold the /mcp request.
+_HANDLER_TIMEOUT_S = 30.0
 
 
-def _drive_coro(coro):
-    """Run a coroutine to completion from this blocking dispatch thread,
-    bounded by ``_ASYNC_HANDLER_TIMEOUT_S``.
-
-    A fresh loop is used because this always runs on a blocking Tokio
-    thread that never has its own running asyncio loop.
-    """
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(
-            asyncio.wait_for(coro, timeout=_ASYNC_HANDLER_TIMEOUT_S)
-        )
-    finally:
-        # On normal return, timeout, or error the coroutine may have spawned
-        # child tasks (or wait_for's own cancellation may not have fully
-        # propagated). Cancel and await any stragglers, then shut down async
-        # generators, before closing — otherwise `loop.close()` discards them
-        # in a half-cancelled state and emits "Task was destroyed but it is
-        # pending" / "coroutine ignored GeneratorExit" warnings.
-        try:
-            pending = asyncio.all_tasks(loop)
-            for task in pending:
-                task.cancel()
-            if pending:
-                loop.run_until_complete(
-                    asyncio.gather(*pending, return_exceptions=True)
-                )
-            loop.run_until_complete(loop.shutdown_asyncgens())
-        finally:
-            loop.close()
+def _call(handler: Callable, arguments: dict) -> Any:
+    """``handler(**arguments)``, driven to a value if it is async, within
+    ``_HANDLER_TIMEOUT_S`` (``TimeoutError`` past it)."""
+    return call_with_timeout(lambda: handler(**arguments), _HANDLER_TIMEOUT_S)
 
 
-def _resolve(result):
-    """If a handler returned a coroutine/awaitable, drive it to a value;
-    otherwise return it unchanged. Shared by tool/resource/prompt handlers
-    so async support is uniform across all three (arc finding mcp-57)."""
-    if inspect.iscoroutine(result):
-        return _drive_coro(result)
-    return result
+def _as_text(result: Any) -> str:
+    """A handler's result as the text MCP carries: text as is; any other value as JSON (a
+    list, a number, None), never its repr."""
+    return result if isinstance(result, str) else json.dumps(result)
 
 
 def _extract_schema(fn: Callable) -> dict:
@@ -469,7 +438,19 @@ class MCPServer:
         # converts to a 204-like empty response.
         is_notification = "id" not in req
         req_id = req.get("id")
-        method = req.get("method", "")
+        # §4: an id is a String, Number or Null; echoed back as is.
+        if not _is_json_rpc_id(req_id):
+            return self._error_response(
+                None, JsonRpcCode.INVALID_REQUEST,
+                f"Invalid Request: id must be a string, number or null, got {_json_type_name(req_id)}",
+            )
+        method = req.get("method")
+        if not isinstance(method, str):
+            return self._error_response(
+                req_id, JsonRpcCode.INVALID_REQUEST,
+                "Invalid Request: method must be a string, got "
+                + ("nothing" if "method" not in req else _json_type_name(method)),
+            )
         # JSON-RPC 2.0 §5.1: when present, `params` MUST be a Structured
         # value (Object or Array). Treat absent as empty dict.
         params = req.get("params", {})
@@ -543,7 +524,7 @@ class MCPServer:
         return {"tools": tools}
 
     def _handle_tools_call(self, params: dict) -> dict:
-        tool_name = params.get("name", "")
+        tool_name = _str_param(params, "name")
         tool = self._tools.get(tool_name)
         if tool is None:
             raise JsonRpcError(JsonRpcCode.INVALID_PARAMS, f"Unknown tool: {tool_name}")
@@ -554,14 +535,8 @@ class MCPServer:
         tool.params.check(arguments)
         _check_arguments(tool.input_schema, arguments)
 
-        # _resolve awaits a coroutine result on a fresh loop with a timeout
-        # (safe — this handler runs on a blocking Tokio thread, never inside
-        # an asyncio loop).
-        result = _resolve(tool.handler(**arguments))
-
-        # Text as is; any other result as JSON (a list, a number, None), never its repr.
-        text = result if isinstance(result, str) else json.dumps(result)
-        return {"content": [{"type": "text", "text": text}], "isError": False}
+        result = _call(tool.handler, arguments)
+        return {"content": [{"type": "text", "text": _as_text(result)}], "isError": False}
 
     def _handle_resources_list(self, params: dict) -> dict:
         resources = [
@@ -571,14 +546,15 @@ class MCPServer:
         return {"resources": resources}
 
     def _handle_resources_read(self, params: dict) -> dict:
-        uri = params.get("uri", "")
+        uri = _str_param(params, "uri")
         resource = self._resources.get(uri)
         if resource is None:
             raise JsonRpcError(JsonRpcCode.RESOURCE_NOT_FOUND, f"Resource not found: {uri}")
 
-        result = _resolve(resource.handler())
-        text = result if isinstance(result, str) else json.dumps(result)
-        return {"contents": [{"uri": uri, "mimeType": resource.mime_type, "text": text}]}
+        result = _call(resource.handler, {})
+        return {
+            "contents": [{"uri": uri, "mimeType": resource.mime_type, "text": _as_text(result)}]
+        }
 
     def _handle_prompts_list(self, params: dict) -> dict:
         prompts = [
@@ -588,7 +564,7 @@ class MCPServer:
         return {"prompts": prompts}
 
     def _handle_prompts_get(self, params: dict) -> dict:
-        prompt_name = params.get("name", "")
+        prompt_name = _str_param(params, "name")
         prompt = self._prompts.get(prompt_name)
         if prompt is None:
             raise JsonRpcError(JsonRpcCode.INVALID_PARAMS, f"Unknown prompt: {prompt_name}")
@@ -598,13 +574,19 @@ class MCPServer:
             raise JsonRpcError(JsonRpcCode.INVALID_PARAMS, f"missing required argument(s): {missing}")
         prompt.params.check(arguments)
 
-        result = _resolve(prompt.handler(**arguments))
+        result = _call(prompt.handler, arguments)
         return {
             "description": prompt.description,
             "messages": [
-                {"role": "user", "content": {"type": "text", "text": str(result)}}
+                {"role": "user", "content": {"type": "text", "text": _as_text(result)}}
             ],
         }
+
+    @classmethod
+    def refusal(cls, reason: str) -> str:
+        """The body of an HTTP-level refusal (a body type or ``Origin`` ``/mcp`` does not
+        take): a JSON-RPC Invalid Request error carrying the reason."""
+        return cls._error_response(None, JsonRpcCode.INVALID_REQUEST, reason)
 
     @staticmethod
     def _error_response(
@@ -614,6 +596,23 @@ class MCPServer:
         if data is not None:
             error["data"] = data
         return json.dumps({"jsonrpc": "2.0", "id": req_id, "error": error})
+
+
+def _is_json_rpc_id(value: object) -> bool:
+    return value is None or isinstance(value, str) or (
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+    )
+
+
+def _str_param(params: dict, key: str) -> str:
+    """``params[key]``, which must be a string: -32602 with the reason otherwise."""
+    value = params.get(key)
+    if not isinstance(value, str):
+        got = "nothing" if key not in params else _json_type_name(value)
+        raise JsonRpcError(
+            JsonRpcCode.INVALID_PARAMS, f"Invalid params: {key!r} must be a string, got {got}"
+        )
+    return value
 
 
 def _arguments_object(params: dict) -> dict:

@@ -3,7 +3,7 @@
 from collections.abc import Mapping as _Mapping
 
 from pyronova.engine import PyronovaApp, Request, Response, Headers, WebSocket, SharedState, Stream, Metrics, get_gil_metrics, reset_peaks, init_logger, emit_python_log, LogLevel, Compression
-from pyronova.app import Pyronova
+from pyronova.app import Pyronova, RouteInfo, FastRouteInfo
 from pyronova.rpc import RPCClient
 from pyronova.cookies import SameSite, get_cookies, get_cookie, set_cookie, delete_cookie
 from pyronova.uploads import parse_multipart, MultipartError, UploadFile
@@ -50,7 +50,7 @@ def redirect(url: str, status_code: int = 302) -> Response:
 _Mapping.register(Headers)
 
 __all__ = [
-    "Pyronova", "PyronovaApp", "Request", "Response", "Headers", "WebSocket", "SharedState", "Stream",
+    "Pyronova", "RouteInfo", "FastRouteInfo", "PyronovaApp", "Request", "Response", "Headers", "WebSocket", "SharedState", "Stream",
     "Metrics", "get_gil_metrics", "reset_peaks", "init_logger", "emit_python_log",
     "LogLevel", "Compression",
     "redirect", "RPCClient",
