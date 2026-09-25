@@ -87,13 +87,12 @@ jobs:
           source .venv/bin/activate
           pip install maturin pytest pytest-asyncio websockets httpx pydantic numpy msgpack
 
-      # isojson 0.2 (native numpy) for tests/test_isojson_numpy_workers.py (isojson
-      # E2E-3), pinned to the isojson commit that contains numpy until 0.2 is on PyPI.
-      # The runtime dependency stays isojson>=0.1.
-      - name: Install isojson 0.2 + orjson 3.12.0
+      # orjson 3.12.0 is the byte reference for tests/test_isojson_numpy_workers.py
+      # (isojson E2E-3); isojson>=0.2 comes with pyronova's own dependencies.
+      - name: Install orjson 3.12.0
         run: |
           source .venv/bin/activate
-          pip install "orjson==3.12.0" "isojson @ git+https://github.com/leocaolab/isojson@9053d10fc4915584caca98018426926d1658dabe"
+          pip install "orjson==3.12.0"
 
       - name: Build (release)
         run: |
