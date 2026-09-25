@@ -1,6 +1,6 @@
 """Type stubs for pyronova.engine (Rust extension module)."""
 
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Tuple
 
 def init_logger(level: str, access_log: bool, format: str) -> None:
     """Install the Rust tracing engine, or reconfigure it if already installed.
@@ -57,12 +57,32 @@ def reset_peaks() -> None:
     """Clear ``gil_wait_peak_us`` and ``gil_hold_peak_us``."""
     ...
 
+class Headers:
+    """The request's header fields: a read-only mapping, names case-insensitive.
+
+    A name sent on several field lines reads as one value joined with ``", "``
+    (RFC 9110 §5.3), except ``cookie``, joined with ``"; "`` (RFC 9113
+    §8.2.3). ``get_all`` returns each field line as sent.
+    """
+
+    def __getitem__(self, name: str) -> str: ...
+    def get(self, name: str, default: Optional[str] = None) -> Optional[str]: ...
+    def get_all(self, name: str) -> list[str]:
+        """Every field line named ``name``, in the order received; ``[]`` if none."""
+        ...
+    def __contains__(self, name: object) -> bool: ...
+    def __len__(self) -> int: ...
+    def __iter__(self) -> Iterator[str]: ...
+    def keys(self) -> list[str]: ...
+    def values(self) -> list[str]: ...
+    def items(self) -> list[tuple[str, str]]: ...
+
 class Request:
     method: str
     path: str
     params: dict[str, str]
     query: str
-    headers: dict[str, str]
+    headers: Headers
     client_ip: str
     body: bytes
     query_params: dict[str, str]
@@ -90,12 +110,22 @@ class Request:
         ...
 
 class Response:
+    """A handler's response.
+
+    The body's content type comes from what it is, never from its text: a
+    ``dict`` / ``list`` is JSON, a ``str`` is ``text/plain``, ``bytes`` are
+    ``application/octet-stream`` — unless ``content_type`` names one.
+
+    A header value is a ``str``, or a list of ``str`` to send the name on
+    several lines (e.g. ``Set-Cookie``). A ``Content-Type`` or ``Server`` in
+    ``headers`` replaces the default. A non-``str`` value raises
+    ``TypeError`` and an invalid one (CR, LF, NUL) ``ValueError``, naming the
+    header. ``headers`` reads back with lower-case names.
+    """
+
     body: object
     status_code: int
     content_type: Optional[str]
-    # A header value may be a single string, or a list of strings to emit
-    # the same header name multiple times (e.g. multiple ``Set-Cookie``
-    # lines — see pyronova.cookies.set_cookie). The runtime accepts both.
     headers: dict[str, str | list[str]]
     def __init__(
         self,

@@ -26,6 +26,7 @@ test = [
     "pytest>=8",
     "pytest-asyncio>=1",
     "httpx",
+    "h2",
     "websockets",
     "pydantic",
     "numpy",

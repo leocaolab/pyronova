@@ -1,7 +1,6 @@
-//! Channel-based interpreter pool: domain types (`WorkRequest`,
-//! `SubInterpResponse`), the `InterpreterPool` orchestrator, and the
-//! per-OS-thread worker loops (sync + async) that drive
-//! `SubInterpreterWorker`s.
+//! Channel-based interpreter pool: the `WorkRequest` domain type, the
+//! `InterpreterPool` orchestrator, and the per-OS-thread worker loops (sync + async)
+//! that drive `SubInterpreterWorker`s.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -12,19 +11,6 @@ use pyo3::prelude::*;
 
 use super::ffi::*;
 use super::worker::*;
-
-// ---------------------------------------------------------------------------
-// Sub-interpreter response
-// ---------------------------------------------------------------------------
-
-/// Result from a sub-interpreter handler call.
-pub(crate) struct SubInterpResponse {
-    pub body: Vec<u8>,
-    pub status: u16,
-    pub content_type: Option<String>,
-    pub headers: Vec<(String, String)>,
-    pub is_json: bool,
-}
 
 // ---------------------------------------------------------------------------
 // Work item for channel-based dispatch
@@ -41,12 +27,11 @@ pub(crate) struct WorkRequest {
     pub params: Vec<(String, String)>,
     pub query: String,
     pub body: bytes::Bytes,
-    /// Raw HeaderMap: deferred extract_headers() to the worker thread so
-    /// the O(n_headers) HashMap build doesn't block the Tokio executor.
+    /// The request's header fields, moved into its `Request` as is.
     pub headers: hyper::HeaderMap,
     /// IpAddr: deferred to_string() to the worker thread.
     pub client_ip: std::net::IpAddr,
-    pub response_tx: tokio::sync::oneshot::Sender<Result<SubInterpResponse, String>>,
+    pub response_tx: tokio::sync::oneshot::Sender<Result<crate::types::ResponseData, String>>,
 }
 
 // Diagnostic: count WorkRequest creates vs worker-completes. Gated
@@ -474,7 +459,7 @@ fn worker_thread_loop(
         worker.tstate = rebind_tstate_to_current_thread(worker.tstate);
     }
 
-    while let Ok(req) = rx.recv() {
+    while let Ok(mut req) = rx.recv() {
         // Skip requests whose caller already timed out (504) — avoid wasting
         // CPU on "dead" requests during queue backlog (prevents snowball effect).
         if req.response_tx.is_closed() {
@@ -491,8 +476,7 @@ fn worker_thread_loop(
 
         // Catch panics to prevent worker thread death.
         // SubInterpGilGuard ensures GIL is released even if call_handler panics.
-        // Deferred conversions: moved off Tokio thread.
-        let headers_map = crate::types::extract_headers(&req.headers);
+        let headers = std::mem::take(&mut req.headers);
 
         current_route.store(req.route.index(), Ordering::Relaxed);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
@@ -505,7 +489,7 @@ fn worker_thread_loop(
                 &req.params,
                 &req.query,
                 req.body.clone(),
-                &headers_map,
+                headers,
                 req.client_ip,
             )
             // _guard drops here → PyEval_SaveThread() → tstate_cell updated

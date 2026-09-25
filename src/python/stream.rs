@@ -8,8 +8,12 @@
 //! when PyronovaStream is held by long-lived Python references.
 
 use bytes::Bytes;
+use hyper::header::HeaderValue;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use tokio::sync::mpsc;
+
+use crate::types::{header_text, header_value, ResponseHeaders};
 
 /// Upper bound on buffered stream chunks before `send()` rejects.
 ///
@@ -27,33 +31,51 @@ pub(crate) struct PyronovaStream {
     // decoupling channel lifetime from Python GC (Haskell bracket pattern).
     tx: std::sync::Mutex<Option<mpsc::Sender<StreamItem>>>,
     rx: std::sync::Mutex<Option<mpsc::Receiver<StreamItem>>>,
-    /// Custom headers to include in the response
-    #[pyo3(get)]
-    pub(crate) content_type: String,
+    pub(crate) content_type: HeaderValue,
     #[pyo3(get)]
     pub(crate) status_code: u16,
-    #[pyo3(get)]
-    pub(crate) headers: std::collections::HashMap<String, String>,
+    /// Extra response headers, validated when the stream is made.
+    pub(crate) headers: ResponseHeaders,
 }
 
 #[pymethods]
 impl PyronovaStream {
     /// Create a new SSE stream. Channel is created immediately so send() works right away.
     #[new]
+    /// `headers` as for `Response`: a name maps to a `str` or a list of `str`; a bad one is
+    /// a `TypeError` / `ValueError` naming it.
     #[pyo3(signature = (content_type=None, status_code=200, headers=None))]
     fn new(
-        content_type: Option<String>,
+        content_type: Option<&str>,
         status_code: u16,
-        headers: Option<std::collections::HashMap<String, String>>,
-    ) -> Self {
+        headers: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Self> {
+        let content_type = match content_type {
+            Some(ct) => header_value("content_type", ct)?,
+            None => HeaderValue::from_static("text/event-stream"),
+        };
+        let headers = headers
+            .map(ResponseHeaders::from_py)
+            .transpose()?
+            .unwrap_or_default();
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAP);
-        PyronovaStream {
+        Ok(PyronovaStream {
             tx: std::sync::Mutex::new(Some(tx)),
             rx: std::sync::Mutex::new(Some(rx)),
-            content_type: content_type.unwrap_or_else(|| "text/event-stream".to_string()),
+            content_type,
             status_code,
-            headers: headers.unwrap_or_default(),
-        }
+            headers,
+        })
+    }
+
+    #[getter]
+    fn content_type(&self) -> PyResult<&str> {
+        header_text(&self.content_type)
+    }
+
+    #[getter]
+    fn headers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        self.headers.to_py(py)
     }
 
     /// Send raw data chunk. Returns BlockingIOError when the channel is

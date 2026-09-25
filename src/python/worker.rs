@@ -8,7 +8,6 @@
 //! handlers from the app that script registered routes on, checked index by index against
 //! the main interpreter's table.
 
-use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 
 use pyo3::ffi;
@@ -16,8 +15,8 @@ use pyo3::prelude::*;
 
 use super::convert::*;
 use super::ffi::*;
-use super::pool::*;
 use crate::router::RouteSignature;
+use crate::types::ResponseData;
 
 /// Name of the module the user's script executes as in a worker. Not `__main__`, so a script's
 /// `if __name__ == "__main__": app.run()` does not run in workers.
@@ -442,23 +441,19 @@ impl SubInterpreterWorker {
         params: &[(String, String)],
         query: &str,
         body: bytes::Bytes,
-        headers: &HashMap<String, String>,
+        headers: hyper::HeaderMap,
         client_ip: std::net::IpAddr,
     ) -> Result<*mut ffi::PyObject, String> {
-        // `headers` is already converted to a HashMap (the Tokio side
-        // extracted the hyper HeaderMap off the worker thread), so use the
-        // pre-converted variant. params → dict and body → bytes are still
-        // materialized lazily by the pyclass getters, so a handler that
-        // never touches `.params` / `.headers` / `.body` pays nothing for
-        // them — same laziness the old raw type had, minus the hand-written
-        // FFI.
+        // params, headers and body are materialized lazily by the pyclass getters, so a
+        // handler that never touches `.params` / `.headers` / `.body` pays nothing for
+        // them.
         let req = new_request(
             method,
             path,
             params.to_vec(),
             query,
             body,
-            headers.clone(),
+            headers,
             client_ip,
         );
         Py::new(py, req)
@@ -531,9 +526,9 @@ impl SubInterpreterWorker {
         params: &[(String, String)],
         query: &str,
         body: bytes::Bytes,
-        headers: &HashMap<String, String>,
+        headers: hyper::HeaderMap,
         client_ip: std::net::IpAddr,
-    ) -> Result<SubInterpResponse, String> {
+    ) -> Result<ResponseData, String> {
         self.attached(|worker, py| {
             worker.requests_served += 1;
             // The hooks and the handler share one fresh `contextvars.Context`.
@@ -637,9 +632,9 @@ impl SubInterpreterWorker {
         params: &[(String, String)],
         query: &str,
         body: bytes::Bytes,
-        headers: &HashMap<String, String>,
+        headers: hyper::HeaderMap,
         client_ip: std::net::IpAddr,
-    ) -> Result<SubInterpResponse, String> {
+    ) -> Result<ResponseData, String> {
         let func = *self.handlers.get(handler_idx).ok_or_else(|| {
             format!(
                 "handler index {handler_idx} out of range ({} handlers)",
@@ -654,7 +649,7 @@ impl SubInterpreterWorker {
         // ── Leak-hunt bisection hook (leak_detect feature only) ──────
         // PYRONOVA_BISECT values:
         //   "skip_all"     — no build_request, no handler call; return a
-        //                    fixed SubInterpResponse. Exercises hyper +
+        //                    fixed response. Exercises hyper +
         //                    channel only. If this still leaks, the
         //                    leak is NOT in the Python side at all.
         //   "skip_handler" — build_request + dealloc runs, but handler
@@ -671,13 +666,7 @@ impl SubInterpreterWorker {
         let bisect_mode: Option<String> = None;
 
         if bisect_mode.as_deref() == Some("skip_all") {
-            return Ok(SubInterpResponse {
-                body: b"ok".to_vec(),
-                status: 200,
-                content_type: None,
-                headers: Vec::new(),
-                is_json: false,
-            });
+            return Ok(bisect_response());
         }
 
         let request_ref: Option<PyObjRef> = if bisect_mode.as_deref() == Some("skip_build") {
@@ -698,13 +687,7 @@ impl SubInterpreterWorker {
             // Drop request (triggers tp_dealloc) and return a fixed
             // response — skips hooks, Vectorcall, parse_result.
             drop(request);
-            return Ok(SubInterpResponse {
-                body: b"ok".to_vec(),
-                status: 200,
-                content_type: None,
-                headers: Vec::new(),
-                is_json: false,
-            });
+            return Ok(bisect_response());
         }
 
         // Run before_request hooks
@@ -727,7 +710,7 @@ impl SubInterpreterWorker {
                     // coroutine object as a "short-circuit response".
                     let resolved = self.resolve_coroutine(r)?;
                     if resolved.as_ptr() != ffi::Py_None() {
-                        return parse_result(py, resolved);
+                        return worker_response(py, resolved);
                     }
                 }
                 None => {
@@ -759,7 +742,7 @@ impl SubInterpreterWorker {
         let mut response = match result_obj {
             Some(r) => {
                 let resolved = self.resolve_coroutine(r)?;
-                parse_result(py, resolved)?
+                worker_response(py, resolved)?
             }
             None => {
                 // req_for_hooks dropped here automatically → DECREF
@@ -768,10 +751,16 @@ impl SubInterpreterWorker {
             }
         };
 
-        // Run after_request hooks: hook(request, response) → response.
+        // Run after_request hooks: hook(request, response) → response. One that raises
+        // fails the request, as on the main interpreter.
         for &hook_func in &self.after_hooks {
-            // Build a Response from the current response
-            let resp_obj = build_response(py, &response)?;
+            let resp_obj = PyObjRef::from_owned(
+                response
+                    .to_py(py)
+                    .map_err(|e| format!("failed to create Response: {e}"))?
+                    .into_ptr(),
+            )
+            .ok_or("Response object is null")?;
 
             let hook_args =
                 PyObjRef::from_owned(ffi::PyTuple_New(2)).ok_or("failed to create hook args")?;
@@ -790,11 +779,15 @@ impl SubInterpreterWorker {
                     // Drive async after_hooks through the event loop.
                     let resolved = self.resolve_coroutine(r)?;
                     if resolved.as_ptr() != ffi::Py_None() {
-                        response = parse_result(py, resolved)?;
+                        response = worker_response(py, resolved)?;
                     }
                 }
                 None => {
                     log_and_clear_py_exception("after_request hook");
+                    let hook_name = callable_name(hook_func);
+                    return Err(format!(
+                        "after_request hook {hook_name:?} raised an exception"
+                    ));
                 }
             }
         }
@@ -908,17 +901,15 @@ pub(crate) fn new_request(
     params: Vec<(String, String)>,
     query: &str,
     body: bytes::Bytes,
-    headers: HashMap<String, String>,
+    headers: hyper::HeaderMap,
     client_ip: std::net::IpAddr,
 ) -> crate::types::PyronovaRequest {
-    use crate::types::{LazyHeaders, PyronovaRequest};
-    PyronovaRequest {
+    crate::types::PyronovaRequest {
         method: std::sync::Arc::from(method),
         path: std::sync::Arc::from(path),
         params,
         query: query.to_string(),
-        headers_source: LazyHeaders::Converted(headers),
-        headers_cache: std::sync::OnceLock::new(),
+        headers,
         client_ip_addr: client_ip,
         body_bytes: body,
         body_stream_rx: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -928,58 +919,36 @@ pub(crate) fn new_request(
 }
 
 // ---------------------------------------------------------------------------
-// Handler result ↔ response (shared by the sync path and the async engine)
+// Handler result → response (shared by the sync path and the async engine)
 // ---------------------------------------------------------------------------
 
-/// `isojson.dumps` (orjson-compatible, and safe in own-GIL sub-interpreters), falling back
-/// to `json.dumps`; one per interpreter. Not orjson: it keeps its types and strings in
-/// process-global statics, so every sub-interpreter got the first one's objects, and ending
-/// any sub-interpreter freed objects another one still used.
-static JSON_DUMPS: pyo3::sync::PyOnceLock<Py<PyAny>> = pyo3::sync::PyOnceLock::new();
-
-fn json_dumps_func(py: Python<'_>) -> Result<&Py<PyAny>, String> {
-    JSON_DUMPS
-        .get_or_try_init(py, || {
-            py.import("isojson")
-                .or_else(|_| py.import("json"))
-                .and_then(|m| m.getattr("dumps"))
-                .map(|f| f.unbind())
-        })
-        .map_err(|e| format!("no JSON serializer: {e}"))
+/// A worker handler's (or hook's) return value as a response: the one mapping every
+/// interpreter uses (`response::extract_response_data`), except that a worker can't
+/// stream, so a `Stream` is an error (streaming needs `gil=True, stream=True`, FR-16).
+///
+/// # Safety
+/// Must be called with the GIL of the interpreter `result_obj` belongs to.
+pub(crate) unsafe fn worker_response(
+    py: Python<'_>,
+    result_obj: PyObjRef,
+) -> Result<ResponseData, String> {
+    let value = Bound::from_owned_ptr(py, result_obj.into_raw());
+    if value.is_instance_of::<crate::python::stream::PyronovaStream>() {
+        let msg = "a sub-interpreter handler returned a Stream; streaming responses need \
+                   gil=True, stream=True on the route";
+        tracing::error!(target: "pyronova::handler", "{msg}");
+        return Err(msg.to_string());
+    }
+    crate::response::extract_response_data(py, value)
 }
 
-/// Serialize a Python dict/list to a JSON string (isojson returns bytes, json a str).
-unsafe fn json_dumps(py: Python<'_>, obj: PyObjRef) -> Result<String, String> {
-    let dumps = json_dumps_func(py)?.as_ptr();
-    let args = PyObjRef::from_owned(ffi::PyTuple_New(1)).ok_or("failed to create tuple")?;
-    ffi::PyTuple_SetItem(args.as_ptr(), 0, obj.into_raw());
-
-    let result = PyObjRef::from_owned(ffi::PyObject_Call(
-        dumps,
-        args.as_ptr(),
-        std::ptr::null_mut(),
-    ))
-    .ok_or_else(|| {
-        log_and_clear_py_exception("json.dumps");
-        "json.dumps failed".to_string()
-    })?;
-
-    if ffi::PyBytes_Check(result.as_ptr()) != 0 {
-        let ptr = ffi::PyBytes_AsString(result.as_ptr());
-        let size = ffi::PyBytes_Size(result.as_ptr());
-        // PyBytes_Size returns -1 on error (Py_ssize_t). Cast to
-        // usize without checking would yield usize::MAX and feed
-        // an enormous slice to from_raw_parts → UB (arc interp-2).
-        if ptr.is_null() || size < 0 {
-            if !ffi::PyErr_Occurred().is_null() {
-                ffi::PyErr_Clear();
-            }
-            return Err("failed to extract bytes".to_string());
-        }
-        let bytes = std::slice::from_raw_parts(ptr as *const u8, size as usize);
-        String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())
-    } else {
-        pyobj_to_string(result.as_ptr())
+/// The fixed response of the leak-hunt bisection modes.
+fn bisect_response() -> ResponseData {
+    ResponseData {
+        body: bytes::Bytes::from_static(b"ok"),
+        content_type: hyper::header::HeaderValue::from_static("text/plain; charset=utf-8"),
+        status: 200,
+        headers: crate::types::ResponseHeaders::new(),
     }
 }
 
@@ -993,368 +962,4 @@ unsafe fn callable_name(obj: *mut ffi::PyObject) -> String {
             "<unnamed>".to_string()
         }
     }
-}
-
-/// Copies a `bytes` object's contents.
-unsafe fn bytes_contents(obj: *mut ffi::PyObject) -> Vec<u8> {
-    let size = ffi::PyBytes_Size(obj);
-    let ptr = ffi::PyBytes_AsString(obj);
-    if !ptr.is_null() && size > 0 {
-        std::slice::from_raw_parts(ptr as *const u8, size as usize).to_vec()
-    } else {
-        ffi::PyErr_Clear();
-        Vec::new()
-    }
-}
-
-/// Map a handler's return value to a response. The same mapping serves the sync worker
-/// path and the async engine (`_worker_to_response` / `_worker_send`, M4 review N1b):
-///
-/// - a `Response` (or anything with `status_code` + `body`) → its fields;
-/// - `dict` → JSON;
-/// - `str` → its text (the HTTP layer labels a `{`/`[`-prefixed body JSON);
-/// - `bytes` → the bytes, `application/octet-stream`;
-/// - `None` → an empty 200;
-/// - a `Stream` → an error: streaming responses need `gil=True, stream=True` (FR-16);
-/// - anything else → `str(value)`.
-///
-/// # Safety
-/// Must be called with the GIL of the interpreter `result_obj` belongs to.
-pub(crate) unsafe fn parse_result(
-    py: Python<'_>,
-    result_obj: PyObjRef,
-) -> Result<SubInterpResponse, String> {
-    let ptr = result_obj.as_ptr();
-
-    // Check if it's a Response or any response-like object
-    // (duck typing: has status_code + body attributes).
-    //
-    // PyObject_IsInstance returns 1 (true), 0 (false), or -1 (error
-    // with exception set). Treating -1 as false without clearing
-    // the exception is a SystemError latent bomb — the next C-API
-    // call short-circuits on the pending exception.
-    let resp_cls = py.get_type::<crate::types::PyronovaResponse>();
-    let is_response = match ffi::PyObject_IsInstance(ptr, resp_cls.as_ptr()) {
-        1 => true,
-        -1 => {
-            ffi::PyErr_Clear();
-            // Fall through to duck-type check.
-            let has_status = ffi::PyObject_HasAttrString(ptr, c"status_code".as_ptr()) == 1;
-            let has_body = ffi::PyObject_HasAttrString(ptr, c"body".as_ptr()) == 1;
-            has_status && has_body
-        }
-        _ => {
-            // 0 (not an instance) — try duck-typing.
-            let has_status = ffi::PyObject_HasAttrString(ptr, c"status_code".as_ptr()) == 1;
-            let has_body = ffi::PyObject_HasAttrString(ptr, c"body".as_ptr()) == 1;
-            has_status && has_body
-        }
-    };
-    if is_response {
-        return parse_response(py, result_obj);
-    }
-
-    // A worker can't stream a response: the body would be `str(stream)`. Refuse loudly.
-    let stream_cls = py.get_type::<crate::python::stream::PyronovaStream>();
-    if ffi::PyObject_IsInstance(ptr, stream_cls.as_ptr()) == 1 {
-        let msg = "a sub-interpreter handler returned a Stream; streaming responses need \
-                   gil=True, stream=True on the route";
-        tracing::error!(target: "pyronova::handler", "{msg}");
-        return Err(msg.to_string());
-    }
-    ffi::PyErr_Clear();
-
-    // dict → JSON
-    if ffi::PyDict_Check(ptr) != 0 {
-        let json_str = json_dumps(py, result_obj)?;
-        return Ok(SubInterpResponse {
-            body: json_str.into_bytes(),
-            status: 200,
-            content_type: None,
-            headers: Vec::new(),
-            is_json: true,
-        });
-    }
-
-    // string
-    if ffi::PyUnicode_Check(ptr) != 0 {
-        let s = pyobj_to_string(ptr)?;
-        return Ok(SubInterpResponse {
-            body: s.into_bytes(),
-            status: 200,
-            content_type: None,
-            headers: Vec::new(),
-            is_json: false,
-        });
-    }
-
-    // bytes → raw body
-    if ffi::PyBytes_Check(ptr) != 0 {
-        return Ok(SubInterpResponse {
-            body: bytes_contents(ptr),
-            status: 200,
-            content_type: Some("application/octet-stream".to_string()),
-            headers: Vec::new(),
-            is_json: false,
-        });
-    }
-
-    // None → empty 200
-    if ptr == ffi::Py_None() {
-        return Ok(SubInterpResponse {
-            body: Vec::new(),
-            status: 200,
-            content_type: None,
-            headers: Vec::new(),
-            is_json: false,
-        });
-    }
-
-    // fallback: str(result)
-    let str_obj = PyObjRef::from_owned(ffi::PyObject_Str(ptr)).ok_or_else(|| {
-        ffi::PyErr_Clear();
-        "str() failed".to_string()
-    })?;
-    let s = pyobj_to_string(str_obj.as_ptr())?;
-    Ok(SubInterpResponse {
-        body: s.into_bytes(),
-        status: 200,
-        content_type: None,
-        headers: Vec::new(),
-        is_json: false,
-    })
-}
-
-/// Build a `Response` Python object from a SubInterpResponse.
-///
-/// # Safety
-/// Must be called with the GIL of the target interpreter.
-pub(crate) unsafe fn build_response(
-    py: Python<'_>,
-    resp: &SubInterpResponse,
-) -> Result<PyObjRef, String> {
-    let resp_cls = py.get_type::<crate::types::PyronovaResponse>();
-
-    // Convert body to Python object — use bytes for binary, str for text
-    let py_body = if resp.is_json || std::str::from_utf8(&resp.body).is_ok() {
-        let body_str = unsafe { std::str::from_utf8_unchecked(&resp.body) };
-        py_str(body_str).ok_or("failed to create body str")?
-    } else {
-        // Binary data: use PyBytes to avoid UTF-8 corruption
-        PyObjRef::from_owned(ffi::PyBytes_FromStringAndSize(
-            resp.body.as_ptr() as *const _,
-            resp.body.len() as isize,
-        ))
-        .ok_or("failed to create body bytes")?
-    };
-    let py_status = PyObjRef::from_owned(ffi::PyLong_FromLong(resp.status as i64))
-        .ok_or("failed to create status")?;
-    let py_ct = match &resp.content_type {
-        Some(ct) => py_str(ct).ok_or("failed to create content_type")?,
-        None => PyObjRef::from_borrowed(ffi::Py_None()).unwrap(),
-    };
-    let py_headers = py_str_dict_from_vec(&resp.headers).ok_or("failed to create headers dict")?;
-
-    // Response(body, status_code, content_type, headers)
-    let args = PyObjRef::from_owned(ffi::PyTuple_New(0)).ok_or("failed to create args")?;
-    let kwargs = PyObjRef::from_owned(ffi::PyDict_New()).ok_or("failed to create kwargs")?;
-
-    ffi::PyDict_SetItemString(kwargs.as_ptr(), c"body".as_ptr(), py_body.as_ptr());
-    ffi::PyDict_SetItemString(kwargs.as_ptr(), c"status_code".as_ptr(), py_status.as_ptr());
-    ffi::PyDict_SetItemString(kwargs.as_ptr(), c"content_type".as_ptr(), py_ct.as_ptr());
-    ffi::PyDict_SetItemString(kwargs.as_ptr(), c"headers".as_ptr(), py_headers.as_ptr());
-
-    PyObjRef::from_owned(ffi::PyObject_Call(
-        resp_cls.as_ptr(),
-        args.as_ptr(),
-        kwargs.as_ptr(),
-    ))
-    .ok_or_else(|| {
-        log_and_clear_py_exception("_Response construction");
-        "failed to create _Response".to_string()
-    })
-}
-
-/// Parse a `Response` (or duck-typed response) Python object.
-unsafe fn parse_response(py: Python<'_>, obj: PyObjRef) -> Result<SubInterpResponse, String> {
-    let ptr = obj.as_ptr();
-
-    // status_code
-    let status = {
-        let attr = PyObjRef::from_owned(ffi::PyObject_GetAttrString(ptr, c"status_code".as_ptr()));
-        match attr {
-            Some(a) => {
-                let code = ffi::PyLong_AsLong(a.as_ptr());
-                if code == -1 && !ffi::PyErr_Occurred().is_null() {
-                    ffi::PyErr_Clear();
-                    200
-                } else {
-                    code as u16
-                }
-            }
-            None => {
-                ffi::PyErr_Clear();
-                200
-            }
-        }
-    };
-
-    // content_type
-    let content_type = {
-        let attr = PyObjRef::from_owned(ffi::PyObject_GetAttrString(ptr, c"content_type".as_ptr()));
-        match attr {
-            Some(a) if a.as_ptr() != ffi::Py_None() => pyobj_to_string(a.as_ptr()).ok(),
-            _ => {
-                ffi::PyErr_Clear();
-                None
-            }
-        }
-    };
-
-    // headers
-    //
-    // CRITICAL: PyDict_Next forbids dict mutation during iteration.
-    // PyObject_Str may invoke user __str__ which could mutate the
-    // dict → undefined behaviour / segfault. We collect borrowed
-    // key/value refs first, INCREF them, then release the iteration
-    // scope before calling any method that may re-enter Python.
-    let mut resp_headers: Vec<(String, String)> = Vec::new();
-    {
-        let attr = PyObjRef::from_owned(ffi::PyObject_GetAttrString(ptr, c"headers".as_ptr()));
-        if let Some(a) = &attr {
-            if ffi::PyDict_Check(a.as_ptr()) != 0 {
-                // Phase 1: snapshot (no user code runs).
-                let mut snapshot: Vec<(PyObjRef, PyObjRef)> = Vec::new();
-                let mut pos: isize = 0;
-                let mut key: *mut ffi::PyObject = std::ptr::null_mut();
-                let mut val: *mut ffi::PyObject = std::ptr::null_mut();
-                while ffi::PyDict_Next(a.as_ptr(), &mut pos, &mut key, &mut val) != 0 {
-                    // PyDict_Next returns borrowed refs — INCREF to own them.
-                    if let (Some(k), Some(v)) =
-                        (PyObjRef::from_borrowed(key), PyObjRef::from_borrowed(val))
-                    {
-                        snapshot.push((k, v));
-                    }
-                }
-                // Phase 2: convert — safe to invoke __str__ now.
-                for (k_obj, v_obj) in snapshot {
-                    let str_key = PyObjRef::from_owned(ffi::PyObject_Str(k_obj.as_ptr()));
-                    if let Some(sk) = str_key {
-                        if let Ok(k) = pyobj_to_string(sk.as_ptr()) {
-                            // Check if value is a Python list — e.g. multiple Set-Cookie values
-                            if ffi::PyList_Check(v_obj.as_ptr()) != 0 {
-                                // Phase 1: snapshot the list items (no user code
-                                // runs). PyList_GetItem returns borrowed refs, and
-                                // PyObject_Str below may invoke user __str__ which
-                                // could mutate the list → invalidating the borrow.
-                                // INCREF each item to own it before converting.
-                                let n = ffi::PyList_Size(v_obj.as_ptr());
-                                let mut items: Vec<PyObjRef> = Vec::new();
-                                for i in 0..n {
-                                    let item = ffi::PyList_GetItem(v_obj.as_ptr(), i);
-                                    if item.is_null() {
-                                        ffi::PyErr_Clear();
-                                        continue;
-                                    }
-                                    if let Some(owned) = PyObjRef::from_borrowed(item) {
-                                        items.push(owned);
-                                    }
-                                }
-                                // Phase 2: convert — safe to invoke __str__ now.
-                                for item in items {
-                                    if let Some(item_str) =
-                                        PyObjRef::from_owned(ffi::PyObject_Str(item.as_ptr()))
-                                    {
-                                        if let Ok(v) = pyobj_to_string(item_str.as_ptr()) {
-                                            resp_headers.push((k.clone(), v));
-                                        } else {
-                                            ffi::PyErr_Clear();
-                                        }
-                                    } else {
-                                        ffi::PyErr_Clear();
-                                    }
-                                }
-                            } else {
-                                let str_val =
-                                    PyObjRef::from_owned(ffi::PyObject_Str(v_obj.as_ptr()));
-                                if let Some(sv) = str_val {
-                                    if let Ok(v) = pyobj_to_string(sv.as_ptr()) {
-                                        resp_headers.push((k, v));
-                                    } else {
-                                        ffi::PyErr_Clear();
-                                    }
-                                } else {
-                                    ffi::PyErr_Clear();
-                                }
-                            }
-                        }
-                    } else {
-                        ffi::PyErr_Clear();
-                    }
-                }
-            }
-        }
-        ffi::PyErr_Clear();
-    }
-
-    // body (returns Vec<u8>)
-    let (body, is_json): (Vec<u8>, bool) = {
-        let attr = PyObjRef::from_owned(ffi::PyObject_GetAttrString(ptr, c"body".as_ptr()));
-        match attr {
-            Some(a) => {
-                if ffi::PyDict_Check(a.as_ptr()) != 0 {
-                    match json_dumps(py, a) {
-                        Ok(s) => (s.into_bytes(), true),
-                        Err(e) => {
-                            tracing::error!(
-                                target: "pyronova::server",
-                                error = %e,
-                                "JSON serialization failed for response body dict"
-                            );
-                            let msg = format!(r#"{{"error":"json serialization failed: {}"}}"#, e);
-                            return Ok(SubInterpResponse {
-                                body: msg.into_bytes(),
-                                status: 500,
-                                content_type: Some("application/json".to_string()),
-                                headers: resp_headers,
-                                is_json: true,
-                            });
-                        }
-                    }
-                } else if ffi::PyBytes_Check(a.as_ptr()) != 0 {
-                    // Raw bytes — pass through without UTF-8 conversion
-                    (bytes_contents(a.as_ptr()), false)
-                } else if ffi::PyUnicode_Check(a.as_ptr()) != 0 {
-                    (
-                        pyobj_to_string(a.as_ptr()).unwrap_or_default().into_bytes(),
-                        false,
-                    )
-                } else {
-                    let str_obj = PyObjRef::from_owned(ffi::PyObject_Str(a.as_ptr()));
-                    match str_obj {
-                        Some(s) => (
-                            pyobj_to_string(s.as_ptr()).unwrap_or_default().into_bytes(),
-                            false,
-                        ),
-                        None => {
-                            ffi::PyErr_Clear();
-                            (Vec::new(), false)
-                        }
-                    }
-                }
-            }
-            None => {
-                ffi::PyErr_Clear();
-                (Vec::new(), false)
-            }
-        }
-    };
-
-    Ok(SubInterpResponse {
-        body,
-        status,
-        content_type,
-        headers: resp_headers,
-        is_json,
-    })
 }

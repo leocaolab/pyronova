@@ -41,9 +41,9 @@ async def _handle(handler, req):
     # Hooks and handler run in this request's own Task, so per-request state kept
     # in ContextVars (observability's request id, pyronova.context) stays apart
     # from concurrent requests on this loop (FR-14). Same order and semantics as
-    # the sync worker path: a before hook that returns something short-circuits;
-    # one that raises fails the request; after hooks get a Response and may
-    # replace it; one that raises is logged and skipped.
+    # every other path: a before hook that returns something short-circuits;
+    # after hooks get a Response and may replace it; a hook that raises fails
+    # the request (500, from `_process_request`).
     for hook in _BEFORE_HOOKS:
         res = await _call(hook, req)
         if res is not None:
@@ -51,11 +51,7 @@ async def _handle(handler, req):
     res = await _call(handler, req)
     res = _engine._worker_to_response(res)
     for hook in _AFTER_HOOKS:
-        try:
-            replaced = await _call(hook, req, res)
-        except Exception:
-            _log.exception("worker=%s after_request hook raised", WORKER_ID)
-            continue
+        replaced = await _call(hook, req, res)
         if replaced is not None:
             res = _engine._worker_to_response(replaced)
     return res

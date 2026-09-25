@@ -15,8 +15,8 @@
 //!     (`_worker_recv`, `_worker_send`, ...).
 //!   - [`super::convert`] — Python `str`/`dict` conversion helpers.
 //!   - [`super::worker`]  — `SubInterpreterWorker` (owns one sub-interpreter).
-//!   - [`super::pool`]    — `InterpreterPool`, `WorkRequest`,
-//!     `SubInterpResponse`, and the per-thread worker loops.
+//!   - [`super::pool`]    — `InterpreterPool`, `WorkRequest`, and the per-thread
+//!     worker loops.
 //!
 //! Everything is re-exported here so existing `crate::python::interp::X`
 //! call sites keep compiling unchanged.

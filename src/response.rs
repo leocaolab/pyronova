@@ -1,15 +1,21 @@
-use std::collections::HashMap;
+//! A handler's return value → [`ResponseData`] → HTTP response. One mapping for every
+//! interpreter: the main one (GIL mode, `gil=True` routes, the TPC bridge) and the
+//! sub-interpreter workers (pool, TPC inline, the async engine).
 
 use bytes::Bytes;
 use http_body_util::Full;
+use hyper::header::{HeaderValue, CONTENT_TYPE, SERVER};
 use hyper::{Response, StatusCode};
+use pyo3::prelude::*;
+use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList, PyString};
+
+use crate::types::{PyronovaResponse, ResponseData, ResponseHeaders};
 
 pub(crate) const SERVER_HEADER: &str = concat!("Pyronova/", env!("CARGO_PKG_VERSION"));
-use pyo3::prelude::*;
-use pyo3::types::{PyAnyMethods, PyDict, PyList, PyString};
 
-use crate::types::{PyronovaResponse, ResponseData};
-use pyo3::types::PyBytes;
+const JSON: HeaderValue = HeaderValue::from_static("application/json");
+const TEXT: HeaderValue = HeaderValue::from_static("text/plain; charset=utf-8");
+const OCTET_STREAM: HeaderValue = HeaderValue::from_static("application/octet-stream");
 
 // ---------------------------------------------------------------------------
 // isojson-backed serializer (required dep: always available)
@@ -50,145 +56,144 @@ fn json_dumps(py: Python<'_>, obj: &pyo3::Bound<'_, pyo3::PyAny>) -> Result<Byte
 }
 
 // ---------------------------------------------------------------------------
-// Extract handler return value → ResponseData
+// Handler return value → ResponseData
 // ---------------------------------------------------------------------------
 
+/// What a handler (or a hook) returned, as a response. The type comes from the value,
+/// never from the text:
+///
+/// - `dict` / `list` → JSON;
+/// - `str` → `text/plain`;
+/// - `bytes` / `bytearray` → `application/octet-stream`;
+/// - `None` → an empty 200;
+/// - a `Response` → its status and headers, its body mapped by the same rules unless it
+///   names its `content_type`;
+/// - anything else → `str(value)` as text.
+///
+/// A value that can't be turned into a body (a `str` that isn't valid Unicode, a failing
+/// `__str__`, an unserializable dict) is an error, never an empty or lossy body.
 pub(crate) fn extract_response_data(
     py: Python<'_>,
-    obj: Bound<'_, pyo3::PyAny>,
+    obj: Bound<'_, PyAny>,
 ) -> Result<ResponseData, String> {
-    // dict / list → JSON — most common return type; checked first to skip
-    // the PyronovaResponse cast on the hot path.
-    if obj.cast::<PyDict>().is_ok() || obj.cast::<PyList>().is_ok() {
-        let json_bytes = json_dumps(py, &obj)?;
-        return Ok(ResponseData {
-            body: json_bytes,
-            content_type: "application/json".to_string(),
-            status: 200,
-            headers: HashMap::new(),
-        });
+    // The common returns skip the `Response` type lookup.
+    if is_json_value(&obj) || obj.cast::<PyString>().is_ok() {
+        return plain_response(py, &obj);
     }
-
-    // Plain string
-    if let Ok(s) = obj.cast::<PyString>() {
-        let st = s.to_string();
-        let ct = if st.starts_with('{') || (st.starts_with('[') && st.trim_end().ends_with(']')) {
-            "application/json"
-        } else {
-            "text/plain; charset=utf-8"
-        };
-        return Ok(ResponseData {
-            body: Bytes::from(st),
-            content_type: ct.to_string(),
-            status: 200,
-            headers: HashMap::new(),
-        });
+    match obj.cast::<PyronovaResponse>() {
+        Ok(resp) => from_response(py, resp.get()),
+        Err(_) => plain_response(py, &obj),
     }
+}
 
-    // PyronovaResponse — custom status / headers / content-type
-    if let Ok(resp) = obj.cast::<PyronovaResponse>() {
-        let resp = resp.get();
-        let body_bound = resp.body.bind(py);
-
-        let (body_bytes, auto_ct) = if let Ok(s) = body_bound.cast::<PyString>() {
-            let st = s.to_string();
-            let ct = if st.starts_with('{') || (st.starts_with('[') && st.trim_end().ends_with(']'))
-            {
-                "application/json"
-            } else {
-                "text/plain; charset=utf-8"
-            };
-            (Bytes::from(st), ct)
-        } else if body_bound.cast::<PyDict>().is_ok() || body_bound.cast::<PyList>().is_ok() {
-            let json_bytes = json_dumps(py, body_bound)?;
-            (json_bytes, "application/json")
-        } else if let Ok(pb) = body_bound.cast::<PyBytes>() {
-            // Fast path for PyBytes: one copy (PyBytes buffer → Bytes
-            // heap) instead of PyBytes::extract which builds a
-            // transient Vec<u8> before we wrap it — same number of
-            // allocations on the surface, but skips the iteration.
-            (
-                Bytes::copy_from_slice(pb.as_bytes()),
-                "application/octet-stream",
-            )
-        } else if let Ok(b) = body_bound.extract::<Vec<u8>>() {
-            (Bytes::from(b), "application/octet-stream")
-        } else {
-            let st = body_bound.str().map_err(|e| e.to_string())?.to_string();
-            (Bytes::from(st), "text/plain; charset=utf-8")
-        };
-
-        let content_type = resp
-            .content_type
-            .clone()
-            .unwrap_or_else(|| auto_ct.to_string());
-
-        return Ok(ResponseData {
-            body: body_bytes,
-            content_type,
-            status: resp.status_code,
-            headers: resp.headers.clone(),
-        });
-    }
-
-    // bytes — fast path for PyBytes skips the Vec<u8> extraction step
-    if let Ok(pb) = obj.cast::<PyBytes>() {
-        return Ok(ResponseData {
-            body: Bytes::copy_from_slice(pb.as_bytes()),
-            content_type: "application/octet-stream".to_string(),
-            status: 200,
-            headers: HashMap::new(),
-        });
-    }
-    if let Ok(b) = obj.extract::<Vec<u8>>() {
-        return Ok(ResponseData {
-            body: Bytes::from(b),
-            content_type: "application/octet-stream".to_string(),
-            status: 200,
-            headers: HashMap::new(),
-        });
-    }
-
-    // fallback: str()
-    let st = obj.str().map_err(|e| e.to_string())?.to_string();
+/// A value that isn't a `Response`: a 200 with the value as its body.
+fn plain_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Result<ResponseData, String> {
+    let (body, content_type) = body_of(py, obj)?;
     Ok(ResponseData {
-        body: Bytes::from(st),
-        content_type: "text/plain; charset=utf-8".to_string(),
+        body,
+        content_type,
         status: 200,
-        headers: HashMap::new(),
+        headers: ResponseHeaders::new(),
     })
+}
+
+fn from_response(py: Python<'_>, resp: &PyronovaResponse) -> Result<ResponseData, String> {
+    let (body, derived_type) = body_of(py, resp.body.bind(py))?;
+    Ok(ResponseData {
+        body,
+        content_type: resp.content_type.clone().unwrap_or(derived_type),
+        status: resp.status_code,
+        headers: resp.headers.clone(),
+    })
+}
+
+fn is_json_value(obj: &Bound<'_, PyAny>) -> bool {
+    obj.cast::<PyDict>().is_ok() || obj.cast::<PyList>().is_ok()
+}
+
+/// A value as a body, and the type that body has.
+fn body_of(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Result<(Bytes, HeaderValue), String> {
+    if is_json_value(obj) {
+        return Ok((json_dumps(py, obj)?, JSON));
+    }
+    if let Ok(s) = obj.cast::<PyString>() {
+        return Ok((text_bytes(s)?, TEXT));
+    }
+    if let Ok(b) = obj.cast::<PyBytes>() {
+        return Ok((Bytes::copy_from_slice(b.as_bytes()), OCTET_STREAM));
+    }
+    if let Ok(b) = obj.cast::<PyByteArray>() {
+        return Ok((Bytes::from(b.to_vec()), OCTET_STREAM));
+    }
+    if obj.is_none() {
+        return Ok((Bytes::new(), TEXT));
+    }
+    let text = obj
+        .str()
+        .map_err(|e| format!("str() of the returned {} failed: {e}", type_name(obj)))?;
+    Ok((text_bytes(&text)?, TEXT))
+}
+
+/// A `str`'s UTF-8 bytes; a lone surrogate is an error, not a replacement character.
+fn text_bytes(s: &Bound<'_, PyString>) -> Result<Bytes, String> {
+    let text = s
+        .to_str()
+        .map_err(|e| format!("response text is not valid Unicode: {e}"))?;
+    Ok(Bytes::copy_from_slice(text.as_bytes()))
+}
+
+fn type_name(obj: &Bound<'_, PyAny>) -> String {
+    match obj.get_type().name() {
+        Ok(name) => name.to_string(),
+        Err(e) => format!("<type name unavailable: {e}>"),
+    }
+}
+
+impl ResponseData {
+    /// This response as a `Response`, for an `after_request` hook: a body that is UTF-8
+    /// text is a `str`, any other a `bytes`.
+    pub(crate) fn to_py<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyronovaResponse>> {
+        let body = match std::str::from_utf8(&self.body) {
+            Ok(text) => PyString::new(py, text).into_any(),
+            Err(_) => PyBytes::new(py, &self.body).into_any(),
+        };
+        Bound::new(
+            py,
+            PyronovaResponse {
+                body: body.unbind(),
+                status_code: self.status,
+                content_type: Some(self.content_type.clone()),
+                headers: self.headers.clone(),
+            },
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
 // HTTP response builders
 // ---------------------------------------------------------------------------
 
-/// The HTTP response for a handler's result. A handler error, an invalid status and an
-/// unbuildable header all become a 500 (the cause is logged), so this can't fail.
+/// The HTTP response for a handler's result; an error becomes a logged 500. The headers
+/// were validated when the `Response` was made, so building can't fail: the handler's
+/// header map becomes the response's, and `content-type` / `server` are added only if the
+/// handler didn't set them.
 pub(crate) fn build_response(result: Result<ResponseData, String>) -> Response<Full<Bytes>> {
     let data = match result {
         Ok(data) => data,
-        Err(e) => return error_response(&e),
-    };
-    let mut builder = Response::builder()
-        .status(status_or_500(data.status))
-        .header("content-type", &data.content_type)
-        .header("server", SERVER_HEADER);
-    for (k, v) in &data.headers {
-        // NUL-separated values encode multiple occurrences of the same
-        // header key (e.g. multiple Set-Cookie lines set via cookies.py).
-        for part in v.split('\0') {
-            builder = builder.header(k.as_str(), part);
+        Err(e) => {
+            tracing::error!(target: "pyronova::handler", error = %e, "handler failed; responding 500");
+            return error_response(&e);
         }
-    }
-    builder.body(Full::new(data.body)).unwrap_or_else(|e| {
-        tracing::error!(
-            target: "pyronova::handler",
-            error = %e,
-            "handler returned invalid response headers; responding 500"
-        );
-        error_response("invalid response headers")
-    })
+    };
+    let mut headers = data.headers.into_map();
+    headers.entry(CONTENT_TYPE).or_insert(data.content_type);
+    headers
+        .entry(SERVER)
+        .or_insert(HeaderValue::from_static(SERVER_HEADER));
+    let mut resp = Response::new(Full::new(data.body));
+    *resp.status_mut() = status_or_500(data.status);
+    *resp.headers_mut() = headers;
+    resp
 }
 
 /// A handler's status code, or 500 (logged) if it isn't an HTTP status.
@@ -378,9 +383,9 @@ mod tests {
     fn build_response_ok() {
         let data = ResponseData {
             body: Bytes::from("hello"),
-            content_type: "text/plain".to_string(),
+            content_type: HeaderValue::from_static("text/plain"),
             status: 200,
-            headers: HashMap::new(),
+            headers: ResponseHeaders::new(),
         };
         let resp = build_response(Ok(data));
         assert_eq!(resp.status(), StatusCode::OK);
@@ -389,11 +394,13 @@ mod tests {
 
     #[test]
     fn build_response_custom_status_and_headers() {
-        let mut headers = HashMap::new();
-        headers.insert("x-custom".to_string(), "value".to_string());
+        let mut headers = ResponseHeaders::new();
+        headers
+            .as_map_mut()
+            .insert("x-custom", HeaderValue::from_static("value"));
         let data = ResponseData {
             body: Bytes::from("created"),
-            content_type: "application/json".to_string(),
+            content_type: JSON,
             status: 201,
             headers,
         };
@@ -406,5 +413,44 @@ mod tests {
     fn build_response_error_falls_back_to_500() {
         let resp = build_response(Err("oops".to_string()));
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn handler_content_type_and_server_replace_the_defaults() {
+        let mut headers = ResponseHeaders::new();
+        let map = headers.as_map_mut();
+        map.insert(CONTENT_TYPE, HeaderValue::from_static("text/csv"));
+        map.insert(SERVER, HeaderValue::from_static("mine"));
+        let resp = build_response(Ok(ResponseData {
+            body: Bytes::from("a,b"),
+            content_type: TEXT,
+            status: 200,
+            headers,
+        }));
+        let all = |name| {
+            resp.headers()
+                .get_all(name)
+                .iter()
+                .map(|v| v.to_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(all(CONTENT_TYPE), ["text/csv"]);
+        assert_eq!(all(SERVER), ["mine"]);
+    }
+
+    #[test]
+    fn repeated_header_lines_stay_separate() {
+        let mut headers = ResponseHeaders::new();
+        let map = headers.as_map_mut();
+        map.append("set-cookie", HeaderValue::from_static("a=1"));
+        map.append("set-cookie", HeaderValue::from_static("b=2"));
+        let resp = build_response(Ok(ResponseData {
+            body: Bytes::new(),
+            content_type: TEXT,
+            status: 200,
+            headers,
+        }));
+        let cookies: Vec<_> = resp.headers().get_all("set-cookie").iter().collect();
+        assert_eq!(cookies, ["a=1", "b=2"]);
     }
 }

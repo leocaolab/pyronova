@@ -14,6 +14,7 @@ use std::io::Write;
 
 use bytes::Bytes;
 use crossbeam_utils::atomic::AtomicCell;
+use hyper::header::{HeaderMap, HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH, VARY};
 use parking_lot::Mutex;
 
 use crate::types::ResponseData;
@@ -333,63 +334,37 @@ fn try_compress(
     ))
 }
 
-/// Merge `Accept-Encoding` into an existing `Vary` header (case-insensitive)
-/// and set `Content-Encoding`. Used by the main-thread `ResponseData` path.
-fn set_compression_headers(
-    headers: &mut std::collections::HashMap<String, String>,
-    encoding: &'static str,
-) {
-    headers.insert("content-encoding".to_string(), encoding.to_string());
-    // Remove any handler-supplied Content-Length — it reflected the pre-compression
-    // size and is now wrong. hyper will recompute from the compressed body.
-    headers.retain(|k, _| !k.eq_ignore_ascii_case("content-length"));
-    let existing_vary = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("vary"))
-        .map(|(k, v)| (k.clone(), v.clone()));
-    match existing_vary {
-        Some((k, v)) => {
-            if !v
-                .split(',')
-                .any(|tok| tok.trim().eq_ignore_ascii_case("accept-encoding"))
-            {
-                let v_clean = v.trim_end().trim_end_matches(',').trim_end();
-                headers.insert(k, format!("{v_clean}, Accept-Encoding"));
-            }
-        }
-        None => {
-            headers.insert("vary".to_string(), "Accept-Encoding".to_string());
-        }
+/// Mark `headers` as carrying a body compressed with `encoding`: set `Content-Encoding`,
+/// drop a handler-supplied `Content-Length` (it counted the uncompressed body; hyper
+/// recomputes it), and add `Accept-Encoding` to `Vary` unless a `Vary` line names it.
+fn set_compression_headers(headers: &mut HeaderMap, encoding: &'static str) {
+    headers.insert(CONTENT_ENCODING, HeaderValue::from_static(encoding));
+    headers.remove(CONTENT_LENGTH);
+    if headers.get_all(VARY).iter().any(names_accept_encoding) {
+        return;
+    }
+    // Merged into a lone `Vary` line; otherwise a line of its own, which a cache reads
+    // the same way.
+    let mut lines = headers.get_all(VARY).iter();
+    let merged = match (lines.next(), lines.next()) {
+        (Some(only), None) => only.to_str().ok().and_then(|v| {
+            let v = v.trim_end().trim_end_matches(',').trim_end();
+            HeaderValue::from_str(&format!("{v}, Accept-Encoding")).ok()
+        }),
+        _ => None,
+    };
+    if let Some(vary) = merged {
+        headers.insert(VARY, vary);
+    } else {
+        headers.append(VARY, HeaderValue::from_static("Accept-Encoding"));
     }
 }
 
-/// Same as [`set_compression_headers`] but for the sub-interpreter path where
-/// headers are stored as `Vec<(String, String)>` to support duplicate keys
-/// (e.g. multiple `Set-Cookie` values).
-fn set_compression_headers_vec(headers: &mut Vec<(String, String)>, encoding: &'static str) {
-    headers.push(("content-encoding".to_string(), encoding.to_string()));
-    // Remove any handler-supplied Content-Length — it reflected the pre-compression
-    // size and is now wrong. hyper will recompute from the compressed body.
-    headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
-    let existing_vary = headers
-        .iter()
-        .position(|(k, _)| k.eq_ignore_ascii_case("vary"));
-    match existing_vary {
-        Some(idx) => {
-            let v = &headers[idx].1;
-            if !v
-                .split(',')
-                .any(|tok| tok.trim().eq_ignore_ascii_case("accept-encoding"))
-            {
-                let v_clean = v.trim_end().trim_end_matches(',').trim_end();
-                let new_val = format!("{v_clean}, Accept-Encoding");
-                headers[idx].1 = new_val;
-            }
-        }
-        None => {
-            headers.push(("vary".to_string(), "Accept-Encoding".to_string()));
-        }
-    }
+fn names_accept_encoding(vary: &HeaderValue) -> bool {
+    vary.to_str().is_ok_and(|v| {
+        v.split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case("accept-encoding"))
+    })
 }
 
 /// Maybe compress `data` in place. No-op when:
@@ -399,52 +374,29 @@ fn set_compression_headers_vec(headers: &mut Vec<(String, String)>, encoding: &'
 ///   - content-type is not in the compressible allowlist
 ///   - handler already set a `Content-Encoding` header
 pub(crate) fn maybe_compress(data: &mut ResponseData, accept_encoding: &str) {
-    if data
-        .headers
-        .keys()
-        .any(|k| k.eq_ignore_ascii_case("content-encoding"))
-    {
+    if data.headers.contains_key("content-encoding") {
         return;
     }
-    let Some((compressed, encoding)) =
-        try_compress(&data.body, &data.content_type, accept_encoding)
+    // A handler's own `content-type` header is the type that goes out.
+    let content_type = data
+        .headers
+        .get("content-type")
+        .or_else(|| data.content_type.to_str().ok());
+    let Some(content_type) = content_type else {
+        return;
+    };
+    let Some((compressed, encoding)) = try_compress(&data.body, content_type, accept_encoding)
     else {
         return;
     };
     data.body = compressed;
-    set_compression_headers(&mut data.headers, encoding);
-}
-
-/// Variant used by the sub-interpreter fast path.
-///
-/// Takes `body` by value to avoid the `Bytes → Vec` copy that the old
-/// `&mut Vec<u8>` + `compressed.to_vec()` pattern required. Returns
-/// `Bytes` directly: the compressed pool buffer or (if no compression)
-/// the original `Vec<u8>` wrapped in `Bytes::from` (O(1) ownership
-/// transfer, no copy).
-pub(crate) fn maybe_compress_subinterp(
-    body: Vec<u8>,
-    content_type: &str,
-    headers: &mut Vec<(String, String)>,
-    accept_encoding: &str,
-) -> Bytes {
-    if headers
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
-    {
-        return Bytes::from(body);
-    }
-    let Some((compressed, encoding)) = try_compress(&body, content_type, accept_encoding) else {
-        return Bytes::from(body);
-    };
-    set_compression_headers_vec(headers, encoding);
-    compressed
+    set_compression_headers(data.headers.as_map_mut(), encoding);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use crate::types::ResponseHeaders;
     use std::sync::Mutex;
 
     // Tests share global config state — serialize them to prevent races.
@@ -541,9 +493,9 @@ mod tests {
         reset();
         let mut data = ResponseData {
             body: Bytes::from(vec![b'x'; 2048]),
-            content_type: "application/json".to_string(),
+            content_type: HeaderValue::from_static("application/json"),
             status: 200,
-            headers: HashMap::new(),
+            headers: ResponseHeaders::new(),
         };
         let before = data.body.clone();
         maybe_compress(&mut data, "gzip, br");
@@ -561,9 +513,9 @@ mod tests {
         .unwrap();
         let mut data = ResponseData {
             body: Bytes::from(payload.clone()),
-            content_type: "application/json".to_string(),
+            content_type: HeaderValue::from_static("application/json"),
             status: 200,
-            headers: HashMap::new(),
+            headers: ResponseHeaders::new(),
         };
         maybe_compress(&mut data, "br, gzip");
         assert!(data.body.len() < payload.len());
@@ -581,9 +533,9 @@ mod tests {
         configure(true, 512, true, true, 6, 4);
         let mut data = ResponseData {
             body: Bytes::from("small"),
-            content_type: "application/json".to_string(),
+            content_type: HeaderValue::from_static("application/json"),
             status: 200,
-            headers: HashMap::new(),
+            headers: ResponseHeaders::new(),
         };
         maybe_compress(&mut data, "gzip, br");
         assert!(!data.headers.contains_key("content-encoding"));
@@ -596,9 +548,9 @@ mod tests {
         configure(true, 100, true, true, 6, 4);
         let mut data = ResponseData {
             body: Bytes::from(vec![0u8; 2048]),
-            content_type: "image/png".to_string(),
+            content_type: HeaderValue::from_static("image/png"),
             status: 200,
-            headers: HashMap::new(),
+            headers: ResponseHeaders::new(),
         };
         maybe_compress(&mut data, "gzip, br");
         assert!(!data.headers.contains_key("content-encoding"));
@@ -609,11 +561,13 @@ mod tests {
     fn handler_content_encoding_preserved() {
         let _g = CONFIG_LOCK.lock().unwrap();
         configure(true, 100, true, true, 6, 4);
-        let mut headers = HashMap::new();
-        headers.insert("Content-Encoding".to_string(), "identity".to_string());
+        let mut headers = ResponseHeaders::new();
+        headers
+            .as_map_mut()
+            .insert(CONTENT_ENCODING, HeaderValue::from_static("identity"));
         let mut data = ResponseData {
             body: Bytes::from(vec![b'x'; 2048]),
-            content_type: "application/json".to_string(),
+            content_type: HeaderValue::from_static("application/json"),
             status: 200,
             headers,
         };
@@ -627,12 +581,14 @@ mod tests {
     fn vary_merges_with_existing() {
         let _g = CONFIG_LOCK.lock().unwrap();
         configure(true, 100, true, true, 6, 4);
-        let mut headers = HashMap::new();
-        headers.insert("Vary".to_string(), "Origin".to_string());
+        let mut headers = ResponseHeaders::new();
+        headers
+            .as_map_mut()
+            .insert(VARY, HeaderValue::from_static("Origin"));
         let payload = vec![b'a'; 4096];
         let mut data = ResponseData {
             body: Bytes::from(payload),
-            content_type: "application/json".to_string(),
+            content_type: HeaderValue::from_static("application/json"),
             status: 200,
             headers,
         };
@@ -649,9 +605,9 @@ mod tests {
         configure(true, 100, true, true, 6, 4);
         let mut data = ResponseData {
             body: Bytes::from(vec![b'x'; 2048]),
-            content_type: "application/json".to_string(),
+            content_type: HeaderValue::from_static("application/json"),
             status: 200,
-            headers: HashMap::new(),
+            headers: ResponseHeaders::new(),
         };
         maybe_compress(&mut data, "");
         assert!(!data.headers.contains_key("content-encoding"));

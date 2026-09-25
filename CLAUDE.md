@@ -8,11 +8,11 @@ High-performance Python web framework powered by Rust. Per-Interpreter GIL (PEP 
 
 - **Rust core** (`src/`): 12 modules
   - `lib.rs` — module declarations, `#[pymodule]`, mimalloc global allocator
-  - `types.rs` — `Request`, `Response`, `extract_headers`
+  - `types.rs` — `Request`, `Headers` (the request-header view), `Response`, `ResponseHeaders`, `ResponseData`
   - `app.rs` — `PyronovaApp` with `run_gil()` / `run_subinterp()`, graceful shutdown
   - `handlers.rs` — GIL handler, sub-interp handler (30s zombie timeout), streaming
   - `router.rs` — `RouteTable` (`Vec<Route>`, `Target`, `Call`), `MutableRoutes`; `site.rs` — `Site` (frozen table + CORS/access-log config) served by a run
-  - `response.rs` — response builders (200/404/413/500/503/504)
+  - `response.rs` — the one handler-result → `ResponseData` mapping every interpreter uses (type from the value, never sniffed from the text), response builders (200/404/413/500/503/504)
   - `json.rs` — Rust-side `py_to_json_value` serializer
   - `static_fs.rs` — async static file serving + MIME detection + path traversal protection
   - `python/` — sub-interpreter workers: `worker.rs` (`SubInterpreterWorker`, runs the real `pyronova` package + engine), `pool.rs` (dual worker pool, sync+async), `worker_api.rs` (`_worker_recv`/`_worker_send` pyfunctions for the async engine), `ffi.rs` (`PyObjRef` RAII, tstate helpers)
@@ -86,12 +86,12 @@ bash benchmarks/run_bench.sh
 src/
   lib.rs              # Module declarations + #[pymodule] + mimalloc
   logging.rs          # Rust tracing engine + Python logging bridge
-  types.rs            # Request, Response, extract_headers
+  types.rs            # Request, Headers, Response, ResponseHeaders, ResponseData
   app.rs              # PyronovaApp — route registration + server startup
   handlers.rs         # handle_request (GIL), handle_request_subinterp (channel)
   router.rs           # RouteTable, MutableRoutes
   site.rs             # Site: frozen RouteTable + CORS / access-log config
-  response.rs         # Response builders, extract_response_data
+  response.rs         # the one handler-result → response mapping + builders
   json.rs             # py_to_json_value
   static_fs.rs        # try_static_file, mime_from_ext
   run_context.rs      # main_attach / attach_to: explicit-interpreter attach

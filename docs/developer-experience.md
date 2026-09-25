@@ -291,6 +291,12 @@ reset_peaks()                  # 显式开始新的峰值窗口
 - `req.method`, `req.path`, `req.params`, `req.query`, `req.headers`
 - `req.body`, `req.text()`, `req.json()`, `req.query_params`
 
+`req.headers` 是只读、名字大小写不敏感的映射（`Headers`）。同名多行的字段读出来是按 RFC 9110 用 `", "` 合并的一个值，`cookie` 例外，用 `"; "` 合并（RFC 9113 §8.2.3）；`req.headers.get_all(name)` 返回原样的每一行。
+
+## 返回值 → 响应
+
+所有解释器（GIL、子解释器池、TPC、async 引擎）用同一套映射，类型只看返回的值，不看文本内容：`dict` / `list` → JSON，`str` → `text/plain`，`bytes` → `application/octet-stream`，`None` → 空 200，`Response` → 它的状态码和头。`Response(headers=...)` 的值必须是 `str` 或 `str` 列表（每项一行，如多个 `Set-Cookie`），否则抛 `TypeError` / `ValueError` 并指明是哪个头；其中的 `Content-Type` / `Server` 会替换默认值。`after_request` 钩子抛异常时，每条路径都返回 500。
+
 ## 内存效率
 
 每个子解释器增量 ~10 MB（共享进程代码段）：

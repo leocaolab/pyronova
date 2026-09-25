@@ -1,19 +1,18 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
-use hyper::{Response, StatusCode};
+use hyper::header::{HeaderValue, CACHE_CONTROL, CONNECTION, CONTENT_TYPE, SERVER};
+use hyper::Response;
 use pyo3::prelude::*;
-use pyo3::types::PyString;
 
 use crate::python::interp;
 use crate::python::stream::PyronovaStream;
-use crate::response::{error_response, extract_response_data, status_or_500};
+use crate::response::{extract_response_data, status_or_500};
 use crate::router::Target;
 use crate::site::Site;
-use crate::types::{PyronovaRequest, PyronovaResponse, ResponseData};
+use crate::types::{PyronovaRequest, ResponseData, ResponseHeaders};
 
 pub(crate) type SharedPool = Arc<interp::InterpreterPool>;
 
@@ -52,9 +51,9 @@ pub(crate) enum HandlerResult {
 
 pub(crate) struct StreamInfo {
     rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::convert::Infallible>>,
-    content_type: String,
+    content_type: HeaderValue,
     status: u16,
-    headers: HashMap<String, String>,
+    headers: ResponseHeaders,
 }
 
 /// A thread's persistent asyncio event loop, and the interpreter it was created in.
@@ -199,66 +198,26 @@ pub(crate) fn full_body(resp: Response<Full<Bytes>>) -> Response<BoxBody> {
     resp.map(|b| b.map_err(|e| match e {}).boxed())
 }
 
-/// Turn a sub-interpreter handler result (pool worker or TPC inline) into a hyper
-/// response: content-type detection, compression, status mapping, header assembly.
-/// `handler_name` only enriches the error log on the invalid-header path.
-pub(crate) fn build_subinterp_http_response(
-    result: Result<crate::python::interp::SubInterpResponse, String>,
+/// A handler's result as a hyper response, compressed if the client accepts it. Every
+/// interpreter's handlers (main, pool workers, TPC inline) end here.
+pub(crate) fn http_response(
+    mut result: Result<ResponseData, String>,
     accept_encoding: &str,
-    handler_name: &str,
 ) -> Response<BoxBody> {
-    match result {
-        Ok(mut resp) => {
-            let ct_owned: String = resp.content_type.clone().unwrap_or_else(|| {
-                if resp.is_json || resp.body.starts_with(b"{") || resp.body.starts_with(b"[") {
-                    "application/json".to_string()
-                } else {
-                    "text/plain; charset=utf-8".to_string()
-                }
-            });
-            let body_bytes = crate::compression::maybe_compress_subinterp(
-                std::mem::take(&mut resp.body),
-                &ct_owned,
-                &mut resp.headers,
-                accept_encoding,
-            );
-            let mut builder = Response::builder()
-                .status(status_or_500(resp.status))
-                .header("content-type", &ct_owned)
-                .header("server", crate::response::SERVER_HEADER);
-            for (k, v) in &resp.headers {
-                builder = builder.header(k.as_str(), v.as_str());
-            }
-            match builder.body(Full::new(body_bytes)) {
-                Ok(r) => full_body(r),
-                Err(e) => {
-                    tracing::error!(
-                        target: "pyronova::handler",
-                        error = %e,
-                        handler = handler_name,
-                        "handler returned invalid response headers"
-                    );
-                    full_body(error_response("invalid response headers"))
-                }
-            }
-        }
-        Err(e) => full_body(error_response(&e)),
+    if let Ok(data) = result.as_mut() {
+        crate::compression::maybe_compress(data, accept_encoding);
     }
+    full_body(crate::response::build_response(result))
 }
 
-/// Turn a main-interpreter handler result (GIL mode, the pool's `gil=True` routes, the TPC
-/// bridge) into a hyper response.
+/// A main-interpreter handler result (GIL mode, the pool's `gil=True` routes, the TPC
+/// bridge) as a hyper response: a buffered response, or an SSE stream.
 pub(crate) fn build_main_http_response(
     result: HandlerResult,
     accept_encoding: &str,
 ) -> Response<BoxBody> {
     match result {
-        HandlerResult::PyronovaResponse(mut result) => {
-            if let Ok(data) = result.as_mut() {
-                crate::compression::maybe_compress(data, accept_encoding);
-            }
-            full_body(crate::response::build_response(result))
-        }
+        HandlerResult::PyronovaResponse(result) => http_response(result, accept_encoding),
         HandlerResult::PyronovaStream(info) => build_stream_response(info),
     }
 }
@@ -459,6 +418,8 @@ pub(crate) fn run_before_hooks(
     Ok(None)
 }
 
+/// The after-request hooks, in order: each gets the response so far and may replace it.
+/// One that raises fails the request (500), on every interpreter.
 fn run_after_hooks(
     py: Python<'_>,
     hooks: &[Py<PyAny>],
@@ -466,22 +427,9 @@ fn run_after_hooks(
     mut resp_data: ResponseData,
 ) -> Result<ResponseData, String> {
     for hook in hooks {
-        let body_py: Py<PyAny> = match std::str::from_utf8(&resp_data.body) {
-            Ok(s) => PyString::new(py, s).into_any().unbind(),
-            Err(_) => pyo3::types::PyBytes::new(py, &resp_data.body)
-                .into_any()
-                .unbind(),
-        };
-        let current_resp = Py::new(
-            py,
-            PyronovaResponse {
-                body: body_py,
-                status_code: resp_data.status,
-                content_type: Some(resp_data.content_type.clone()),
-                headers: resp_data.headers.clone(),
-            },
-        )
-        .map_err(|e| format!("failed to create PyronovaResponse: {e}"))?;
+        let current_resp = resp_data
+            .to_py(py)
+            .map_err(|e| format!("failed to create Response: {e}"))?;
         let result = hook
             .call1(py, (req.clone_ref(py), current_resp))
             .map_err(|e| format!("after_request hook error: {e}"))?;
@@ -510,19 +458,21 @@ pub(crate) fn build_stream_response(info: StreamInfo) -> Response<BoxBody> {
     // boxed body's `hyper::Error`.
     let boxed: BoxBody = BoxBody::new(body.map_err(|e| match e {}));
 
-    let mut builder = Response::builder()
-        .status(status_or_500(info.status))
-        .header("content-type", &info.content_type)
-        .header("cache-control", "no-cache")
-        .header("connection", "keep-alive")
-        .header("server", crate::response::SERVER_HEADER);
-    for (k, v) in &info.headers {
-        builder = builder.header(k.as_str(), v.as_str());
-    }
-    builder.body(boxed).unwrap_or_else(|e| {
-        tracing::error!(target: "pyronova::handler", error = %e, "stream handler returned invalid response headers");
-        let mut resp = Response::new(BoxBody::default());
-        *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-        resp
-    })
+    // The stream's headers were validated when it was made; its own values replace the
+    // defaults.
+    let mut headers = info.headers.into_map();
+    headers.entry(CONTENT_TYPE).or_insert(info.content_type);
+    headers
+        .entry(CACHE_CONTROL)
+        .or_insert(HeaderValue::from_static("no-cache"));
+    headers
+        .entry(CONNECTION)
+        .or_insert(HeaderValue::from_static("keep-alive"));
+    headers
+        .entry(SERVER)
+        .or_insert(HeaderValue::from_static(crate::response::SERVER_HEADER));
+    let mut resp = Response::new(boxed);
+    *resp.status_mut() = status_or_500(info.status);
+    *resp.headers_mut() = headers;
+    resp
 }
