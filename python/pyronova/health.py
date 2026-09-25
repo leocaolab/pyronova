@@ -31,8 +31,8 @@ Behaviour:
   to the log with the same request id. k8s uses this to gate traffic.
 
 Checks run sequentially in the handler. Keep them fast — a readyz
-handler is a hot loop during rolling deploys. Sync + async both work;
-async checks are awaited from the async pool.
+handler is a hot loop during rolling deploys. Sync + async both work, and
+each is bounded by the same timeout: one that takes longer fails.
 """
 
 from __future__ import annotations
@@ -60,6 +60,22 @@ CheckFn = Union[Callable[[], Any], Callable[[], Awaitable[Any]]]
 _CHECK_TIMEOUT_S = 10.0
 
 
+def _bounded(check: Callable[[], Any], timeout: float) -> Any:
+    """``check()`` on a thread of its own, waited for at most ``timeout``: a sync check
+    that hangs is a ``TimeoutError`` (a failed check), as an async one is.
+
+    Not ``with ThreadPoolExecutor()``: its exit joins the thread, so a hung check would
+    block anyway. The thread of a hung check is abandoned (a Python thread can't be
+    killed)."""
+    import concurrent.futures
+
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        return ex.submit(check).result(timeout=timeout)
+    finally:
+        ex.shutdown(wait=False)
+
+
 def _drive(coro: Awaitable[Any]) -> Any:
     """Run a coroutine to completion from sync code, even if this thread
     already has a running event loop.
@@ -80,26 +96,11 @@ def _drive(coro: Awaitable[Any]) -> Any:
     except RuntimeError:
         # No loop running on this thread — create+close one properly.
         return asyncio.run(bounded)
-    # A loop is already running here; asyncio.run() would blow up. Drive
-    # the coroutine on a worker thread that has no running loop. The inner
-    # wait_for cancels the coroutine on timeout; the slightly-longer
-    # .result() timeout is a backstop in case the worker itself wedges.
-    import concurrent.futures
-
-    # NOTE: do NOT use ThreadPoolExecutor as a context manager here. Its
-    # __exit__ calls shutdown(wait=True), which blocks until the worker future
-    # finishes. If the check wedges (e.g. a coroutine that swallows the
-    # wait_for cancellation), .result() raises TimeoutError as intended — but
-    # shutdown(wait=True) would then block forever joining the still-running
-    # thread, defeating the timeout and re-exposing the exhausted-worker-pool
-    # scenario this bound exists to prevent. shutdown(wait=False) abandons a
-    # hung worker (it can't be killed in Python) so _drive returns promptly
-    # and the TimeoutError propagates to be recorded as a failed check.
-    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    try:
-        return ex.submit(asyncio.run, bounded).result(timeout=_CHECK_TIMEOUT_S + 1.0)
-    finally:
-        ex.shutdown(wait=False)
+    # A loop is already running here; asyncio.run() would blow up. Drive the coroutine
+    # on a thread with no running loop. The inner wait_for cancels the coroutine on
+    # timeout; the slightly longer bound is a backstop for a coroutine that swallows
+    # the cancellation.
+    return _bounded(lambda: asyncio.run(bounded), _CHECK_TIMEOUT_S + 1.0)
 
 
 def _run_checks_sync(
@@ -114,7 +115,7 @@ def _run_checks_sync(
             if inspect.iscoroutinefunction(fn):
                 res = _drive(fn())
             else:
-                res = fn()
+                res = _bounded(fn, _CHECK_TIMEOUT_S)
                 # A plain function that *returns* a coroutine/awaitable
                 # (e.g. `def c(): return redis.ping()`) would otherwise be
                 # recorded as passing with the un-awaited awaitable as its

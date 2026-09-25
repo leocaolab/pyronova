@@ -9,10 +9,16 @@ Usage::
         form = parse_multipart(req)
         f = form["file"]
         return {"filename": f.filename, "size": len(f.data)}
+
+``UploadFile.filename`` is what the client sent, decoded but otherwise as is: it
+may hold ``../``, an absolute path, a drive letter, control characters or be
+empty. Never join it into a filesystem path; name stored files yourself (a
+UUID, a content hash) and keep the client's name only as data.
 """
 
 from __future__ import annotations
 from dataclasses import dataclass
+from urllib.parse import unquote_to_bytes
 
 
 def _split_header_params(value: str) -> list[str]:
@@ -85,6 +91,7 @@ class UploadFile:
     still holding a reference. Immutable + slots is free and correct.
     """
     name: str
+    # Client-controlled: see the module docstring before using it in a path.
     filename: str | None
     content_type: str
     data: bytes
@@ -142,16 +149,45 @@ def parse_multipart(req) -> "dict[str, UploadFile | list[UploadFile]]":
 
 
 def _boundary(content_type: str) -> str:
-    if "multipart/form-data" not in content_type:
+    media_type, *params = _split_header_params(content_type)
+    # RFC 9110 §8.3.1: the type, subtype and parameter names are case-insensitive; the
+    # boundary value is not. A quoted boundary may contain ";".
+    if media_type.strip().lower() != "multipart/form-data":
         raise MultipartError(f"Expected multipart/form-data, got: {content_type}")
-    # RFC 2045: parameter names are case-insensitive; the boundary value is not.
-    for param in content_type.split(";"):
-        param = param.strip()
-        if param.lower().startswith("boundary="):
-            boundary = _unquote_param(param[len("boundary="):])
-            if boundary:
-                return boundary
-    raise MultipartError(f"Missing boundary in Content-Type: {content_type}")
+    boundary = _header_params(params).get("boundary")
+    if not boundary:
+        raise MultipartError(f"Missing boundary in Content-Type: {content_type}")
+    return boundary
+
+
+def _header_params(params: list[str]) -> dict[str, str]:
+    """``name=value`` header parameters by lowercased name, values unquoted."""
+    out: dict[str, str] = {}
+    for param in params:
+        name, eq, value = param.partition("=")
+        if eq:
+            out[name.strip().lower()] = _unquote_param(value)
+    return out
+
+
+# RFC 8187 §3.2.1: recipients must support these two charsets.
+_EXT_VALUE_CHARSETS = {"utf-8": "utf-8", "iso-8859-1": "latin-1"}
+
+
+def _ext_value(value: str) -> str:
+    """An RFC 8187 (RFC 5987) ext-value, ``charset'language'pct-encoded``, decoded."""
+    charset, sep1, rest = value.partition("'")
+    _language, sep2, encoded = rest.partition("'")
+    codec = _EXT_VALUE_CHARSETS.get(charset.strip().lower())
+    if not (sep1 and sep2) or codec is None:
+        raise MultipartError(
+            f"filename*={value!r} is not charset'language'value with charset UTF-8 or "
+            "ISO-8859-1 (RFC 8187)"
+        )
+    try:
+        return unquote_to_bytes(encoded).decode(codec)
+    except UnicodeDecodeError as e:
+        raise MultipartError(f"filename*={value!r} is not valid {charset}: {e}") from None
 
 
 def _line_break(body: bytes, boundary: str) -> bytes:
@@ -206,17 +242,12 @@ def _parse_part(part: bytes, nl: bytes) -> UploadFile:
             headers[key.strip().lower()] = val.strip()
 
     # RFC 2045 §5.1: parameter names are case-insensitive (NAME=, FileName=),
-    # and quoted values may contain semicolons and escaped quotes.
-    field_name = None
-    filename = None
+    # and quoted values may contain semicolons and escaped quotes. RFC 6266 §4.3:
+    # filename* (RFC 8187, non-ASCII names) wins over filename.
     disposition = headers.get("content-disposition", "")
-    for param in _split_header_params(disposition):
-        param = param.strip()
-        lowered = param.lower()
-        if lowered.startswith("name="):
-            field_name = _unquote_param(param[5:])
-        elif lowered.startswith("filename="):
-            filename = _unquote_param(param[9:])
+    params = _header_params(_split_header_params(disposition)[1:])
+    field_name = params.get("name")
+    filename = _ext_value(params["filename*"]) if "filename*" in params else params.get("filename")
     if not field_name:
         raise MultipartError(
             f"part has no field name in its Content-Disposition: {disposition!r}"

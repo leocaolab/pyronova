@@ -1227,7 +1227,8 @@ def _bind_path_params(fn: Callable, path: str, template: frozenset[str]) -> Call
 
 
 def _bind_model(fn: Callable, path: str, template: frozenset[str], model: type) -> Callable:
-    """``fn(req, body, **path_params)`` or ``fn(body, **path_params)``."""
+    """``fn(req, body, **path_params)`` or ``fn(body, **path_params)``, by the rule
+    ``_model_takes_request`` checks at registration."""
     # Imported here, only for routes that declare model=: importing pydantic at
     # module level would load pydantic_core in every worker of every app. If it
     # can't be imported, route registration fails with the ImportError.
@@ -1236,11 +1237,7 @@ def _bind_model(fn: Callable, path: str, template: frozenset[str], model: type) 
     if not (isinstance(model, type) and issubclass(model, BaseModel)):
         raise TypeError(f"model= must be a pydantic BaseModel subclass, got {model!r}")
     sig = inspect.signature(fn)
-    positional = [
-        p for p in sig.parameters.values()
-        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-    ]
-    takes_request = len(positional) >= 2 and positional[1].name not in template
+    takes_request = _model_takes_request(fn, sig, template, model)
     names = _path_param_names(fn, sig, path, template, leading=2 if takes_request else 1)
 
     def args(req, body):
@@ -1265,6 +1262,46 @@ def _bind_model(fn: Callable, path: str, template: frozenset[str], model: type) 
                 return _validation_error_response(e)
             return fn(*args(req, body), **kwargs(req))
     return _named_like(bound, fn)
+
+
+def _model_takes_request(
+    fn: Callable, sig: inspect.Signature, template: frozenset[str], model: type
+) -> bool:
+    """The ``model=`` rule: a handler's leading positional parameters that are not path
+    params are the request and the validated body, ``(req, body)``, or the body alone,
+    ``(body)``; every other parameter names a path param. Whether it takes the request
+    follows from that count, never from a guess. A signature the rule rejects raises here:
+    no parameter for the body, or the parameter annotated as ``model`` in the request's
+    place. (More than two is left to the path-param check, which names the extras.)"""
+    leading = []
+    for param in sig.parameters.values():
+        positional = param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD
+        )
+        if not positional or param.name in template:
+            break
+        leading.append(param)
+    if not leading:
+        raise TypeError(
+            f"handler {fn.__name__!r} has no parameter for the validated "
+            f"{model.__name__} body: with model=, a handler is "
+            f"fn(req, body, **path_params) or fn(body, **path_params)"
+        )
+    takes_request = len(leading) >= 2
+    if takes_request and _annotated_as(leading[0], model):
+        raise TypeError(
+            f"handler {fn.__name__!r}: parameter {leading[0].name!r} is annotated "
+            f"{model.__name__} but stands where the request goes (with model=, a handler "
+            f"is fn(req, body, **path_params) or fn(body, **path_params); is "
+            f"{leading[1].name!r} a path param missing from the URL template?)"
+        )
+    return takes_request
+
+
+def _annotated_as(param: inspect.Parameter, cls: type) -> bool:
+    """Whether ``param`` is annotated as ``cls``: the class itself, or its name as a string
+    (``from __future__ import annotations``)."""
+    return param.annotation is cls or param.annotation in (cls.__name__, cls.__qualname__)
 
 
 def _validation_error_response(e) -> Response:

@@ -778,3 +778,110 @@ def test_enable_logging_without_a_level_keeps_the_configured_one():
     pinned.enable_logging(level="error")
     pinned.enable_logging()  # PYRONOVA_LOG=1 / debug=True at run()
     assert pinned._log_config["level"] == "ERROR"
+
+
+# ---------------------------------------------------------------------------
+# Python: model= rule, metrics counters, readiness timeouts, uploads
+# ---------------------------------------------------------------------------
+
+
+def test_model_rule_is_checked_at_registration():
+    from pydantic import BaseModel
+
+    from pyronova import Pyronova
+
+    class Item(BaseModel):
+        name: str
+
+    app = Pyronova()
+
+    # The body annotated as the model, but standing where the request goes: `sku` was
+    # meant as a path param the template lacks. Used to bind `item` to the request.
+    def misplaced(item: Item, sku):
+        return sku
+
+    with pytest.raises(TypeError, match=r"'item' is annotated Item but stands where the request goes"):
+        app.post("/items", misplaced, model=Item)
+
+    # No parameter for the body at all: used to fail on every request instead.
+    def bodiless():
+        return "x"
+
+    with pytest.raises(TypeError, match=r"no parameter for the validated Item body"):
+        app.post("/things", bodiless, model=Item)
+
+    # The two shapes the rule allows.
+    app.post("/a/{item_id}", lambda req, body, item_id: None, model=Item)
+    app.post("/b/{item_id}", lambda body, item_id: None, model=Item)
+
+
+def test_corrupt_metrics_counter_fails_the_scrape_not_reads_as_zero():
+    from pyronova.observability import CorruptMetric, _render_prometheus
+
+    class State(dict):
+        pass
+
+    ok = _render_prometheus(State({"_m:req:total": "3"}))
+    assert "pyronova_http_requests_total 3" in ok
+    with pytest.raises(CorruptMetric, match=r"'_m:req:total' holds 'garbage'"):
+        _render_prometheus(State({"_m:req:total": "garbage"}))
+
+
+def test_sync_readiness_check_is_bounded_like_an_async_one(monkeypatch):
+    import pyronova.health as health
+
+    monkeypatch.setattr(health, "_CHECK_TIMEOUT_S", 0.5)
+    started = time.monotonic()
+    ok, results = health._run_checks_sync(
+        [("hangs", lambda: time.sleep(5)), ("fine", lambda: True)], "rid-ra"
+    )
+    assert time.monotonic() - started < 3
+    assert ok is False
+    assert results == {"hangs": {"ok": False}, "fine": {"ok": True}}
+
+
+class _MultipartRequest:
+    def __init__(self, content_type: str, body: bytes):
+        self.headers = {"content-type": content_type}
+        self.body = body
+
+
+def _form(boundary: str, disposition: str, data: bytes = b"x") -> bytes:
+    return (
+        f"--{boundary}\r\nContent-Disposition: {disposition}\r\n\r\n".encode()
+        + data
+        + f"\r\n--{boundary}--\r\n".encode()
+    )
+
+
+def test_upload_filename_star_is_decoded_and_wins():
+    from pyronova.uploads import parse_multipart
+
+    body = _form(
+        "b1",
+        "form-data; name=\"f\"; filename=\"rates.txt\"; filename*=UTF-8''%E2%82%AC%20rates.txt",
+    )
+    f = parse_multipart(_MultipartRequest("multipart/form-data; boundary=b1", body))["f"]
+    assert f.filename == "€ rates.txt"
+
+    body = _form("b1", "form-data; name=\"f\"; filename*=iso-8859-1'en'%A3.txt")
+    f = parse_multipart(_MultipartRequest("multipart/form-data; boundary=b1", body))["f"]
+    assert f.filename == "£.txt"
+
+
+def test_upload_bad_filename_star_is_a_multipart_error():
+    from pyronova.uploads import MultipartError, parse_multipart
+
+    body = _form("b1", "form-data; name=\"f\"; filename*=KOI8-R''%C1")
+    with pytest.raises(MultipartError, match="RFC 8187"):
+        parse_multipart(_MultipartRequest("multipart/form-data; boundary=b1", body))
+
+
+def test_upload_media_type_is_case_insensitive_and_boundary_may_quote_a_semicolon():
+    from pyronova.uploads import MultipartError, parse_multipart
+
+    body = _form("a;b", 'form-data; name="t"', b"hello")
+    form = parse_multipart(_MultipartRequest('Multipart/Form-Data; Boundary="a;b"', body))
+    assert form["t"].data == b"hello"
+    with pytest.raises(MultipartError, match="Expected multipart/form-data"):
+        parse_multipart(_MultipartRequest('multipart/mixed; boundary="a;b"', body))
