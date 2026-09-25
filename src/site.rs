@@ -19,6 +19,9 @@ pub(crate) type SharedSite = Arc<Site>;
 pub(crate) struct SiteConfig {
     pub(crate) cors: Option<Cors>,
     pub(crate) access_log: AccessLog,
+    /// Answer HttpArena's `benchmark.BenchmarkService/GetSum` gRPC method; off unless the
+    /// app enables it.
+    pub(crate) grpc_benchmark: bool,
 }
 
 /// CORS response headers, parsed once at configuration. Applied to every response, not

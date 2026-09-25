@@ -21,6 +21,7 @@ adds per-object counters and is disabled in the published wheel.
 | MCP server endpoint | any `@mcp.tool` decorator | off |
 | WebSocket | `@app.websocket(path)` | off |
 | SSE streaming (response) | `return Stream(...)` | off |
+| gRPC benchmark service (HttpArena `GetSum`) | `app.enable_grpc_benchmark()` | off |
 | `leak_detect` (diagnostic) | `maturin develop --features leak_detect` | compile-time off |
 
 All items above (except `leak_detect`) are zero-cost when disabled —

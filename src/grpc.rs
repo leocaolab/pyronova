@@ -2,6 +2,10 @@
 //! interface used by HttpArena's `unary-grpc` / `unary-grpc-tls`
 //! profiles.
 //!
+//! Opt-in (`app.enable_grpc_benchmark()`): when enabled, a POST to exactly
+//! [`GET_SUM_PATH`] with an `application/grpc*` content-type is answered here;
+//! every other request, gRPC or not, is routed like any other.
+//!
 //! Hand-rolled (no `tonic`/`prost` dependency) because the protobuf
 //! surface is a single pair of messages:
 //!
@@ -73,8 +77,6 @@ enum GrpcError {
     Compressed { flag: u8 },
     #[error("frame declares a {declared}-byte message but carries {actual} bytes")]
     TruncatedFrame { declared: usize, actual: usize },
-    #[error("method {0} is not implemented")]
-    Unimplemented(String),
     #[error("malformed SumRequest: {0}")]
     Decode(#[from] DecodeError),
 }
@@ -84,7 +86,7 @@ impl GrpcError {
         match self {
             Self::BodyTooLarge { .. } => GrpcStatus::ResourceExhausted,
             Self::BodyRead(_) => GrpcStatus::Unavailable,
-            Self::Compressed { .. } | Self::Unimplemented(_) => GrpcStatus::Unimplemented,
+            Self::Compressed { .. } => GrpcStatus::Unimplemented,
             Self::ShortFrame { .. } | Self::TruncatedFrame { .. } | Self::Decode(_) => {
                 GrpcStatus::Internal
             }
@@ -102,26 +104,27 @@ enum DecodeError {
     WireType { field: u64, wire_type: u8 },
 }
 
-/// Is this a gRPC call? Matches POST with an `application/grpc*`
-/// content-type. Caller has already routed on HTTP/2 upgrade so we
-/// trust the outer transport.
-pub(crate) fn is_grpc_request(req: &Request<Incoming>) -> bool {
-    if req.method() != hyper::Method::POST {
-        return false;
-    }
-    let ct = req
-        .headers()
-        .get(hyper::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    ct.starts_with("application/grpc")
+/// The one method the benchmark service implements.
+pub(crate) const GET_SUM_PATH: &str = "/benchmark.BenchmarkService/GetSum";
+
+/// A gRPC call to [`GET_SUM_PATH`]: POST to that exact path with an `application/grpc*`
+/// content-type.
+pub(crate) fn is_get_sum_call(req: &Request<Incoming>) -> bool {
+    req.method() == hyper::Method::POST
+        && req.uri().path() == GET_SUM_PATH
+        && req
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.starts_with("application/grpc"))
 }
 
-pub(crate) async fn handle_grpc(req: Request<Incoming>) -> Result<Response<BoxBody>, hyper::Error> {
-    let path = req.uri().path().to_string();
+pub(crate) async fn handle_get_sum(
+    req: Request<Incoming>,
+) -> Result<Response<BoxBody>, hyper::Error> {
     let reply = read_message(req.into_body())
         .await
-        .and_then(|message| dispatch(&path, &message));
+        .and_then(|message| get_sum(&message));
     Ok(match reply {
         Ok(reply) => grpc_reply(Some(frame(&reply)), GrpcStatus::Ok, None),
         Err(e) => grpc_reply(None, e.status(), Some(&e.to_string())),
@@ -161,13 +164,6 @@ fn unframe(framed: Bytes) -> Result<Bytes, GrpcError> {
         return Err(GrpcError::TruncatedFrame { declared, actual });
     }
     Ok(framed.slice(HEADER_LEN..HEADER_LEN + declared))
-}
-
-fn dispatch(path: &str, message: &[u8]) -> Result<Bytes, GrpcError> {
-    match path {
-        "/benchmark.BenchmarkService/GetSum" => get_sum(message),
-        _ => Err(GrpcError::Unimplemented(path.to_string())),
-    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]

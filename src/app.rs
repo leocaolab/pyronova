@@ -32,6 +32,8 @@ pub(crate) struct PyronovaApp {
     cors: Option<Cors>,
     /// Per-instance access log. Its sampling counter is shared by every copy served.
     access_log: AccessLog,
+    /// Answer the built-in gRPC benchmark method (`enable_grpc_benchmark`).
+    grpc_benchmark: bool,
     /// Opt into Thread-Per-Core mode. See docs/tpc-rearch.md. Can also
     /// be flipped via the `PYRONOVA_TPC=1` env var; either is sufficient.
     tpc: bool,
@@ -47,6 +49,7 @@ impl PyronovaApp {
             shared_state: crate::state::map_for_new(py),
             cors: None,
             access_log: AccessLog::disabled(),
+            grpc_benchmark: false,
             tpc: false,
         }
     }
@@ -105,6 +108,13 @@ impl PyronovaApp {
             allow_credentials,
         })?);
         Ok(())
+    }
+
+    /// Answer HttpArena's `benchmark.BenchmarkService/GetSum` gRPC method. Only a POST to
+    /// that exact path with an `application/grpc*` content-type reaches it; every other
+    /// request is routed as usual.
+    fn enable_grpc_benchmark(&mut self) {
+        self.grpc_benchmark = true;
     }
 
     /// Enable/disable per-instance request logging.
@@ -812,6 +822,7 @@ impl PyronovaApp {
             config: SiteConfig {
                 cors: self.cors.clone(),
                 access_log: self.access_log.clone(),
+                grpc_benchmark: self.grpc_benchmark,
             },
         }
     }
