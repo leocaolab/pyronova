@@ -88,7 +88,7 @@ def test_tools_call_unknown():
     server = MCPServer()
     resp = _rpc(server, "tools/call", {"name": "nonexistent"})
     assert "error" in resp
-    assert resp["error"]["code"] == -32000
+    assert resp["error"]["code"] == -32602
 
 
 def test_resources_list(mcp):
