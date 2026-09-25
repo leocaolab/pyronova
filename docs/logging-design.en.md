@@ -96,7 +96,13 @@ app = Pyronova(log_config={"level": "OFF"})
 # 5. enable_logging() — activates access log + Python hook output
 app = Pyronova()
 app.enable_logging()       # upgrades level to INFO, enables access_log
+app.enable_logging(level="warn")  # the explicit level wins over log_config / debug=True
 ```
+
+`enable_logging(level=...)` is the one writer of an explicit level: it replaces whatever
+`log_config` or `debug=True` set, and a later call without a level (`PYRONOVA_LOG=1` or
+`debug=True` at `run()`) keeps it. Without a level, `enable_logging()` keeps the configured
+level, raised to INFO when it is ERROR or OFF (the access lines are INFO).
 
 ### Environment Variables
 

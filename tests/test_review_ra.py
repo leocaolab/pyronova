@@ -725,3 +725,56 @@ def test_mcp_non_str_results_are_json():
     assert text("items") != str([{"id": 1, "ok": True}, None])
     assert text("ratio") == "0.5"
     assert text("nothing") == "null"
+
+
+# ---------------------------------------------------------------------------
+# Logging: an explicit enable_logging(level=...) is the level
+# ---------------------------------------------------------------------------
+
+LEVEL_SCRIPT = """
+import logging, os
+from pyronova import Pyronova
+app = Pyronova(debug=os.environ.get("RA_DEBUG") == "1")
+app.enable_logging(level=os.environ["RA_LEVEL"])
+
+@app.get("/log", gil=True)
+def log(req):
+    logging.getLogger("ra.app").info("ra-info-line")
+    logging.getLogger("ra.app").warning("ra-warning-line")
+    logging.getLogger("ra.app").error("ra-error-line")
+    return "ok"
+""" + RUN
+
+
+@pytest.mark.parametrize(
+    "env,shown,hidden",
+    [
+        # debug=True's DEBUG used to win over the explicit level
+        ({"RA_DEBUG": "1", "RA_LEVEL": "warn"}, "ra-warning-line", "ra-info-line"),
+        # the implicit enable_logging() at run() used to raise an explicit ERROR to INFO
+        ({"PYRONOVA_LOG": "1", "RA_LEVEL": "error"}, "ra-error-line", "ra-warning-line"),
+    ],
+    ids=["over-debug", "over-PYRONOVA_LOG"],
+)
+def test_explicit_logging_level_wins(env, shown, hidden):
+    with serve(LEVEL_SCRIPT, "gil", env=env) as srv:
+        assert srv.get("/log").status == 200
+        srv.wait_for_records(lambda r: shown in _record_text(r))
+        text = srv.log()
+        assert shown in text, text[-3000:]
+        assert hidden not in text, text[-3000:]
+
+
+def test_enable_logging_without_a_level_keeps_the_configured_one():
+    from pyronova import Pyronova
+
+    app = Pyronova(log_config={"level": "DEBUG"})
+    app.enable_logging()
+    assert app._log_config["level"] == "DEBUG"
+    quiet = Pyronova()  # ERROR would hide the INFO access lines
+    quiet.enable_logging()
+    assert quiet._log_config["level"] == "INFO"
+    pinned = Pyronova()
+    pinned.enable_logging(level="error")
+    pinned.enable_logging()  # PYRONOVA_LOG=1 / debug=True at run()
+    assert pinned._log_config["level"] == "ERROR"

@@ -123,6 +123,17 @@ _LOGGING_LEVEL_MAP = {
 }
 
 
+def _level_with_access_log(current: str, requested: str | None, pinned: bool) -> str:
+    """The log level once the access log is on: the level asked for; else the current
+    one, raised to INFO when it would hide the access lines (ERROR, OFF), unless an
+    explicit ``enable_logging(level=...)`` chose it."""
+    if requested is not None:
+        return requested.upper()
+    if pinned or current not in ("ERROR", "OFF"):
+        return current
+    return "INFO"
+
+
 def _require_int(name: str, value: object) -> None:
     """``bool`` is an ``int`` subclass; a limit set to ``True`` is a bug, not 1."""
     if not isinstance(value, int) or isinstance(value, bool):
@@ -227,6 +238,8 @@ class Pyronova:
                 "access_log": user.get("access_log", False),
                 "format": user.get("format", "json"),
             }
+        # Whether enable_logging(level=...) chose the level (it then keeps it).
+        self._log_level_pinned = False
         # Set by the first server's _prepare(); later servers reuse it.
         self._prepared = False
         self._defined_in = _defining_module_file(self)
@@ -826,7 +839,7 @@ class Pyronova:
 
     def enable_logging(
         self,
-        level: str = "info",
+        level: str | None = None,
         sample: int = 1,
         always_log_status: int = 0,
     ) -> None:
@@ -839,6 +852,10 @@ class Pyronova:
             INFO  pyronova::access Request handled method=GET path=/ status=200 latency_us=198 mode="gil"
 
         :param level: minimum log level — "debug" / "info" / "warn" / "error".
+            Given, it is the level, whatever ``log_config`` or ``debug=True`` set,
+            and a later call without one (``PYRONOVA_LOG=1``, ``debug=True`` at
+            ``run()``) keeps it. Left out, the level stays as configured, raised
+            to "info" when it is "error" or "off" (the access lines are INFO).
             An unknown level raises ``ValueError`` when the server starts.
         :param sample: log 1 in every ``sample`` requests. ``1`` (default)
             logs every request. ``100`` keeps roughly 1% — production knob
@@ -857,8 +874,10 @@ class Pyronova:
             self._engine.set_request_log_sampling(sample, always_log_status)
 
         # The deferred init_logger picks these up (and validates the level).
-        if self._log_config.get("level", "ERROR") in ("ERROR", "OFF"):
-            self._log_config["level"] = level.upper()
+        self._log_level_pinned = self._log_level_pinned or level is not None
+        self._log_config["level"] = _level_with_access_log(
+            self._log_config["level"], level, self._log_level_pinned
+        )
         self._log_config["access_log"] = True
 
     # ------------------------------------------------------------------
@@ -1020,7 +1039,6 @@ class Pyronova:
             return
         self._engine._seal_registrations()
 
-        # enable_logging() is itself idempotent + lock-guarded.
         if os.environ.get("PYRONOVA_LOG") == "1" or self.debug:
             self.enable_logging()
         # Deferred from __init__ so enable_logging() can adjust the config first.

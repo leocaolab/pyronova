@@ -147,9 +147,11 @@ def trade(req):
 ### 日志级别
 
 ```python
-app.enable_logging(level="info")    # INFO/WARN/ERROR (默认)
+app.enable_logging()                # 保留已配置级别；ERROR/OFF 提升到 INFO
+app.enable_logging(level="info")    # INFO/WARN/ERROR
 app.enable_logging(level="error")   # 只显示错误
 app.enable_logging(level="debug")   # 全部显示
+# 显式 level 优先于 log_config / debug=True
 ```
 
 ## Pydantic 集成
