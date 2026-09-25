@@ -50,8 +50,10 @@ PYRONOVA_GC_MODE=count
 PYRONOVA_GC_THRESHOLD=100000   # 默认 100k；零循环 workload 设 0 彻底关
 
 # 模式 2 — idle (生产级金融量化推荐)
-# 只在 accept queue 空闲 >= PYRONOVA_GC_IDLE_MS 时触发 collect。
-# 流量洪峰中 PYRONOVA_GC_OOM_FAILSAFE 熔断强制清扫防 OOM。
+# 只在 worker 连续一个 PYRONOVA_GC_IDLE_MS tick 没有处理任何请求时触发 collect
+# （按请求计数，keep-alive 连接同样生效）。
+# 流量洪峰中 PYRONOVA_GC_OOM_FAILSAFE 熔断（按请求数）强制清扫防 OOM。
+# 仅 TPC 默认拓扑支持；PYRONOVA_TPC=0（线程池）或 PYRONOVA_TPC_DARWIN=fanout 下启动报错。
 # **P99 永远不包含 GC 停顿**。
 PYRONOVA_GC_MODE=idle
 PYRONOVA_GC_IDLE_MS=100        # 默认 100ms 时间轮 tick
@@ -61,6 +63,9 @@ PYRONOVA_GC_OOM_FAILSAFE=50000 # 默认 50k req 熔断
 # 零框架级触发。用户自己调 gc.collect() 或依赖 refcount。
 # 适合 tick-driven 系统（量化交易每个 tick 结束手动 collect）。
 PYRONOVA_GC_MODE=off
+# PYRONOVA_TPC=0（线程池）不支持 off，启动报错；线程池下用 PYRONOVA_GC_THRESHOLD=0。
+
+# 其他取值（拼错如 "idel"）启动即报错，不会静默退回 count。
 ```
 
 本地实测（7840HS, TPC-8, 零循环 hello workload）：
@@ -78,9 +83,9 @@ PYRONOVA_GC_MODE=off
 
 **强烈推荐金融量化场景选 idle**。原因：`count` 模式有一个理论雷
 区——count 阈值命中的那一刻，**有概率正好是流量高峰**，这个请求就
-吃到 collect 延迟。idle 模式的定义是"只有无请求在排队时才 collect"，
+吃到 collect 延迟。idle 模式的定义是"worker 一整个 tick 没处理请求才 collect"，
 **物理上**把停顿挤到业务空窗期。OOM 熔断（50k req 默认）是兜底——
-极端行情下 accept 从不 drain，熔断触发保证内存不无限涨。
+极端行情下 worker 从不空闲，熔断触发保证内存不无限涨。
 
 交易开盘前 5 分钟的洪峰：`idle` tick 可能被饿死，但熔断会在 50k 
 请求累积后强制清扫一次，这是可控的、可观测的保护性自救。对比之下 

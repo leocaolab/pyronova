@@ -225,13 +225,13 @@ impl PyronovaApp {
         &self,
         py: Python<'_>,
         enabled: bool,
-        min_size: usize,
+        min_size: u32,
         gzip: bool,
         brotli: bool,
         gzip_level: u32,
         brotli_quality: u32,
     ) {
-        let wanted = crate::compression::Settings::new(
+        let wanted = crate::compression::requested(
             enabled,
             min_size,
             gzip,
@@ -1073,6 +1073,13 @@ impl PyronovaApp {
         // What every worker's script must register (Layer 2, C3), as plain values.
         let expected = crate::router::RouteSignature::of(&routes);
 
+        // The pool's workers keep their `PYRONOVA_GC_THRESHOLD` count trigger: count mode only.
+        crate::tpc::GcMode::from_env()
+            .and_then(|mode| mode.supported_by(crate::tpc::GcServer::SubInterpreterPool))
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let split = interp::split_workers_for_routes(workers, &requires_gil, &routes.is_async)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
         let gil_count = requires_gil.iter().filter(|&&g| g).count();
         let subinterp_count = requires_gil.len() - gil_count;
 
@@ -1102,15 +1109,11 @@ impl PyronovaApp {
         };
         println!("  Listening on {scheme}://{addr}");
         println!("  Sub-interpreters: {workers} | IO threads: {io_workers} (CPUs: {num_cpus})");
-        if has_async {
-            // Cap async at workers-1 so sync always keeps at least one
-            // slot; on tiny pools (workers<=2) async gets 1, sync gets
-            // the rest. Plain subtraction here panics on usize underflow
-            // in debug builds and wraps to garbage in release builds
-            // when workers < 2.
-            let async_w = (workers / 2).max(2).min(workers.saturating_sub(1).max(1));
-            let sync_w = workers.saturating_sub(async_w);
-            println!("  Workers: {sync_w} sync + {async_w} async");
+        if split.async_workers > 0 {
+            println!(
+                "  Workers: {} sync + {} async",
+                split.sync_workers, split.async_workers
+            );
         }
         println!(
             "  Routes: {subinterp_count} sub-interp + {gil_count} GIL + {async_count_routes} async"
@@ -1119,7 +1122,7 @@ impl PyronovaApp {
 
         let pool = unsafe {
             interp::InterpreterPool::new(
-                workers,
+                split,
                 py,
                 &script_path,
                 &expected,
@@ -1334,6 +1337,9 @@ impl PyronovaApp {
         // What every worker's script must register (Layer 2, C3), as plain values.
         let expected = crate::router::RouteSignature::of(&routes);
 
+        let gc_mode = crate::tpc::GcMode::from_env()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
         // Read the user script once.
         let raw_script = std::fs::read_to_string(&script_path).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("read script '{script_path}': {e}"))
@@ -1417,6 +1423,7 @@ impl PyronovaApp {
                 tls_acceptor,
                 main_bridge,
                 extra_tls,
+                gc_mode,
             );
             // The TPC threads are joined, so this is the last bridge reference: close it and
             // wait for its threads to release their Python objects (FR-6).
@@ -1545,6 +1552,8 @@ impl PyronovaApp {
             main_mod.getattr("__file__")?.extract::<String>()?
         };
         let expected = crate::router::RouteSignature::of(&routes);
+        let gc_mode = crate::tpc::GcMode::from_env()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
         crate::monitor::init_metrics_flag();
         let raw_script = std::fs::read_to_string(&script_path).map_err(|e| {
@@ -1579,6 +1588,7 @@ impl PyronovaApp {
                 built_workers,
                 routes,
                 None,
+                gc_mode,
             )
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)
         })

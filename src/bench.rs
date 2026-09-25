@@ -300,6 +300,7 @@ pub(crate) fn run_loopback_bench(
     mut workers: Vec<SubInterpreterWorker>,
     routes: FrozenRoutes,
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
+    gc_mode: crate::tpc::GcMode,
 ) -> Result<(u64, f64, u16), String> {
     if workers.len() != n_threads {
         return Err(format!(
@@ -373,6 +374,7 @@ pub(crate) fn run_loopback_bench(
                         shutdown_c,
                         None,
                         bridge,
+                        gc_mode,
                     )
                     .await;
                 });

@@ -361,6 +361,7 @@ pub(crate) fn run_tpc_subinterp(
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
     extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
+    gc_mode: GcMode,
 ) -> Result<(), String> {
     if workers.len() != n_threads {
         return Err(format!(
@@ -384,6 +385,15 @@ pub(crate) fn run_tpc_subinterp(
             Some("fanout")
         );
         if use_fanout {
+            let gc_mode = match gc_mode.supported_by(GcServer::DarwinFanout) {
+                Ok(mode) => mode,
+                Err(e) => {
+                    // SAFETY: called from `PyronovaApp::run_tpc_subinterp` on the main thread
+                    // inside `py.detach`, so no thread state is current; none was rebound.
+                    unsafe { SubInterpreterWorker::end_all(workers) };
+                    return Err(e.to_string());
+                }
+            };
             return run_tpc_subinterp_fanout(
                 addr,
                 n_threads,
@@ -393,6 +403,7 @@ pub(crate) fn run_tpc_subinterp(
                 tls_acceptor,
                 main_bridge,
                 extra_tls,
+                gc_mode,
             );
         }
         run_tpc_subinterp_per_thread_listener(
@@ -404,6 +415,7 @@ pub(crate) fn run_tpc_subinterp(
             tls_acceptor,
             main_bridge,
             extra_tls,
+            gc_mode,
         )
     }
 
@@ -418,6 +430,7 @@ pub(crate) fn run_tpc_subinterp(
             tls_acceptor,
             main_bridge,
             extra_tls,
+            gc_mode,
         )
     }
 }
@@ -432,6 +445,7 @@ fn run_tpc_subinterp_per_thread_listener(
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
     extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
+    gc_mode: GcMode,
 ) -> Result<(), String> {
     log_startup("hybrid-inline", &addr, n_threads, n_cpus, &routes);
 
@@ -506,6 +520,7 @@ fn run_tpc_subinterp_per_thread_listener(
                         shutdown_thread,
                         tls,
                         bridge,
+                        gc_mode,
                     )
                     .await;
                 });
@@ -567,6 +582,7 @@ fn run_tpc_subinterp_fanout(
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
     _extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
+    gc_mode: GcMode,
 ) -> Result<(), String> {
     log_startup("hybrid-inline-fanout", &addr, n_threads, n_cpus, &routes);
 
@@ -640,6 +656,8 @@ fn run_tpc_subinterp_fanout(
                 worker.tstate = unsafe {
                     crate::python::interp::rebind_tstate_to_current_thread(worker.tstate)
                 };
+                // Count or off only (`GcServer::DarwinFanout`): the fanout loop has no idle tick.
+                apply_gc_mode(&mut worker, gc_mode);
                 let worker = std::rc::Rc::new(std::cell::RefCell::new(worker));
                 let worker_exit = std::rc::Rc::clone(&worker);
                 local.block_on(&rt, async move {
@@ -808,15 +826,6 @@ async fn tpc_worker_loop_fanout(
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
 ) {
-    // Fanout path supports the Count GC mode only. Idle mode's drained-
-    // queue signal lives in the acceptor now, not the worker, and the
-    // count-based trigger inside call_handler covers the common case.
-    // Off mode still silences the trigger.
-    let gc_mode = gc_mode_from_env();
-    if matches!(gc_mode, GcMode::Off) {
-        worker.borrow_mut().gc_threshold = 0;
-    }
-
     let tracker = TaskTracker::new();
     loop {
         tokio::select! {
@@ -848,33 +857,139 @@ async fn tpc_worker_loop_fanout(
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), tracker.wait()).await;
 }
 
-/// GC scheduling mode. Read once at startup from `PYRONOVA_GC_MODE`:
-///   - `"count"` (default) — the count-based trigger inside
-///     `SubInterpreterWorker::call_handler` fires `gc.collect()` every
-///     `PYRONOVA_GC_THRESHOLD` requests per worker. Simple, predictable,
-///     can collide with bursty traffic.
-///   - `"idle"` — the TPC accept loop fires `gc.collect()` on a
-///     100ms-cadence timer, but ONLY when the accept queue drained to
-///     empty since the previous tick. Traffic-density-adaptive. A
-///     hard failsafe at `PYRONOVA_GC_OOM_FAILSAFE` requests (default
-///     50_000) forces a collect even under sustained load so sustained
-///     bursts can't starve the collector into OOM. The per-call_handler
-///     count trigger is disabled while in this mode.
-///   - `"off"` — no framework-level triggers at all. `gc.disable()`
-///     still runs at sub-interp init; users must call `gc.collect()`
-///     themselves or accept ref-count-only cleanup.
-#[derive(Clone, Copy, Debug)]
-enum GcMode {
+const GC_MODE_ENV: &str = "PYRONOVA_GC_MODE";
+
+/// GC scheduling mode, parsed once at startup from `PYRONOVA_GC_MODE` (unset = count):
+///   - `count` — the count trigger inside `SubInterpreterWorker::call_handler` fires
+///     `gc.collect()` every `PYRONOVA_GC_THRESHOLD` requests per worker. Simple,
+///     predictable, can collide with bursty traffic.
+///   - `idle` — the TPC accept loop collects once a worker has run requests and then
+///     none for a full `PYRONOVA_GC_IDLE_MS` tick (default 100ms), so the pause lands in
+///     a lull. The worker's count trigger becomes the OOM failsafe at
+///     `PYRONOVA_GC_OOM_FAILSAFE` requests (default 50_000), so sustained traffic can't
+///     starve the collector. Needs the per-thread-listener TPC topology.
+///   - `off` — no framework-level triggers at all. `gc.disable()` still runs at sub-interp
+///     init; users must call `gc.collect()` themselves or accept ref-count-only cleanup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GcMode {
     Count,
     Idle,
     Off,
 }
 
-fn gc_mode_from_env() -> GcMode {
-    match std::env::var("PYRONOVA_GC_MODE").ok().as_deref() {
-        Some("idle") => GcMode::Idle,
-        Some("off") => GcMode::Off,
-        _ => GcMode::Count,
+impl std::fmt::Display for GcMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            GcMode::Count => "count",
+            GcMode::Idle => "idle",
+            GcMode::Off => "off",
+        })
+    }
+}
+
+impl std::str::FromStr for GcMode {
+    type Err = GcModeError;
+
+    fn from_str(raw: &str) -> Result<Self, GcModeError> {
+        match raw {
+            "count" => Ok(GcMode::Count),
+            "idle" => Ok(GcMode::Idle),
+            "off" => Ok(GcMode::Off),
+            _ => Err(GcModeError::Unknown(raw.to_string())),
+        }
+    }
+}
+
+impl GcMode {
+    /// `PYRONOVA_GC_MODE`, parsed.
+    pub(crate) fn from_env() -> Result<Self, GcModeError> {
+        match std::env::var(GC_MODE_ENV) {
+            Err(std::env::VarError::NotPresent) => Ok(GcMode::Count),
+            Err(std::env::VarError::NotUnicode(raw)) => {
+                Err(GcModeError::Unknown(raw.to_string_lossy().into_owned()))
+            }
+            Ok(raw) => raw.parse(),
+        }
+    }
+
+    /// This mode, if `server` can run it.
+    pub(crate) fn supported_by(self, server: GcServer) -> Result<Self, GcModeError> {
+        let supported = match server {
+            #[cfg(target_os = "macos")]
+            GcServer::DarwinFanout => matches!(self, GcMode::Count | GcMode::Off),
+            GcServer::SubInterpreterPool => self == GcMode::Count,
+        };
+        if supported {
+            Ok(self)
+        } else {
+            Err(GcModeError::Unsupported { mode: self, server })
+        }
+    }
+}
+
+/// A server shape that runs only some GC modes (the TPC per-thread-listener one runs all).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GcServer {
+    #[cfg(target_os = "macos")]
+    DarwinFanout,
+    SubInterpreterPool,
+}
+
+impl std::fmt::Display for GcServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            #[cfg(target_os = "macos")]
+            GcServer::DarwinFanout => "the Darwin fanout TPC topology (PYRONOVA_TPC_DARWIN=fanout)",
+            GcServer::SubInterpreterPool => "the sub-interpreter pool (PYRONOVA_TPC=0)",
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum GcModeError {
+    Unknown(String),
+    Unsupported { mode: GcMode, server: GcServer },
+}
+
+impl std::fmt::Display for GcModeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GcModeError::Unknown(raw) => write!(
+                f,
+                "{GC_MODE_ENV}={raw:?} is not a GC mode; expected \"count\", \"idle\" or \"off\""
+            ),
+            GcModeError::Unsupported { mode, server } => {
+                write!(f, "{GC_MODE_ENV}={mode} is not supported by {server}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GcModeError {}
+
+/// Sets `worker`'s count trigger for `mode`: count keeps `PYRONOVA_GC_THRESHOLD`, idle
+/// makes it the OOM failsafe, off disables it.
+fn apply_gc_mode(worker: &mut SubInterpreterWorker, mode: GcMode) {
+    match mode {
+        GcMode::Count => {}
+        GcMode::Idle => worker.gc_threshold = oom_failsafe_from_env(),
+        GcMode::Off => worker.gc_threshold = 0,
+    }
+}
+
+/// The idle-mode trigger: collect at a tick when the worker ran requests since its last
+/// collect and none since the previous tick.
+#[derive(Default)]
+struct IdleGc {
+    served_at_last_tick: u64,
+}
+
+impl IdleGc {
+    /// Whether to collect at this tick, given the worker's counters now.
+    fn on_tick(&mut self, served: u64, since_collect: u64) -> bool {
+        let quiet = served == self.served_at_last_tick;
+        self.served_at_last_tick = served;
+        quiet && since_collect > 0
     }
 }
 
@@ -893,65 +1008,17 @@ fn idle_tick_ms_from_env() -> u64 {
         .max(1) // tokio::time::interval panics on Duration::ZERO
 }
 
-/// Fire a single `gc.collect()` on the worker's sub-interpreter.
-/// Acquires + releases the sub-interp GIL for the duration of the call.
-/// Cheap no-op when `gc_collect_func` is null (e.g. `gc` module failed
-/// to import at sub-interp init — unreachable in practice).
-fn fire_gc(worker: &std::rc::Rc<std::cell::RefCell<SubInterpreterWorker>>) {
-    use pyo3::ffi;
-    let mut w = worker.borrow_mut();
-    if w.gc_collect_func.is_null() {
-        return;
+/// The idle tick: collect on `worker` if it went quiet (see [`IdleGc`]).
+fn idle_gc_tick(idle: &mut IdleGc, worker: &std::rc::Rc<std::cell::RefCell<SubInterpreterWorker>>) {
+    let due = {
+        let w = worker.borrow();
+        idle.on_tick(w.requests_served(), w.requests_since_collect())
+    };
+    if due {
+        // SAFETY: this TPC thread is the one the worker was rebound to, and the accept
+        // loop runs between requests, so no thread state is current.
+        unsafe { worker.borrow_mut().collect_garbage_between_requests() };
     }
-    let tstate_cell = std::cell::Cell::new(w.tstate);
-    unsafe {
-        let _guard =
-            crate::python::interp::SubInterpGilGuard::acquire(tstate_cell.get(), &tstate_cell);
-        // PyObject_CallNoArgs: skip the empty-tuple alloc the generic
-        // PyObject_Call path requires. Idiomatic 3.9+ invocation.
-        let res = ffi::PyObject_CallNoArgs(w.gc_collect_func);
-        if !res.is_null() {
-            ffi::Py_DECREF(res);
-        } else {
-            // gc.collect() failing is a serious signal (OOM, heap
-            // corruption, interp state damage). Pre-fix the exception
-            // was cleared silently — issue cascades into mysterious
-            // later crashes (arc tpc-2). Log the exception value
-            // before clearing so the root cause is captured. Uses
-            // 3.12+ PyErr_GetRaisedException (the deprecated triple
-            // PyErr_Fetch was replaced).
-            if !ffi::PyErr_Occurred().is_null() {
-                let exc = ffi::PyErr_GetRaisedException();
-                let msg = if !exc.is_null() {
-                    let s = ffi::PyObject_Str(exc);
-                    let owned = if !s.is_null() {
-                        let cs = ffi::PyUnicode_AsUTF8(s);
-                        let m = if !cs.is_null() {
-                            std::ffi::CStr::from_ptr(cs).to_string_lossy().into_owned()
-                        } else {
-                            "<repr failed>".to_string()
-                        };
-                        ffi::Py_DECREF(s);
-                        m
-                    } else {
-                        "<str failed>".to_string()
-                    };
-                    ffi::Py_DECREF(exc);
-                    owned
-                } else {
-                    "<no value>".to_string()
-                };
-                tracing::error!(
-                    target: "pyronova::app",
-                    error = %msg,
-                    "gc.collect() raised — clearing exception to keep worker \
-                     alive, but this signals OOM / heap corruption / interp \
-                     damage and will likely cascade"
-                );
-            }
-        }
-    }
-    w.tstate = tstate_cell.get();
 }
 
 /// Accept from `slot` if Some, otherwise pend forever.
@@ -977,6 +1044,7 @@ pub(crate) async fn tpc_accept_loop_inline(
     shutdown: CancellationToken,
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
+    gc_mode: GcMode,
 ) {
     let std_listener = match create_reuseport_listener(addr) {
         Ok(l) => l,
@@ -1015,28 +1083,17 @@ pub(crate) async fn tpc_accept_loop_inline(
     let tls_slot0 = extra_listeners.first();
     let tls_slot1 = extra_listeners.get(1);
 
-    let gc_mode = gc_mode_from_env();
-    // In idle mode, disable the count-based trigger inside call_handler —
-    // we drive GC from the accept loop instead. Each TPC thread owns its
-    // worker exclusively so the borrow_mut is free of contention.
-    if matches!(gc_mode, GcMode::Idle | GcMode::Off) {
-        worker.borrow_mut().gc_threshold = 0;
-    }
-    let oom_failsafe = oom_failsafe_from_env();
-    let idle_ms = idle_tick_ms_from_env();
+    // Each TPC thread owns its worker exclusively, so the borrow_mut is uncontended.
+    apply_gc_mode(&mut worker.borrow_mut(), gc_mode);
 
     let tracker = TaskTracker::new();
     match gc_mode {
         GcMode::Idle => {
-            // Hybrid idle trigger: collect either on every idle tick
-            // (when the accept queue drained since last tick) or on a
-            // hard failsafe to prevent OOM during sustained bursts.
-            //
-            // `requests_since_last_gc` is written from the accept path
-            // (one TPC thread — no atomics needed; the borrow is single-
-            // threaded on this current_thread runtime).
-            let mut requests_since_last_gc: u64 = 0;
-            let mut gc_timer = tokio::time::interval(std::time::Duration::from_millis(idle_ms));
+            // The worker counts requests as it runs them and fires the OOM failsafe
+            // itself; this loop adds the idle tick.
+            let mut idle_gc = IdleGc::default();
+            let mut gc_timer =
+                tokio::time::interval(std::time::Duration::from_millis(idle_tick_ms_from_env()));
             // First tick fires immediately — skip it so we don't collect
             // an empty heap before any requests have run.
             gc_timer.tick().await;
@@ -1049,7 +1106,6 @@ pub(crate) async fn tpc_accept_loop_inline(
                             Ok((stream, remote_addr)) => {
                                 let _ = stream.set_nodelay(true);
                                 setup_tcp_quickack(&stream);
-                                requests_since_last_gc += 1;
 
                                 let worker_clone = std::rc::Rc::clone(&worker);
                                 let routes_arc_c = Arc::clone(&routes_arc);
@@ -1059,16 +1115,6 @@ pub(crate) async fn tpc_accept_loop_inline(
                                 tracker.spawn_local(async move {
                                     crate::worker::drive_tcp_conn(stream, remote_addr, worker_clone, routes_static, routes_arc_c, conn_token, tls_acc_c, bridge_c).await;
                                 });
-
-                                // Failsafe: sustained burst — accept
-                                // queue never drains, so the idle tick
-                                // never gets its chance. Force a
-                                // collect here to keep RSS bounded.
-                                if requests_since_last_gc >= oom_failsafe {
-                                    fire_gc(&worker);
-                                    requests_since_last_gc = 0;
-                                    gc_timer.reset();
-                                }
                             }
                             Err(e) => handle_accept_error(&e).await,
                         }
@@ -1078,7 +1124,6 @@ pub(crate) async fn tpc_accept_loop_inline(
                             Ok((stream, remote_addr)) => {
                                 let _ = stream.set_nodelay(true);
                                 setup_tcp_quickack(&stream);
-                                requests_since_last_gc += 1;
                                 let worker_clone = std::rc::Rc::clone(&worker);
                                 let routes_arc_c = Arc::clone(&routes_arc);
                                 let conn_token = shutdown.clone();
@@ -1086,11 +1131,6 @@ pub(crate) async fn tpc_accept_loop_inline(
                                 tracker.spawn_local(async move {
                                     crate::worker::drive_tcp_conn(stream, remote_addr, worker_clone, routes_static, routes_arc_c, conn_token, tls_acc, bridge_c).await;
                                 });
-                                if requests_since_last_gc >= oom_failsafe {
-                                    fire_gc(&worker);
-                                    requests_since_last_gc = 0;
-                                    gc_timer.reset();
-                                }
                             }
                             Err(e) => handle_accept_error(&e).await,
                         }
@@ -1100,7 +1140,6 @@ pub(crate) async fn tpc_accept_loop_inline(
                             Ok((stream, remote_addr)) => {
                                 let _ = stream.set_nodelay(true);
                                 setup_tcp_quickack(&stream);
-                                requests_since_last_gc += 1;
                                 let worker_clone = std::rc::Rc::clone(&worker);
                                 let routes_arc_c = Arc::clone(&routes_arc);
                                 let conn_token = shutdown.clone();
@@ -1108,24 +1147,11 @@ pub(crate) async fn tpc_accept_loop_inline(
                                 tracker.spawn_local(async move {
                                     crate::worker::drive_tcp_conn(stream, remote_addr, worker_clone, routes_static, routes_arc_c, conn_token, tls_acc, bridge_c).await;
                                 });
-                                if requests_since_last_gc >= oom_failsafe {
-                                    fire_gc(&worker);
-                                    requests_since_last_gc = 0;
-                                    gc_timer.reset();
-                                }
                             }
                             Err(e) => handle_accept_error(&e).await,
                         }
                     }
-                    _ = gc_timer.tick(), if requests_since_last_gc > 0 => {
-                        // Idle tick: the select! raced the tick against
-                        // accept() and the tick won — the accept queue
-                        // was quiet for at least the tick period. Fire
-                        // the collect without interrupting any user-
-                        // visible request.
-                        fire_gc(&worker);
-                        requests_since_last_gc = 0;
-                    }
+                    _ = gc_timer.tick() => idle_gc_tick(&mut idle_gc, &worker),
                 }
             }
         }
@@ -1284,4 +1310,70 @@ pub(crate) fn env_enabled() -> bool {
         std::env::var("PYRONOVA_TPC").ok().as_deref(),
         Some("1") | Some("true") | Some("yes") | Some("on")
     )
+}
+
+#[cfg(test)]
+mod gc_tests {
+    use super::*;
+
+    #[test]
+    fn gc_mode_parses_the_three_modes_and_nothing_else() {
+        assert_eq!("count".parse(), Ok(GcMode::Count));
+        assert_eq!("idle".parse(), Ok(GcMode::Idle));
+        assert_eq!("off".parse(), Ok(GcMode::Off));
+        for raw in ["idel", "", "IDLE", " idle"] {
+            assert_eq!(
+                raw.parse::<GcMode>(),
+                Err(GcModeError::Unknown(raw.to_string()))
+            );
+        }
+        let message = "idel".parse::<GcMode>().unwrap_err().to_string();
+        assert!(message.contains("PYRONOVA_GC_MODE") && message.contains("\"idel\""));
+    }
+
+    #[test]
+    fn pool_runs_count_mode_only() {
+        let pool = GcServer::SubInterpreterPool;
+        assert_eq!(GcMode::Count.supported_by(pool), Ok(GcMode::Count));
+        for mode in [GcMode::Idle, GcMode::Off] {
+            assert_eq!(
+                mode.supported_by(pool),
+                Err(GcModeError::Unsupported { mode, server: pool })
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_fanout_has_no_idle_mode() {
+        let fanout = GcServer::DarwinFanout;
+        assert_eq!(GcMode::Count.supported_by(fanout), Ok(GcMode::Count));
+        assert_eq!(GcMode::Off.supported_by(fanout), Ok(GcMode::Off));
+        let err = GcMode::Idle.supported_by(fanout).unwrap_err();
+        assert_eq!(
+            err,
+            GcModeError::Unsupported {
+                mode: GcMode::Idle,
+                server: fanout
+            }
+        );
+        assert!(err.to_string().contains("idle") && err.to_string().contains("fanout"));
+    }
+
+    #[test]
+    fn idle_gc_collects_after_a_quiet_tick() {
+        let mut idle = IdleGc::default();
+        // Nothing served yet: nothing to collect.
+        assert!(!idle.on_tick(0, 0));
+        // Requests ran during this tick (keep-alive or not): not quiet yet.
+        assert!(!idle.on_tick(3, 3));
+        // No request since the previous tick: collect.
+        assert!(idle.on_tick(3, 3));
+        // Collected (since_collect back to 0), still quiet: nothing to do.
+        assert!(!idle.on_tick(3, 0));
+        // Busy on every tick: the idle trigger never fires (the failsafe covers it).
+        assert!(!idle.on_tick(10, 7));
+        assert!(!idle.on_tick(20, 17));
+        assert!(idle.on_tick(20, 17));
+    }
 }
