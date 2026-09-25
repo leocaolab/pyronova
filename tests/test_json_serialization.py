@@ -18,6 +18,9 @@ Covers all PyJsonError variants, path tracking, duck typing, and edge cases:
 - Server resilience after errors
 """
 
+import json
+import time
+
 import pytest
 from collections import defaultdict, OrderedDict, deque
 from pyronova import Pyronova
@@ -375,6 +378,36 @@ def client():
     c.close()
 
 
+def _assert_generic_500(resp) -> str:
+    """A serialization failure is a 5xx: the body is generic plus the request id (D4);
+    returns the id."""
+    assert resp.status_code == 500, (resp.status_code, resp.text)
+    body = resp.json()
+    rid = body.get("request_id")
+    assert isinstance(rid, str) and rid, body
+    assert body == {"error": "Internal Server Error", "request_id": rid}, body
+    return rid
+
+
+def _logged_error(capfd, rid: str, timeout: float = 5.0) -> str:
+    """The `error` field of the process-log line carrying `rid`. The server runs in this
+    process and its log writer is non-blocking, so the line lands on stderr a moment
+    after the response."""
+    seen = ""
+    deadline = time.time() + timeout
+    while True:
+        seen += capfd.readouterr().err
+        for line in seen.splitlines():
+            try:
+                fields = json.loads(line).get("fields", {})
+            except ValueError:
+                continue
+            if fields.get("request_id") == rid:
+                return fields["error"]
+        assert time.time() < deadline, f"no log line with request_id={rid}:\n{seen[-3000:]}"
+        time.sleep(0.05)
+
+
 # ========================
 # Primitive tests
 # ========================
@@ -560,9 +593,11 @@ class TestDictKeyCoercion:
         resp = client.get("/dict/nan_key")
         assert resp.status_code == 500
 
-    def test_unsupported_key_error_message(self, client):
-        body = client.get("/dict/unsupported_key").text
-        assert "key" in body.lower() or "tuple" in body.lower()
+    def test_unsupported_key_error_message(self, client, capfd):
+        """The client gets the generic 500; the serializer's message is in the log."""
+        rid = _assert_generic_500(client.get("/dict/unsupported_key"))
+        error = _logged_error(capfd, rid)
+        assert "key" in error.lower() or "tuple" in error.lower(), error
 
 
 class TestCircularReference:
@@ -572,10 +607,12 @@ class TestCircularReference:
     def test_circular_dict_returns_500(self, client):
         assert client.get("/circular/dict").status_code == 500
 
-    def test_circular_error_message(self, client):
-        """orjson raises 'Recursion limit reached' for circular refs."""
-        body = client.get("/circular/list").text
-        assert "ecursion" in body or "ircular" in body
+    def test_circular_error_message(self, client, capfd):
+        """orjson raises 'Recursion limit reached' for circular refs. The client gets the
+        generic 500; that message is in the log."""
+        rid = _assert_generic_500(client.get("/circular/list"))
+        error = _logged_error(capfd, rid)
+        assert "ecursion" in error or "ircular" in error, error
 
 
 class TestRepeatedReference:
@@ -604,9 +641,11 @@ class TestUnsupportedTypes:
     def test_custom_obj_rejected(self, client):
         assert client.get("/unsupported/custom_obj").status_code == 500
 
-    def test_unsupported_error_message(self, client):
-        body = client.get("/unsupported/complex").text
-        assert "complex" in body.lower() or "serialize" in body.lower()
+    def test_unsupported_error_message(self, client, capfd):
+        """The client gets the generic 500; the serializer's message is in the log."""
+        rid = _assert_generic_500(client.get("/unsupported/complex"))
+        error = _logged_error(capfd, rid)
+        assert "complex" in error.lower() or "serialize" in error.lower(), error
 
 
 class TestDepthLimiting:
@@ -621,10 +660,12 @@ class TestDepthLimiting:
     def test_300_levels_rejected(self, client):
         assert client.get("/deep/exceed").status_code == 500
 
-    def test_depth_error_message(self, client):
-        """orjson raises 'Recursion limit reached' for deeply nested objects."""
-        body = client.get("/deep/exceed").text
-        assert "ecursion" in body or "depth" in body.lower() or "limit" in body.lower()
+    def test_depth_error_message(self, client, capfd):
+        """orjson raises 'Recursion limit reached' for deeply nested objects. The client
+        gets the generic 500; that message is in the log."""
+        rid = _assert_generic_500(client.get("/deep/exceed"))
+        error = _logged_error(capfd, rid)
+        assert "ecursion" in error or "depth" in error.lower() or "limit" in error.lower(), error
 
 
 class TestPathTracking:
@@ -639,10 +680,8 @@ class TestPathTracking:
         assert client.get("/path/nested_unsupported").status_code == 500
 
     def test_deep_circular_raises_error(self, client):
-        """Circular ref raises Recursion limit reached → 500."""
-        r = client.get("/path/deep_circular")
-        assert r.status_code == 500
-        assert "ecursion" in r.text or "ircular" in r.text
+        """Circular ref raises Recursion limit reached → generic 500 with a request id."""
+        _assert_generic_500(client.get("/path/deep_circular"))
 
 
 class TestResilience:

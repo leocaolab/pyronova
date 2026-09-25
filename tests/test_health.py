@@ -3,10 +3,25 @@
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
 from pyronova.testing import TestClient
+
+
+def _log_lines_with(capfd, needle: str, timeout: float = 5.0) -> list[str]:
+    """The process-log lines containing `needle`, once at least one has been written. The
+    server runs in this process and its log writer is non-blocking, so a line lands on
+    stderr a moment after the response."""
+    seen = ""
+    deadline = time.time() + timeout
+    while True:
+        seen += capfd.readouterr().err
+        lines = [line for line in seen.splitlines() if needle in line]
+        if lines or time.time() > deadline:
+            return lines
+        time.sleep(0.05)
 
 
 def test_livez_returns_200_always():
@@ -52,9 +67,9 @@ def test_readyz_503_on_exception():
         assert r.status_code == 503
         data = r.json()
         assert data["status"] == "not_ready"
-        assert data["checks"]["db"]["ok"] is False
-        assert "connection refused" in data["checks"]["db"]["error"]
-        assert "RuntimeError" in data["checks"]["db"]["error"]
+        # The exception goes to the log, not to the client (D4).
+        assert data["checks"]["db"] == {"ok": False}
+        assert isinstance(data["request_id"], str) and data["request_id"]
 
 
 def test_readyz_503_on_false_return():
@@ -90,8 +105,9 @@ def test_async_readiness_check_supported():
         assert r.status_code == 503
         data = r.json()
         assert data["checks"]["async_ok"]["ok"] is True
-        assert data["checks"]["async_fail"]["ok"] is False
-        assert "timeout" in data["checks"]["async_fail"]["error"]
+        # The exception goes to the log, not to the client (D4).
+        assert data["checks"]["async_fail"] == {"ok": False}
+        assert isinstance(data["request_id"], str) and data["request_id"]
 
 
 def test_enable_health_probes_idempotent():
@@ -113,14 +129,20 @@ def test_custom_paths():
         assert c.get("/livez").status_code == 404
 
 
-def test_check_registered_after_enable_still_runs():
+def test_check_registered_after_enable_still_runs(capfd):
     """You can enable probes early (e.g., in Pyronova() setup) and register
     checks later as modules load. The readyz handler closes over the
-    shared list, so late appends take effect immediately."""
+    shared list, so late appends take effect immediately. The late check's
+    failure is logged with the request id, which proves it ran."""
     # Its own module: a worker serves one app per module.
     from tests.apps.health_late_check import app
 
     with TestClient(app, port=None) as c:
         r = c.get("/readyz")
         assert r.status_code == 503
-        assert "late check ran" in r.json()["checks"]["late"]["error"]
+        data = r.json()
+        assert data["checks"]["late"] == {"ok": False}
+        rid = data["request_id"]
+        lines = _log_lines_with(capfd, "late check ran")
+        assert len(lines) == 1, lines
+        assert rid in lines[0], lines[0]
