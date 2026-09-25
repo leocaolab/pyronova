@@ -31,7 +31,7 @@ jobs:
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install maturin pytest pytest-asyncio websockets httpx pydantic numpy msgpack watchfiles
+          pip install maturin pytest pytest-asyncio websockets httpx h2 pydantic numpy msgpack watchfiles
 
       - name: cargo test (Rust compile check)
         env:
@@ -85,7 +85,7 @@ jobs:
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install maturin pytest pytest-asyncio websockets httpx pydantic numpy msgpack watchfiles
+          pip install maturin pytest pytest-asyncio websockets httpx h2 pydantic numpy msgpack watchfiles
 
       # orjson 3.12.0 is the byte reference for tests/test_isojson_numpy_workers.py
       # (isojson E2E-3); isojson>=0.2 comes with pyronova's own dependencies.
