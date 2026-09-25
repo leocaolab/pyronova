@@ -379,3 +379,70 @@ def test_testclient_reports_the_port_the_engine_bound():
         assert c.port != 0
         assert c.get("/").text == "ok"
     assert _bound._engine.bound_port() is None
+
+
+# ---------------------------------------------------------------------------
+# 4. Small items
+# ---------------------------------------------------------------------------
+
+
+def test_a_duplicate_websocket_path_is_an_error():
+    from pyronova.engine import PyronovaApp
+
+    def first(ws):
+        pass
+
+    def second(ws):
+        pass
+
+    app = PyronovaApp()
+    app.websocket("/ws", first)
+    with pytest.raises(ValueError, match="/ws"):
+        app.websocket("/ws", second)
+
+
+def test_a_failing_async_check_fails_the_registration():
+    from pyronova.engine import PyronovaApp
+
+    class Handler:
+        __name__ = "handler"
+
+        @property
+        def __call__(self):
+            raise RuntimeError("m5: __call__ lookup failed")
+
+    app = PyronovaApp()
+    with pytest.raises(RuntimeError, match="m5: __call__ lookup failed"):
+        app.get("/", Handler())
+
+
+def test_a_programmatic_stop_on_the_main_thread_restores_sigint():
+    r = _run(
+        """
+        import signal, threading, time, urllib.request
+        from pyronova import Pyronova
+
+        app = Pyronova()
+
+        @app.get("/")
+        def root(req):
+            return "ok"
+
+        def stop_when_up():
+            for _ in range(200):
+                try:
+                    urllib.request.urlopen("http://127.0.0.1:__PORT__/", timeout=1).read()
+                    break
+                except Exception:
+                    time.sleep(0.05)
+            app._stop()
+
+        if __name__ == "__main__":
+            before = signal.getsignal(signal.SIGINT)
+            threading.Thread(target=stop_when_up, daemon=True).start()
+            app.run(host="127.0.0.1", port=__PORT__, mode="gil")
+            print("RESTORED", signal.getsignal(signal.SIGINT) is before, flush=True)
+        """,
+        timeout=60,
+    )
+    assert "RESTORED True" in r.stdout, r.stdout + r.stderr

@@ -969,12 +969,17 @@ class Pyronova:
         # interrupting it) or after run() has returned (a KeyboardInterrupt in the
         # caller). Ignoring SIGINT here lets the hooks run to completion and
         # run() return cleanly. Retry through a KeyboardInterrupt that fires
-        # while we're installing the handler.
+        # while we're installing the handler (`signal.signal` delivers a pending
+        # signal first, so once it returns none is left). The previous handler is
+        # put back after the hooks: a program that goes on after run() returns
+        # (e.g. stopped with _stop()) still gets KeyboardInterrupt on ctrl-C.
+        import signal as _signal
+
+        previous_sigint = None
         if graceful:
             while True:
                 try:
-                    import signal as _signal
-                    _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
+                    previous_sigint = _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
                     break
                 except KeyboardInterrupt:
                     continue
@@ -991,6 +996,8 @@ class Pyronova:
                 _logging.getLogger("pyronova.app").exception(
                     "shutdown hook %s raised", getattr(hook, "__name__", repr(hook))
                 )
+        if previous_sigint is not None:
+            _signal.signal(_signal.SIGINT, previous_sigint)
 
         # A worker thread that outlived the shutdown grace period (a handler that ignores
         # shutdown) still has a live interpreter, and finalizing with one aborts. Say which,

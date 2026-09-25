@@ -56,6 +56,24 @@ impl AsyncWrite for MaybeTlsStream {
             MaybeTlsProj::Tls { inner } => inner.poll_write(cx, buf),
         }
     }
+    /// Forwarded so hyper's vectored writes (response head + body in one `writev`) reach
+    /// the socket as one syscall; the trait default would write only the first buffer.
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.project() {
+            MaybeTlsProj::Plain { inner } => inner.poll_write_vectored(cx, bufs),
+            MaybeTlsProj::Tls { inner } => inner.poll_write_vectored(cx, bufs),
+        }
+    }
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            MaybeTlsStream::Plain { inner } => inner.is_write_vectored(),
+            MaybeTlsStream::Tls { inner } => inner.is_write_vectored(),
+        }
+    }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.project() {
             MaybeTlsProj::Plain { inner } => inner.poll_flush(cx),
@@ -206,6 +224,31 @@ pub(crate) async fn wrap(stream: TcpStream, tls: Option<&TlsAcceptor>) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_plain_stream_keeps_the_sockets_vectored_writes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let mut client = client.unwrap();
+        let mut stream = wrap(accepted.unwrap().0, None)
+            .await
+            .expect("plain needs no handshake");
+        assert!(stream.is_write_vectored());
+
+        // Both buffers go out through the forwarded `poll_write_vectored`.
+        let bufs = [
+            std::io::IoSlice::new(b"head "),
+            std::io::IoSlice::new(b"body"),
+        ];
+        let written = stream.write_vectored(&bufs).await.unwrap();
+        assert_eq!(written, 9);
+        let mut got = [0u8; 9];
+        client.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"head body");
+    }
 
     #[test]
     fn a_missing_cert_is_a_typed_open_error_naming_the_file() {

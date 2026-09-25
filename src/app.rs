@@ -69,20 +69,6 @@ impl PyronovaApp {
         }
     }
 
-    /// Set per-instance CORS origin (legacy setter — disables advanced CORS
-    /// features. Prefer `set_cors_config` which propagates credentials and
-    /// expose-headers to every response per W3C CORS spec.)
-    fn set_cors_origin(&mut self, origin: String) -> PyResult<()> {
-        self.cors = Some(parse_cors(&CorsSpec {
-            origin: &origin,
-            methods: "GET, POST, PUT, DELETE, PATCH, OPTIONS",
-            headers: "*",
-            expose_headers: None,
-            allow_credentials: false,
-        })?);
-        Ok(())
-    }
-
     /// Set full per-instance CORS configuration. All fields are applied to
     /// every response (GET/POST/etc.), not just OPTIONS preflight.
     #[pyo3(signature = (origin, methods, headers, expose_headers=None, allow_credentials=false))]
@@ -413,10 +399,21 @@ impl PyronovaApp {
         Ok(())
     }
 
+    /// Register the WebSocket handler for `path`. A second handler for the same path
+    /// raises `ValueError`, as a duplicate route does, instead of replacing the first.
     fn websocket(&mut self, path: &str, handler: Py<PyAny>) -> PyResult<()> {
         let mut routes = self.routes.write();
-        routes.ws_handlers.insert(path.to_string(), handler);
-        Ok(())
+        match routes.ws_handlers.entry(path.to_string()) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "websocket handler already registered for {path}"
+                )))
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(handler);
+                Ok(())
+            }
+        }
     }
 
     fn static_dir(&mut self, prefix: &str, directory: &str) -> PyResult<()> {
@@ -988,21 +985,21 @@ impl PyronovaApp {
         stream: bool,
         py: Python<'_>,
     ) -> PyResult<()> {
-        // Auto-detect if handler is async def (also check __call__ for class-based views)
+        // Auto-detect if handler is async def (also check __call__ for class-based views).
+        // A failing check fails the registration: guessing "sync" would dispatch an async
+        // handler to the sync pool.
         let inspect = py.import("inspect")?;
-        let is_async = inspect
-            .call_method1("iscoroutinefunction", (&handler,))?
-            .extract::<bool>()
-            .unwrap_or(false)
-            || handler
-                .bind(py)
-                .getattr("__call__")
-                .and_then(|c| {
-                    inspect
-                        .call_method1("iscoroutinefunction", (c,))
-                        .and_then(|r| r.extract::<bool>())
-                })
-                .unwrap_or(false);
+        let is_coroutine_function = |f: &Bound<'_, PyAny>| -> PyResult<bool> {
+            inspect.call_method1("iscoroutinefunction", (f,))?.extract()
+        };
+        let handler_obj = handler.bind(py);
+        let is_async = is_coroutine_function(handler_obj)?
+            || match handler_obj.getattr(pyo3::intern!(py, "__call__")) {
+                Ok(call) => is_coroutine_function(&call)?,
+                // Not callable through `__call__`: nothing more to inspect.
+                Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => false,
+                Err(e) => return Err(e),
+            };
 
         // Streaming constraints (v1): GIL-only, sync handlers only.
         // Sub-interp streaming isn't supported (a worker handler returning a
