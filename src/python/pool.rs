@@ -333,6 +333,7 @@ impl InterpreterPool {
         split: WorkerSplit,
         _py: Python<'_>,
         script_path: &str,
+        import_path: &[String],
         expected: &crate::router::RouteSignature,
         shared_state: &crate::state::SharedMap,
         gc_threshold: u64,
@@ -370,6 +371,7 @@ impl InterpreterPool {
         let spec = WorkerSpec {
             script: &raw_script,
             script_path,
+            import_path,
             expected,
             pool_id,
             shared_state,

@@ -1057,6 +1057,7 @@ impl PyronovaApp {
             num_cpus,
         } = run;
         let script_path = self.worker_script_path(py)?;
+        let import_path = interp::main_import_path(py)?;
 
         // What every worker's script must register (Layer 2, C3), as plain values.
         let expected = crate::router::RouteSignature::of(&routes.routes);
@@ -1105,6 +1106,7 @@ impl PyronovaApp {
                 split,
                 py,
                 &script_path,
+                &import_path,
                 &expected,
                 &self.shared_state,
                 env.gc.threshold,
@@ -1228,10 +1230,13 @@ impl PyronovaApp {
         // Each worker gets it as `POOL_ID` (the async engine's zombie guard).
         let pool_id = interp::next_pool_id();
 
+        let import_path = interp::main_import_path(py)?;
+
         let expected = crate::router::RouteSignature::of(&site.routes);
         let spec = interp::WorkerSpec {
             script: &script,
             script_path: &script_path,
+            import_path: &import_path,
             expected: &expected,
             pool_id,
             shared_state: &self.shared_state,

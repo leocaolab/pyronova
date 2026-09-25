@@ -173,6 +173,11 @@ pub(crate) struct WorkerSpec<'a> {
     /// The app's script (`script_path`'s text), which each worker executes.
     pub(crate) script: &'a str,
     pub(crate) script_path: &'a str,
+    /// Main's `sys.path` when the workers are built ([`main_import_path`]). A new
+    /// interpreter's own `sys.path` is only what the process started with; whatever main
+    /// added since (the CLI's working directory, a test runner's root, the program's own
+    /// inserts) would be missing, and the script's imports would not resolve as on main.
+    pub(crate) import_path: &'a [String],
     /// The routes the script must register: main's table up to its seal.
     pub(crate) expected: &'a RouteSignature,
     /// See `SubInterpreterWorker::pool_id`.
@@ -298,6 +303,7 @@ impl SubInterpreterWorker {
         let WorkerSpec {
             script,
             script_path,
+            import_path,
             expected,
             pool_id,
             shared_state,
@@ -314,6 +320,12 @@ impl SubInterpreterWorker {
         // Before the script runs: a `PyronovaApp` or `SharedState` it creates in this
         // interpreter must see the running app's map (Layer 2, C2 / FR-5).
         crate::state::hand_to_worker(py, shared_state)?;
+
+        // Before anything is imported: the bootstrap and the script resolve their imports
+        // as they do on main.
+        pyo3::types::PyList::new(py, import_path)
+            .and_then(|path| py.import("sys")?.setattr("path", path))
+            .map_err(setup("setting sys.path to main's"))?;
 
         // 1. The bootstrap (logging bridge, GC policy, C-extension isolation) in its own
         //    namespace, with this worker's id (FR-20).
@@ -756,6 +768,12 @@ fn new_event_loop(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
 // ---------------------------------------------------------------------------
 // Worker init helpers
 // ---------------------------------------------------------------------------
+
+/// Main's `sys.path` now, for [`WorkerSpec::import_path`]. An entry that is not a `str`
+/// is an error: a worker's copy is rebuilt from the text.
+pub(crate) fn main_import_path(py: Python<'_>) -> PyResult<Vec<String>> {
+    py.import("sys")?.getattr("path")?.extract()
+}
 
 /// A new module named `name`, registered in `sys.modules`, with builtins, `__file__` and,
 /// for the bootstrap and async engine, `WORKER_ID` / `POOL_ID`.
