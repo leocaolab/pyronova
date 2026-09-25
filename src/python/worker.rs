@@ -53,19 +53,20 @@ pub(crate) struct SubInterpreterWorker {
     /// Cached `gc.collect` function pointer. `_bootstrap.py` runs
     /// `gc.disable()` at sub-interp init so CPython's threshold-based
     /// automatic triggers never fire. Instead we call this manually at
-    /// a request-count cadence (see `gc_threshold` + `gc_counter`),
-    /// pushing all cycle-collection work off the hot path and into
-    /// deterministic slots between requests.
-    pub(crate) gc_collect_func: *mut ffi::PyObject,
-    /// Trigger interval in requests. 0 disables scheduled collection
-    /// entirely (use when you've verified your handler graph creates no
-    /// cycles — ref-counting handles everything else instantly).
-    /// Default 5000, overridable via `PYRONOVA_GC_THRESHOLD=N`.
+    /// a request-count cadence (see `gc_threshold`) and, in TPC idle mode,
+    /// when the worker's thread goes quiet, pushing all cycle-collection
+    /// work off the hot path and into slots between requests.
+    gc_collect_func: *mut ffi::PyObject,
+    /// Collect once this many requests ran since the last collect; 0 disables the
+    /// count trigger (use when you've verified your handler graph creates no cycles —
+    /// ref-counting handles everything else instantly). `PYRONOVA_GC_THRESHOLD=N`;
+    /// TPC idle mode sets it to the OOM failsafe.
     pub(crate) gc_threshold: u64,
-    /// Request counter for the GC scheduler. Incremented at the end of
-    /// each `call_handler`; every `gc_threshold` ticks we invoke
-    /// `gc.collect()`. Per-worker = per-thread, so no atomics needed.
-    gc_counter: u64,
+    /// Requests this worker has run, counted as each is dispatched (`call_handler`).
+    /// Per-worker = per-thread, so no atomics needed.
+    requests_served: u64,
+    /// `requests_served` at the last `gc.collect()`.
+    collected_at: u64,
     /// Set once the interpreter is ended (or deliberately abandoned). `Drop` checks it.
     ended: bool,
 }
@@ -312,7 +313,8 @@ impl SubInterpreterWorker {
             pool_id,
             gc_collect_func,
             gc_threshold,
-            gc_counter: 0,
+            requests_served: 0,
+            collected_at: 0,
             ended: false,
         })
     }
@@ -532,11 +534,9 @@ impl SubInterpreterWorker {
         headers: &HashMap<String, String>,
         client_ip: std::net::IpAddr,
     ) -> Result<SubInterpResponse, String> {
-        // Re-entrant: this worker's thread state is current (SubInterpGilGuard), and it is
-        // the thread's gilstate one (`rebind_tstate_to_current_thread`), so this registers
-        // the attach with PyO3 without switching thread states.
-        Python::attach(|py| {
-            self.call_handler_attached(
+        self.attached(|worker, py| {
+            worker.requests_served += 1;
+            let response = worker.call_handler_attached(
                 py,
                 handler_idx,
                 method,
@@ -546,8 +546,77 @@ impl SubInterpreterWorker {
                 body,
                 headers,
                 client_ip,
-            )
+            );
+            if worker.gc_threshold > 0 && worker.requests_since_collect() >= worker.gc_threshold {
+                worker.collect_garbage(py);
+            }
+            response
         })
+    }
+
+    /// Runs `gc.collect()` between requests, from the thread this worker is bound to (TPC
+    /// idle mode).
+    ///
+    /// # Safety
+    /// On the thread `rebind_tstate_to_current_thread` bound this worker to, with no thread
+    /// state current.
+    pub(crate) unsafe fn collect_garbage_between_requests(&mut self) {
+        let tstate = std::cell::Cell::new(self.tstate);
+        {
+            let _gil = SubInterpGilGuard::acquire(tstate.get(), &tstate);
+            self.attached(|worker, py| worker.collect_garbage(py));
+        }
+        self.tstate = tstate.get();
+    }
+
+    /// Requests this worker has run.
+    pub(crate) fn requests_served(&self) -> u64 {
+        self.requests_served
+    }
+
+    /// Requests this worker has run since its last `gc.collect()`.
+    pub(crate) fn requests_since_collect(&self) -> u64 {
+        self.requests_served - self.collected_at
+    }
+
+    /// Runs `f` attached to this worker's interpreter.
+    ///
+    /// # Safety
+    /// This worker's thread state is current on the calling thread (`SubInterpGilGuard`).
+    unsafe fn attached<R>(&mut self, f: impl FnOnce(&mut Self, Python<'_>) -> R) -> R {
+        // Re-entrant: this worker's thread state is current (SubInterpGilGuard), and it is
+        // the thread's gilstate one (`rebind_tstate_to_current_thread`), so this registers
+        // the attach with PyO3 without switching thread states.
+        Python::attach(|py| f(self, py))
+    }
+
+    /// One full `gc.collect()`. `_bootstrap.py` ran `gc.disable()`, so this is the only
+    /// cycle collection the worker gets. A failure is logged with its real error and
+    /// taken off the interpreter, so the next request starts with no exception set.
+    fn collect_garbage(&mut self, py: Python<'_>) {
+        self.collected_at = self.requests_served;
+        if self.gc_collect_func.is_null() {
+            return;
+        }
+        // SAFETY: attached (`py`); `gc_collect_func` is an owned reference to this
+        // interpreter's `gc.collect`. `PyObject_CallNoArgs` skips the empty-tuple alloc.
+        let collected = unsafe {
+            Bound::from_owned_ptr_or_err(py, ffi::PyObject_CallNoArgs(self.gc_collect_func))
+        };
+        if let Err(err) = collected {
+            let traceback = err
+                .traceback(py)
+                .and_then(|tb| tb.format().ok())
+                .unwrap_or_default();
+            tracing::error!(
+                target: "pyronova::app",
+                worker_id = self.worker_id,
+                error = %err,
+                traceback,
+                "gc.collect() raised; the worker keeps serving, but this signals OOM, heap \
+                 corruption or interpreter damage"
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -718,34 +787,6 @@ impl SubInterpreterWorker {
                 }
                 None => {
                     log_and_clear_py_exception("after_request hook");
-                }
-            }
-        }
-
-        // Smart GC: count requests and trigger `gc.collect()` at the
-        // configured interval. gc.disable() was called at sub-interp
-        // init (see _bootstrap.py) so this is the only cycle collector
-        // running — Python's threshold-based auto-trigger never fires.
-        // Cost per request is a single u64 increment + compare; the
-        // collect itself fires at most once per `gc_threshold` calls
-        // and runs under the GIL we already hold.
-        if self.gc_threshold > 0 && !self.gc_collect_func.is_null() {
-            self.gc_counter = self.gc_counter.wrapping_add(1);
-            if self.gc_counter.is_multiple_of(self.gc_threshold) {
-                // `PyObject_CallNoArgs` skips the empty-tuple alloc that
-                // `PyObject_Call` would require; saves a small per-tick
-                // cost and is the idiomatic 3.9+ invocation. `gc.collect()`
-                // with no args = full 3-generation collection — cheap
-                // when there are few cycles, which is the common case
-                // under our ref-count-first request lifecycle.
-                let res = ffi::PyObject_CallNoArgs(self.gc_collect_func);
-                if !res.is_null() {
-                    ffi::Py_DECREF(res);
-                } else {
-                    // Clear any exception raised during the collect so
-                    // we don't leak it into the handler's return path
-                    // (handler already succeeded).
-                    ffi::PyErr_Clear();
                 }
             }
         }

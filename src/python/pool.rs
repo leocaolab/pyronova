@@ -95,6 +95,91 @@ impl WorkRequest {
 }
 
 // ---------------------------------------------------------------------------
+// Worker split
+// ---------------------------------------------------------------------------
+
+/// How the pool divides its workers: `def` handlers run on sync workers, `async def`
+/// handlers on async workers (the async engine's event loop), never the other way round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WorkerSplit {
+    pub(crate) sync_workers: usize,
+    pub(crate) async_workers: usize,
+}
+
+impl WorkerSplit {
+    pub(crate) fn total(&self) -> usize {
+        self.sync_workers + self.async_workers
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SplitError {
+    /// A pool is needed and there are no workers at all.
+    NoWorkers,
+    /// Sync and async handlers each need a worker of their own, and there is one.
+    OneWorkerForBothKinds,
+}
+
+impl std::fmt::Display for SplitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SplitError::NoWorkers => {
+                f.write_str("workers=0: the sub-interpreter pool needs at least one worker")
+            }
+            SplitError::OneWorkerForBothKinds => f.write_str(
+                "workers=1 cannot serve both sync (`def`) and async (`async def`) routes: the \
+                 sub-interpreter pool runs each kind on workers of its own, so it needs at least \
+                 2 workers (or handlers of one kind only)",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SplitError {}
+
+/// The split of `n` workers for the handler kinds the pool must serve: half (rounded
+/// down) async when both are needed, all of them for the only kind needed.
+pub(crate) fn split_workers(
+    n: usize,
+    has_sync: bool,
+    has_async: bool,
+) -> Result<WorkerSplit, SplitError> {
+    let split = |sync_workers, async_workers| WorkerSplit {
+        sync_workers,
+        async_workers,
+    };
+    match (has_sync, has_async) {
+        (false, false) => Ok(split(n, 0)),
+        _ if n == 0 => Err(SplitError::NoWorkers),
+        (true, true) if n == 1 => Err(SplitError::OneWorkerForBothKinds),
+        (true, true) => Ok(split(n - n / 2, n / 2)),
+        (true, false) => Ok(split(n, 0)),
+        (false, true) => Ok(split(0, n)),
+    }
+}
+
+/// [`split_workers`] for a route table: a `gil=True` route runs on the main interpreter,
+/// every other route on a pool worker of its handler's kind.
+pub(crate) fn split_workers_for_routes(
+    n: usize,
+    requires_gil: &[bool],
+    is_async: &[bool],
+) -> Result<WorkerSplit, SplitError> {
+    let pooled_kinds = || {
+        requires_gil
+            .iter()
+            .zip(is_async)
+            .filter(|(&gil, _)| !gil)
+            .map(|(_, &is_async)| is_async)
+    };
+    split_workers(
+        n,
+        pooled_kinds().any(|is_async| !is_async),
+        pooled_kinds().any(|is_async| is_async),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Channel-based Interpreter Pool
 // ---------------------------------------------------------------------------
 
@@ -219,12 +304,13 @@ unsafe impl Send for InterpreterPool {}
 unsafe impl Sync for InterpreterPool {}
 
 impl InterpreterPool {
-    /// Create N sub-interpreters, each in its own OS thread, connected via channels.
+    /// Create `split.total()` sub-interpreters, each in its own OS thread, connected via
+    /// channels: the first `split.sync_workers` serve `def` handlers, the rest `async def`.
     ///
     /// Must be called with the main interpreter's GIL held (before `py.detach()`).
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn new(
-        n: usize,
+        split: WorkerSplit,
         _py: Python<'_>,
         script_path: &str,
         expected: &crate::router::RouteSignature,
@@ -236,7 +322,8 @@ impl InterpreterPool {
         request_logging: bool,
         shared_state: &crate::state::SharedMap,
     ) -> Result<Self, String> {
-        let has_any_async = is_async_handler.iter().any(|&a| a);
+        let n = split.total();
+        let has_any_async = split.async_workers > 0;
 
         let raw_script = std::fs::read_to_string(script_path)
             .map_err(|e| format!("Failed to read script: {e}"))?;
@@ -250,14 +337,6 @@ impl InterpreterPool {
             (Some(tx), Some(rx))
         } else {
             (None, None)
-        };
-
-        // Determine worker split: if async handlers exist, split workers
-        let (sync_count, _async_count) = if has_any_async {
-            let async_n = (n / 2).max(1).min(n); // At least 1, never exceed total
-            (n.saturating_sub(async_n), async_n)
-        } else {
-            (n, 0)
         };
 
         // Allocate a fresh pool_id for this InterpreterPool instance.
@@ -312,13 +391,13 @@ impl InterpreterPool {
         let current_route: Vec<Arc<AtomicUsize>> =
             (0..n).map(|_| Arc::new(AtomicUsize::new(IDLE))).collect();
 
-        // Spawn workers: first sync_count as sync, rest as async
+        // Spawn workers: the first `split.sync_workers` as sync, the rest as async.
         let mut pending = workers.into_iter().enumerate();
         while let Some((i, worker)) = pending.next() {
             let logging = Arc::clone(&logging_flag);
             let current = Arc::clone(&current_route[i]);
 
-            let spawned = if i >= sync_count && has_any_async {
+            let spawned = if i >= split.sync_workers {
                 // Async worker
                 std::thread::Builder::new()
                     .name(format!("pyronova-async-worker-{i}"))
@@ -578,5 +657,73 @@ fn worker_thread_loop_async(mut worker: SubInterpreterWorker) {
         unsafe { worker.end() };
     } else {
         worker.abandon();
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    fn split(sync_workers: usize, async_workers: usize) -> Result<WorkerSplit, SplitError> {
+        Ok(WorkerSplit {
+            sync_workers,
+            async_workers,
+        })
+    }
+
+    #[test]
+    fn both_kinds_share_the_workers_async_half_rounded_down() {
+        assert_eq!(split_workers(0, true, true), Err(SplitError::NoWorkers));
+        assert_eq!(
+            split_workers(1, true, true),
+            Err(SplitError::OneWorkerForBothKinds)
+        );
+        assert_eq!(split_workers(2, true, true), split(1, 1));
+        assert_eq!(split_workers(3, true, true), split(2, 1));
+        assert_eq!(split_workers(4, true, true), split(2, 2));
+        assert_eq!(split_workers(5, true, true), split(3, 2));
+    }
+
+    #[test]
+    fn one_kind_gets_every_worker() {
+        for n in 1..=4 {
+            assert_eq!(split_workers(n, true, false), split(n, 0));
+            assert_eq!(split_workers(n, false, true), split(0, n));
+            assert_eq!(split_workers(n, false, false), split(n, 0));
+        }
+        assert_eq!(split_workers(0, true, false), Err(SplitError::NoWorkers));
+        assert_eq!(split_workers(0, false, true), Err(SplitError::NoWorkers));
+    }
+
+    #[test]
+    fn a_needed_kind_never_gets_zero_workers() {
+        for n in 0..=8 {
+            for (has_sync, has_async) in [(true, true), (true, false), (false, true)] {
+                if let Ok(s) = split_workers(n, has_sync, has_async) {
+                    assert_eq!(s.total(), n);
+                    assert!(!has_sync || s.sync_workers > 0, "n={n}: {s:?}");
+                    assert!(!has_async || s.async_workers > 0, "n={n}: {s:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gil_routes_need_no_pool_worker() {
+        // sync, async gil=True, sync gil=True
+        assert_eq!(
+            split_workers_for_routes(1, &[false, true, true], &[false, true, false]),
+            split(1, 0)
+        );
+        // sync, async
+        assert_eq!(
+            split_workers_for_routes(1, &[false, false], &[false, true]),
+            Err(SplitError::OneWorkerForBothKinds)
+        );
+        // async, async
+        assert_eq!(
+            split_workers_for_routes(3, &[false, false], &[true, true]),
+            split(0, 3)
+        );
     }
 }
