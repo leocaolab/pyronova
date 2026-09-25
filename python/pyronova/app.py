@@ -860,8 +860,9 @@ class Pyronova:
         :param sample: log 1 in every ``sample`` requests. ``1`` (default)
             logs every request. ``100`` keeps roughly 1% — production knob
             to recover the 25-30% throughput tax of full access logging
-            while retaining a usable observability sample. Per-route
-            atomic counter; sampling decision is global.
+            while retaining a usable observability sample. Each serving
+            thread keeps 1 in ``sample`` of its own responses (no shared
+            counter), so the log keeps about 1 in ``sample`` overall.
         :param always_log_status: bypass sampling for responses whose
             status is >= this value. ``400`` keeps full visibility of
             4xx/5xx errors while sampling 2xx success traffic. ``None``
