@@ -49,8 +49,14 @@ FFI/workers: `worker_thread_loop_async` lacks `SubInterpGilGuard`/`catch_panic` 
 DB/WS/gRPC: `db.rs:6` doc contradicts the connect decision; NUMERIC digit ≥ 10000 and dscale > 0x3FFF not rejected; big ints can't reach NUMERIC; float4 narrowing to `inf`; gRPC body read has no budget and skips `count_request`; `unframe` accepts trailing bytes; any request with `Upgrade: websocket` on a normal route is 404; duplicate Pong; limit setters are read-modify-write across two locks.
 Python: `os._exit(1)` reachable from a TestClient thread; `_prepare` unlocked and once-per-app (BLAS/`/mcp` fixed by the first server's settings); MCP list results sent as Python repr; crud maps any TypeError/ValueError to 422; `model=` guesses whether the handler takes `req`; `testing.py:361` / `observability.py:138` swallow into sentinels; sync readiness checks unbounded; uploads `filename*=` ignored, `filename` unsanitized and undocumented; `_defined_in` misses package-relative imports.
 
-## 5. Plan
+## 5. Decisions (human, 2026-09-25)
 
-- **Q1, Q2** go to the human (below).
+- **Q1 → A.** On TPC, `async def` routes go to the async worker pool (the dual-engine async pool), off the TPC thread: async handlers get concurrency and the on-time 504. Sync `def` stays inline. Correct `tpc-rearch.md` Line 3 and the 504 log hint accordingly.
+- **Q2 → A.** `:name` in a route template is a registration error pointing to `{name}`; only `{name}` / `{*name}` are parsed. Approved edit: `tests/test_path_param_injection.py::test_colon_path_template_supported` asserts the registration error.
+
+## 6. Plan
+
+- **R-a** (now, files M5 does not touch): R1, R3 (Q2), R4; §2 rows: M4 panic-payload fault injection on pool, isojson-in-worker test, async-engine death variant + test, streamed-body typed errors (`ChunkMsg`), MCP value validation + schema, `enable_logging` level + stale comment, vacuous `test_review_m1a.py:429` test, bench Python tests in CI; §4 Python rows except `testing.py`/`_prepare`; §4 DB and gRPC rows.
+- **R-b** (after M5 merges): Q1, R2, R5; §2 rows: TPC zero-alloc + one `PyronovaRequest` constructor, inline-timeout double log, CORS parse test, WS cap on the pool path, bridge panic on TPC-bridge fault injection, pool worker spawn failure; §4 core + pipeline rows; `os._exit` from TestClient, `_prepare` lock.
 - **R-milestone** (after M5 merges, before M7): R1–R5, every §2 row, and the §4 rows outside M7/M9 scope. Same rules: repro test first, no existing-test edits without approval.
 - §4 FFI rows join M7; hygiene rows join M9.
