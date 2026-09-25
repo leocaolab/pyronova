@@ -466,7 +466,9 @@ class PgPool:
     ) -> "PgPool":
         """Open the pool, or return the open one. Raises ``ValueError`` if it is open
         with another DSN or with settings that differ from the ones asked for; settings
-        left out match the open pool. Defaults on the first call: 10 connections, 30 s."""
+        left out match the open pool. Defaults on the first call: 10 connections, 30 s.
+        A failed connect raises ``ConnectionError`` with ``.sqlstate``: the server's code
+        when it answered (``28P01`` bad password, ``3D000`` no such database), else ``None``."""
         ...
     def fetch_one(self, sql: str, *params: Any) -> Optional[Dict[str, Any]]: ...
     def fetch_all(self, sql: str, *params: Any) -> List[Dict[str, Any]]: ...

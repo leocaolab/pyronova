@@ -6,7 +6,9 @@
 //! `IntegrityError`, and duplicate keys (23505) its subclass `UniqueViolation`, so a
 //! handler can answer 409 without parsing message text. A value its parameter can't take
 //! raises `ParamError`, a subclass of both `TypeError` and `ValueError`, before the query
-//! is sent: a handler can answer it 422 without catching every `TypeError`.
+//! is sent: a handler can answer it 422 without catching every `TypeError`. A failed
+//! `PgPool.connect()` raises `ConnectionError`, with `.sqlstate` too: the server's code when
+//! it answered (a bad password is 28P01), `None` when it was never reached.
 
 use std::time::Duration;
 
@@ -77,7 +79,12 @@ impl DbError {
         match self {
             Self::NotConnected | Self::Task(_) => PyRuntimeError::new_err(message),
             Self::Reconfigured(_) => PyValueError::new_err(message),
-            Self::Connect(_) => PyConnectionError::new_err(message),
+            // A `ConnectionError` still, with the server's SQLSTATE when it answered
+            // (28P01 bad password, 3D000 no such database); `None` when it was never
+            // reached (refused, DNS, TLS).
+            Self::Connect(_) => {
+                with_sqlstate(py, PyConnectionError::new_err(message), self.sqlstate())
+            }
             // The statement's arity is the caller's code, not a value.
             Self::Param(ParamError::Count { .. }) => PyTypeError::new_err(message),
             Self::Param(_) => match param_error_type(py) {
@@ -96,6 +103,11 @@ fn database_error(py: Python<'_>, message: String, sqlstate: Option<String>) -> 
         Some(code) if code.starts_with(INTEGRITY_CLASS) => IntegrityError::new_err(message),
         _ => DatabaseError::new_err(message),
     };
+    with_sqlstate(py, err, sqlstate)
+}
+
+/// `err` with `.sqlstate` set on its instance.
+fn with_sqlstate(py: Python<'_>, err: PyErr, sqlstate: Option<String>) -> PyErr {
     match err.value(py).setattr("sqlstate", sqlstate) {
         Ok(()) => err,
         Err(set_failed) => {
