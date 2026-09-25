@@ -267,6 +267,37 @@ class PyronovaApp:
         workers: Optional[int] = None,
         mode: Optional[str] = None,
     ) -> None: ...
+    # Feature-gated: present only in an engine built with
+    # `maturin develop --release --features bench` (absent from the default build and
+    # from published wheels).
+    def bench_inmem(
+        self,
+        duration_s: int = 10,
+        workers: Optional[int] = None,
+        conns_per_worker: int = 8,
+    ) -> Tuple[int, float]:
+        """``--features bench`` only. In-memory bench (no TCP): pipelines ``GET /``.
+        Returns ``(requests, elapsed_s)``.
+
+        :raises ValueError: ``workers`` is 0.
+        :raises RuntimeError: a route is ``gil=True``, ``async def`` or ``stream=True``;
+            a worker failed to start; or a worker or client failed during the run (a
+            non-200 response included).
+        """
+        ...
+    def bench_loopback(
+        self,
+        duration_s: int = 10,
+        workers: Optional[int] = None,
+        client_conns: int = 32,
+    ) -> Tuple[int, float, int]:
+        """``--features bench`` only. Real TCP on an ephemeral 127.0.0.1 port, client in
+        this process: pipelines ``GET /``. Returns ``(requests, elapsed_s, port)``.
+
+        :raises ValueError: ``workers`` is 0.
+        :raises RuntimeError: as for :meth:`bench_inmem`.
+        """
+        ...
 
 # --- Postgres (see pyronova.db) ---------------------------------------------
 

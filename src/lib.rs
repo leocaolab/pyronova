@@ -2,6 +2,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod app;
+#[cfg(feature = "bench")]
 mod bench;
 mod bridge;
 mod compression;

@@ -22,6 +22,15 @@ crate-type = ["cdylib"]
 # this to pin down the sub-interpreter finalizer bug.
 leak_detect = ["dep:metrics", "dep:metrics-util"]
 
+# In-process throughput harnesses: `PyronovaApp.bench_inmem` (virtual
+# connections, no TCP) and `PyronovaApp.bench_loopback` (real TCP, client in
+# the same process). Not compiled into the default build.
+#
+# Build with:
+#   maturin develop --release --features bench
+# then run the scripts in benchmarks/ (bench_inmem*.py, bench_loopback*.py).
+bench = ["dep:httparse"]
+
 [dependencies]
 pyo3 = { version = "0.29", features = ["extension-module"] }
 tokio = { version = "1", features = ["full"] }
@@ -71,6 +80,9 @@ sqlx = { version = "0.8", default-features = false, features = [
 # Optional — pulled in only by the `leak_detect` feature.
 metrics = { version = "0.24", optional = true }
 metrics-util = { version = "0.19", features = ["debugging"], optional = true }
+
+# Optional — pulled in only by the `bench` feature (the bench client parses response heads).
+httparse = { version = "1", optional = true }
 
 [profile.release]
 lto = "fat"            # Cross-crate inlining: LLVM optimizes across hyper/tokio/pyo3 boundaries
