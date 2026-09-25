@@ -54,23 +54,15 @@ use bytes::Bytes;
 use crossbeam_channel as cbc;
 use tokio::sync::oneshot;
 
-use crate::handlers::{call_handler_with_hooks, HandlerResult, StreamInfo};
-use crate::router::FrozenRoutes;
-use crate::types::{LazyHeaders, PyronovaRequest, ResponseData};
-
-/// Bridge reply can be either a buffered response or a streaming one.
-/// Stream handlers (SSE, chunked upload replies, long-poll) need to
-/// hand an mpsc::Receiver back to the TPC thread so the hyper body
-/// writer can drive it. The oneshot channel is Send + one-shot, and
-/// tokio's mpsc::Receiver is Send, so transferring StreamInfo
-/// across the main-interp → TPC thread boundary is safe.
-pub(crate) enum BridgeResponse {
-    Resp(ResponseData),
-    Stream(StreamInfo),
-}
+use crate::handlers::{call_handler_with_hooks, HandlerResult};
+use crate::router::Target;
+use crate::site::SharedSite;
+use crate::types::{LazyHeaders, PyronovaRequest};
 
 /// Work request for the main-interp bridge. Carries everything a GIL
-/// handler needs plus the oneshot reply channel.
+/// handler needs plus the oneshot reply channel. The reply is a buffered response or a
+/// stream (SSE): tokio's mpsc receiver inside a stream is `Send`, so it crosses back to
+/// the TPC thread, whose hyper body writer drives it.
 pub(crate) struct GilWorkItem {
     pub method: Arc<str>,
     pub path: Arc<str>,
@@ -79,14 +71,14 @@ pub(crate) struct GilWorkItem {
     pub body: Bytes,
     pub headers: HashMap<String, String>,
     pub client_ip: IpAddr,
-    pub handler_idx: usize,
+    pub target: Target,
     /// Body-stream receiver for `stream=True` routes. The feeder task
     /// running on the TPC thread's LocalSet pushes body frames into
     /// this receiver; the bridge thread's handler pulls them. Buffered
     /// routes share the [`crate::python::body_stream::empty_body_stream_rx`]
     /// singleton — `body` carries the collected bytes there.
     pub body_stream_rx: crate::python::body_stream::BodyStreamRx,
-    pub response_tx: oneshot::Sender<Result<BridgeResponse, String>>,
+    pub response_tx: oneshot::Sender<HandlerResult>,
 }
 
 /// Handle returned to callers. Cheap to Arc-share across all TPC
@@ -109,7 +101,7 @@ impl MainInterpBridge {
     /// Defaults applied at the call site in src/app.rs:
     ///   PYRONOVA_GIL_BRIDGE_WORKERS=4
     ///   PYRONOVA_GIL_BRIDGE_CAPACITY=16 × workers
-    pub(crate) fn spawn(routes: FrozenRoutes, capacity: usize, workers: usize) -> Arc<Self> {
+    pub(crate) fn spawn(site: SharedSite, capacity: usize, workers: usize) -> Arc<Self> {
         let workers = workers.max(1);
         let (tx, rx) = cbc::bounded::<GilWorkItem>(capacity);
 
@@ -133,7 +125,7 @@ impl MainInterpBridge {
         let mut handles = Vec::with_capacity(workers);
         for i in 0..workers {
             let rx = rx.clone();
-            let routes = Arc::clone(&routes);
+            let site = Arc::clone(&site);
             let res = std::thread::Builder::new()
                 .name(format!("pyronova-main-bridge-{i}"))
                 .stack_size(crate::python::PYTHON_THREAD_STACK)
@@ -149,13 +141,13 @@ impl MainInterpBridge {
                             Ok(i) => i,
                             Err(_) => break,
                         };
-                        dispatch_one(&routes, item);
+                        dispatch_one(&site, item);
                     }
                     // Everything this thread owns that holds Python objects goes while
                     // attached, before the thread state does.
                     crate::run_context::main_attach(move |py| {
                         crate::handlers::close_thread_event_loop(py);
-                        drop(routes);
+                        drop(site);
                     });
                     tracing::info!(
                         target: "pyronova::server",
@@ -260,7 +252,7 @@ pub(crate) enum TryDispatchError {
     Closed,
 }
 
-fn dispatch_one(routes: &FrozenRoutes, item: GilWorkItem) {
+fn dispatch_one(site: &SharedSite, item: GilWorkItem) {
     let GilWorkItem {
         method,
         path,
@@ -269,7 +261,7 @@ fn dispatch_one(routes: &FrozenRoutes, item: GilWorkItem) {
         body,
         headers,
         client_ip,
-        handler_idx,
+        target,
         body_stream_rx,
         response_tx,
     } = item;
@@ -281,10 +273,6 @@ fn dispatch_one(routes: &FrozenRoutes, item: GilWorkItem) {
         return;
     }
 
-    // Reconstruct the pyo3 PyronovaRequest from raw parts. Same shape
-    // as what `handle_request` builds in non-TPC GIL mode, so the
-    // downstream call_handler_with_hooks path is byte-for-byte the
-    // same behavior.
     let sky_req = PyronovaRequest {
         method,
         path,
@@ -299,11 +287,7 @@ fn dispatch_one(routes: &FrozenRoutes, item: GilWorkItem) {
         body_stream_rx,
     };
 
-    let result = call_handler_with_hooks(routes.clone(), handler_idx, sky_req);
-    let resp = match result {
-        HandlerResult::PyronovaResponse(Ok(rd)) => Ok(BridgeResponse::Resp(rd)),
-        HandlerResult::PyronovaResponse(Err(e)) => Err(e),
-        HandlerResult::PyronovaStream(info) => Ok(BridgeResponse::Stream(info)),
-    };
-    let _ = response_tx.send(resp);
+    let result = call_handler_with_hooks(site, target, sky_req);
+    // The caller gave up (504) while the handler ran: nobody reads this reply.
+    let _ = response_tx.send(result);
 }

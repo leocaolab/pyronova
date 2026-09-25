@@ -1,366 +1,245 @@
-//! TPC inline request handler.
+//! TPC request handler.
 //!
-//! Hot path for the default (sync handler, non-GIL, non-streaming)
-//! dispatch. Runs on the TPC worker's own OS thread, directly calls
-//! the sub-interpreter's Python handler, writes the response back
-//! through hyper. No cross-thread wakes, no mpsc channels.
-//!
-//! Extracted out of the monolithic `src/handlers.rs` so the hot path
-//! has its own file; the GIL-mode and sub-interp-pool handlers stay
-//! next door in the parent module. Shared helpers (`apply_cors`,
-//! `full_body`, `build_fast_response`, `collect_body_bounded`,
-//! `build_stream_response`) live in the parent and are imported via
-//! `super::`.
+//! A worker route runs inline: on the TPC thread's own OS thread, in its own
+//! sub-interpreter, with no cross-thread wake. A `gil=True` route or the fallback goes to
+//! the main-interpreter bridge.
 
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use hyper::body::Incoming;
+use hyper::http::request::Parts;
 use hyper::{Request, Response};
 
-use crate::python::interp;
-use crate::response::{
-    build_response, error_response, gateway_timeout_response, not_found_response,
-    overloaded_response,
-};
-use crate::static_fs::try_static_file;
+use crate::bridge::main_bridge::{GilWorkItem, MainInterpBridge, TryDispatchError};
+use crate::python::interp::{self, SubInterpreterWorker};
+use crate::router::{Call, Params, RequestBody, RouteId, Target};
+use crate::site::Site;
 use crate::types::extract_headers;
 
+use super::pipeline::{
+    accept_encoding, await_reply, collect_body, finish, preprocess, refuse, Prepared, Preprocessed,
+    Refusal, RequestLine, Served, REQUEST_BUDGET,
+};
 use super::{
-    apply_cors, build_fast_response, build_stream_response, collect_body_bounded, full_body,
-    max_body_size, stream_body_feeder, BoxBody,
+    build_main_http_response, build_subinterp_http_response, full_body, max_body_size,
+    stream_body_feeder, BoxBody,
 };
 
 pub(crate) async fn handle_request_tpc_inline(
     req: Request<Incoming>,
-    routes: &'static crate::router::RouteTable,
-    worker: std::rc::Rc<std::cell::RefCell<interp::SubInterpreterWorker>>,
+    site: &'static Site,
+    worker: Rc<RefCell<SubInterpreterWorker>>,
     client_ip_addr: std::net::IpAddr,
-    main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
+    main_bridge: Option<Arc<MainInterpBridge>>,
 ) -> Result<Response<BoxBody>, hyper::Error> {
-    // gRPC short-circuit — fully handled in Rust, doesn't touch the sub-interp.
-    if crate::grpc::is_grpc_request(&req) {
-        return crate::grpc::handle_grpc(req).await;
-    }
-    crate::monitor::count_request();
-    let start = std::time::Instant::now();
-
-    // Fast-path: pre-built response. Zero Python, zero allocation.
-    // Borrows method/path directly from hyper's request — no Arc::from,
-    // no uri.clone, no String allocations. Nested map lookup uses
-    // `String: Borrow<str>` so both levels accept `&str` directly.
-    if !routes.fast_responses.is_empty() {
-        if let Some(fr) = routes
-            .fast_responses
-            .get(req.method().as_str())
-            .and_then(|m| m.get(req.uri().path()))
-        {
-            return Ok(full_body(build_fast_response(
-                fr,
-                routes.cors_config.as_ref(),
-            )));
-        }
-    }
-
-    // Decompose with `into_parts` — no uri/method/headers clone, no
-    // Arc::from, no `query.to_string()`. `hyper::Method` / `hyper::Uri`
-    // / `HeaderMap` are all Arc-backed internally; moving them out of
-    // Parts is refcount-free. The sub-interp hot path below runs
-    // entirely on `&str` borrows from these locals — zero heap
-    // allocations for method/path/query on the common route.
-    let (parts, body_obj) = req.into_parts();
-    let method = parts.method;
-    let uri = parts.uri;
-    let raw_headers = parts.headers;
-
-    let accept_encoding = raw_headers
-        .get(hyper::header::ACCEPT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    let method_str: &str = method.as_str();
-    let path: &str = uri.path();
-    let query: &str = uri.query().unwrap_or("");
-
-    // Router lookup. Use RouteTable::lookup to get percent-decoding
-    // of path params for free — raw matchit param iteration would
-    // leave `john%20doe` undecoded. (This was the bug in v2.3.0's
-    // first TPC draft; test_path_params_are_url_decoded caught it.)
-    let lookup = routes.lookup(method_str, path);
-
-    // Static files — only on GET/HEAD miss.
-    if lookup.is_none() && (method_str == "GET" || method_str == "HEAD") {
-        if let Some(resp) = try_static_file(path, &routes.static_dirs).await {
-            let mut r = full_body(resp);
-            apply_cors(&mut r, routes.cors_config.as_ref());
-            return Ok(r);
-        }
-    }
-
-    let (handler_idx, params) = match lookup {
-        Some(v) => v,
-        None => {
-            let mut r = full_body(not_found_response());
-            apply_cors(&mut r, routes.cors_config.as_ref());
-            return Ok(r);
+    let prepared = match preprocess(req, site).await? {
+        Preprocessed::Respond(r) => return Ok(r),
+        Preprocessed::Dispatch(p) => p,
+    };
+    let resp = match prepared.call {
+        Call::Worker(route, _) => run_inline(site, &worker, prepared, route, client_ip_addr).await,
+        Call::Main(target, body) => {
+            run_on_bridge(site, main_bridge, prepared, target, body, client_ip_addr).await
         }
     };
+    Ok(resp)
+}
 
-    // Body handling depends on the route's stream flag:
-    //   stream=True  → spawn a feeder task on this TPC thread's LocalSet
-    //                  so the handler can drain the mpsc receiver chunk
-    //                  by chunk. `body_bytes` stays empty. Route-
-    //                  registration layer already enforces stream=True
-    //                  implies gil=True, so this path feeds straight
-    //                  into the main-interp bridge below.
-    //   stream=False → collect the whole body with size + timeout
-    //                  limits before dispatch.
-    // Stream-route body handling. Route registration enforces
-    // `stream=True ⇒ gil=True`, so a streaming route is always dispatched
-    // through the main-interp bridge below — we build the mpsc receiver
-    // here (so the feeder can run on this TPC thread's LocalSet) and
-    // hand it to `GilWorkItem`. Non-stream routes skip all of this: the
-    // TPC inline hot path (sync + non-gil + non-stream) never touches
-    // `body_stream_rx` and pays no Arc::clone for a value it won't use.
-    let is_stream_route = routes.is_stream[handler_idx];
-    // For streaming routes we spawn a feeder that drains the hyper body into the
-    // mpsc sender. Keep its JoinHandle so the dispatch-failure path below can
-    // abort it deterministically — otherwise dropping the work item only closes
-    // the receiver, which the feeder won't observe while parked on the next
-    // `body.frame().await`, leaving a detached task alive until the connection
-    // dies.
-    let mut feeder_handle = None;
-    let (body_bytes, stream_rx): (
-        Vec<u8>,
-        Option<tokio::sync::mpsc::Receiver<crate::python::body_stream::ChunkMsg>>,
-    ) = if is_stream_route {
-        let (tx, rx) = tokio::sync::mpsc::channel::<crate::python::body_stream::ChunkMsg>(
-            crate::python::body_stream::CHANNEL_CAPACITY,
-        );
-        feeder_handle = Some(tokio::task::spawn_local(stream_body_feeder(
-            body_obj,
-            tx,
-            max_body_size(),
-        )));
-        (Vec::new(), Some(rx))
-    } else {
-        match collect_body_bounded(body_obj).await {
-            Ok(b) => (b, None),
-            Err(r) => {
-                let mut r = *r;
-                apply_cors(&mut r, routes.cors_config.as_ref());
-                return Ok(r);
-            }
-        }
+/// Runs a worker route on this thread's sub-interpreter.
+///
+/// The call blocks this thread (which is the point: peer TPC threads keep serving), so
+/// nothing on it can answer before the handler returns. The request budget is enforced
+/// when it does: a handler that ran past [`REQUEST_BUDGET`] gets the same 504 as on the
+/// other paths, not its late result.
+async fn run_inline(
+    site: &Site,
+    worker: &Rc<RefCell<SubInterpreterWorker>>,
+    prepared: Prepared,
+    route: RouteId,
+    client_ip_addr: std::net::IpAddr,
+) -> Response<BoxBody> {
+    let Prepared {
+        parts,
+        body,
+        params,
+        start,
+        ..
+    } = prepared;
+    let line = RequestLine {
+        method: parts.method.as_str(),
+        path: parts.uri.path(),
+        start,
     };
-
-    let headers = extract_headers(&raw_headers);
-
-    // ── Phase 3: gil=True route → main-interp bridge ──────────────────
-    // If the matched route is registered with gil=True (C-extension /
-    // pydantic-core / numpy / torch etc. that can't run in a sub-interp),
-    // send the work to the dedicated main-interp bridge thread and await
-    // its oneshot reply. TPC accept thread pays an MPSC try_send +
-    // oneshot.await — everything else stays on the main interp. Full
-    // MPSC queue → 503 fast (GIL-bound path mustn't back up and stall
-    // the 440k rps sub-interp fleet). See src/main_bridge.rs for design.
-    let is_gil_route = routes
-        .requires_gil
-        .get(handler_idx)
-        .copied()
-        .unwrap_or(false);
-    if is_gil_route {
-        let bridge = match main_bridge {
-            Some(b) => b,
-            None => {
-                // Shouldn't happen: accept-loop bootstrap builds the
-                // bridge iff `routes.requires_gil` contains any true.
-                // If we got here with None, startup wiring is wrong.
-                let mut r = full_body(error_response(
-                    "gil=True route requested but main-interp bridge is not initialized",
-                ));
-                apply_cors(&mut r, routes.cors_config.as_ref());
-                return Ok(r);
-            }
-        };
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        // body_stream_rx materialized lazily: wrap the per-request
-        // receiver for streaming routes, fall back to the shared
-        // singleton for buffered gil routes. Non-gil TPC inline
-        // dispatch never runs this line — zero Arc::clone on that path.
-        let body_stream_rx = match stream_rx {
-            Some(rx) => std::sync::Arc::new(std::sync::Mutex::new(Some(rx))),
-            None => crate::python::body_stream::empty_body_stream_rx(),
-        };
-        // Only here do we materialize owned strings — the bridge ships
-        // the item cross-thread so it must outlive these stack locals.
-        let item = crate::bridge::main_bridge::GilWorkItem {
-            method: Arc::from(method_str),
-            path: Arc::from(path),
-            params,
-            query: query.to_string(),
-            body: Bytes::from(body_bytes),
-            headers,
-            client_ip: client_ip_addr,
-            handler_idx,
-            body_stream_rx,
-            response_tx,
-        };
-        if let Err((dropped_item, err)) = bridge.try_dispatch(item) {
-            // Drop the rejected item (closing body_stream_rx) and abort the
-            // feeder so it can't linger detached if it's parked awaiting the
-            // next body frame from a stalled client.
-            drop(dropped_item);
-            if let Some(feeder) = feeder_handle.take() {
-                feeder.abort();
-            }
-            crate::monitor::DROPPED_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let resp = match err {
-                crate::bridge::main_bridge::TryDispatchError::Full => {
-                    overloaded_response("gil=True bridge queue full")
-                }
-                crate::bridge::main_bridge::TryDispatchError::Closed => {
-                    error_response("gil=True bridge thread stopped")
-                }
-            };
-            let mut r = full_body(resp);
-            apply_cors(&mut r, routes.cors_config.as_ref());
-            return Ok(r);
-        }
-        let result = match tokio::time::timeout(std::time::Duration::from_secs(30), response_rx)
-            .await
-        {
-            Ok(Ok(r)) => r,
-            Ok(Err(_)) => {
-                crate::monitor::DROPPED_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Err("gil=True bridge dropped response (worker panicked or shut down)".to_string())
-            }
-            Err(_) => {
-                crate::monitor::DROPPED_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let mut r = full_body(gateway_timeout_response());
-                apply_cors(&mut r, routes.cors_config.as_ref());
-                return Ok(r);
-            }
-        };
-        // Bridge can return either a buffered response or a stream.
-        // Buffered path: compress, build response, wrap. Stream path:
-        // hand the mpsc receiver to hyper via build_stream_response,
-        // which returns a Response<BoxBody> backed by StreamBody.
-        let mut http_resp = match result {
-            Ok(crate::bridge::main_bridge::BridgeResponse::Resp(mut resp_data)) => {
-                crate::compression::maybe_compress(&mut resp_data, &accept_encoding);
-                match build_response(Ok(resp_data)) {
-                    Ok(r) => full_body(r),
-                    Err(e) => {
-                        tracing::error!(
-                            target: "pyronova::handler",
-                            error = %e,
-                            "GIL bridge response build failed"
-                        );
-                        full_body(error_response("response build failed"))
-                    }
-                }
-            }
-            Ok(crate::bridge::main_bridge::BridgeResponse::Stream(info)) => {
-                build_stream_response(info)
-            }
-            Err(e) => full_body(error_response(&e)),
-        };
-        apply_cors(&mut http_resp, routes.cors_config.as_ref());
-        let latency_us = start.elapsed().as_micros() as u64;
-        let status = http_resp.status().as_u16();
-        if super::should_log_request(routes, status) {
-            tracing::info!(
-                target: "pyronova::access",
-                method = %method,
-                path = %path,
-                status,
-                latency_us,
-                mode = "tpc-gil-bridge",
-                "PyronovaRequest handled"
-            );
-        }
-        return Ok(http_resp);
-    }
-
-    // Resolve the handler name up front via a checked lookup. handler_idx
-    // comes from the router, which registers names/flags in lockstep, so
-    // this should always succeed — but if the route table is ever
-    // inconsistent we surface it as an explicit 500 here rather than
-    // letting an out-of-range index panic *inside* the catch_unwind below,
-    // where it would be misreported as a handler panic at line ~304.
-    // call_handler is sync, so the &'static-derived borrow lives long enough.
-    let handler_name = match routes.handler_names.get(handler_idx) {
-        Some(name) => name,
-        None => {
-            tracing::error!(
-                target: "pyronova::handler",
-                handler_idx,
-                handler_count = routes.handler_names.len(),
-                "route table inconsistency: handler_idx out of range"
-            );
-            let mut r = full_body(error_response("internal error: route table inconsistency"));
-            apply_cors(&mut r, routes.cors_config.as_ref());
-            return Ok(r);
-        }
+    let resp = match collect_body(body, max_body_size()).await {
+        Ok(body) => call_inline(site, worker, &parts, route, &params, body, client_ip_addr),
+        Err(reject) => reject.into_response(),
     };
+    finish(resp, site, &line, Served::Inline)
+}
 
-    // The inline dispatch: acquire the TPC thread's sub-interp GIL,
-    // run the handler, release. Blocks the thread (which is the point —
-    // peer TPC threads continue serving via SO_REUSEPORT). Non-Send
-    // because Rc<RefCell<_>> and *mut PyThreadState cross no await.
+fn call_inline(
+    site: &Site,
+    worker: &Rc<RefCell<SubInterpreterWorker>>,
+    parts: &Parts,
+    route: RouteId,
+    params: &Params,
+    body: Bytes,
+    client_ip_addr: std::net::IpAddr,
+) -> Response<BoxBody> {
+    let name = &site.routes.route(route).name;
+    let headers = extract_headers(&parts.headers);
+    let called = Instant::now();
+
+    // Acquire the TPC thread's sub-interp GIL, run the handler, release. Non-Send because
+    // Rc<RefCell<_>> and *mut PyThreadState cross no await.
     let result = {
         let mut worker_ref = worker.borrow_mut();
-        let tstate_cell = std::cell::Cell::new(worker_ref.tstate);
+        let tstate_cell = Cell::new(worker_ref.tstate);
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let _guard = interp::SubInterpGilGuard::acquire(tstate_cell.get(), &tstate_cell);
             worker_ref.call_handler(
-                handler_idx,
-                method_str,
-                path,
-                &params,
-                query,
-                &body_bytes,
+                route,
+                parts.method.as_str(),
+                parts.uri.path(),
+                params,
+                parts.uri.query().unwrap_or(""),
+                body,
                 &headers,
                 client_ip_addr,
             )
         }));
         worker_ref.tstate = tstate_cell.get();
-        match res {
-            Ok(r) => r,
-            Err(payload) => {
-                let msg = payload
-                    .downcast_ref::<String>()
-                    .map(|s| s.as_str())
-                    .or_else(|| payload.downcast_ref::<&str>().copied())
-                    .unwrap_or("unknown panic");
-                tracing::error!(
-                    target: "pyronova::handler",
-                    panic = msg,
-                    handler = %handler_name,
-                    "TPC handler panicked"
-                );
-                Err(format!("internal error: TPC handler panic: {msg}"))
-            }
-        }
+        res.unwrap_or_else(|payload| {
+            let msg = payload
+                .downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            tracing::error!(target: "pyronova::handler", panic = msg, handler = %name, "TPC handler panicked");
+            Err(format!("internal error: TPC handler panic: {msg}"))
+        })
     };
 
-    let mut http_resp =
-        super::build_subinterp_http_response(result, &accept_encoding, Some(handler_name.as_str()));
-    apply_cors(&mut http_resp, routes.cors_config.as_ref());
-    let latency_us = start.elapsed().as_micros() as u64;
-    let status = http_resp.status().as_u16();
-    if super::should_log_request(routes, status) {
-        tracing::info!(
-            target: "pyronova::access",
-            method = %method,
-            path = %path,
-            status,
-            latency_us,
-            mode = "tpc-inline",
-            "PyronovaRequest handled"
+    let took = called.elapsed();
+    if took > REQUEST_BUDGET {
+        tracing::error!(
+            target: "pyronova::handler",
+            handler = %name,
+            took_ms = took.as_millis() as u64,
+            "handler ran past the {REQUEST_BUDGET:?} request budget, blocking its TPC thread \
+             the whole time; answered 504. Use `async def` or gil=True for slow work"
         );
+        return refuse(Refusal::TimedOut);
     }
-    Ok(http_resp)
+    build_subinterp_http_response(result, accept_encoding(&parts.headers), name)
+}
+
+/// Runs a main-interpreter call (a `gil=True` route or the fallback) through the bridge.
+async fn run_on_bridge(
+    site: &Site,
+    bridge: Option<Arc<MainInterpBridge>>,
+    prepared: Prepared,
+    target: Target,
+    body: RequestBody,
+    client_ip_addr: std::net::IpAddr,
+) -> Response<BoxBody> {
+    let Prepared {
+        parts,
+        body: incoming,
+        params,
+        start,
+        ..
+    } = prepared;
+    let line = RequestLine {
+        method: parts.method.as_str(),
+        path: parts.uri.path(),
+        start,
+    };
+    let resp = match bridge {
+        Some(bridge) => {
+            let call = BridgeCall {
+                target,
+                body,
+                params,
+                client_ip: client_ip_addr,
+            };
+            dispatch_to_bridge(&bridge, &parts, incoming, call).await
+        }
+        // The bridge is spawned whenever the table has a main-interpreter call.
+        None => full_body(crate::response::error_response(
+            "main-interpreter call requested but the main-interp bridge is not running",
+        )),
+    };
+    finish(resp, site, &line, Served::Bridge)
+}
+
+struct BridgeCall {
+    target: Target,
+    body: RequestBody,
+    params: Params,
+    client_ip: std::net::IpAddr,
+}
+
+async fn dispatch_to_bridge(
+    bridge: &MainInterpBridge,
+    parts: &Parts,
+    incoming: Incoming,
+    call: BridgeCall,
+) -> Response<BoxBody> {
+    // A streamed body is fed on this thread's LocalSet while the bridge's handler reads it.
+    // The feeder's handle is kept so a rejected dispatch can stop it: dropping the receiver
+    // alone isn't seen while the feeder waits on the client's next frame.
+    let (body_bytes, body_stream_rx, feeder) = match call.body {
+        RequestBody::Streamed => {
+            let (tx, rx) = tokio::sync::mpsc::channel(crate::python::body_stream::CHANNEL_CAPACITY);
+            let feeder =
+                tokio::task::spawn_local(stream_body_feeder(incoming, tx, max_body_size()));
+            (
+                Bytes::new(),
+                Arc::new(std::sync::Mutex::new(Some(rx))),
+                Some(feeder),
+            )
+        }
+        RequestBody::Buffered => match collect_body(incoming, max_body_size()).await {
+            Ok(bytes) => (
+                bytes,
+                crate::python::body_stream::empty_body_stream_rx(),
+                None,
+            ),
+            Err(reject) => return reject.into_response(),
+        },
+    };
+
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    let item = GilWorkItem {
+        method: Arc::from(parts.method.as_str()),
+        path: Arc::from(parts.uri.path()),
+        params: call.params,
+        query: parts.uri.query().unwrap_or("").to_string(),
+        body: body_bytes,
+        headers: extract_headers(&parts.headers),
+        client_ip: call.client_ip,
+        target: call.target,
+        body_stream_rx,
+        response_tx,
+    };
+    if let Err((rejected, err)) = bridge.try_dispatch(item) {
+        drop(rejected);
+        if let Some(feeder) = feeder {
+            feeder.abort();
+        }
+        return refuse(match err {
+            TryDispatchError::Full => Refusal::Overloaded("gil=True bridge queue full"),
+            TryDispatchError::Closed => Refusal::ShuttingDown("gil=True bridge stopped"),
+        });
+    }
+
+    match await_reply(response_rx, "gil=True bridge dropped the request").await {
+        Ok(result) => build_main_http_response(result, accept_encoding(&parts.headers)),
+        Err(refusal) => refuse(refusal),
+    }
 }

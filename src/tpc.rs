@@ -31,8 +31,8 @@ use tokio_util::task::TaskTracker;
 
 use crate::handlers::handle_request;
 use crate::python::interp::SubInterpreterWorker;
-use crate::router::FrozenRoutes;
 use crate::server::listener::{create_reuseport_listener, handle_accept_error, setup_tcp_quickack};
+use crate::site::{SharedSite, Site};
 use crate::websocket;
 
 /// Custom hyper executor that spawns onto the current thread's
@@ -112,18 +112,13 @@ pub(crate) fn elevate_thread_qos_macos() {}
 /// `routes` is used to surface the gil / async / sub-interp split so the
 /// operator knows up front how many routes will go through the
 /// single-thread main_bridge versus the per-thread TPC fleet.
-fn log_startup(
-    mode: &str,
-    addr: &SocketAddr,
-    n_threads: usize,
-    n_cpus: usize,
-    routes: &crate::router::RouteTable,
-) {
-    let gil_count = routes.requires_gil.iter().filter(|&&g| g).count();
-    let async_count = routes.is_async.iter().filter(|&&a| a).count();
-    let stream_count = routes.is_stream.iter().filter(|&&s| s).count();
-    let total = routes.requires_gil.len();
-    let subinterp_count = total.saturating_sub(gil_count).saturating_sub(async_count);
+fn log_startup(mode: &str, addr: &SocketAddr, n_threads: usize, n_cpus: usize, site: &Site) {
+    let shape = crate::router::RouteShape::of(&site.routes);
+    let gil_count = shape.gil_count();
+    let async_count = shape.async_count();
+    let stream_count = shape.streamed;
+    let total = shape.gil.len();
+    let subinterp_count = total - gil_count - async_count;
     tracing::info!(
         target: "pyronova::server",
         version = env!("CARGO_PKG_VERSION"),
@@ -163,7 +158,7 @@ pub(crate) fn run_tpc_gil(
     addr: SocketAddr,
     n_threads: usize,
     n_cpus: usize,
-    routes: FrozenRoutes,
+    routes: SharedSite,
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
 ) -> Result<(), String> {
     log_startup("gil", &addr, n_threads, n_cpus, &routes);
@@ -234,7 +229,7 @@ pub(crate) fn run_tpc_gil(
 
 async fn tpc_accept_loop_gil(
     addr: SocketAddr,
-    routes: FrozenRoutes,
+    routes: SharedSite,
     shutdown: CancellationToken,
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
 ) {
@@ -283,7 +278,7 @@ async fn tpc_accept_loop_gil(
 async fn drive_gil_conn(
     stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
-    routes: FrozenRoutes,
+    routes: SharedSite,
     conn_token: CancellationToken,
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
 ) {
@@ -303,7 +298,7 @@ async fn drive_gil_conn(
         let client_ip_addr = remote_addr.ip();
         async move {
             if websocket::is_websocket_upgrade(&req) {
-                websocket::handle_websocket(req, routes).await
+                websocket::handle_websocket(req, routes, client_ip_addr).await
             } else {
                 handle_request(req, routes, client_ip_addr).await
             }
@@ -357,7 +352,7 @@ pub(crate) fn run_tpc_subinterp(
     n_threads: usize,
     n_cpus: usize,
     mut workers: Vec<SubInterpreterWorker>,
-    routes: FrozenRoutes,
+    routes: SharedSite,
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
     extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
@@ -441,7 +436,7 @@ fn run_tpc_subinterp_per_thread_listener(
     n_threads: usize,
     n_cpus: usize,
     workers: &mut Vec<SubInterpreterWorker>,
-    routes: FrozenRoutes,
+    routes: SharedSite,
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
     extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
@@ -467,17 +462,17 @@ fn run_tpc_subinterp_per_thread_listener(
         });
     });
 
-    // Leak one Arc into a `&'static RouteTable` shared across workers.
-    // The RouteTable is read-only after startup; leaking the Arc means
+    // Leak one Arc into a `&'static Site` shared across workers.
+    // The Site is read-only after startup; leaking the Arc means
     // per-request dispatch on the hot path does zero refcount ops. The
-    // memory cost is one RouteTable worth, held for the server's life
+    // memory cost is one Site worth, held for the server's life
     // — acceptable for a long-running server. `Arc::into_raw` + deref
     // is the stable-since-1.0 way to get this; the pointer is never
     // reclaimed on the success path, which is the whole point. We keep
     // the raw pointer so the error path below can reclaim it instead of
     // leaking on every failed start.
-    let routes_raw: *const crate::router::RouteTable = Arc::into_raw(Arc::clone(&routes));
-    let routes_static: &'static crate::router::RouteTable = unsafe { &*routes_raw };
+    let routes_raw: *const Site = Arc::into_raw(Arc::clone(&routes));
+    let routes_static: &'static Site = unsafe { &*routes_raw };
 
     let mut handles = Vec::with_capacity(n_threads);
     for i in 0..n_threads {
@@ -535,7 +530,7 @@ fn run_tpc_subinterp_per_thread_listener(
                 // Tell the threads that did spawn to exit, join them so
                 // none still reference routes_static, then reclaim the
                 // leaked Arc before returning — otherwise repeated failed
-                // starts (restart, tests) accumulate leaked RouteTables.
+                // starts (restart, tests) accumulate leaked Sites.
                 shutdown.cancel();
                 for h in handles {
                     let _ = h.join();
@@ -578,7 +573,7 @@ fn run_tpc_subinterp_fanout(
     n_threads: usize,
     n_cpus: usize,
     mut workers: Vec<SubInterpreterWorker>,
-    routes: FrozenRoutes,
+    routes: SharedSite,
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
     _extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
@@ -627,8 +622,8 @@ fn run_tpc_subinterp_fanout(
     // listener path. All workers read from the same static, no Arc ops.
     // Keep the raw pointer so the error path can reclaim it on a failed
     // start instead of leaking.
-    let routes_raw: *const crate::router::RouteTable = Arc::into_raw(Arc::clone(&routes));
-    let routes_static: &'static crate::router::RouteTable = unsafe { &*routes_raw };
+    let routes_raw: *const Site = Arc::into_raw(Arc::clone(&routes));
+    let routes_static: &'static Site = unsafe { &*routes_raw };
 
     let mut handles = Vec::with_capacity(n_threads + 1);
 
@@ -820,8 +815,8 @@ fn run_tpc_subinterp_fanout(
 async fn tpc_worker_loop_fanout(
     mut rx: tokio::sync::mpsc::Receiver<(std::net::TcpStream, SocketAddr)>,
     worker: std::rc::Rc<std::cell::RefCell<SubInterpreterWorker>>,
-    routes_static: &'static crate::router::RouteTable,
-    routes_arc: FrozenRoutes,
+    routes_static: &'static Site,
+    routes_arc: SharedSite,
     shutdown: CancellationToken,
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
@@ -1039,8 +1034,8 @@ pub(crate) async fn tpc_accept_loop_inline(
     addr: SocketAddr,
     extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
     worker: std::rc::Rc<std::cell::RefCell<SubInterpreterWorker>>,
-    routes_static: &'static crate::router::RouteTable,
-    routes_arc: FrozenRoutes,
+    routes_static: &'static Site,
+    routes_arc: SharedSite,
     shutdown: CancellationToken,
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,

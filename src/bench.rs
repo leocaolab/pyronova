@@ -35,7 +35,7 @@ use tokio::task::LocalSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::python::interp::SubInterpreterWorker;
-use crate::router::{FrozenRoutes, RouteTable};
+use crate::site::{SharedSite, Site};
 use crate::tpc::{elevate_thread_qos_macos, tpc_accept_loop_inline, try_pin_current};
 
 const INMEM_REQ: &[u8] = b"GET / HTTP/1.1\r\nHost: inmem\r\nConnection: keep-alive\r\n\r\n";
@@ -50,7 +50,7 @@ pub(crate) fn run_inmem_bench(
     conns_per_worker: usize,
     duration_s: u64,
     mut workers: Vec<SubInterpreterWorker>,
-    mut per_worker_routes: Vec<FrozenRoutes>,
+    mut per_worker_routes: Vec<SharedSite>,
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
 ) -> Result<(u64, f64), String> {
     if workers.len() != n_threads {
@@ -82,7 +82,7 @@ pub(crate) fn run_inmem_bench(
     // Arc::from_raw runs after every worker thread is joined (see the
     // reclaim loop before the Ok return) so the allocations are freed
     // rather than leaked — at which point no live &'static remains.
-    let per_worker_ptrs: Vec<*const RouteTable> =
+    let per_worker_ptrs: Vec<*const Site> =
         per_worker_routes.drain(..).map(Arc::into_raw).collect();
 
     let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(n_threads);
@@ -90,7 +90,7 @@ pub(crate) fn run_inmem_bench(
     for i in 0..n_threads {
         let core_id = core_ids.get(i).copied();
         let worker = workers.remove(0);
-        let routes: &'static RouteTable = unsafe { &*per_worker_ptrs[i] };
+        let routes: &'static Site = unsafe { &*per_worker_ptrs[i] };
         // Extra clone for spawn-failure cleanup path (arc bench-2).
         // Closure consumes its own `shutdown` clone; this one stays in
         // the outer scope so map_err can cancel before joining handles.
@@ -298,7 +298,7 @@ pub(crate) fn run_loopback_bench(
     client_conns: usize,
     duration_s: u64,
     mut workers: Vec<SubInterpreterWorker>,
-    routes: FrozenRoutes,
+    routes: SharedSite,
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
     gc_mode: crate::tpc::GcMode,
 ) -> Result<(u64, f64, u16), String> {
@@ -332,8 +332,8 @@ pub(crate) fn run_loopback_bench(
 
     // Shared &'static route table across all server workers, reclaimed
     // after the workers are joined (see the Arc::from_raw before Ok).
-    let routes_ptr: *const RouteTable = Arc::into_raw(Arc::clone(&routes));
-    let routes_static: &'static RouteTable = unsafe { &*routes_ptr };
+    let routes_ptr: *const Site = Arc::into_raw(Arc::clone(&routes));
+    let routes_static: &'static Site = unsafe { &*routes_ptr };
 
     // --- Server threads (mirrors run_tpc_subinterp_per_thread_listener) ---
     let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(n_threads + 1);

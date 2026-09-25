@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::handlers::handle_request_tpc_inline;
 use crate::python::interp::SubInterpreterWorker;
-use crate::router::{FrozenRoutes, RouteTable};
+use crate::site::{SharedSite, Site};
 use crate::websocket;
 
 /// LocalSet-compatible hyper executor. `spawn_local` means the
@@ -94,7 +94,7 @@ fn is_benign_disconnect(err: &(dyn std::error::Error + 'static)) -> bool {
 ///
 /// - `io`: any `AsyncRead + AsyncWrite + Unpin + 'static + Send`
 ///   (TLS-wrapped TCP, plain TCP, duplex for bench).
-/// - `routes`: leaked `&'static RouteTable` — zero atomic per request.
+/// - `routes`: leaked `&'static Site` — zero atomic per request.
 /// - `routes_for_ws`: `Some(arc)` enables WS upgrades (production
 ///   path); `None` for paths that don't need WS (bench). Stored in
 ///   the closure at connection scope; an Arc clone only fires inside
@@ -103,8 +103,8 @@ pub(crate) async fn drive_conn<IO>(
     io: IO,
     remote_addr: std::net::IpAddr,
     worker: std::rc::Rc<std::cell::RefCell<SubInterpreterWorker>>,
-    routes: &'static RouteTable,
-    routes_for_ws: Option<FrozenRoutes>,
+    routes: &'static Site,
+    routes_for_ws: Option<SharedSite>,
     conn_token: CancellationToken,
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
 ) where
@@ -147,7 +147,7 @@ pub(crate) async fn drive_conn<IO>(
 
     // Split by ws support at connection start so the per-request
     // closure is fully specialized — no runtime `if ws_supported`
-    // branch, no `Option<FrozenRoutes>` state to carry through every
+    // branch, no `Option<SharedSite>` state to carry through every
     // future. The bench path's closure is byte-identical to the old
     // hand-written drive_inmem_conn, so no per-request regression.
     match routes_for_ws {
@@ -163,7 +163,12 @@ pub(crate) async fn drive_conn<IO>(
                 };
                 async move {
                     if is_ws {
-                        websocket::handle_websocket(req, ws_routes.expect("ws routes set")).await
+                        websocket::handle_websocket(
+                            req,
+                            ws_routes.expect("ws routes set"),
+                            remote_addr,
+                        )
+                        .await
                     } else {
                         handle_request_tpc_inline(req, routes, worker, remote_addr, bridge).await
                     }
@@ -192,8 +197,8 @@ pub(crate) async fn drive_tcp_conn(
     stream: tokio::net::TcpStream,
     remote_addr: std::net::SocketAddr,
     worker: std::rc::Rc<std::cell::RefCell<SubInterpreterWorker>>,
-    routes: &'static RouteTable,
-    routes_for_ws: FrozenRoutes,
+    routes: &'static Site,
+    routes_for_ws: SharedSite,
     conn_token: CancellationToken,
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,

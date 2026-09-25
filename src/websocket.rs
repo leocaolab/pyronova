@@ -22,13 +22,16 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::WebSocketStream;
 use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tungstenite::Message;
 
-use crate::router::FrozenRoutes;
+use crate::handlers::pipeline::{await_reply, finish, refuse, Refusal, RequestLine, Served};
+use crate::handlers::{full_body, run_before_hooks, BoxBody};
+use crate::site::{SharedSite, Site};
+use crate::types::{PyronovaRequest, ResponseData};
 
 // ---------------------------------------------------------------------------
 // Limits (process-wide, like max_body_size)
@@ -309,10 +312,18 @@ impl Outbox {
 pub(crate) struct PyronovaWebSocket {
     inbox: Mutex<Inbox>,
     outbox: Mutex<Option<Outbox>>,
+    request: Py<PyronovaRequest>,
 }
 
 #[pymethods]
 impl PyronovaWebSocket {
+    /// The upgrade request: method, path, query, headers (Origin, cookies), client IP. The
+    /// same object the `before_request` hooks saw.
+    #[getter]
+    fn request(&self, py: Python<'_>) -> Py<PyronovaRequest> {
+        self.request.clone_ref(py)
+    }
+
     /// Receive the next message as `str` (text) or `bytes` (binary); `None` once the
     /// connection is closed.
     ///
@@ -393,50 +404,134 @@ fn ws_upgrade_response(key: &[u8]) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
-fn refusal(status: StatusCode, body: &'static str) -> Response<crate::handlers::BoxBody> {
+fn refusal(status: StatusCode, body: &'static str) -> Response<BoxBody> {
     let mut response = Response::new(Full::new(Bytes::from_static(body.as_bytes())));
     *response.status_mut() = status;
-    crate::handlers::full_body(response)
+    full_body(response)
 }
 
+/// Answers a WebSocket upgrade request: the 101, or the response that refused it. Either
+/// is finished like any other response (CORS, access log).
 pub(crate) async fn handle_websocket(
     mut req: Request<Incoming>,
-    routes: FrozenRoutes,
-) -> Result<Response<crate::handlers::BoxBody>, hyper::Error> {
-    let path = req.uri().path().to_string();
+    site: SharedSite,
+    client_ip: std::net::IpAddr,
+) -> Result<Response<BoxBody>, hyper::Error> {
+    crate::monitor::count_request();
+    let start = std::time::Instant::now();
+    let upgrade = hyper::upgrade::on(&mut req);
+    let (parts, _body) = req.into_parts();
+    let method: Arc<str> = Arc::from(parts.method.as_str());
+    let path: Arc<str> = Arc::from(parts.uri.path());
+    let handshake = Handshake {
+        key: parts
+            .headers
+            .get("sec-websocket-key")
+            .map(|k| k.as_bytes().to_vec()),
+        request: upgrade_request(parts, &method, &path, client_ip),
+        upgrade,
+    };
+    let resp = answer_upgrade(&site, handshake).await;
+    let line = RequestLine {
+        method: &method,
+        path: &path,
+        start,
+    };
+    Ok(finish(resp, &site, &line, Served::WebSocket))
+}
 
-    // Only check that a handler exists here; no Python on this thread. In TPC mode this
-    // runs on a worker's thread, bound to that worker's interpreter: attaching here used to
-    // re-attach the WORKER's thread state and `clone_ref` a main-interpreter object under
-    // the worker's GIL. The handler is cloned on the connection thread instead, attached to
-    // main (Layer 2, C4).
-    if !routes.ws_handlers.contains_key(&path) {
-        return Ok(refusal(StatusCode::NOT_FOUND, "no websocket handler"));
+struct Handshake {
+    key: Option<Vec<u8>>,
+    request: PyronovaRequest,
+    upgrade: hyper::upgrade::OnUpgrade,
+}
+
+/// The `Request` the hooks and `ws.request` see. An upgrade request has no body.
+fn upgrade_request(
+    parts: hyper::http::request::Parts,
+    method: &Arc<str>,
+    path: &Arc<str>,
+    client_ip: std::net::IpAddr,
+) -> PyronovaRequest {
+    PyronovaRequest {
+        method: Arc::clone(method),
+        path: Arc::clone(path),
+        params: Vec::new(),
+        query: parts.uri.query().unwrap_or("").to_string(),
+        headers_source: crate::types::LazyHeaders::Raw(parts.headers),
+        headers_cache: std::sync::OnceLock::new(),
+        client_ip_addr: client_ip,
+        body_bytes: Bytes::new(),
+        body_stream_rx: crate::python::body_stream::empty_body_stream_rx(),
+        query_cache: std::sync::OnceLock::new(),
+        query_all_cache: std::sync::OnceLock::new(),
     }
-    let Some(key) = req
-        .headers()
-        .get("sec-websocket-key")
-        .map(|k| k.as_bytes().to_vec())
-    else {
-        return Ok(refusal(
-            StatusCode::BAD_REQUEST,
-            "missing sec-websocket-key",
-        ));
+}
+
+/// What the `before_request` hooks decided about an upgrade.
+enum Verdict {
+    Accept,
+    /// A hook returned this response (or raised: `Err`).
+    Reject(Result<ResponseData, String>),
+}
+
+async fn answer_upgrade(site: &SharedSite, handshake: Handshake) -> Response<BoxBody> {
+    let path = Arc::clone(&handshake.request.path);
+    // Only check that a handler exists here; no Python on this thread. In TPC mode this
+    // runs on a worker's thread, bound to that worker's interpreter; the handler and hooks
+    // are main's, and run on the connection's own thread, attached to main (Layer 2, C4).
+    if !site.routes.ws_handlers.contains_key(&*path) {
+        return refusal(StatusCode::NOT_FOUND, "no websocket handler");
+    }
+    let Some(key) = handshake.key else {
+        return refusal(StatusCode::BAD_REQUEST, "missing sec-websocket-key");
     };
     let limits = limits();
     let Some(slot) = ConnectionSlot::try_acquire(limits.max_connections) else {
-        crate::monitor::DROPPED_REQUESTS.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(target: "pyronova::server", path, max_connections = limits.max_connections,
+        tracing::debug!(target: "pyronova::server", path = %path, max_connections = limits.max_connections,
             "WebSocket connection limit reached; answered 503");
-        return Ok(refusal(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "websocket connection limit reached",
-        ));
+        return refuse(Refusal::Overloaded("websocket connection limit reached"));
     };
 
-    // The route table belongs to the main interpreter.
-    let main = crate::run_context::main_interp();
-    let upgrade = hyper::upgrade::on(&mut req);
+    // The hooks run on the connection's thread before the 101; the handler runs there
+    // after it, in the same request context.
+    let (ends, handler_ends) = connection_channels(limits);
+    let (verdict_tx, verdict_rx) = oneshot::channel();
+    let thread = match spawn_handler_thread(
+        Arc::clone(site),
+        handshake.request,
+        handler_ends,
+        verdict_tx,
+    ) {
+        Ok(thread) => thread,
+        Err(e) => {
+            tracing::error!(target: "pyronova::server", error = %e,
+                "WebSocket handler thread could not be spawned");
+            return full_body(crate::response::error_response(
+                "websocket handler thread could not be spawned",
+            ));
+        }
+    };
+
+    match await_reply(
+        verdict_rx,
+        "websocket handler thread exited before the upgrade",
+    )
+    .await
+    {
+        Ok(Verdict::Accept) => {}
+        Ok(Verdict::Reject(response)) => {
+            join_handler_thread(thread).await;
+            return full_body(crate::response::build_response(response));
+        }
+        Err(refusal) => {
+            // The thread sees the verdict go unread and exits without running the handler.
+            tokio::spawn(join_handler_thread(thread));
+            return refuse(refusal);
+        }
+    }
+
+    let upgrade = handshake.upgrade;
     tokio::spawn(async move {
         let _slot = slot;
         match upgrade.await {
@@ -447,48 +542,141 @@ pub(crate) async fn handle_websocket(
                     Some(limits.tungstenite_config()),
                 )
                 .await;
-                run_ws_connection(ws_stream, routes, path, main, limits).await;
+                run_ws_connection(ws_stream, ends, limits).await;
             }
             Err(e) => {
                 tracing::error!(target: "pyronova::server", error = %e, "WebSocket upgrade error");
+                // Dropping the ends makes the handler's recv() return None.
+                drop(ends);
             }
         }
+        join_handler_thread(thread).await;
     });
 
-    Ok(crate::handlers::full_body(ws_upgrade_response(&key)))
+    full_body(ws_upgrade_response(&key))
 }
 
 // ---------------------------------------------------------------------------
 // Connection: Python handler thread + message pump
 // ---------------------------------------------------------------------------
 
-/// Run the handler registered for `path` on its own OS thread, attached to main.
+/// The pump's ends of a connection's two queues.
+struct ConnEnds {
+    incoming: UnboundedSender<Queued>,
+    incoming_budget: ByteBudget,
+    outgoing: UnboundedReceiver<Queued>,
+}
+
+/// The handler's ends: what `recv()` reads and `send()` writes.
+struct HandlerEnds {
+    inbox: Inbox,
+    outbox: Outbox,
+}
+
+fn connection_channels(limits: WsLimits) -> (ConnEnds, HandlerEnds) {
+    let (incoming_tx, incoming_rx) = unbounded_channel::<Queued>();
+    let (outgoing_tx, outgoing_rx) = unbounded_channel::<Queued>();
+    (
+        ConnEnds {
+            incoming: incoming_tx,
+            incoming_budget: ByteBudget::new(limits.max_message_bytes),
+            outgoing: outgoing_rx,
+        },
+        HandlerEnds {
+            inbox: Inbox {
+                rx: incoming_rx,
+                held: None,
+            },
+            outbox: Outbox {
+                tx: outgoing_tx,
+                budget: ByteBudget::new(limits.max_message_bytes),
+                max_message_bytes: limits.max_message_bytes,
+            },
+        },
+    )
+}
+
+/// The connection's OS thread, attached to main: the `before_request` hooks, then (if they
+/// let the upgrade through) the handler, all in one request context.
 ///
-/// Contract: WebSocket handlers live in the main interpreter (they are registered via
-/// `@app.websocket(...)` at import time, which runs in the main interp). The thread has
-/// no thread state, so it attaches to main explicitly, with one thread state for the
-/// connection's life, and takes the handler from the route table there (Layer 2, C4).
-/// Not `main_attach`: this thread can outlive the server run whose context
-/// `main_attach` reads. The route table clone is dropped inside the attach.
+/// Contract: WebSocket handlers and hooks live in the main interpreter. The thread has no
+/// thread state, so it attaches to main explicitly, with one thread state for the
+/// connection's life (Layer 2, C4). Not `main_attach`: this thread can outlive the server
+/// run whose context `main_attach` reads. The site clone is dropped inside the attach.
 fn spawn_handler_thread(
-    ws: PyronovaWebSocket,
-    routes: FrozenRoutes,
-    path: String,
-    main: crate::run_context::Interp,
+    site: SharedSite,
+    request: PyronovaRequest,
+    ends: HandlerEnds,
+    verdict: oneshot::Sender<Verdict>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
+    let main = crate::run_context::main_interp();
     std::thread::Builder::new()
         .name("pyronova-ws".to_string())
         .spawn(move || {
             crate::run_context::attach_to(main, move |py| {
-                let handler = routes.ws_handlers.get(&path).map(|h| h.clone_ref(py));
-                drop(routes);
-                // Checked at handshake; the table is frozen.
-                let Some(handler) = handler else { return };
-                run_handler(py, &handler, ws);
-                // Drop the handler under the GIL, not via PyO3's pending-drop path.
-                drop(handler);
+                let served = crate::python::request_context::in_request_context(py, || {
+                    serve_connection(py, &site, request, ends, verdict)
+                });
+                if let Err(e) = served {
+                    tracing::error!(target: "pyronova::server", error = %e,
+                        "WebSocket connection could not enter its contextvars.Context");
+                }
+                drop(site);
             });
         })
+}
+
+fn serve_connection(
+    py: Python<'_>,
+    site: &Site,
+    request: PyronovaRequest,
+    ends: HandlerEnds,
+    verdict: oneshot::Sender<Verdict>,
+) {
+    // Checked at handshake; the table is frozen.
+    let Some(handler) = site
+        .routes
+        .ws_handlers
+        .get(&*request.path)
+        .map(|h| h.clone_ref(py))
+    else {
+        return;
+    };
+    let request = match Py::new(py, request) {
+        Ok(r) => r,
+        Err(e) => {
+            // Unread only if the handshake already gave up.
+            let _ = verdict.send(Verdict::Reject(Err(format!(
+                "failed to create Request: {e}"
+            ))));
+            return;
+        }
+    };
+    match run_before_hooks(py, &site.routes.before_hooks, &request) {
+        Ok(None) => {}
+        Ok(Some(response)) => {
+            let _ = verdict.send(Verdict::Reject(Ok(response)));
+            return;
+        }
+        Err(e) => {
+            tracing::error!(target: "pyronova::server", error = %e,
+                "before_request hook failed on a WebSocket upgrade; refused it");
+            let _ = verdict.send(Verdict::Reject(Err(e)));
+            return;
+        }
+    }
+    if verdict.send(Verdict::Accept).is_err() {
+        // The handshake gave up waiting (request budget): no 101 was sent.
+        return;
+    }
+    let ws = PyronovaWebSocket {
+        inbox: Mutex::new(ends.inbox),
+        outbox: Mutex::new(Some(ends.outbox)),
+        request,
+    };
+    run_handler(py, &handler, ws);
+    // Drop the handler under the GIL, not via PyO3's pending-drop path.
+    drop(handler);
 }
 
 fn run_handler(py: Python<'_>, handler: &Py<PyAny>, ws: PyronovaWebSocket) {
@@ -523,60 +711,29 @@ fn run_handler(py: Python<'_>, handler: &Py<PyAny>, ws: PyronovaWebSocket) {
     }
 }
 
-async fn run_ws_connection<S>(
-    ws_stream: WebSocketStream<S>,
-    routes: FrozenRoutes,
-    path: String,
-    main: crate::run_context::Interp,
-    limits: WsLimits,
-) where
+async fn run_ws_connection<S>(ws_stream: WebSocketStream<S>, ends: ConnEnds, limits: WsLimits)
+where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (ws_sink, ws_source) = ws_stream.split();
-
-    let (incoming_tx, incoming_rx) = unbounded_channel::<Queued>();
-    let (outgoing_tx, outgoing_rx) = unbounded_channel::<Queued>();
-    let ws = PyronovaWebSocket {
-        inbox: Mutex::new(Inbox {
-            rx: incoming_rx,
-            held: None,
-        }),
-        outbox: Mutex::new(Some(Outbox {
-            tx: outgoing_tx,
-            budget: ByteBudget::new(limits.max_message_bytes),
-            max_message_bytes: limits.max_message_bytes,
-        })),
-    };
-
-    let py_handle = match spawn_handler_thread(ws, routes, path, main) {
-        Ok(handle) => handle,
-        Err(e) => {
-            tracing::error!(target: "pyronova::server", error = %e,
-                "WebSocket handler thread could not be spawned; closing the connection");
-            close_connection(ws_sink, ws_source, None).await;
-            return;
-        }
-    };
-
-    let mut ends = PumpEnds {
+    let mut pump_ends = PumpEnds {
         sink: ws_sink,
         source: ws_source,
-        incoming: incoming_tx,
-        incoming_budget: ByteBudget::new(limits.max_message_bytes),
-        outgoing: outgoing_rx,
+        incoming: ends.incoming,
+        incoming_budget: ends.incoming_budget,
+        outgoing: ends.outgoing,
     };
-    let close_frame = pump(&mut ends, limits).await;
+    let close_frame = pump(&mut pump_ends, limits).await;
 
     let PumpEnds {
         sink,
         source,
         incoming,
         ..
-    } = ends;
+    } = pump_ends;
     // Dropping the sender makes Python's pending recv return None.
     drop(incoming);
     close_connection(sink, source, close_frame).await;
-    join_handler_thread(py_handle).await;
 }
 
 type WsSink<S> = SplitSink<WebSocketStream<S>, Message>;

@@ -163,36 +163,44 @@ pub(crate) fn extract_response_data(
 // HTTP response builders
 // ---------------------------------------------------------------------------
 
-pub(crate) fn build_response(
-    result: Result<ResponseData, String>,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    match result {
-        Ok(data) => {
-            let status = StatusCode::from_u16(data.status).unwrap_or_else(|_| {
-                tracing::warn!(
-                    target: "pyronova::response",
-                    status = data.status,
-                    "handler returned invalid HTTP status code, using 500"
-                );
-                StatusCode::INTERNAL_SERVER_ERROR
-            });
-            let mut builder = Response::builder()
-                .status(status)
-                .header("content-type", &data.content_type)
-                .header("server", SERVER_HEADER);
-            for (k, v) in &data.headers {
-                // NUL-separated values encode multiple occurrences of the same
-                // header key (e.g. multiple Set-Cookie lines set via cookies.py).
-                for part in v.split('\0') {
-                    builder = builder.header(k.as_str(), part);
-                }
-            }
-            Ok(builder
-                .body(Full::new(data.body))
-                .unwrap_or_else(|_| error_response("invalid response headers")))
+/// The HTTP response for a handler's result. A handler error, an invalid status and an
+/// unbuildable header all become a 500 (the cause is logged), so this can't fail.
+pub(crate) fn build_response(result: Result<ResponseData, String>) -> Response<Full<Bytes>> {
+    let data = match result {
+        Ok(data) => data,
+        Err(e) => return error_response(&e),
+    };
+    let mut builder = Response::builder()
+        .status(status_or_500(data.status))
+        .header("content-type", &data.content_type)
+        .header("server", SERVER_HEADER);
+    for (k, v) in &data.headers {
+        // NUL-separated values encode multiple occurrences of the same
+        // header key (e.g. multiple Set-Cookie lines set via cookies.py).
+        for part in v.split('\0') {
+            builder = builder.header(k.as_str(), part);
         }
-        Err(e) => Ok(error_response(&e)),
     }
+    builder.body(Full::new(data.body)).unwrap_or_else(|e| {
+        tracing::error!(
+            target: "pyronova::handler",
+            error = %e,
+            "handler returned invalid response headers; responding 500"
+        );
+        error_response("invalid response headers")
+    })
+}
+
+/// A handler's status code, or 500 (logged) if it isn't an HTTP status.
+pub(crate) fn status_or_500(code: u16) -> StatusCode {
+    StatusCode::from_u16(code).unwrap_or_else(|_| {
+        tracing::error!(
+            target: "pyronova::handler",
+            status = code,
+            "handler returned invalid HTTP status {code}; responding 500"
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 pub(crate) fn error_response(msg: &str) -> Response<Full<Bytes>> {
@@ -222,6 +230,39 @@ pub(crate) fn overloaded_response(msg: &str) -> Response<Full<Bytes>> {
         .header("retry-after", "1")
         .body(Full::new(Bytes::from(error_json_body(msg))))
         .unwrap()
+}
+
+/// 503 for a request whose workers are gone (the server is shutting down).
+#[inline]
+pub(crate) fn unavailable_response(msg: &str) -> Response<Full<Bytes>> {
+    json_error(StatusCode::SERVICE_UNAVAILABLE, msg)
+}
+
+/// 400 for a request whose body could not be read.
+#[inline]
+pub(crate) fn bad_request_response(msg: &str) -> Response<Full<Bytes>> {
+    json_error(StatusCode::BAD_REQUEST, msg)
+}
+
+/// 408 for a request body that did not arrive within the request budget.
+#[inline]
+pub(crate) fn request_timeout_response() -> Response<Full<Bytes>> {
+    json_error(StatusCode::REQUEST_TIMEOUT, "request body timeout")
+}
+
+fn json_error(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
+    let mut resp = Response::new(Full::new(Bytes::from(error_json_body(msg))));
+    *resp.status_mut() = status;
+    let headers = resp.headers_mut();
+    headers.insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        hyper::header::SERVER,
+        hyper::header::HeaderValue::from_static(SERVER_HEADER),
+    );
+    resp
 }
 
 #[inline]
@@ -341,7 +382,7 @@ mod tests {
             status: 200,
             headers: HashMap::new(),
         };
-        let resp = build_response(Ok(data)).unwrap();
+        let resp = build_response(Ok(data));
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()["content-type"], "text/plain");
     }
@@ -356,14 +397,14 @@ mod tests {
             status: 201,
             headers,
         };
-        let resp = build_response(Ok(data)).unwrap();
+        let resp = build_response(Ok(data));
         assert_eq!(resp.status(), StatusCode::CREATED);
         assert_eq!(resp.headers()["x-custom"], "value");
     }
 
     #[test]
     fn build_response_error_falls_back_to_500() {
-        let resp = build_response(Err("oops".to_string())).unwrap();
+        let resp = build_response(Err("oops".to_string()));
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
