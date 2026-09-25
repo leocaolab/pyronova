@@ -9,7 +9,7 @@
 
 use std::fs::File;
 use std::io::BufReader;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -70,30 +70,85 @@ impl AsyncWrite for MaybeTlsStream {
     }
 }
 
+/// Why the TLS acceptor could not be built.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum TlsError {
+    #[error("open {what} {path:?}: {source}")]
+    Open {
+        what: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("parse {what} {path:?}: {source}")]
+    Parse {
+        what: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("no certificates found in {0:?}")]
+    NoCertificate(PathBuf),
+    #[error("no private key found in {0:?}")]
+    NoKey(PathBuf),
+    #[error("TLS config error: {0}")]
+    Config(#[from] rustls::Error),
+}
+
+/// Why a TLS handshake did not complete.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum HandshakeError {
+    #[error("TLS handshake error: {0}")]
+    Failed(#[source] std::io::Error),
+    #[error("TLS handshake timed out after {HANDSHAKE_TIMEOUT:?} (possible Slowloris)")]
+    TimedOut,
+}
+
+/// How long a client gets to finish the TLS handshake.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn open(what: &'static str, path: &Path) -> Result<BufReader<File>, TlsError> {
+    File::open(path)
+        .map(BufReader::new)
+        .map_err(|source| TlsError::Open {
+            what,
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
 /// Load certificate chain (PEM) from disk.
-fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
-    let file = File::open(path).map_err(|e| format!("open cert {path:?}: {e}"))?;
-    let mut reader = BufReader::new(file);
-    let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut reader).collect();
-    let certs = certs.map_err(|e| format!("parse cert {path:?}: {e}"))?;
+fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError> {
+    let mut reader = open("cert", path)?;
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| TlsError::Parse {
+            what: "cert",
+            path: path.to_path_buf(),
+            source,
+        })?;
     if certs.is_empty() {
-        return Err(format!("no certificates found in {path:?}"));
+        return Err(TlsError::NoCertificate(path.to_path_buf()));
     }
     Ok(certs)
 }
 
 /// Load a private key (PEM) from disk. Accepts PKCS#8, PKCS#1, or SEC1.
-fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
-    let file = File::open(path).map_err(|e| format!("open key {path:?}: {e}"))?;
-    let mut reader = BufReader::new(file);
+fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> {
+    let mut reader = open("key", path)?;
     // private_key() picks the first key of any supported format.
     rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| format!("parse key {path:?}: {e}"))?
-        .ok_or_else(|| format!("no private key found in {path:?}"))
+        .map_err(|source| TlsError::Parse {
+            what: "key",
+            path: path.to_path_buf(),
+            source,
+        })?
+        .ok_or_else(|| TlsError::NoKey(path.to_path_buf()))
 }
 
 /// Build a `TlsAcceptor` from cert/key PEM files. Called once at startup.
-pub(crate) fn build_acceptor(cert_path: &str, key_path: &str) -> Result<Arc<TlsAcceptor>, String> {
+pub(crate) fn build_acceptor(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<Arc<TlsAcceptor>, TlsError> {
     // rustls needs a default crypto provider installed before any ServerConfig
     // is built. Idempotent — `install_default` errors if already installed, so
     // we ignore the result.
@@ -104,8 +159,7 @@ pub(crate) fn build_acceptor(cert_path: &str, key_path: &str) -> Result<Arc<TlsA
 
     let mut cfg = ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| format!("TLS config error: {e}"))?;
+        .with_single_cert(certs, key)?;
 
     // Advertise HTTP/2 and HTTP/1.1 via ALPN. hyper_util::server::conn::auto
     // selects the right protocol based on the negotiated ALPN value.
@@ -125,15 +179,51 @@ pub(crate) fn build_acceptor(cert_path: &str, key_path: &str) -> Result<Arc<TlsA
 pub(crate) async fn wrap_tls(
     acceptor: &TlsAcceptor,
     stream: TcpStream,
-) -> Result<MaybeTlsStream, String> {
-    const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+) -> Result<MaybeTlsStream, HandshakeError> {
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
         Ok(Ok(tls)) => Ok(MaybeTlsStream::Tls { inner: tls }),
-        Ok(Err(e)) => Err(format!("TLS handshake error: {e}")),
-        Err(_) => Err("TLS handshake timed out after 10s (possible Slowloris)".to_string()),
+        Ok(Err(e)) => Err(HandshakeError::Failed(e)),
+        Err(_) => Err(HandshakeError::TimedOut),
     }
 }
 
 pub(crate) fn wrap_plain(stream: TcpStream) -> MaybeTlsStream {
     MaybeTlsStream::Plain { inner: stream }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_cert_is_a_typed_open_error_naming_the_file() {
+        let err = build_acceptor("/nonexistent/m4-cert.pem", "/nonexistent/m4-key.pem")
+            .err()
+            .expect("no such file");
+        match &err {
+            TlsError::Open { what, path, source } => {
+                assert_eq!(*what, "cert");
+                assert_eq!(path, Path::new("/nonexistent/m4-cert.pem"));
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected TlsError::Open, got {other:?}"),
+        }
+        assert!(err.to_string().contains("m4-cert.pem"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_cert_file_says_so() {
+        let dir = std::env::temp_dir().join(format!("pyronova-m4-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("empty.pem");
+        std::fs::write(&cert, b"").unwrap();
+        let err = build_acceptor(cert.to_str().unwrap(), "/nonexistent/key.pem")
+            .err()
+            .expect("no certificate");
+        assert!(
+            matches!(err, TlsError::NoCertificate(ref p) if p == &cert),
+            "{err:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

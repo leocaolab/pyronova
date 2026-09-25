@@ -11,10 +11,11 @@ use crate::python::interp;
 use crate::router::{Call, HandlerKind, RouteId};
 use crate::site::SharedSite;
 
+use super::error::{HandlerError, RequestTag};
 use super::gil::run_on_main;
 use super::pipeline::{
-    await_reply, collect_body_with_admission, finish, preprocess, refuse, Admission, Prepared,
-    Preprocessed, Refusal, RequestLine, Served,
+    await_reply, collect_body_with_admission, fail, finish, preprocess, Admission, Prepared,
+    Preprocessed, RequestLine, Served, OVERLOADED,
 };
 use super::{http_response, max_body_size, BoxBody, SharedPool};
 
@@ -43,6 +44,12 @@ pub(crate) async fn handle_request_subinterp(
             let method: Arc<str> = Arc::from(prepared.parts.method.as_str());
             let path: Arc<str> = Arc::from(prepared.parts.uri.path());
             let line_start = prepared.start;
+            let id = prepared.request_id.clone();
+            let tag = RequestTag {
+                id: &id,
+                method: &method,
+                path: &path,
+            };
             let work = PoolWork {
                 route,
                 kind,
@@ -50,7 +57,7 @@ pub(crate) async fn handle_request_subinterp(
                 path: Arc::clone(&path),
                 client_ip: client_ip_addr,
             };
-            let resp = run_on_pool(&pool, prepared, work).await;
+            let resp = run_on_pool(&pool, prepared, work, &tag).await;
             let line = RequestLine {
                 method: &method,
                 path: &path,
@@ -71,7 +78,12 @@ struct PoolWork {
     client_ip: std::net::IpAddr,
 }
 
-async fn run_on_pool(pool: &SharedPool, prepared: Prepared, work: PoolWork) -> Response<BoxBody> {
+async fn run_on_pool(
+    pool: &SharedPool,
+    prepared: Prepared,
+    work: PoolWork,
+    tag: &RequestTag<'_>,
+) -> Response<BoxBody> {
     // An honestly declared large body takes its permit before a byte is read, so it can be
     // rejected upfront. One that under-declares is caught by the collector.
     let content_length = prepared
@@ -84,7 +96,7 @@ async fn run_on_pool(pool: &SharedPool, prepared: Prepared, work: PoolWork) -> R
     let upfront = if content_length > ADMISSION_SKIP_BYTES {
         match pool.submit_semaphore.clone().try_acquire_owned() {
             Ok(permit) => Some(permit),
-            Err(_) => return refuse(Refusal::Overloaded("server overloaded")),
+            Err(_) => return fail(OVERLOADED, tag),
         }
     } else {
         None
@@ -99,7 +111,7 @@ async fn run_on_pool(pool: &SharedPool, prepared: Prepared, work: PoolWork) -> R
     let admitted =
         match collect_body_with_admission(prepared.body, max_body_size(), admission).await {
             Ok(admitted) => admitted,
-            Err(reject) => return reject.into_response(),
+            Err(e) => return fail(e, tag),
         };
     // Held until the response is ready.
     let _permit = admitted.permit;
@@ -115,18 +127,21 @@ async fn run_on_pool(pool: &SharedPool, prepared: Prepared, work: PoolWork) -> R
         body: admitted.body,
         headers: prepared.parts.headers,
         client_ip: work.client_ip,
+        request_id: prepared.request_id,
         response_tx,
     });
     if let Err(e) = submitted {
-        return refuse(match e {
-            interp::SubmitError::Full => Refusal::Overloaded("server overloaded"),
-            interp::SubmitError::Closed => Refusal::ShuttingDown("worker pool closed"),
-        });
+        let error = match e {
+            interp::SubmitError::Full => HandlerError::Overloaded("sub-interpreter work queue"),
+            interp::SubmitError::Closed => HandlerError::PoolClosed("sub-interpreter pool"),
+        };
+        return fail(error, tag);
     }
     interp::WorkRequest::inc_created();
 
-    match await_reply(response_rx, "sub-interpreter worker dropped the request").await {
+    let lost = |_| HandlerError::WorkerLost("the sub-interpreter worker dropped the request");
+    match await_reply(response_rx, lost).await {
         Ok(result) => http_response(result, accept_encoding.as_str()),
-        Err(refusal) => refuse(refusal),
+        Err(e) => fail(e, tag),
     }
 }

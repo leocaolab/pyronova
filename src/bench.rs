@@ -62,7 +62,7 @@ pub(crate) enum BenchError {
         source: io::Error,
     },
     #[error("bind a loopback port: {0}")]
-    Bind(String),
+    Bind(#[source] crate::server::listener::ListenerError),
     #[error("read the bound loopback port: {0}")]
     LocalAddr(#[source] io::Error),
     #[error("the bench failed: {}", join_failures(.0))]

@@ -16,7 +16,6 @@
 //!   tstate rebinding, and the async worker-state registry.
 //! - `worker_api`: the `#[pyfunction]`s the async engine calls
 //!   (`_worker_recv`/`_worker_send`/...).
-//! - `convert`: Python `str`/`dict` conversion helpers.
 //! - `worker`: `SubInterpreterWorker` — owns one sub-interpreter.
 //! - `pool`: `InterpreterPool`, `WorkRequest`, and the per-OS-thread worker
 //!   loops.
@@ -33,7 +32,6 @@
 //! sites keep compiling with `crate::python::interp::X`.
 
 pub(crate) mod body_stream;
-pub(crate) mod convert;
 pub(crate) mod ffi;
 pub(crate) mod interp;
 pub(crate) mod pool;

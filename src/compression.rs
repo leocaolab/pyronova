@@ -494,7 +494,7 @@ mod tests {
         let mut data = ResponseData {
             body: Bytes::from(vec![b'x'; 2048]),
             content_type: HeaderValue::from_static("application/json"),
-            status: 200,
+            status: hyper::StatusCode::OK,
             headers: ResponseHeaders::new(),
         };
         let before = data.body.clone();
@@ -514,7 +514,7 @@ mod tests {
         let mut data = ResponseData {
             body: Bytes::from(payload.clone()),
             content_type: HeaderValue::from_static("application/json"),
-            status: 200,
+            status: hyper::StatusCode::OK,
             headers: ResponseHeaders::new(),
         };
         maybe_compress(&mut data, "br, gzip");
@@ -534,7 +534,7 @@ mod tests {
         let mut data = ResponseData {
             body: Bytes::from("small"),
             content_type: HeaderValue::from_static("application/json"),
-            status: 200,
+            status: hyper::StatusCode::OK,
             headers: ResponseHeaders::new(),
         };
         maybe_compress(&mut data, "gzip, br");
@@ -549,7 +549,7 @@ mod tests {
         let mut data = ResponseData {
             body: Bytes::from(vec![0u8; 2048]),
             content_type: HeaderValue::from_static("image/png"),
-            status: 200,
+            status: hyper::StatusCode::OK,
             headers: ResponseHeaders::new(),
         };
         maybe_compress(&mut data, "gzip, br");
@@ -568,7 +568,7 @@ mod tests {
         let mut data = ResponseData {
             body: Bytes::from(vec![b'x'; 2048]),
             content_type: HeaderValue::from_static("application/json"),
-            status: 200,
+            status: hyper::StatusCode::OK,
             headers,
         };
         maybe_compress(&mut data, "gzip, br");
@@ -589,7 +589,7 @@ mod tests {
         let mut data = ResponseData {
             body: Bytes::from(payload),
             content_type: HeaderValue::from_static("application/json"),
-            status: 200,
+            status: hyper::StatusCode::OK,
             headers,
         };
         maybe_compress(&mut data, "gzip");
@@ -606,7 +606,7 @@ mod tests {
         let mut data = ResponseData {
             body: Bytes::from(vec![b'x'; 2048]),
             content_type: HeaderValue::from_static("application/json"),
-            status: 200,
+            status: hyper::StatusCode::OK,
             headers: ResponseHeaders::new(),
         };
         maybe_compress(&mut data, "");

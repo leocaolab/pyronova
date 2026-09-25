@@ -160,7 +160,7 @@ pub(crate) fn run_tpc_gil(
     n_cpus: usize,
     routes: SharedSite,
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
-) -> Result<(), String> {
+) -> Result<(), ServeError> {
     log_startup("gil", &addr, n_threads, n_cpus, &routes);
 
     let shutdown = CancellationToken::new();
@@ -209,7 +209,10 @@ pub(crate) fn run_tpc_gil(
             Ok(h) => handles.push(h),
             Err(e) => {
                 shutdown.cancel();
-                return Err(format!("spawn tpc-{i}: {e}"));
+                return Err(ServeError::Spawn {
+                    thread: format!("pyronova-tpc-{i}"),
+                    source: e,
+                });
             }
         }
     }
@@ -338,6 +341,21 @@ async fn drive_gil_conn(
 // Sub-interpreter mode — dispatch still via the old pool for Phase 1
 // ---------------------------------------------------------------------------
 
+/// Why a TPC server run could not start (or stopped).
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ServeError {
+    #[error("could not spawn thread {thread}: {source}")]
+    Spawn {
+        thread: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("TPC worker count mismatch: expected {expected}, got {got}")]
+    WorkerCount { expected: usize, got: usize },
+    #[error(transparent)]
+    Gc(#[from] GcModeError),
+}
+
 /// TPC inline mode (Phase 2) — each TPC thread owns its own sub-interp
 /// and executes handlers synchronously on the accept thread. No shared
 /// pool, no channel, no oneshot wake.
@@ -357,12 +375,12 @@ pub(crate) fn run_tpc_subinterp(
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
     extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
     gc_mode: GcMode,
-) -> Result<(), String> {
+) -> Result<(), ServeError> {
     if workers.len() != n_threads {
-        return Err(format!(
-            "TPC worker count mismatch: expected {n_threads}, got {}",
-            workers.len()
-        ));
+        return Err(ServeError::WorkerCount {
+            expected: n_threads,
+            got: workers.len(),
+        });
     }
 
     // Darwin: kqueue-backed SO_REUSEPORT routes ~all traffic to one
@@ -386,7 +404,7 @@ pub(crate) fn run_tpc_subinterp(
                     // SAFETY: called from `PyronovaApp::run_tpc_subinterp` on the main thread
                     // inside `py.detach`, so no thread state is current; none was rebound.
                     unsafe { SubInterpreterWorker::end_all(workers) };
-                    return Err(e.to_string());
+                    return Err(e.into());
                 }
             };
             return run_tpc_subinterp_fanout(
@@ -441,7 +459,7 @@ fn run_tpc_subinterp_per_thread_listener(
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
     extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
     gc_mode: GcMode,
-) -> Result<(), String> {
+) -> Result<(), ServeError> {
     log_startup("hybrid-inline", &addr, n_threads, n_cpus, &routes);
 
     let shutdown = CancellationToken::new();
@@ -542,7 +560,10 @@ fn run_tpc_subinterp_per_thread_listener(
                 // SAFETY: called from `run_tpc_subinterp` on the main thread inside
                 // `py.detach`, so no thread state is current.
                 unsafe { SubInterpreterWorker::end_all(workers.drain(..)) };
-                return Err(format!("spawn tpc-{i}: {e}"));
+                return Err(ServeError::Spawn {
+                    thread: format!("pyronova-tpc-{i}"),
+                    source: e,
+                });
             }
         }
     }
@@ -578,7 +599,7 @@ fn run_tpc_subinterp_fanout(
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
     _extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
     gc_mode: GcMode,
-) -> Result<(), String> {
+) -> Result<(), ServeError> {
     log_startup("hybrid-inline-fanout", &addr, n_threads, n_cpus, &routes);
 
     let shutdown = CancellationToken::new();
@@ -689,7 +710,10 @@ fn run_tpc_subinterp_fanout(
                 // SAFETY: called from `run_tpc_subinterp` on the main thread inside
                 // `py.detach`, so no thread state is current.
                 unsafe { SubInterpreterWorker::end_all(workers.drain(..)) };
-                return Err(format!("spawn tpc-{i}: {e}"));
+                return Err(ServeError::Spawn {
+                    thread: format!("pyronova-tpc-{i}"),
+                    source: e,
+                });
             }
         }
     }
@@ -794,7 +818,10 @@ fn run_tpc_subinterp_fanout(
         Ok(h) => handles.push(h),
         Err(e) => {
             shutdown.cancel();
-            return Err(format!("spawn acceptor: {e}"));
+            return Err(ServeError::Spawn {
+                thread: "pyronova-tpc-acceptor".to_string(),
+                source: e,
+            });
         }
     }
 

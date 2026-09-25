@@ -53,7 +53,9 @@ use bytes::Bytes;
 use crossbeam_channel as cbc;
 use tokio::sync::oneshot;
 
-use crate::handlers::{call_handler_with_hooks, HandlerResult};
+use crate::handlers::error::Logged;
+use crate::handlers::{call_handler_with_hooks, MainReply};
+use crate::request_id::RequestId;
 use crate::router::Target;
 use crate::site::SharedSite;
 use crate::types::PyronovaRequest;
@@ -70,6 +72,7 @@ pub(crate) struct GilWorkItem {
     pub body: Bytes,
     pub headers: hyper::HeaderMap,
     pub client_ip: IpAddr,
+    pub request_id: RequestId,
     pub target: Target,
     /// Body-stream receiver for `stream=True` routes. The feeder task
     /// running on the TPC thread's LocalSet pushes body frames into
@@ -77,7 +80,7 @@ pub(crate) struct GilWorkItem {
     /// routes share the [`crate::python::body_stream::empty_body_stream_rx`]
     /// singleton — `body` carries the collected bytes there.
     pub body_stream_rx: crate::python::body_stream::BodyStreamRx,
-    pub response_tx: oneshot::Sender<HandlerResult>,
+    pub response_tx: oneshot::Sender<Result<MainReply, Logged>>,
 }
 
 /// Handle returned to callers. Cheap to Arc-share across all TPC
@@ -260,6 +263,7 @@ fn dispatch_one(site: &SharedSite, item: GilWorkItem) {
         body,
         headers,
         client_ip,
+        request_id,
         target,
         body_stream_rx,
         response_tx,
@@ -281,6 +285,7 @@ fn dispatch_one(site: &SharedSite, item: GilWorkItem) {
         query_cache: OnceLock::new(),
         query_all_cache: OnceLock::new(),
         client_ip_addr: client_ip,
+        request_id,
         body_bytes: body,
         body_stream_rx,
     };

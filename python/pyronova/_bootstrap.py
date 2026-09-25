@@ -25,6 +25,11 @@ import sys, os
 _emit_python_log = None
 
 
+# Formats a record's exception (`logger.exception`) as its traceback. A `Handler`
+# has no `formatException`; that is a `Formatter` method.
+_TRACEBACK_FORMAT = _logging.Formatter()
+
+
 class _PyronovaRustHandler(_logging.Handler):
     """Routes Python logging records through Rust tracing, tagged with this
     worker's id. Records logged before the engine is imported (during this
@@ -41,7 +46,7 @@ class _PyronovaRustHandler(_logging.Handler):
             # Use a local variable rather than mutating record.exc_text so the
             # same LogRecord can safely be routed to multiple handlers.
             if record.exc_info:
-                exc_text = record.exc_text or self.formatException(record.exc_info)
+                exc_text = record.exc_text or _TRACEBACK_FORMAT.formatException(record.exc_info)
                 msg = f"{msg}\n{exc_text}"
             if _emit_python_log is None:
                 sys.stderr.write(f"{record.levelname} {record.name}: {msg}\n")

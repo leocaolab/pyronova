@@ -65,6 +65,7 @@ bash benchmarks/run_bench.sh
 - `#[pyclass(frozen)]` on Request/Response for thread safety
 - `Pyronova` Python wrapper provides decorator syntax; `PyronovaApp` is the raw Rust engine
 - Sub-interpreter mode uses `crossbeam-channel` multi-consumer pool with `tokio::sync::oneshot` async responses
+- Errors: one typed `HandlerError` (`handlers/error.rs`) carries the raw error (exception text + traceback, panic payload); it is logged once where it happens with the request id (`request_id.rs`, one writer per request) and rendered once at the edge — 4xx carry the reason, 5xx are `{"error": "Internal Server Error", "request_id": ...}` (decision D4)
 - `PyObjRef` RAII wrapper for all raw FFI pointer operations — Drop auto-DECREFs
 - Workers import the real `pyronova` package and engine (the fork makes the module per-interpreter); the async engine talks to Rust through `pyronova.engine._worker_recv`/`_worker_send`, which release the GIL during the channel wait
 - Every Rust thread that enters Python names its interpreter (`run_context::main_attach` / `attach_to`); a bare foreign-thread `Python::attach` is rejected by `tests/test_attach_allowlist.py`

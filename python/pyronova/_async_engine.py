@@ -26,10 +26,6 @@ _HANDLERS = _engine._worker_app_handlers()
 _BEFORE_HOOKS, _AFTER_HOOKS = _engine._worker_app_hooks()
 
 
-def _error_response(status, text):
-    return _engine.Response(text, status_code=status, content_type="text/plain")
-
-
 async def _call(fn, *args):
     res = fn(*args)
     if asyncio.iscoroutine(res) or asyncio.isfuture(res) or hasattr(res, "__await__"):
@@ -58,34 +54,25 @@ async def _handle(handler, req):
 
 
 async def _process_request(req_id, handler_idx, req):
+    # A failure goes to Rust as what it is: the exception itself (logged there once,
+    # with its traceback and the request id; the client gets a generic 500), or the
+    # timeout (504).
     try:
-        try:
-            handler = _HANDLERS[handler_idx]
-        except IndexError:
-            _log.error("worker=%s invalid handler_idx=%r", WORKER_ID, handler_idx)
-            _engine._worker_send(WORKER_ID, POOL_ID, req_id, _error_response(500, "routing error"))
-            return
         # Bracket pattern: bound the request's lifetime so cancelled/timed-out
         # requests don't accumulate as phantom load in the event loop.
-        res = await asyncio.wait_for(_handle(handler, req), timeout=_HANDLER_TIMEOUT)
-        _engine._worker_send(WORKER_ID, POOL_ID, req_id, res)
+        res = await asyncio.wait_for(
+            _handle(_HANDLERS[handler_idx], req), timeout=_HANDLER_TIMEOUT
+        )
     except asyncio.TimeoutError:
-        try:
-            _engine._worker_send(WORKER_ID, POOL_ID, req_id, _error_response(504, "handler timeout"))
-        except Exception:
-            _log.exception("async handler req_id=%s: send timeout response failed", req_id)
+        _engine._worker_timed_out(WORKER_ID, POOL_ID, req_id)
     except asyncio.CancelledError:
         # Propagated cancellation — client disconnected or Rust future dropped.
         # Re-raise to let asyncio mark the task as CANCELLED (required by asyncio contract).
         raise
-    except Exception:
-        _log.exception("async handler req_id=%s path=%s raised", req_id, req.path)
-        try:
-            _engine._worker_send(
-                WORKER_ID, POOL_ID, req_id, _error_response(500, "internal server error")
-            )
-        except Exception:
-            _log.exception("async handler req_id=%s: send error response failed", req_id)
+    except Exception as exc:
+        _engine._worker_fail(WORKER_ID, POOL_ID, req_id, exc)
+    else:
+        _engine._worker_send(WORKER_ID, POOL_ID, req_id, res)
 
 
 def _fetcher_thread(loop):
@@ -170,7 +157,10 @@ async def _pyronova_engine():
 # back-off loop catches and retries it forever, pinning a core.
 _missing = [_name for _name in ("WORKER_ID", "POOL_ID") if _name not in globals()]
 _missing += [
-    _name for _name in ("_worker_recv", "_worker_send", "_worker_to_response")
+    _name for _name in (
+        "_worker_recv", "_worker_send", "_worker_fail", "_worker_timed_out",
+        "_worker_to_response",
+    )
     if not hasattr(_engine, _name)
 ]
 if _missing:
