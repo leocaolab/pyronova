@@ -13,10 +13,10 @@
 //! - **GIL metrics** are collected passively on the real request path — each
 //!   `call_handler_with_hooks` records GIL acquisition wait time as a
 //!   byproduct. Zero overhead when idle, zero artificial contention.
-//! - **RSS sampling** runs in a separate non-GIL thread with an explicit
-//!   stop flag and JoinHandle for deterministic shutdown.
+//! - **RSS sampling** runs in a separate non-GIL thread while a server with metrics
+//!   serves ([`RssSampling`]); the last one to stop joins it.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crossbeam_utils::CachePadded;
@@ -36,8 +36,8 @@ pub static GIL_PROBE_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static GIL_TOTAL_WAIT_US: AtomicU64 = AtomicU64::new(0);
 
 /// Process RSS in bytes from the background sampler's latest read. `None` until the
-/// sampler has read it once (it runs only with `PYRONOVA_METRICS=1`), and after a read
-/// that failed.
+/// sampler has read it once (it runs only while a server with `PYRONOVA_METRICS=1`
+/// serves), after a read that failed, and once the last such server stopped.
 static MEMORY_RSS_BYTES: parking_lot::Mutex<Option<u64>> = parking_lot::Mutex::new(None);
 
 /// Number of threads currently waiting to acquire the main GIL
@@ -119,77 +119,65 @@ pub fn record_gil_wait(wait_us: u64) {
 // Decoupled RSS sampler (no GIL, deterministic shutdown)
 // ---------------------------------------------------------------------------
 
-/// Stop flag for the RSS sampler thread.
-static RSS_SAMPLER_RUNNING: AtomicBool = AtomicBool::new(false);
-
-/// Handle to the spawned sampler thread. `stop_rss_sampler` takes it
-/// and joins — the previous code dropped the handle immediately,
-/// leaving the thread racing `Py_Finalize` during process exit. If
-/// the extension's `.so` was unloaded before the sampler's sleep(1)
-/// woke up, the thread's next instruction pointed at freed pages →
-/// segfault (spurious non-zero exit signalled K8s / systemd etc.).
-static RSS_SAMPLER_HANDLE: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
-    std::sync::Mutex::new(None);
-
-/// Spawn a lightweight background thread that samples process RSS.
-/// The handle is stashed in `RSS_SAMPLER_HANDLE`; `stop_rss_sampler`
-/// joins it on shutdown.
-///
-/// This thread never touches Python or the GIL — it only reads /proc/self/statm.
-pub fn spawn_rss_sampler() {
-    // Hold the handle lock across the whole check-and-spawn so two callers
-    // can't race, and bail out if a sampler is already installed. Spawning a
-    // second would overwrite (and thus detach) the first's JoinHandle, leaving
-    // stop_rss_sampler able to join only the newest — the detached thread would
-    // then outlive Py_Finalize and segfault on freed code pages (ISSUE-72).
-    let mut slot = RSS_SAMPLER_HANDLE.lock().unwrap_or_else(|e| e.into_inner());
-    if slot.is_some() {
-        return;
-    }
-    RSS_SAMPLER_RUNNING.store(true, Ordering::Release);
-    let handle = match std::thread::Builder::new()
-        .name("pyronova-rss-sampler".to_string())
-        .spawn(sample_rss_until_stopped)
-    {
-        Ok(handle) => handle,
-        Err(e) => {
-            // RSS sampling is a passive observability feature. If the OS
-            // refuses the thread (resource exhaustion, ulimit), don't take
-            // the whole server down — degrade gracefully and serve requests
-            // without RSS metrics. Reset the run flag so stop_rss_sampler is
-            // a no-op and a later spawn attempt starts clean.
-            RSS_SAMPLER_RUNNING.store(false, Ordering::Release);
-            tracing::warn!(
-                target: "pyronova::server",
-                error = %e,
-                "failed to spawn RSS sampler; continuing without RSS metrics"
-            );
-            return;
-        }
-    };
-    // slot was locked at the top and confirmed empty above, so this never
-    // overwrites (and thus detaches) a live handle.
-    *slot = Some(handle);
+/// The sampler thread, shared by every server serving with metrics: the first
+/// [`RssSampling::start`] spawns it, the last one's drop stops and joins it.
+struct Sampler {
+    users: usize,
+    /// Dropping the sender stops the thread at once (it waits on the receiver between
+    /// samples); `None` while no thread runs, or if spawning it failed.
+    thread: Option<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
 }
 
-/// Signal the RSS sampler to stop AND join the thread. Blocks up to
-/// one sample interval (~1s) while the thread wakes from its sleep,
-/// observes the stop flag, and exits. On process shutdown this is
-/// mandatory — otherwise `Py_Finalize` can unload the Rust extension
-/// while the sampler thread is still sleeping, and waking into freed
-/// code pages segfaults.
-pub fn stop_rss_sampler() {
-    RSS_SAMPLER_RUNNING.store(false, Ordering::Release);
-    // Same poison-recovery rationale as the install side (arc monitor-1).
-    let handle = RSS_SAMPLER_HANDLE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take();
-    if let Some(h) = handle {
-        if let Err(panic) = h.join() {
-            tracing::error!(target: "pyronova::server", ?panic,
-                "RSS sampler thread panicked");
+static SAMPLER: parking_lot::Mutex<Sampler> = parking_lot::Mutex::new(Sampler {
+    users: 0,
+    thread: None,
+});
+
+/// RSS sampling for as long as it is held: one per serving run with `PYRONOVA_METRICS=1`.
+/// Every stop path of the run drops it (return, error, `shutdown()`, SIGINT); when the last
+/// holder goes, the thread is joined (it must not outlive `Py_Finalize`, which may unload
+/// this library under it) and `rss_bytes` reads `None` again, not a stale value.
+pub(crate) struct RssSampling(());
+
+impl RssSampling {
+    pub(crate) fn start() -> Self {
+        let mut sampler = SAMPLER.lock();
+        sampler.users += 1;
+        if sampler.users == 1 {
+            let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+            match std::thread::Builder::new()
+                .name("pyronova-rss-sampler".to_string())
+                .spawn(move || sample_rss_until_stopped(stop_rx))
+            {
+                Ok(handle) => sampler.thread = Some((stop_tx, handle)),
+                // A passive observability feature: serve without it rather than fail.
+                Err(e) => tracing::warn!(
+                    target: "pyronova::server",
+                    error = %e,
+                    "failed to spawn RSS sampler; continuing without RSS metrics"
+                ),
+            }
         }
+        RssSampling(())
+    }
+}
+
+impl Drop for RssSampling {
+    fn drop(&mut self) {
+        // Held through the join (immediate: the thread wakes on the disconnect), so a
+        // server starting meanwhile spawns its thread after this one's last write.
+        let mut sampler = SAMPLER.lock();
+        sampler.users -= 1;
+        if sampler.users > 0 {
+            return;
+        }
+        if let Some((stop_tx, handle)) = sampler.thread.take() {
+            drop(stop_tx);
+            if let Err(panic) = handle.join() {
+                tracing::error!(target: "pyronova::server", ?panic, "RSS sampler thread panicked");
+            }
+        }
+        *MEMORY_RSS_BYTES.lock() = None;
     }
 }
 
@@ -197,10 +185,10 @@ pub fn stop_rss_sampler() {
 /// does no GIL work.
 const RSS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
-fn sample_rss_until_stopped() {
+fn sample_rss_until_stopped(stop: std::sync::mpsc::Receiver<()>) {
     // Warn on the first failed read after a good one (or at start), not every interval.
     let mut warn_on_failure = true;
-    while RSS_SAMPLER_RUNNING.load(Ordering::Acquire) {
+    loop {
         let rss = match get_rss_bytes() {
             Ok(bytes) => {
                 warn_on_failure = true;
@@ -216,7 +204,11 @@ fn sample_rss_until_stopped() {
             }
         };
         *MEMORY_RSS_BYTES.lock() = rss;
-        std::thread::sleep(RSS_SAMPLE_INTERVAL);
+        // Only a disconnect (the last holder dropped) ends the wait early.
+        if stop.recv_timeout(RSS_SAMPLE_INTERVAL) != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        {
+            break;
+        }
     }
     tracing::debug!(target: "pyronova::server", "RSS sampler stopped");
 }

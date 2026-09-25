@@ -87,6 +87,11 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // it explicitly (Layer 2, C4).
     run_context::capture_main(m.py());
     m.add_class::<app::PyronovaApp>()?;
+    m.add_class::<app::Server>()?;
+    m.add(
+        "RegistrationSealed",
+        m.py().get_type::<app::RegistrationSealed>(),
+    )?;
     m.add_class::<config::Mode>()?;
     m.add_class::<types::PyronovaRequest>()?;
     m.add_class::<types::PyronovaResponse>()?;

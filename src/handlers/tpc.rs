@@ -1,8 +1,8 @@
 //! TPC request handler.
 //!
-//! A worker route runs inline: on the TPC thread's own OS thread, in its own
-//! sub-interpreter, with no cross-thread wake. A `gil=True` route or the fallback goes to
-//! the main-interpreter bridge.
+//! A `def` worker route runs inline: on the TPC thread's own OS thread, in its own
+//! sub-interpreter, with no cross-thread wake. An `async def` route goes to the async
+//! worker pool; a `gil=True` route or the fallback goes to the main-interpreter bridge.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -17,7 +17,7 @@ use hyper::{Request, Response};
 use crate::bridge::main_bridge::{GilWorkItem, MainInterpBridge, TryDispatchError};
 use crate::python::interp::SubInterpreterWorker;
 use crate::request_id::RequestId;
-use crate::router::{Call, Params, RequestBody, RouteId, Target};
+use crate::router::{Call, HandlerKind, Params, RequestBody, RouteId, Target};
 use crate::site::Site;
 use crate::types::PyronovaRequest;
 use crate::worker::TpcContext;
@@ -27,6 +27,7 @@ use super::pipeline::{
     await_reply, await_streamed_reply, collect_body, fail, finish, preprocess, AcceptEncoding,
     Prepared, Preprocessed, RequestLine, Served, REQUEST_BUDGET,
 };
+use super::subinterp::serve_on_pool;
 use super::{build_main_http_response, http_response, stream_body_feeder, BoxBody};
 
 pub(crate) async fn handle_request_tpc_inline(
@@ -40,15 +41,42 @@ pub(crate) async fn handle_request_tpc_inline(
         Preprocessed::Dispatch(p) => p,
     };
     let resp = match prepared.call {
-        Call::Worker(route, _) => {
+        Call::Worker(route, HandlerKind::Sync) => {
             run_inline(site, &context.worker, prepared, route, client_ip_addr).await
         }
+        // Off this thread, so the handler's awaits overlap other requests and its budget
+        // is enforced on time (decision Q1).
+        Call::Worker(route, kind @ HandlerKind::Async) => match &context.async_pool {
+            Some(pool) => serve_on_pool(pool, site, prepared, route, kind, client_ip_addr).await,
+            None => no_async_pool(site, prepared),
+        },
         Call::Main(target, body) => {
             let bridge = context.bridge.as_deref();
             run_on_bridge(site, bridge, prepared, target, body, client_ip_addr).await
         }
     };
     Ok(resp)
+}
+
+/// An `async def` route on a TPC context without an async pool: the server builds one
+/// whenever the table has an `async def` route, so only a context built without it (the
+/// benches, which refuse such tables) gets here.
+fn no_async_pool(site: &Site, prepared: Prepared) -> Response<BoxBody> {
+    let line = RequestLine {
+        method: prepared.parts.method.as_str(),
+        path: prepared.parts.uri.path(),
+        start: prepared.start,
+    };
+    let tag = RequestTag {
+        id: &prepared.request_id,
+        method: prepared.parts.method.as_str(),
+        path: prepared.parts.uri.path(),
+    };
+    let resp = fail(
+        HandlerError::WorkerLost("the async worker pool is not running"),
+        &tag,
+    );
+    finish(resp, site, &line, Served::Pool)
 }
 
 /// Runs a worker route on this thread's sub-interpreter.
@@ -152,7 +180,9 @@ fn call_inline(
             handler = %site.routes.route(route).name,
             took_ms = took.as_millis() as u64,
             "handler ran past the {REQUEST_BUDGET:?} request budget, blocking its TPC thread \
-             the whole time; answered 504. Use `async def` or gil=True for slow work"
+             the whole time; answered 504 only once it returned. A sync `def` runs inline and \
+             cannot be preempted; make slow work `async def` or gil=True, where the 504 is \
+             sent on time"
         );
         return fail(HandlerError::Timeout, tag);
     }

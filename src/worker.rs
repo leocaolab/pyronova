@@ -49,13 +49,16 @@ where
     }
 }
 
-/// What one TPC sub-interpreter thread serves with: its worker, the site, the
-/// main-interpreter bridge. Shared (`Rc`) by the thread's connection tasks; never leaves
-/// the thread. One non-atomic `Rc` clone per request.
+/// What one TPC sub-interpreter thread serves with: its worker (the `def` routes), the
+/// site, the main-interpreter bridge, the async pool (the `async def` routes). Shared
+/// (`Rc`) by the thread's connection tasks; never leaves the thread. One non-atomic `Rc`
+/// clone per request.
 pub(crate) struct TpcContext {
     pub(crate) worker: RefCell<SubInterpreterWorker>,
     pub(crate) site: SharedSite,
     pub(crate) bridge: Option<Arc<MainInterpBridge>>,
+    /// `None` when the table has no `async def` route.
+    pub(crate) async_pool: Option<crate::handlers::SharedPool>,
 }
 
 impl TpcContext {

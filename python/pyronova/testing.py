@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 from http.cookiejar import CookieJar
 from typing import Any, Iterator, NoReturn
 
-from pyronova.app import Pyronova, _ServeSettings
+from pyronova.app import Pyronova, WorkersAbandoned, _ServeSettings
 
 _logger = _logging.getLogger("pyronova.testing")
 
@@ -176,7 +176,13 @@ class TestClient:
         if app._app_file_path is None and app._defined_in is not None:
             app._set_app_file(app._defined_in)
 
-        self._port: int | None = None
+        # This client's own server (an engine `Server`), once bound; `close()` stops that
+        # one server, never another server of the same app (e.g. an outer TestClient).
+        # `_closing` records a close() that came before the server existed, so the
+        # server is stopped as soon as it is bound.
+        self._lock = threading.Lock()
+        self._server = None
+        self._closing = False
         self._server_error: Exception | None = None
         self._thread = threading.Thread(
             target=self._serve, name="pyronova-testclient", daemon=True
@@ -187,7 +193,8 @@ class TestClient:
     @property
     def port(self) -> int:
         """The port the server listens on (the one the kernel picked for ``port=None``)."""
-        return self._settings.port if self._port is None else self._port
+        server = self._server
+        return self._settings.port if server is None else server.port
 
     @property
     def base_url(self) -> str:
@@ -195,26 +202,34 @@ class TestClient:
 
     def _serve(self) -> None:
         try:
-            self._app._serve(self._settings, self._app._start)
-        except Exception as e:  # noqa: BLE001 — stored for the readiness probe and logged
+            self._app._serve(
+                self._settings,
+                lambda settings: self._app._start(settings, on_bound=self._bound),
+            )
+        except Exception as e:  # noqa: BLE001 — stored for the readiness probe / close()
             self._server_error = e
             _logger.error(
                 "TestClient server on port %d stopped with an error; clients will see "
                 "connection refused", self.port, exc_info=e,
             )
 
+    def _bound(self, server) -> None:
+        """The engine bound this client's server; it serves next unless close() came first."""
+        with self._lock:
+            self._server = server
+            if self._closing:
+                server.shutdown()
+
     def _wait_until_ready(self) -> None:
-        # The engine binds every listener before it builds a worker, then reports the
-        # port; after that, any HTTP response (2xx-5xx) proves it is serving, and only
-        # ConnectionError / timeout means it is still starting.
+        # The engine binds every listener before it builds a worker, and the server is
+        # this client's from then on; after that, any HTTP response (2xx-5xx) proves it is
+        # serving, and only ConnectionError / timeout means it is still starting.
         for _ in range(_READY_POLLS):
             time.sleep(_READY_POLL_S)
             if not self._thread.is_alive():
                 self._raise_exited_early()
-            if self._port is None:
-                self._port = self._app._engine.bound_port()
-                if self._port is None:
-                    continue
+            if self._server is None:
+                continue
             try:
                 # Context manager guarantees the response is closed even if
                 # something raises after open() (arc finding testing-48).
@@ -251,17 +266,27 @@ class TestClient:
         raise err
 
     def close(self) -> None:
-        """Stop the server and wait until it has: its shutdown hooks have run and the port
-        is free. Idempotent."""
-        if not self._thread.is_alive():
-            return
-        self._app._stop()
+        """Stop this client's server and wait until it has: its shutdown hooks have run and
+        the port is free. Other servers of the same app keep serving. Safe from any
+        thread, also while the server is still starting. Idempotent.
+
+        Raises ``WorkersAbandoned`` when worker threads outlived the shutdown grace
+        period: ``app.run()`` would exit the process there; a test process is left
+        running, and will abort when it finalizes."""
+        with self._lock:
+            self._closing = True
+            server = self._server
+        if server is not None:
+            server.shutdown()
         self._thread.join(_STOP_TIMEOUT_S)
         if self._thread.is_alive():
             raise RuntimeError(
                 f"TestClient: server on port {self.port} did not stop within "
                 f"{_STOP_TIMEOUT_S}s"
             )
+        err, self._server_error = self._server_error, None
+        if isinstance(err, WorkersAbandoned):
+            raise err
 
     def __enter__(self):
         return self
