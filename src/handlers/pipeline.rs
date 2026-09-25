@@ -146,10 +146,10 @@ pub(crate) async fn preprocess(
     req: Request<Incoming>,
     site: &Site,
 ) -> Result<Preprocessed, hyper::Error> {
+    crate::monitor::count_request();
     if site.config.grpc_benchmark && crate::grpc::is_get_sum_call(&req) {
         return grpc_get_sum(req, site).await.map(Preprocessed::Respond);
     }
-    crate::monitor::count_request();
     let start = Instant::now();
 
     if let Some(fast) = site

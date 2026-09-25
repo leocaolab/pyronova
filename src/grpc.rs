@@ -33,12 +33,13 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 use futures_util::stream;
-use http_body_util::{BodyExt, LengthLimitError, Limited, StreamBody};
+use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::header::{HeaderValue, InvalidHeaderValue};
 use hyper::{HeaderMap, Request, Response};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 
+use crate::handlers::pipeline::{read_body, BodyReject, REQUEST_BUDGET};
 use crate::handlers::BoxBody;
 
 /// The canonical gRPC status codes this server emits
@@ -46,6 +47,7 @@ use crate::handlers::BoxBody;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GrpcStatus {
     Ok,
+    DeadlineExceeded,
     ResourceExhausted,
     Unimplemented,
     Internal,
@@ -56,6 +58,7 @@ impl GrpcStatus {
     fn header_value(self) -> HeaderValue {
         HeaderValue::from_static(match self {
             Self::Ok => "0",
+            Self::DeadlineExceeded => "4",
             Self::ResourceExhausted => "8",
             Self::Unimplemented => "12",
             Self::Internal => "13",
@@ -69,6 +72,8 @@ impl GrpcStatus {
 enum GrpcError {
     #[error("request body exceeds max_body_size ({limit} bytes)")]
     BodyTooLarge { limit: usize },
+    #[error("request body did not arrive within {REQUEST_BUDGET:?}")]
+    BodyTimedOut,
     #[error("request body read failed: {0}")]
     BodyRead(Box<dyn std::error::Error + Send + Sync>),
     #[error("request is {len} bytes, shorter than the 5-byte gRPC frame header")]
@@ -77,6 +82,11 @@ enum GrpcError {
     Compressed { flag: u8 },
     #[error("frame declares a {declared}-byte message but carries {actual} bytes")]
     TruncatedFrame { declared: usize, actual: usize },
+    #[error(
+        "frame declares a {declared}-byte message but carries {actual} bytes: a unary call \
+         sends exactly one message, nothing after it"
+    )]
+    TrailingBytes { declared: usize, actual: usize },
     #[error("malformed SumRequest: {0}")]
     Decode(#[from] DecodeError),
 }
@@ -85,11 +95,13 @@ impl GrpcError {
     fn status(&self) -> GrpcStatus {
         match self {
             Self::BodyTooLarge { .. } => GrpcStatus::ResourceExhausted,
+            Self::BodyTimedOut => GrpcStatus::DeadlineExceeded,
             Self::BodyRead(_) => GrpcStatus::Unavailable,
             Self::Compressed { .. } => GrpcStatus::Unimplemented,
-            Self::ShortFrame { .. } | Self::TruncatedFrame { .. } | Self::Decode(_) => {
-                GrpcStatus::Internal
-            }
+            Self::ShortFrame { .. }
+            | Self::TruncatedFrame { .. }
+            | Self::TrailingBytes { .. }
+            | Self::Decode(_) => GrpcStatus::Internal,
         }
     }
 }
@@ -131,21 +143,18 @@ pub(crate) async fn handle_get_sum(
     })
 }
 
-/// Collect the body under the server's size cap (a multi-GB body behind an
-/// `application/grpc` content-type must not OOM the process) and unframe it.
+/// Collect the body under the budget every request body gets (the size cap: a multi-GB
+/// body behind an `application/grpc` content-type must not OOM the process; the time
+/// budget: a stalled one must not hold the connection) and unframe it.
 async fn read_message(body: Incoming) -> Result<Bytes, GrpcError> {
     let limit = crate::handlers::max_body_size();
-    let collected = Limited::new(body, limit)
-        .collect()
+    let collected = read_body(body, limit)
         .await
-        .map_err(|e| {
-            if e.downcast_ref::<LengthLimitError>().is_some() {
-                GrpcError::BodyTooLarge { limit }
-            } else {
-                GrpcError::BodyRead(e)
-            }
-        })?
-        .to_bytes();
+        .map_err(|reject| match reject {
+            BodyReject::TooLarge => GrpcError::BodyTooLarge { limit },
+            BodyReject::TimedOut => GrpcError::BodyTimedOut,
+            BodyReject::Read(e) => GrpcError::BodyRead(Box::new(e)),
+        })?;
     unframe(collected)
 }
 
@@ -160,10 +169,11 @@ fn unframe(framed: Bytes) -> Result<Bytes, GrpcError> {
     }
     let declared = u32::from_be_bytes([framed[1], framed[2], framed[3], framed[4]]) as usize;
     let actual = framed.len() - HEADER_LEN;
-    if actual < declared {
-        return Err(GrpcError::TruncatedFrame { declared, actual });
+    match actual.cmp(&declared) {
+        std::cmp::Ordering::Less => Err(GrpcError::TruncatedFrame { declared, actual }),
+        std::cmp::Ordering::Greater => Err(GrpcError::TrailingBytes { declared, actual }),
+        std::cmp::Ordering::Equal => Ok(framed.slice(HEADER_LEN..)),
     }
-    Ok(framed.slice(HEADER_LEN..HEADER_LEN + declared))
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -435,6 +445,31 @@ mod tests {
         assert_eq!(e.status(), GrpcStatus::Internal);
         let e = unframe(Bytes::from_static(&[1, 0, 0, 0, 0])).unwrap_err();
         assert_eq!(e.status(), GrpcStatus::Unimplemented);
+    }
+
+    #[test]
+    fn bytes_after_the_message_are_an_error() {
+        let e = unframe(Bytes::from_static(&[0, 0, 0, 0, 2, 8, 1, 0xff])).unwrap_err();
+        assert!(matches!(
+            e,
+            GrpcError::TrailingBytes {
+                declared: 2,
+                actual: 3
+            }
+        ));
+        assert_eq!(e.status(), GrpcStatus::Internal);
+        assert_eq!(
+            unframe(Bytes::from_static(&[0, 0, 0, 0, 2, 8, 1])).unwrap(),
+            Bytes::from_static(&[8, 1])
+        );
+    }
+
+    #[test]
+    fn a_stalled_body_is_deadline_exceeded() {
+        assert_eq!(
+            GrpcError::BodyTimedOut.status().header_value(),
+            HeaderValue::from_static("4")
+        );
     }
 
     #[tokio::test]

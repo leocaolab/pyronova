@@ -998,3 +998,88 @@ def test_crud_maps_only_param_errors_to_422(exc, status):
         assert r.status_code == expected, (raised, r.status_code, r.text)
         if expected == 500:
             assert "a bug in the app" not in r.text
+
+
+# ---------------------------------------------------------------------------
+# gRPC: the body read has the request budget and is counted; trailing bytes refused
+# ---------------------------------------------------------------------------
+
+GRPC_SCRIPT = """
+from pyronova import Pyronova, get_gil_metrics
+app = Pyronova()
+app.max_body_size = 64
+app.enable_grpc_benchmark()
+
+@app.get("/total", gil=True)
+def total(req):
+    return {"total": get_gil_metrics().total_requests}
+""" + RUN
+
+GET_SUM = "/benchmark.BenchmarkService/GetSum"
+
+
+def _grpc_frame(message: bytes, declared: int | None = None) -> bytes:
+    n = len(message) if declared is None else declared
+    return b"\x00" + n.to_bytes(4, "big") + message
+
+
+def _grpc_call(port: int, body: bytes, end: bool = True) -> dict[str, str]:
+    """One h2c call to GetSum; returns its trailers. `end=False` leaves the request body
+    open, as a stalled client does."""
+    import h2.config
+    import h2.connection
+    import h2.events
+
+    with socket.create_connection((HOST, port), timeout=60) as s:
+        conn = h2.connection.H2Connection(h2.config.H2Configuration(client_side=True))
+        conn.initiate_connection()
+        stream = conn.get_next_available_stream_id()
+        conn.send_headers(stream, [
+            (":method", "POST"), (":path", GET_SUM), (":scheme", "http"),
+            (":authority", f"{HOST}:{port}"), ("content-type", "application/grpc"),
+            ("te", "trailers"),
+        ])
+        conn.send_data(stream, body, end_stream=end)
+        s.sendall(conn.data_to_send())
+        trailers: dict[str, str] = {}
+        while not trailers:
+            data = s.recv(65536)
+            if not data:
+                break
+            for event in conn.receive_data(data):
+                if isinstance(event, h2.events.TrailersReceived):
+                    trailers = {k.decode(): v.decode() for k, v in event.headers}
+            s.sendall(conn.data_to_send())
+        return trailers
+
+
+def test_grpc_trailing_bytes_after_the_message_are_refused():
+    with serve(GRPC_SCRIPT, "tpc") as srv:
+        ok = _grpc_call(srv.port, _grpc_frame(bytes([0x08, 2, 0x10, 3])))
+        assert ok["grpc-status"] == "0", ok
+        trailing = _grpc_call(srv.port, _grpc_frame(bytes([0x08, 2, 0x10, 3]), declared=2))
+        assert trailing["grpc-status"] == "13", trailing
+        assert "nothing after it" in trailing["grpc-message"], trailing
+        # The size cap (max_body_size) still applies.
+        too_large = _grpc_call(srv.port, _grpc_frame(b"\x08\x01" * 64))
+        assert too_large["grpc-status"] == "8", too_large
+
+
+def test_grpc_stalled_body_is_deadline_exceeded():
+    # The body read used to have no deadline at all.
+    with serve(GRPC_SCRIPT, "tpc") as srv:
+        started = time.monotonic()
+        stalled = _grpc_call(srv.port, b"\x00\x00\x00", end=False)
+        assert stalled["grpc-status"] == "4", stalled
+        assert 25 < time.monotonic() - started < 50
+
+
+@pytest.mark.parametrize("path", ["tpc", "gil"])
+def test_grpc_calls_are_counted(path):
+    with serve(GRPC_SCRIPT, path, env={"PYRONOVA_METRICS": "1"}) as srv:
+        before = srv.get("/total").json()["total"]
+        for _ in range(3):
+            assert _grpc_call(srv.port, _grpc_frame(bytes([0x08, 1])))["grpc-status"] == "0"
+        after = srv.get("/total").json()["total"]
+        # the three calls and the second /total
+        assert after - before == 4, (before, after)
