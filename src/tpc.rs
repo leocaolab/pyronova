@@ -150,6 +150,46 @@ fn log_startup(mode: &str, addr: &SocketAddr, n_threads: usize, n_cpus: usize, s
     );
 }
 
+/// The thread that stops a TPC server on SIGINT (`crate::app::until_stopped`). Dropping it
+/// cancels the stop token and joins the thread, so a run leaves no watcher behind on any
+/// exit path, including accept loops that ended without a stop.
+struct StopWatcher {
+    stop: CancellationToken,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+fn spawn_stop_watcher(stop: CancellationToken) -> Result<StopWatcher, ServeError> {
+    let watched = stop.clone();
+    let thread = std::thread::Builder::new()
+        .name("pyronova-stop".into())
+        .spawn(move || {
+            let rt = RuntimeBuilder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("stop-watcher runtime");
+            rt.block_on(crate::app::until_stopped(watched));
+        })
+        .map_err(|source| ServeError::Spawn {
+            thread: "pyronova-stop".into(),
+            source,
+        })?;
+    Ok(StopWatcher {
+        stop,
+        thread: Some(thread),
+    })
+}
+
+impl Drop for StopWatcher {
+    fn drop(&mut self) {
+        self.stop.cancel();
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                tracing::error!(target: "pyronova::server", "stop watcher thread panicked");
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GIL mode — every handler on the main interpreter
 // ---------------------------------------------------------------------------
@@ -160,28 +200,12 @@ pub(crate) fn run_tpc_gil(
     n_cpus: usize,
     routes: SharedSite,
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
+    shutdown: CancellationToken,
 ) -> Result<(), ServeError> {
     log_startup("gil", &addr, n_threads, n_cpus, &routes);
 
-    let shutdown = CancellationToken::new();
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-
-    // ctrl_c watcher runs on its own dedicated thread — it's not TPC
-    // traffic, just a signal sink that flips the token.
-    let sigint_token = shutdown.clone();
-    std::thread::spawn(move || {
-        let rt = RuntimeBuilder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("sigint runtime");
-        rt.block_on(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!(target: "pyronova::server", "Shutting down gracefully...");
-            println!("\n  Shutting down gracefully...");
-            crate::monitor::stop_rss_sampler();
-            sigint_token.cancel();
-        });
-    });
+    let _watcher = spawn_stop_watcher(shutdown.clone())?;
 
     let mut handles = Vec::with_capacity(n_threads);
     for i in 0..n_threads {
@@ -375,6 +399,7 @@ pub(crate) fn run_tpc_subinterp(
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
     extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
     gc_mode: GcMode,
+    shutdown: CancellationToken,
 ) -> Result<(), ServeError> {
     if workers.len() != n_threads {
         return Err(ServeError::WorkerCount {
@@ -417,6 +442,7 @@ pub(crate) fn run_tpc_subinterp(
                 main_bridge,
                 extra_tls,
                 gc_mode,
+                shutdown,
             );
         }
         run_tpc_subinterp_per_thread_listener(
@@ -429,6 +455,7 @@ pub(crate) fn run_tpc_subinterp(
             main_bridge,
             extra_tls,
             gc_mode,
+            shutdown,
         )
     }
 
@@ -444,6 +471,7 @@ pub(crate) fn run_tpc_subinterp(
             main_bridge,
             extra_tls,
             gc_mode,
+            shutdown,
         )
     }
 }
@@ -459,36 +487,19 @@ fn run_tpc_subinterp_per_thread_listener(
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
     extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
     gc_mode: GcMode,
+    shutdown: CancellationToken,
 ) -> Result<(), ServeError> {
     log_startup("hybrid-inline", &addr, n_threads, n_cpus, &routes);
 
-    let shutdown = CancellationToken::new();
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+    let _watcher = spawn_stop_watcher(shutdown.clone())?;
 
-    let sigint_token = shutdown.clone();
-    std::thread::spawn(move || {
-        let rt = RuntimeBuilder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("sigint runtime");
-        rt.block_on(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!(target: "pyronova::server", "Shutting down gracefully...");
-            println!("\n  Shutting down gracefully...");
-            crate::monitor::stop_rss_sampler();
-            sigint_token.cancel();
-        });
-    });
-
-    // Leak one Arc into a `&'static Site` shared across workers.
-    // The Site is read-only after startup; leaking the Arc means
-    // per-request dispatch on the hot path does zero refcount ops. The
-    // memory cost is one Site worth, held for the server's life
-    // — acceptable for a long-running server. `Arc::into_raw` + deref
-    // is the stable-since-1.0 way to get this; the pointer is never
-    // reclaimed on the success path, which is the whole point. We keep
-    // the raw pointer so the error path below can reclaim it instead of
-    // leaking on every failed start.
+    // Lend one Arc as a `&'static Site` shared across workers, so
+    // per-request dispatch on the hot path does zero refcount ops.
+    // `Arc::into_raw` + deref is the stable-since-1.0 way to get this. The
+    // raw pointer is reclaimed once every thread that borrows it is joined,
+    // on the error path below and after the server stops, so repeated
+    // starts in one process (TestClient) don't accumulate Sites.
     let routes_raw: *const Site = Arc::into_raw(Arc::clone(&routes));
     let routes_static: &'static Site = unsafe { &*routes_raw };
 
@@ -578,6 +589,8 @@ fn run_tpc_subinterp_per_thread_listener(
             tracing::error!(target: "pyronova::server", panic = msg, "TPC inline worker thread panicked");
         }
     }
+    // SAFETY: every thread that borrowed `routes_static` is joined above.
+    unsafe { drop(Arc::from_raw(routes_raw)) };
     Ok(())
 }
 
@@ -599,26 +612,12 @@ fn run_tpc_subinterp_fanout(
     main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
     _extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
     gc_mode: GcMode,
+    shutdown: CancellationToken,
 ) -> Result<(), ServeError> {
     log_startup("hybrid-inline-fanout", &addr, n_threads, n_cpus, &routes);
 
-    let shutdown = CancellationToken::new();
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-
-    let sigint_token = shutdown.clone();
-    std::thread::spawn(move || {
-        let rt = RuntimeBuilder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("sigint runtime");
-        rt.block_on(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!(target: "pyronova::server", "Shutting down gracefully...");
-            println!("\n  Shutting down gracefully...");
-            crate::monitor::stop_rss_sampler();
-            sigint_token.cancel();
-        });
-    });
+    let _watcher = spawn_stop_watcher(shutdown.clone())?;
 
     type Conn = (std::net::TcpStream, SocketAddr);
 
@@ -639,10 +638,9 @@ fn run_tpc_subinterp_fanout(
         worker_rxs.push(Some(rx));
     }
 
-    // Leak once for a shared &'static, same rationale as the per-thread
-    // listener path. All workers read from the same static, no Arc ops.
-    // Keep the raw pointer so the error path can reclaim it on a failed
-    // start instead of leaking.
+    // Lend once as a shared &'static, same rationale as the per-thread
+    // listener path: all workers read from the same static, no Arc ops,
+    // and the pointer is reclaimed once they are joined.
     let routes_raw: *const Site = Arc::into_raw(Arc::clone(&routes));
     let routes_static: &'static Site = unsafe { &*routes_raw };
 
@@ -835,6 +833,8 @@ fn run_tpc_subinterp_fanout(
             tracing::error!(target: "pyronova::server", panic = msg, "TPC fanout worker/acceptor thread panicked");
         }
     }
+    // SAFETY: every thread that borrowed `routes_static` is joined above.
+    unsafe { drop(Arc::from_raw(routes_raw)) };
     Ok(())
 }
 

@@ -39,7 +39,8 @@ def client():
             total += i
         return {"total": total}
 
-    c = TestClient(app, port=19892)
+    # Main interpreter: these tests measure how long handlers hold the main GIL.
+    c = TestClient(app, port=19892, mode="gil")
     yield c
     c.close()
 

@@ -43,19 +43,9 @@ def client():
         )
     """)
 
-    app = Pyronova()
-    register_crud(
-        app, pool,
-        prefix="/items",
-        table="pyronova_crud_items",
-        columns=["id", "name", "quantity"],
-        id_column="id",
-        id_type=int,
-    )
-
-    @app.get("/")
-    def root(req):
-        return "ok"
+    # After the schema exists: workers execute the app's module, which only connects
+    # and registers routes.
+    from tests.apps.crud_items import app
 
     with TestClient(app, port=None) as c:
         yield c

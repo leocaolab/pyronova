@@ -3,7 +3,6 @@
 import os
 import tempfile
 import pytest
-from pyronova import Pyronova
 from pyronova.testing import TestClient
 
 
@@ -24,18 +23,16 @@ def static_dir():
     os.makedirs(sub)
     with open(os.path.join(sub, "nested.js"), "w") as f:
         f.write("console.log('hi')")
+    # The apps (tests/apps/static_*.py) read their root from here, in main and in
+    # every worker.
+    os.environ["PYRONOVA_TEST_STATIC_DIR"] = d
     yield d
+    del os.environ["PYRONOVA_TEST_STATIC_DIR"]
 
 
 @pytest.fixture(scope="module")
 def client(static_dir):
-    app = Pyronova()
-
-    @app.get("/")
-    def index(req):
-        return {"api": True}
-
-    app.static("/static/", static_dir)
+    from tests.apps.static_site import app
 
     c = TestClient(app, port=19879)
     yield c
@@ -126,14 +123,9 @@ def test_static_symlink_out_of_root_refused(static_dir):
     except (OSError, NotImplementedError):
         pytest.skip("symlink not supported on this platform")
 
-    app = Pyronova()
+    # Its own module: a worker serves one app per module.
+    from tests.apps.static_symlink import app
 
-    @app.get("/")
-    def _health(req):
-        # TestClient polls `/` to detect server readiness.
-        return {"ok": True}
-
-    app.static("/s/", static_dir)
     c = TestClient(app, port=19896)
     try:
         resp = c.get("/s/trap.txt")

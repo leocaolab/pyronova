@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::signal;
+use tokio_util::sync::CancellationToken;
 
 use crate::handlers::{handle_request, handle_request_subinterp};
 use crate::python::interp;
@@ -39,6 +40,8 @@ pub(crate) struct PyronovaApp {
     /// Opt into Thread-Per-Core mode. See docs/tpc-rearch.md. Can also
     /// be flipped via the `PYRONOVA_TPC=1` env var; either is sufficient.
     tpc: bool,
+    /// The stop signal of the server `run` is serving; `None` while nothing is serving.
+    serving: parking_lot::Mutex<Option<CancellationToken>>,
 }
 
 #[pymethods]
@@ -54,6 +57,7 @@ impl PyronovaApp {
             grpc_benchmark: false,
             request_id_header: None,
             tpc: false,
+            serving: parking_lot::Mutex::new(None),
         }
     }
 
@@ -308,10 +312,11 @@ impl PyronovaApp {
         }
     }
 
-    /// Marks the end of the script's registrations. `Pyronova.run()` calls it on the main
-    /// interpreter before anything registered at run time (`/mcp`, logging hooks, startup
-    /// hooks). Idempotent: TestClient retries `run()`, and the first boundary stays
-    /// (Layer 2, FR-2). A worker is never sealed: its table is the script's registrations.
+    /// Marks the end of the script's registrations. `Pyronova` calls it once, on the main
+    /// interpreter, when it prepares its first server and before anything registered at
+    /// run time (`/mcp`, logging hooks, startup hooks). Idempotent, because the engine's
+    /// own `run()` seals an unsealed table too: the first boundary stays (Layer 2, FR-2).
+    /// A worker is never sealed: its table is the script's registrations.
     fn _seal_registrations(&self, py: Python<'_>) -> PyResult<()> {
         if !crate::run_context::on_main(py) {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -613,7 +618,9 @@ impl PyronovaApp {
             workers
         };
 
-        if mode == "subinterp" || mode == "auto" {
+        let stop = CancellationToken::new();
+        *self.serving.lock() = Some(stop.clone());
+        let served = if mode == "subinterp" || mode == "auto" {
             if tpc_enabled {
                 // When extra_tls is non-empty the TLS ports are handled by
                 // those extra listeners; the main addr is plain HTTP.
@@ -623,7 +630,7 @@ impl PyronovaApp {
                     None
                 };
                 self.run_tpc_subinterp(
-                    py, addr, workers, io_workers, num_cpus, frozen, main_tls, extra_tls,
+                    py, addr, workers, io_workers, num_cpus, frozen, main_tls, extra_tls, stop,
                 )
             } else {
                 self.run_subinterp(
@@ -634,12 +641,24 @@ impl PyronovaApp {
                     num_cpus,
                     frozen,
                     tls_acceptor,
+                    stop,
                 )
             }
         } else if tpc_enabled {
-            self.run_tpc_gil(py, addr, workers, num_cpus, frozen, tls_acceptor)
+            self.run_tpc_gil(py, addr, workers, num_cpus, frozen, tls_acceptor, stop)
         } else {
-            self.run_gil(py, addr, io_workers, num_cpus, frozen, tls_acceptor)
+            self.run_gil(py, addr, io_workers, num_cpus, frozen, tls_acceptor, stop)
+        };
+        *self.serving.lock() = None;
+        served
+    }
+
+    /// Stops the server `run()` is serving, the way SIGINT does: stop accepting, drain the
+    /// in-flight connections, return from `run()`. Callable from any thread; a no-op while
+    /// nothing is serving.
+    fn shutdown(&self) {
+        if let Some(stop) = self.serving.lock().as_ref() {
+            stop.cancel();
         }
     }
 
@@ -718,6 +737,31 @@ fn bench_worker_count(workers: Option<usize>) -> PyResult<usize> {
         )),
         Some(n) => Ok(n),
     }
+}
+
+/// Resolves once the server should stop, then cancels `stop` so every accept loop and
+/// connection sees it: on SIGINT, or when `PyronovaApp.shutdown()` cancelled `stop`. If the
+/// SIGINT handler cannot be installed, the server keeps serving until `shutdown()`.
+pub(crate) async fn until_stopped(stop: CancellationToken) {
+    tokio::select! {
+        signalled = signal::ctrl_c() => match signalled {
+            // SIGINT ends the process, so the process-wide RSS sampler stops with it.
+            Ok(()) => crate::monitor::stop_rss_sampler(),
+            Err(e) => {
+                tracing::error!(
+                    target: "pyronova::server",
+                    error = %e,
+                    "ctrl_c signal handler registration failed; cannot receive SIGINT. \
+                     Serving until PyronovaApp.shutdown(), SIGTERM or SIGKILL."
+                );
+                stop.cancelled().await;
+            }
+        },
+        () = stop.cancelled() => {}
+    }
+    tracing::info!(target: "pyronova::server", "Shutting down gracefully...");
+    println!("\n  Shutting down gracefully...");
+    stop.cancel();
 }
 
 /// Drive a single HTTP/1+2 connection to completion, then drain it on
@@ -965,6 +1009,7 @@ impl PyronovaApp {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_gil(
         &self,
         py: Python<'_>,
@@ -973,6 +1018,7 @@ impl PyronovaApp {
         num_cpus: usize,
         routes: SharedSite,
         tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
+        stop: CancellationToken,
     ) -> PyResult<()> {
         let scheme = if tls_acceptor.is_some() {
             "https"
@@ -1010,10 +1056,9 @@ impl PyronovaApp {
                 let n_accept = io_workers.min(num_cpus);
                 #[cfg(not(target_os = "linux"))]
                 let n_accept = 1;
-                let shutdown_token = tokio_util::sync::CancellationToken::new();
                 // TaskTracker: collects every per-connection spawn so we can
                 // `.wait()` for them on shutdown. Without this, `rt.block_on`
-                // returning after `shutdown_token.cancel()` drops the Tokio
+                // returning after `stop` is cancelled drops the Tokio
                 // Runtime, which aborts every spawned connection mid-request
                 // (clients see TCP RST). graceful_shutdown() on each conn is
                 // necessary but insufficient — it only signals hyper to stop
@@ -1029,7 +1074,7 @@ impl PyronovaApp {
                         pyo3::exceptions::PyOSError::new_err(format!("TcpListener::from_std error: {e}"))
                     })?;
                     let routes = Arc::clone(&routes);
-                    let token = shutdown_token.clone();
+                    let token = stop.clone();
                     let tracker = conn_tracker.clone();
                     let tls_acc = tls_acceptor.clone();
 
@@ -1086,31 +1131,7 @@ impl PyronovaApp {
                     });
                 }
 
-                // ctrl_c() returns Err if signal handler registration
-                // failed (e.g. main thread can't take SIGINT in some
-                // embedded contexts). Pre-fix this silently fell through
-                // to immediate shutdown — server appeared to start then
-                // die seconds later with no diagnostic (arc app-1/-2).
-                if let Err(e) = signal::ctrl_c().await {
-                    tracing::error!(
-                        target: "pyronova::server",
-                        error = %e,
-                        "ctrl_c signal handler registration failed; cannot \
-                         receive SIGINT. Accept loops are live and serving — \
-                         parking instead of tearing down. Terminate via \
-                         SIGTERM/SIGKILL."
-                    );
-                    // Do NOT fall through to shutdown: the accept loops were
-                    // already spawned above and are serving traffic. Falling
-                    // through here is what made the server "start then die
-                    // seconds later" (arc app-1/-2/-52). Park forever so the
-                    // server keeps running; the OS can still SIGKILL it.
-                    std::future::pending::<()>().await;
-                }
-                tracing::info!(target: "pyronova::server", "Shutting down gracefully...");
-                println!("\n  Shutting down gracefully...");
-                crate::monitor::stop_rss_sampler();
-                shutdown_token.cancel();
+                until_stopped(stop).await;
                 // Close the tracker (no more spawns) and wait for every
                 // in-flight connection to finish its hyper drain. Bound
                 // the wait at 30 s so a pathological client can't hold
@@ -1141,6 +1162,7 @@ impl PyronovaApp {
         num_cpus: usize,
         routes: SharedSite,
         tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
+        stop: CancellationToken,
     ) -> PyResult<()> {
         let script_path = self.worker_script_path(py)?;
 
@@ -1218,7 +1240,6 @@ impl PyronovaApp {
                 let n_accept = io_workers.min(num_cpus);
                 #[cfg(not(target_os = "linux"))]
                 let n_accept = 1;
-                let shutdown_token = tokio_util::sync::CancellationToken::new();
                 // See comment in run_gil — same contract.
                 let conn_tracker = tokio_util::task::TaskTracker::new();
 
@@ -1231,7 +1252,7 @@ impl PyronovaApp {
                     })?;
                     let pool = Arc::clone(&pool);
                     let routes = Arc::clone(&routes);
-                    let token = shutdown_token.clone();
+                    let token = stop.clone();
                     let tracker = conn_tracker.clone();
                     let tls_acc = tls_acceptor.clone();
 
@@ -1286,31 +1307,7 @@ impl PyronovaApp {
                     });
                 }
 
-                // ctrl_c() returns Err if signal handler registration
-                // failed (e.g. main thread can't take SIGINT in some
-                // embedded contexts). Pre-fix this silently fell through
-                // to immediate shutdown — server appeared to start then
-                // die seconds later with no diagnostic (arc app-1/-2).
-                if let Err(e) = signal::ctrl_c().await {
-                    tracing::error!(
-                        target: "pyronova::server",
-                        error = %e,
-                        "ctrl_c signal handler registration failed; cannot \
-                         receive SIGINT. Accept loops are live and serving — \
-                         parking instead of tearing down. Terminate via \
-                         SIGTERM/SIGKILL."
-                    );
-                    // Do NOT fall through to shutdown: the accept loops were
-                    // already spawned above and are serving traffic. Falling
-                    // through here is what made the server "start then die
-                    // seconds later" (arc app-1/-2/-52). Park forever so the
-                    // server keeps running; the OS can still SIGKILL it.
-                    std::future::pending::<()>().await;
-                }
-                tracing::info!(target: "pyronova::server", "Shutting down gracefully...");
-                println!("\n  Shutting down gracefully...");
-                crate::monitor::stop_rss_sampler();
-                shutdown_token.cancel();
+                until_stopped(stop).await;
                 conn_tracker.close();
                 const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
                 if tokio::time::timeout(DRAIN_TIMEOUT, conn_tracker.wait()).await.is_err() {
@@ -1340,9 +1337,10 @@ impl PyronovaApp {
         num_cpus: usize,
         routes: SharedSite,
         tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
+        stop: CancellationToken,
     ) -> PyResult<()> {
         py.detach(move || -> PyResult<()> {
-            crate::tpc::run_tpc_gil(addr, io_workers, num_cpus, routes, tls_acceptor)
+            crate::tpc::run_tpc_gil(addr, io_workers, num_cpus, routes, tls_acceptor, stop)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })
     }
@@ -1366,6 +1364,7 @@ impl PyronovaApp {
         routes: SharedSite,
         tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
         extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
+        stop: CancellationToken,
     ) -> PyResult<()> {
         // gil=True routes: main-interp bridge (Phase 3).
         // async def: sub-interp path already drives coroutines via the
@@ -1433,6 +1432,7 @@ impl PyronovaApp {
                 main_bridge,
                 extra_tls,
                 gc_mode,
+                stop,
             );
             // The TPC threads are joined, so this is the last bridge reference: close it and
             // wait for its threads to release their Python objects (FR-6).

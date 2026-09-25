@@ -276,20 +276,8 @@ def test_isolate_root_writable_by_others_is_refused(tmp_path, monkeypatch):
 
 
 def test_model_route_also_injects_path_params():
-    from pydantic import BaseModel
-
-    class Item(BaseModel):
-        name: str
-
-    app = Pyronova()
-
-    @app.put("/items/{item_id}", model=Item)
-    def update(req, item: Item, item_id):
-        return {"id": item_id, "name": item.name, "path": req.path}
-
-    @app.post("/tags/{tag}", model=Item)
-    async def tag(item: Item, tag):
-        return {"tag": tag, "name": item.name}
+    # Its own module: a worker serves one app per module.
+    from tests.apps.m1a_model_path_params import app
 
     with TestClient(app) as c:
         r = c.put("/items/7", body={"name": "bolt"})
@@ -401,19 +389,8 @@ def test_mcp_schema_with_unresolvable_hint_fails_at_registration():
 
 
 def test_rpc_and_mcp_routes_are_listed_in_app_routes():
-    app = Pyronova()
-
-    @app.rpc("/rpc/echo")
-    def echo(data):
-        return data
-
-    @app.mcp.tool()
-    def ping() -> str:
-        return "pong"
-
-    @app.get("/")
-    def index(req):
-        return "ok"
+    # Its own module: a worker serves one app per module.
+    from tests.apps.m1a_rpc_and_mcp import app
 
     with TestClient(app):
         paths = {(r["method"], r["path"]) for r in app.routes}
@@ -443,7 +420,8 @@ def test_crud_client_bad_json_is_400_with_the_parse_error_not_logged_as_error(ca
         return "ok"
 
     caplog.set_level(logging.DEBUG, logger="pyronova.crud")
-    with TestClient(app) as c:
+    # caplog sees only the main interpreter's log records.
+    with TestClient(app, mode="gil") as c:
         r = c.post("/items", body=b"{not json", headers={"Content-Type": "application/json"})
     assert r.status_code == 400
     assert r.json()["error"].startswith("invalid JSON: ")

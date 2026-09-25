@@ -311,6 +311,11 @@ class PyronovaApp:
         workers: Optional[int] = None,
         mode: Optional[str] = None,
     ) -> None: ...
+    def shutdown(self) -> None:
+        """Stop the server ``run()`` is serving, as SIGINT does: stop accepting, drain the
+        in-flight connections, return from ``run()``. Callable from any thread; a no-op
+        while nothing is serving."""
+        ...
     # Feature-gated: present only in an engine built with
     # `maturin develop --release --features bench` (absent from the default build and
     # from published wheels).

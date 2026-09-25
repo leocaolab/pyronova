@@ -40,37 +40,44 @@ def test_stream_rejects_async():
 # Functional tests
 # ---------------------------------------------------------------------------
 
+# Module level: TestClient serves it through sub-interpreter workers, which rebuild
+# it by executing this module.
+app = Pyronova()
+
+
+@app.get("/")
+def root(req):
+    return {"ready": True}
+
+
+@app.post("/upload", gil=True, stream=True)
+def upload(req):
+    total = 0
+    count = 0
+    for chunk in req.stream:
+        assert isinstance(chunk, bytes)
+        total += len(chunk)
+        count += 1
+    return {"bytes": total, "chunks": count}
+
+
+@app.post("/read_all", gil=True, stream=True)
+def read_all(req):
+    data = req.stream.read()
+    return {"len": len(data), "echo": data.decode("utf-8", errors="replace")}
+
+
+@app.post("/buffered", gil=True)
+def buffered(req):
+    # Non-stream route — req.stream must be None, req.body must work.
+    return {
+        "stream_is_none": req.stream is None,
+        "body_len": len(req.body),
+    }
+
+
 @pytest.fixture(scope="module")
 def client():
-    app = Pyronova()
-
-    @app.get("/")
-    def root(req):
-        return {"ready": True}
-
-    @app.post("/upload", gil=True, stream=True)
-    def upload(req):
-        total = 0
-        count = 0
-        for chunk in req.stream:
-            assert isinstance(chunk, bytes)
-            total += len(chunk)
-            count += 1
-        return {"bytes": total, "chunks": count}
-
-    @app.post("/read_all", gil=True, stream=True)
-    def read_all(req):
-        data = req.stream.read()
-        return {"len": len(data), "echo": data.decode("utf-8", errors="replace")}
-
-    @app.post("/buffered", gil=True)
-    def buffered(req):
-        # Non-stream route — req.stream must be None, req.body must work.
-        return {
-            "stream_is_none": req.stream is None,
-            "body_len": len(req.body),
-        }
-
     with TestClient(app, port=None) as c:
         yield c
 
@@ -111,22 +118,8 @@ def test_max_body_size_enforced_on_stream(client):
     # the base_url to set the cap then restore.
     # Actually we want a separate app for this to avoid bleeding into other
     # tests. Build one here.
-    app = Pyronova()
-    app.max_body_size = 1024
-
-    @app.get("/")
-    def root(req):
-        return "ok"
-
-    @app.post("/up", gil=True, stream=True)
-    def up(req):
-        try:
-            total = 0
-            for chunk in req.stream:
-                total += len(chunk)
-            return {"bytes": total}
-        except IOError as e:
-            return {"error": str(e)}
+    # Its own module: a worker serves one app per module.
+    from tests.apps.upload_small_cap import app
 
     with TestClient(app, port=None) as c:
         # 2 KB body > 1 KB cap → feeder sends ChunkMsg::Err

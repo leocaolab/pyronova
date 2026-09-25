@@ -24,7 +24,6 @@ import uuid
 
 import pytest
 
-from pyronova import Pyronova
 from pyronova.db import PgPool
 from pyronova.testing import TestClient
 
@@ -130,18 +129,8 @@ def test_handler_can_query(pool):
     pool.execute("DELETE FROM pyronova_test_rows")
     pool.execute("INSERT INTO pyronova_test_rows (name, value) VALUES ($1, $2)", "carol", 100)
 
-    app = Pyronova()
-
-    @app.get("/")
-    def root(req):
-        return "ok"
-
-    @app.get("/users/{name}", gil=True)
-    def get_user(req):
-        return pool.fetch_one(
-            "SELECT name, value FROM pyronova_test_rows WHERE name = $1",
-            req.params["name"],
-        ) or {"error": "not found"}
+    # Module level (workers rebuild the app by executing its module).
+    from tests.apps.db_pg_query import app
 
     with TestClient(app, port=None) as c:
         resp = c.get("/users/carol")

@@ -79,7 +79,7 @@ bash benchmarks/run_bench.sh
 - Logging: Rust `tracing` with `EnvFilter` (zero-cost OFF), three targets (`pyronova::server`, `pyronova::access`, `pyronova::app`), Python logging routed to Rust via `pyronova.engine.emit_python_log` in every interpreter
 - mimalloc global allocator for high-concurrency allocation performance
 - 30s zombie request timeout in sub-interpreter mode (504 Gateway Timeout)
-- Graceful shutdown via `signal::ctrl_c()` + `tokio::select!`
+- Graceful shutdown via `signal::ctrl_c()` or `PyronovaApp.shutdown()` (a per-run `CancellationToken`, `app::until_stopped`); `TestClient.close()` uses the latter
 
 ## Project Structure
 

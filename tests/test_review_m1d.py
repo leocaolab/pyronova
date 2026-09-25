@@ -285,20 +285,17 @@ def static_tree():
 
 @pytest.fixture(scope="module")
 def static_server(static_tree):
-    from pyronova import Pyronova
     from pyronova.testing import TestClient
 
     _, root = static_tree
-    app = Pyronova()
+    # The app's module reads its root from here, in main and in every worker.
+    os.environ["PYRONOVA_TEST_M1D_STATIC_ROOT"] = root
+    from tests.apps.m1d_static import app
 
-    @app.get("/health")
-    def health(req):
-        return {"ok": True}
-
-    app.static("/static", root)
     c = TestClient(app, port=STATIC_PORT)
     yield c
     c.close()
+    del os.environ["PYRONOVA_TEST_M1D_STATIC_ROOT"]
 
 
 def _raw_get(path: str) -> tuple[int, bytes]:
@@ -466,7 +463,9 @@ app = Pyronova()
 def heavy(req):
     return {"t": sum(range(300_000))}
 
-c = TestClient(app, port=19974)
+# Main interpreter: this measures the main GIL, and workers would re-run this unguarded
+# script (TestClient included).
+c = TestClient(app, port=19974, mode="gil")
 assert c.get("/heavy").status_code == 200
 first = get_gil_metrics()
 second = get_gil_metrics()

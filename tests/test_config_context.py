@@ -95,7 +95,8 @@ def test_ctx_populated_by_request_id_middleware():
         seen["snap"] = ctx.snapshot()
         return "ok"
 
-    with TestClient(app, port=None) as c:
+    # The handler writes into this test's dict/list: only the main interpreter shares it.
+    with TestClient(app, port=None, mode="gil") as c:
         r = c.get("/", headers={"X-Request-ID": "trace-xyz"})
         assert r.status_code == 200
         assert seen["rid"] == "trace-xyz"
@@ -120,7 +121,8 @@ def test_ctx_isolated_between_requests():
         observed.append(ctx.get("leaky"))
         return "ok"
 
-    with TestClient(app, port=None) as c:
+    # The handler writes into this test's dict/list: only the main interpreter shares it.
+    with TestClient(app, port=None, mode="gil") as c:
         c.get("/set")
         c.get("/read")
         # Second request started with a fresh ctx — it must not see the

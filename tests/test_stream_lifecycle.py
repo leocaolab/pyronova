@@ -77,7 +77,8 @@ def client():
     def index(req):
         return {"ok": True}
 
-    c = TestClient(app)
+    # Main interpreter: a Stream is served only from a main-interpreter route.
+    c = TestClient(app, mode="gil")
     yield c
     c.close()
 
