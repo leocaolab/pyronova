@@ -9,8 +9,6 @@ import os
 
 import pytest
 
-from pyronova import Pyronova
-from pyronova.crud import register_crud
 from pyronova.db import PgPool
 from pyronova.testing import TestClient
 
@@ -36,13 +34,9 @@ def client():
         )
     """)
 
-    app = Pyronova()
-    register_crud(
-        app, pool,
-        prefix="/items",
-        table=TABLE,
-        columns=["id", "name", "quantity"],
-    )
+    # After the schema exists: workers execute the app's module, which only connects
+    # and registers routes.
+    from tests.apps.m1_followup_items import app
 
     with TestClient(app, port=None) as c:
         yield c

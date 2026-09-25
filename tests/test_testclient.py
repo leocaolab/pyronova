@@ -5,42 +5,53 @@ from pyronova import Pyronova, Response
 from pyronova.testing import TestClient
 
 
+# Module level: TestClient serves it through sub-interpreter workers, which rebuild
+# it by executing this module.
+app = Pyronova()
+
+
+@app.get("/")
+def index(req):
+    return {"hello": "world"}
+
+
+@app.get("/text")
+def text(req):
+    return "plain text"
+
+
+@app.get("/user/{name}")
+def user(req):
+    return {"name": req.params["name"]}
+
+
+@app.post("/echo")
+def echo(req):
+    return req.json()
+
+
+@app.put("/put")
+def put_handler(req):
+    return {"method": "PUT", "data": req.json()}
+
+
+@app.delete("/del/{id}")
+def delete_handler(req):
+    return {"deleted": req.params["id"]}
+
+
+@app.get("/status")
+def custom_status(req):
+    return Response(body="created", status_code=201)
+
+
+@app.get("/headers")
+def custom_headers(req):
+    return Response(body="ok", headers={"x-custom": "test"})
+
+
 @pytest.fixture(scope="module")
 def client():
-    app = Pyronova()
-
-    @app.get("/")
-    def index(req):
-        return {"hello": "world"}
-
-    @app.get("/text")
-    def text(req):
-        return "plain text"
-
-    @app.get("/user/{name}")
-    def user(req):
-        return {"name": req.params["name"]}
-
-    @app.post("/echo")
-    def echo(req):
-        return req.json()
-
-    @app.put("/put")
-    def put_handler(req):
-        return {"method": "PUT", "data": req.json()}
-
-    @app.delete("/del/{id}")
-    def delete_handler(req):
-        return {"deleted": req.params["id"]}
-
-    @app.get("/status")
-    def custom_status(req):
-        return Response(body="created", status_code=201)
-
-    @app.get("/headers")
-    def custom_headers(req):
-        return Response(body="ok", headers={"x-custom": "test"})
-
     c = TestClient(app, port=19877)
     yield c
     c.close()
@@ -102,21 +113,10 @@ def test_404(client):
 
 @pytest.fixture(scope="module")
 def cors_client():
-    app = Pyronova()
-    app.enable_cors()
+    # Its own module (a worker serves one app per module).
+    from tests.apps.testclient_cors import app as cors_app
 
-    @app.get("/")
-    def index(req):
-        return {"ok": True}
-
-    @app.get("/binary")
-    def binary(req):
-        return Response(
-            body=b"\xff\xd8\xff\xe0\x00\x10JFIF",
-            content_type="image/jpeg",
-        )
-
-    c = TestClient(app, port=19890)
+    c = TestClient(cors_app, port=19890)
     yield c
     c.close()
 

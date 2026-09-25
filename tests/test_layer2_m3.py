@@ -171,18 +171,11 @@ def test_import_pyronova_does_not_import_pydantic():
 
 
 def test_model_route_still_validates():
-    pydantic = pytest.importorskip("pydantic")
+    pytest.importorskip("pydantic")
     from pyronova.testing import TestClient
 
-    class Item(pydantic.BaseModel):
-        name: str
-        qty: int
-
-    app = Pyronova()
-
-    @app.post("/items", model=Item)
-    def create(req, item):
-        return {"name": item.name, "qty": item.qty}
+    # Its own module: a worker serves one app per module.
+    from tests.apps.l2_model_route import app
 
     with TestClient(app) as client:
         ok = client.post("/items", body=json.dumps({"name": "a", "qty": 2}))

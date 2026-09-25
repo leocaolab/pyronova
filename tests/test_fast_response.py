@@ -2,23 +2,12 @@
 entirely from the Rust accept loop, no Python dispatch.
 """
 
-from pyronova import Pyronova
 from pyronova.testing import TestClient
 
 
 def test_fast_plain():
-    app = Pyronova()
-
-    @app.get("/")
-    def root(req):
-        return "probe"
-
-    app.add_fast_response("GET", "/health", b'{"ok":true}',
-                         content_type="application/json")
-    app.add_fast_response("GET", "/robots.txt",
-                         b"User-agent: *\nDisallow: /\n")
-    # str body also accepted (encoded as utf-8)
-    app.add_fast_response("GET", "/ping", "pong", content_type="text/plain")
+    # Its own module: a worker serves one app per module.
+    from tests.apps.fast_plain import app
 
     with TestClient(app, port=None) as c:
         r = c.get("/health")
@@ -35,19 +24,8 @@ def test_fast_plain():
 
 
 def test_fast_status_and_headers():
-    app = Pyronova()
-
-    @app.get("/")
-    def root(req):
-        return "probe"
-
-    app.add_fast_response(
-        "GET", "/maintenance",
-        b"we are down",
-        content_type="text/plain",
-        status_code=503,
-        headers={"Retry-After": "30"},
-    )
+    # Its own module: a worker serves one app per module.
+    from tests.apps.fast_status_and_headers import app
 
     with TestClient(app, port=None) as c:
         r = c.get("/maintenance")
@@ -59,17 +37,8 @@ def test_fast_status_and_headers():
 def test_fast_does_not_interfere_with_dynamic():
     """A fast response on one path must not shadow a dynamic handler
     on a different path of the same method."""
-    app = Pyronova()
-
-    @app.get("/")
-    def root(req):
-        return "probe"
-
-    @app.get("/users/{id}")
-    def user(req):
-        return {"id": req.params["id"]}
-
-    app.add_fast_response("GET", "/health", b"ok")
+    # Its own module: a worker serves one app per module.
+    from tests.apps.fast_beside_dynamic import app
 
     with TestClient(app, port=None) as c:
         assert c.get("/health").body == b"ok"
@@ -78,18 +47,8 @@ def test_fast_does_not_interfere_with_dynamic():
 
 def test_fast_exact_match_only():
     """Fast responses match (method, path) exactly — no path globbing."""
-    app = Pyronova()
-
-    @app.get("/")
-    def root(req):
-        return "probe"
-
-    # Only registers GET
-    app.add_fast_response("GET", "/health", b"ok")
-
-    @app.post("/health")
-    def post_health(req):
-        return "posted"
+    # Its own module: a worker serves one app per module.
+    from tests.apps.fast_exact_match import app
 
     with TestClient(app, port=None) as c:
         # GET uses fast path
@@ -102,17 +61,8 @@ def test_bytes_body_fast_path_in_pyronova_response():
     """Response with a bytes body takes the fast cast::<PyBytes>
     path instead of Vec<u8> extraction. Smoke test: the response still
     round-trips correctly."""
-    from pyronova import Response
-
-    app = Pyronova()
-
-    @app.get("/")
-    def root(req):
-        return "probe"
-
-    @app.get("/raw")
-    def raw(req):
-        return Response(b"\x00\x01\x02\xff", content_type="application/octet-stream")
+    # Its own module: a worker serves one app per module.
+    from tests.apps.fast_bytes_body import app
 
     with TestClient(app, port=None) as c:
         r = c.get("/raw")

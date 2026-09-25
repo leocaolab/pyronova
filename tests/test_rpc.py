@@ -6,27 +6,34 @@ from pyronova import Pyronova
 from pyronova.testing import TestClient
 
 
+# Module level: TestClient serves it through sub-interpreter workers, which rebuild
+# it by executing this module.
+app = Pyronova()
+
+
+@app.get("/")
+def health(req):
+    return {"ok": True}
+
+
+@app.rpc("/rpc/add")
+def add(data):
+    return {"sum": data["a"] + data["b"]}
+
+
+@app.rpc("/rpc/echo")
+def echo(req, data):
+    """Handler that takes (req, data) — 2-arg form."""
+    return {"echoed": data, "method": req.method}
+
+
+@app.rpc("/rpc/error")
+def fail(data):
+    raise ValueError("intentional error")
+
+
 @pytest.fixture(scope="module")
 def client():
-    app = Pyronova()
-
-    @app.get("/")
-    def health(req):
-        return {"ok": True}
-
-    @app.rpc("/rpc/add")
-    def add(data):
-        return {"sum": data["a"] + data["b"]}
-
-    @app.rpc("/rpc/echo")
-    def echo(req, data):
-        """Handler that takes (req, data) — 2-arg form."""
-        return {"echoed": data, "method": req.method}
-
-    @app.rpc("/rpc/error")
-    def fail(data):
-        raise ValueError("intentional error")
-
     c = TestClient(app, port=19878)
     yield c
     c.close()

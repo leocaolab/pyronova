@@ -6,13 +6,13 @@ import json
 
 import pytest
 
-from pyronova import Pyronova
 from pyronova.testing import TestClient
 
 
 def test_livez_returns_200_always():
-    app = Pyronova()
-    app.enable_health_probes()
+    # Its own module: a worker serves one app per module.
+    from tests.apps.health_livez import app
+
     with TestClient(app, port=None) as c:
         r = c.get("/livez")
         assert r.status_code == 200
@@ -20,8 +20,9 @@ def test_livez_returns_200_always():
 
 
 def test_readyz_ok_when_no_checks():
-    app = Pyronova()
-    app.enable_health_probes()
+    # Its own module: a worker serves one app per module.
+    from tests.apps.health_no_checks import app
+
     with TestClient(app, port=None) as c:
         r = c.get("/readyz")
         assert r.status_code == 200
@@ -30,17 +31,9 @@ def test_readyz_ok_when_no_checks():
 
 
 def test_readyz_ok_with_passing_checks():
-    app = Pyronova()
+    # Its own module: a worker serves one app per module.
+    from tests.apps.health_passing_checks import app
 
-    @app.readiness_check("always_ok")
-    def _():
-        return True
-
-    @app.readiness_check("none_also_ok")
-    def _():
-        return None  # None is fine — only False / exception fail
-
-    app.enable_health_probes()
     with TestClient(app, port=None) as c:
         r = c.get("/readyz")
         assert r.status_code == 200
@@ -51,13 +44,9 @@ def test_readyz_ok_with_passing_checks():
 
 
 def test_readyz_503_on_exception():
-    app = Pyronova()
+    # Its own module: a worker serves one app per module.
+    from tests.apps.health_raising_check import app
 
-    @app.readiness_check("db")
-    def _():
-        raise RuntimeError("connection refused")
-
-    app.enable_health_probes()
     with TestClient(app, port=None) as c:
         r = c.get("/readyz")
         assert r.status_code == 503
@@ -69,13 +58,9 @@ def test_readyz_503_on_exception():
 
 
 def test_readyz_503_on_false_return():
-    app = Pyronova()
+    # Its own module: a worker serves one app per module.
+    from tests.apps.health_false_check import app
 
-    @app.readiness_check("feature_flag")
-    def _():
-        return False
-
-    app.enable_health_probes()
     with TestClient(app, port=None) as c:
         r = c.get("/readyz")
         assert r.status_code == 503
@@ -83,21 +68,9 @@ def test_readyz_503_on_false_return():
 
 
 def test_readyz_aggregates_multiple_checks():
-    app = Pyronova()
+    # Its own module: a worker serves one app per module.
+    from tests.apps.health_mixed_checks import app
 
-    @app.readiness_check("ok1")
-    def _():
-        return True
-
-    @app.readiness_check("bad")
-    def _():
-        raise ValueError("nope")
-
-    @app.readiness_check("ok2")
-    def _():
-        return "healthy"
-
-    app.enable_health_probes()
     with TestClient(app, port=None) as c:
         r = c.get("/readyz")
         # One failure → overall 503, but every check is reported.
@@ -109,17 +82,9 @@ def test_readyz_aggregates_multiple_checks():
 
 
 def test_async_readiness_check_supported():
-    app = Pyronova()
+    # Its own module: a worker serves one app per module.
+    from tests.apps.health_async_checks import app
 
-    @app.readiness_check("async_ok")
-    async def _():
-        return True
-
-    @app.readiness_check("async_fail")
-    async def _():
-        raise ConnectionError("timeout")
-
-    app.enable_health_probes()
     with TestClient(app, port=None) as c:
         r = c.get("/readyz")
         assert r.status_code == 503
@@ -130,17 +95,17 @@ def test_async_readiness_check_supported():
 
 
 def test_enable_health_probes_idempotent():
-    app = Pyronova()
-    app.enable_health_probes()
-    # Second call is a no-op — no duplicate route registration error.
-    app.enable_health_probes()
+    # Its own module: a worker serves one app per module.
+    from tests.apps.health_enabled_twice import app
+
     with TestClient(app, port=None) as c:
         assert c.get("/livez").status_code == 200
 
 
 def test_custom_paths():
-    app = Pyronova()
-    app.enable_health_probes(livez_path="/_alive", readyz_path="/_ready")
+    # Its own module: a worker serves one app per module.
+    from tests.apps.health_custom_paths import app
+
     with TestClient(app, port=None) as c:
         assert c.get("/_alive").status_code == 200
         assert c.get("/_ready").status_code == 200
@@ -152,12 +117,8 @@ def test_check_registered_after_enable_still_runs():
     """You can enable probes early (e.g., in Pyronova() setup) and register
     checks later as modules load. The readyz handler closes over the
     shared list, so late appends take effect immediately."""
-    app = Pyronova()
-    app.enable_health_probes()
-
-    @app.readiness_check("late")
-    def _():
-        raise RuntimeError("late check ran")
+    # Its own module: a worker serves one app per module.
+    from tests.apps.health_late_check import app
 
     with TestClient(app, port=None) as c:
         r = c.get("/readyz")

@@ -5,41 +5,51 @@ from pyronova import Pyronova, Response
 from pyronova.testing import TestClient
 
 
+# Module level: TestClient serves it through sub-interpreter workers, which rebuild
+# it by executing this module.
+app = Pyronova()
+
+
+@app.get("/")
+def index(req):
+    return "ok"
+
+
+@app.get("/ip")
+def get_ip(req):
+    return {"client_ip": req.client_ip}
+
+
+@app.get("/ip-type")
+def ip_type(req):
+    return {"type": type(req.client_ip).__name__, "len": len(req.client_ip)}
+
+
+@app.post("/ip-post")
+def post_ip(req):
+    return {"client_ip": req.client_ip, "method": req.method}
+
+
+@app.get("/ip-with-params/{id}")
+def ip_with_params(req):
+    return {"client_ip": req.client_ip, "id": req.params["id"]}
+
+
+@app.get("/ip-with-query")
+def ip_with_query(req):
+    return {"client_ip": req.client_ip, "q": req.query_params.get("q", "")}
+
+
+@app.get("/ip-in-header-response")
+def ip_echo(req):
+    return Response(
+        body="ok",
+        headers={"x-client-ip": req.client_ip},
+    )
+
+
 @pytest.fixture(scope="module")
 def client():
-    app = Pyronova()
-
-    @app.get("/")
-    def index(req):
-        return "ok"
-
-    @app.get("/ip")
-    def get_ip(req):
-        return {"client_ip": req.client_ip}
-
-    @app.get("/ip-type")
-    def ip_type(req):
-        return {"type": type(req.client_ip).__name__, "len": len(req.client_ip)}
-
-    @app.post("/ip-post")
-    def post_ip(req):
-        return {"client_ip": req.client_ip, "method": req.method}
-
-    @app.get("/ip-with-params/{id}")
-    def ip_with_params(req):
-        return {"client_ip": req.client_ip, "id": req.params["id"]}
-
-    @app.get("/ip-with-query")
-    def ip_with_query(req):
-        return {"client_ip": req.client_ip, "q": req.query_params.get("q", "")}
-
-    @app.get("/ip-in-header-response")
-    def ip_echo(req):
-        return Response(
-            body="ok",
-            headers={"x-client-ip": req.client_ip},
-        )
-
     c = TestClient(app, port=19881)
     yield c
     c.close()

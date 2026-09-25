@@ -14,30 +14,38 @@ from pyronova import Pyronova
 from pyronova.testing import TestClient
 
 
+# Module level: TestClient serves it through sub-interpreter workers, which rebuild
+# it by executing this module.
+app = Pyronova()
+
+
+@app.get("/orders/{order_id}")
+def get_order(req, order_id):
+    return {"order_id": order_id}
+
+
+@app.get("/users/{user_id}/posts/{post_id}")
+def get_post(req, user_id, post_id):
+    return {"user": user_id, "post": post_id}
+
+
+@app.get("/legacy/{order_id}")
+def legacy(req):
+    return {"order_id": req.params["order_id"]}
+
+
+@app.get("/async/{name}")
+async def get_async(req, name):
+    return {"name": name}
+
+
+@app.get("/decoded/{slug}")
+def decoded(req, slug):
+    return {"slug": slug}
+
+
 @pytest.fixture(scope="module")
 def client():
-    app = Pyronova()
-
-    @app.get("/orders/{order_id}")
-    def get_order(req, order_id):
-        return {"order_id": order_id}
-
-    @app.get("/users/{user_id}/posts/{post_id}")
-    def get_post(req, user_id, post_id):
-        return {"user": user_id, "post": post_id}
-
-    @app.get("/legacy/{order_id}")
-    def legacy(req):
-        return {"order_id": req.params["order_id"]}
-
-    @app.get("/async/{name}")
-    async def get_async(req, name):
-        return {"name": name}
-
-    @app.get("/decoded/{slug}")
-    def decoded(req, slug):
-        return {"slug": slug}
-
     c = TestClient(app)
     yield c
     c.close()

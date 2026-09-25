@@ -21,6 +21,25 @@ import pytest
 from pyronova import Pyronova
 from pyronova.testing import TestClient
 
+# Module level: TestClient serves it through sub-interpreter workers, which rebuild
+# it by executing this module.
+app = Pyronova()
+
+
+@app.get("/")
+def root(req):
+    return "ready"
+
+
+@app.post("/upload", gil=True, stream=True)
+def upload(req):
+    total = 0
+    chunks = 0
+    for chunk in req.stream:
+        total += len(chunk)
+        chunks += 1
+    return {"bytes": total, "chunks": chunks}
+
 
 def test_feeder_uses_bounded_async_channel():
     src = pathlib.Path("src/python/body_stream.rs").read_text()
@@ -43,21 +62,6 @@ def test_streaming_handler_receives_all_chunks():
     """Functional check: streamed uploads still work correctly with the
     new bounded channel. Sends 1 MB split into ~16KB hyper frames and
     the handler should see the same total byte count."""
-    app = Pyronova()
-
-    @app.get("/")
-    def root(req):
-        return "ready"
-
-    @app.post("/upload", gil=True, stream=True)
-    def upload(req):
-        total = 0
-        chunks = 0
-        for chunk in req.stream:
-            total += len(chunk)
-            chunks += 1
-        return {"bytes": total, "chunks": chunks}
-
     payload = b"x" * (1 * 1024 * 1024)  # 1 MB
     with TestClient(app, port=None) as c:
         resp = c.post("/upload", body=payload)

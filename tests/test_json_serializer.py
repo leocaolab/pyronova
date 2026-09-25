@@ -11,101 +11,122 @@ from pyronova import Pyronova
 from pyronova.testing import TestClient
 
 
+# Module level: TestClient serves it through sub-interpreter workers, which rebuild
+# it by executing this module.
+app = Pyronova()
+
+
+@app.get("/primitives")
+def primitives(req):
+    return {"none": None, "true": True, "false": False, "int": 42, "float": 3.14, "str": "hello"}
+
+
+@app.get("/list")
+def as_list(req):
+    return [1, 2, 3]
+
+
+@app.get("/tuple")
+def as_tuple(req):
+    # tuple as a value inside a dict so json.rs serializes it
+    return {"t": (1, "two", True)}
+
+
+@app.get("/big-int-u64")
+def big_int_u64(req):
+    # u64::MAX — beyond i64::MAX; serialized as a JSON string to preserve precision
+    return {"v": 18446744073709551615}
+
+
+@app.get("/big-int-huge")
+def big_int_huge(req):
+    # Beyond u64::MAX — serialized as a JSON string to preserve precision
+    return {"v": 2**65}
+
+
+@app.get("/float-key-whole")
+def float_key_whole(req):
+    # Whole-number float key: Python json.dumps gives "1.0", not "1"
+    return {1.0: "v"}
+
+
+@app.get("/float-key-frac")
+def float_key_frac(req):
+    return {1.5: "v"}
+
+
+@app.get("/bool-key")
+def bool_key(req):
+    # bool keys: "true"/"false", not Python's "True"/"False"
+    return {True: 1, False: 0}
+
+
+@app.get("/none-key")
+def none_key(req):
+    return {None: "v"}
+
+
+@app.get("/ordered-dict")
+def ordered_dict(req):
+    return collections.OrderedDict([("x", 1), ("y", 2)])
+
+
+@app.get("/set")
+def set_handler(req):
+    # set duck-typed as iterable → JSON array (order unspecified)
+    return {"s": {1, 2, 3}}
+
+
+@app.get("/frozenset")
+def frozenset_handler(req):
+    # frozenset duck-typed as iterable → JSON array
+    return {"fs": frozenset([1, 2])}
+
+
+@app.get("/bytes")
+def bytes_handler(req):
+    # bytes as a value inside a dict — json.rs must reject it → 500
+    return {"b": b"hello"}
+
+
+@app.get("/nan")
+def nan_handler(req):
+    return {"v": float("nan")}  # must raise TypeError → 500
+
+
+@app.get("/infinity")
+def infinity_handler(req):
+    return {"v": float("inf")}  # must raise TypeError → 500
+
+
+@app.get("/nested-error")
+def nested_error(req):
+    # set inside a nested structure — duck-typed as array
+    return {"users": [1, {1, 2}]}
+
+
+@app.get("/escape")
+def escape(req):
+    return {
+        "quote": '"',
+        "backslash": "\\",
+        "newline": "\n",
+        "carriage": "\r",
+        "tab": "\t",
+        "backspace": "\x08",
+        "formfeed": "\x0c",
+        "nul": "\x00",
+        "other_ctrl": "\x1f",
+    }
+
+
+@app.get("/unicode")
+def unicode_passthrough(req):
+    return {"msg": "你好，世界！🔥"}
+
+
 @pytest.fixture(scope="module")
 def client():
-    app = Pyronova()
-
-    @app.get("/primitives")
-    def primitives(req):
-        return {"none": None, "true": True, "false": False, "int": 42, "float": 3.14, "str": "hello"}
-
-    @app.get("/list")
-    def as_list(req):
-        return [1, 2, 3]
-
-    @app.get("/tuple")
-    def as_tuple(req):
-        # tuple as a value inside a dict so json.rs serializes it
-        return {"t": (1, "two", True)}
-
-    @app.get("/big-int-u64")
-    def big_int_u64(req):
-        # u64::MAX — beyond i64::MAX; serialized as a JSON string to preserve precision
-        return {"v": 18446744073709551615}
-
-    @app.get("/big-int-huge")
-    def big_int_huge(req):
-        # Beyond u64::MAX — serialized as a JSON string to preserve precision
-        return {"v": 2**65}
-
-    @app.get("/float-key-whole")
-    def float_key_whole(req):
-        # Whole-number float key: Python json.dumps gives "1.0", not "1"
-        return {1.0: "v"}
-
-    @app.get("/float-key-frac")
-    def float_key_frac(req):
-        return {1.5: "v"}
-
-    @app.get("/bool-key")
-    def bool_key(req):
-        # bool keys: "true"/"false", not Python's "True"/"False"
-        return {True: 1, False: 0}
-
-    @app.get("/none-key")
-    def none_key(req):
-        return {None: "v"}
-
-    @app.get("/ordered-dict")
-    def ordered_dict(req):
-        return collections.OrderedDict([("x", 1), ("y", 2)])
-
-    @app.get("/set")
-    def set_handler(req):
-        # set duck-typed as iterable → JSON array (order unspecified)
-        return {"s": {1, 2, 3}}
-
-    @app.get("/frozenset")
-    def frozenset_handler(req):
-        # frozenset duck-typed as iterable → JSON array
-        return {"fs": frozenset([1, 2])}
-
-    @app.get("/bytes")
-    def bytes_handler(req):
-        # bytes as a value inside a dict — json.rs must reject it → 500
-        return {"b": b"hello"}
-
-    @app.get("/nan")
-    def nan_handler(req):
-        return {"v": float("nan")}  # must raise TypeError → 500
-
-    @app.get("/infinity")
-    def infinity_handler(req):
-        return {"v": float("inf")}  # must raise TypeError → 500
-
-    @app.get("/nested-error")
-    def nested_error(req):
-        # set inside a nested structure — duck-typed as array
-        return {"users": [1, {1, 2}]}
-
-    @app.get("/escape")
-    def escape(req):
-        return {
-            "quote": '"',
-            "backslash": "\\",
-            "newline": "\n",
-            "carriage": "\r",
-            "tab": "\t",
-            "backspace": "\x08",
-            "formfeed": "\x0c",
-            "nul": "\x00",
-            "other_ctrl": "\x1f",
-        }
-
-    @app.get("/unicode")
-    def unicode_passthrough(req):
-        return {"msg": "你好，世界！🔥"}
-
     c = TestClient(app)
     yield c
     c.close()
