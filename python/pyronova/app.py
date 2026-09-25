@@ -1023,26 +1023,13 @@ class Pyronova:
             )
             _setup_python_logging_bridge(self._log_config["level"])
         # Auto-register /mcp endpoint if any MCP handlers exist
-        if self._mcp._tools or self._mcp._resources or self._mcp._prompts:
+        if not self._mcp.is_empty():
             mcp = self._mcp
 
             def _mcp_handler(req):
-                try:
-                    body = req.text()
-                    result = mcp.handle_request(body)
-                except Exception:
-                    _logging.getLogger("pyronova.mcp").exception("MCP handler error")
-                    result = _json_module.dumps({
-                        "jsonrpc": "2.0",
-                        "id": None,
-                        "error": {"code": -32603, "message": "Internal error"},
-                    })
-                return Response(
-                    body=result,
-                    content_type="application/json",
-                )
+                return Response(body=mcp.handle_request(req.body), content_type="application/json")
 
-            self._engine.route("POST", "/mcp", _mcp_handler, True)  # gil=True
+            self._route("POST", "/mcp", _mcp_handler, gil=True)
             print(f"  MCP: {len(mcp._tools)} tools, {len(mcp._resources)} resources, {len(mcp._prompts)} prompts → POST /mcp")
 
         # Auto-detect best mode if not explicitly set
