@@ -151,7 +151,8 @@ def make(i):
 
     return app
 
-clients = [TestClient(make(i)) for i in range(3)]
+# Main interpreter: make(i) builds each app in a function, which workers cannot rebuild.
+clients = [TestClient(make(i), mode="gil") for i in range(3)]
 try:
     def hit(pair):
         i, c = pair
