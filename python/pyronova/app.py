@@ -5,29 +5,42 @@ from __future__ import annotations
 import time
 import sys
 from dataclasses import dataclass
-from typing import Callable, TypedDict
+from typing import Callable, Literal, TypedDict
 import inspect
 import json as _json_module
 
 import os
 
-from pyronova.engine import Compression, Mode, PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log, _in_worker, _forgotten_workers, _route_params
+from pyronova.engine import Compression, LogLevel, Mode, PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log, _in_worker, _forgotten_workers, _python_log_level, _route_params
+from pyronova._log_bridge import RustLogHandler, root_level
 from pyronova.mcp import MCPServer
 from pyronova import _reload
 import logging as _logging
+
+
+# A level by name, in either case; `LogLevel.parse` reads it.
+LogLevelName = Literal[
+    "off", "error", "warn", "warning", "info", "debug", "trace",
+    "OFF", "ERROR", "WARN", "WARNING", "INFO", "DEBUG", "TRACE",
+]
 
 
 class LogConfig(TypedDict, total=False):
     """Logging configuration dictionary.
 
     Keys:
-        level: "OFF", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"
+        level: a ``LogLevel``, or its name ("OFF", "ERROR", "WARN", "INFO", "DEBUG",
+            "TRACE"); an unknown name raises ``ValueError`` in ``Pyronova()``
         access_log: Whether to log every HTTP request (method, path, status, latency)
         format: "text" (human-readable) or "json" (structured, for ELK/Datadog)
     """
-    level: str
+    level: LogLevel | LogLevelName
     access_log: bool
-    format: str
+    format: Literal["text", "json"]
+
+
+def _log_level(level: LogLevel | LogLevelName) -> LogLevel:
+    return level if isinstance(level, LogLevel) else LogLevel.parse(level)
 
 def _is_worker() -> bool:
     """Whether this code runs in a sub-interpreter worker (not the main interpreter)."""
@@ -78,60 +91,17 @@ def _limit_blas_threads() -> str:
     return "1 thread per worker"
 
 
-# Formats a record's exception (`logger.exception`) as its traceback. A `Handler`
-# has no `formatException`; that is a `Formatter` method.
-_TRACEBACK_FORMAT = _logging.Formatter()
-
-
-class _PyronovaRustHandler(_logging.Handler):
-    """logging.Handler that bridges to Rust tracing via FFI.
-
-    Defined at module level so the isinstance() dedup check in
-    _setup_python_logging_bridge works across repeated calls.
-    """
-
-    def emit(self, record: _logging.LogRecord) -> None:
-        try:
-            msg = record.getMessage()
-            # Preserve exception tracebacks (logger.exception / exc_info=True).
-            # Use a local variable rather than mutating record.exc_text so the
-            # same LogRecord can safely be routed to multiple handlers.
-            if record.exc_info:
-                exc_text = record.exc_text or _TRACEBACK_FORMAT.formatException(record.exc_info)
-                msg = f"{msg}\n{exc_text}"
-            emit_python_log(
-                levelno=record.levelno,
-                name=record.name,
-                message=msg,
-                pathname=record.pathname or "",
-                lineno=record.lineno or 0,
-            )
-        except Exception:
-            # Fallback to Python's built-in error handler — prints to stderr
-            self.handleError(record)
-
-
-_LOGGING_LEVEL_MAP = {
-    "TRACE": _logging.DEBUG,
-    "DEBUG": _logging.DEBUG,
-    "INFO": _logging.INFO,
-    "WARN": _logging.WARNING,
-    "WARNING": _logging.WARNING,
-    "ERROR": _logging.ERROR,
-    "CRITICAL": _logging.CRITICAL,
-    "OFF": _logging.CRITICAL + 10,  # above CRITICAL — blocks everything
-}
-
-
-def _level_with_access_log(current: str, requested: str | None, pinned: bool) -> str:
+def _level_with_access_log(
+    current: LogLevel, requested: LogLevel | None, pinned: bool
+) -> LogLevel:
     """The log level once the access log is on: the level asked for; else the current
     one, raised to INFO when it would hide the access lines (ERROR, OFF), unless an
     explicit ``enable_logging(level=...)`` chose it."""
     if requested is not None:
-        return requested.upper()
-    if pinned or current not in ("ERROR", "OFF"):
+        return requested
+    if pinned or current not in (LogLevel.Error, LogLevel.Off):
         return current
-    return "INFO"
+    return LogLevel.Info
 
 
 def _require_int(name: str, value: object) -> None:
@@ -140,34 +110,18 @@ def _require_int(name: str, value: object) -> None:
         raise TypeError(f"{name} must be int, got {type(value).__name__}")
 
 
-def _setup_python_logging_bridge(rust_level: str = "DEBUG") -> None:
-    """Hijack Python's root logger to route all logs through Rust tracing.
+def _setup_python_logging_bridge() -> None:
+    """Route the root logger through Rust tracing, gated at the level ``init_logger``
+    applied (``_python_log_level()``, the same source every worker reads).
 
-    Replaces default StreamHandler (synchronous, GIL-blocking I/O) with a
-    lightweight handler that crosses FFI into Rust's tracing system.
-    The actual filtering, formatting, and I/O happen in Rust — Python only
-    does the minimal work of extracting the log record fields.
-
-    The ``rust_level`` parameter syncs Rust's EnvFilter level to Python's
-    root logger, so calls below the threshold (e.g. logger.debug() when
-    level=ERROR) are rejected by Python's own level check *before* any
-    getMessage() formatting or FFI crossing occurs.
+    Adds the one ``RustLogHandler`` (not twice), and keeps the user's other handlers
+    (Sentry, DataDog...). Filtering, formatting and I/O happen in Rust; a record below
+    the level is rejected by Python before ``getMessage()`` or the FFI call.
     """
     root = _logging.getLogger()
-    # Don't clear existing handlers — user may have Sentry, DataDog, etc.
-    # Only add Pyronova bridge if not already present.
-    if not any(isinstance(h, _PyronovaRustHandler) for h in root.handlers):
-        root.addHandler(_PyronovaRustHandler())
-    # Sync Python's level gate with Rust's EnvFilter — avoids wasted
-    # getMessage() + FFI calls for records that Rust would discard anyway
-    level_key = rust_level.upper()
-    if level_key not in _LOGGING_LEVEL_MAP:
-        import sys
-        print(
-            f"pyronova: unrecognized log level {rust_level!r}, defaulting to DEBUG",
-            file=sys.stderr,
-        )
-    root.setLevel(_LOGGING_LEVEL_MAP.get(level_key, _logging.DEBUG))
+    if not any(isinstance(h, RustLogHandler) for h in root.handlers):
+        root.addHandler(RustLogHandler(None, emit_python_log))
+    root.setLevel(root_level(_python_log_level()))
 
 
 class Pyronova:
@@ -228,13 +182,13 @@ class Pyronova:
         user = log_config or {}
         if self.debug:
             self._log_config: LogConfig = {
-                "level": user.get("level", "DEBUG"),
+                "level": _log_level(user.get("level", LogLevel.Debug)),
                 "access_log": user.get("access_log", True),
                 "format": user.get("format", "text"),
             }
         else:
             self._log_config: LogConfig = {
-                "level": user.get("level", "ERROR"),
+                "level": _log_level(user.get("level", LogLevel.Error)),
                 "access_log": user.get("access_log", False),
                 "format": user.get("format", "json"),
             }
@@ -850,7 +804,7 @@ class Pyronova:
 
     def enable_logging(
         self,
-        level: str | None = None,
+        level: LogLevel | LogLevelName | None = None,
         sample: int = 1,
         always_log_status: int | None = None,
     ) -> None:
@@ -862,12 +816,12 @@ class Pyronova:
 
             INFO  pyronova::access Request handled method=GET path=/ status=200 latency_us=198 mode="gil"
 
-        :param level: minimum log level — "debug" / "info" / "warn" / "error".
-            Given, it is the level, whatever ``log_config`` or ``debug=True`` set,
-            and a later call without one (``PYRONOVA_LOG=1``, ``debug=True`` at
-            ``run()``) keeps it. Left out, the level stays as configured, raised
-            to "info" when it is "error" or "off" (the access lines are INFO).
-            An unknown level raises ``ValueError`` when the server starts.
+        :param level: minimum log level — a ``LogLevel``, or its name ("debug" /
+            "info" / "warn" / "error" / ...). Given, it is the level, whatever
+            ``log_config`` or ``debug=True`` set, and a later call without one
+            (``PYRONOVA_LOG=1``, ``debug=True`` at ``run()``) keeps it. Left out, the
+            level stays as configured, raised to "info" when it is "error" or "off"
+            (the access lines are INFO). An unknown name raises ``ValueError`` here.
         :param sample: log 1 in every ``sample`` requests. ``1`` (default)
             logs every request. ``100`` keeps roughly 1% — production knob
             to recover the 25-30% throughput tax of full access logging
@@ -882,13 +836,14 @@ class Pyronova:
         raises ``ValueError``.
         """
         # Validated first, so a bad value leaves the logging settings as they were.
+        requested = None if level is None else _log_level(level)
         self._engine.set_request_log_sampling(sample, always_log_status)
         self._engine.enable_request_logging(True)
 
-        # The deferred init_logger picks these up (and validates the level).
-        self._log_level_pinned = self._log_level_pinned or level is not None
+        # The deferred init_logger picks these up.
+        self._log_level_pinned = self._log_level_pinned or requested is not None
         self._log_config["level"] = _level_with_access_log(
-            self._log_config["level"], level, self._log_level_pinned
+            self._log_config["level"], requested, self._log_level_pinned
         )
         self._log_config["access_log"] = True
 
@@ -1060,13 +1015,14 @@ class Pyronova:
         if os.environ.get("PYRONOVA_LOG") == "1" or self.debug:
             self.enable_logging()
         # Deferred from __init__ so enable_logging() can adjust the config first.
-        # Workers take the level the engine parsed here (`_python_log_level`).
+        # Main and every worker gate Python logging on the level applied here
+        # (`_python_log_level`).
         init_logger(
             self._log_config["level"],
             self._log_config["access_log"],
             self._log_config["format"],
         )
-        _setup_python_logging_bridge(self._log_config["level"])
+        _setup_python_logging_bridge()
 
         if not self._mcp.is_empty():
             mcp = self._mcp

@@ -2,7 +2,7 @@
 
 from collections.abc import Mapping as _Mapping
 
-from pyronova.engine import PyronovaApp, Request, Response, Headers, WebSocket, SharedState, Stream, Metrics, get_gil_metrics, reset_peaks, init_logger, emit_python_log
+from pyronova.engine import PyronovaApp, Request, Response, Headers, WebSocket, SharedState, Stream, Metrics, get_gil_metrics, reset_peaks, init_logger, emit_python_log, LogLevel, Compression
 from pyronova.app import Pyronova
 from pyronova.rpc import RPCClient
 from pyronova.cookies import SameSite, get_cookies, get_cookie, set_cookie, delete_cookie
@@ -52,6 +52,7 @@ _Mapping.register(Headers)
 __all__ = [
     "Pyronova", "PyronovaApp", "Request", "Response", "Headers", "WebSocket", "SharedState", "Stream",
     "Metrics", "get_gil_metrics", "reset_peaks", "init_logger", "emit_python_log",
+    "LogLevel", "Compression",
     "redirect", "RPCClient",
     "SameSite", "get_cookies", "get_cookie", "set_cookie", "delete_cookie",
     "parse_multipart", "MultipartError", "UploadFile",

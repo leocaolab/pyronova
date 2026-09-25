@@ -426,6 +426,16 @@ impl SubInterpreterWorker {
         //    namespace, with this worker's id (FR-20).
         let bootstrap = new_module(py, BOOTSTRAP_MODULE, None, Some((worker_id, pool_id)))
             .map_err(setup("creating the bootstrap module"))?;
+        //    The log handler's source runs in the same namespace first: the bootstrap
+        //    installs it before the package can be imported.
+        const LOG_BRIDGE_FILE: &str = "pyronova/_log_bridge.py";
+        exec_in(
+            py,
+            include_str!("../../python/pyronova/_log_bridge.py"),
+            LOG_BRIDGE_FILE,
+            &bootstrap,
+        )
+        .map_err(|e| WorkerStartError::bootstrap(worker_id, LOG_BRIDGE_FILE, e))?;
         const BOOTSTRAP_FILE: &str = "pyronova/_bootstrap.py";
         exec_in(
             py,

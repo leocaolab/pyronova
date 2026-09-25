@@ -20,57 +20,15 @@ import logging as _logging
 import os as _os
 import sys, os
 
-# Set once `pyronova.engine` is imported, at the end of this file (after the
-# isolation machinery is installed, so the package's own imports go through it).
-_emit_python_log = None
-
-
-# Formats a record's exception (`logger.exception`) as its traceback. A `Handler`
-# has no `formatException`; that is a `Formatter` method.
-_TRACEBACK_FORMAT = _logging.Formatter()
-
-
-class _PyronovaRustHandler(_logging.Handler):
-    """Routes Python logging records through Rust tracing, tagged with this
-    worker's id. Records logged before the engine is imported (during this
-    bootstrap) go to stderr."""
-
-    def __init__(self, worker_id):
-        super().__init__()
-        self._worker_id = worker_id
-
-    def emit(self, record):
-        try:
-            msg = record.getMessage()
-            # Preserve exception tracebacks (logger.exception / exc_info=True).
-            # Use a local variable rather than mutating record.exc_text so the
-            # same LogRecord can safely be routed to multiple handlers.
-            if record.exc_info:
-                exc_text = record.exc_text or _TRACEBACK_FORMAT.formatException(record.exc_info)
-                msg = f"{msg}\n{exc_text}"
-            if _emit_python_log is None:
-                sys.stderr.write(f"{record.levelname} {record.name}: {msg}\n")
-                return
-            _emit_python_log(
-                record.levelno,
-                record.name,
-                msg,
-                record.pathname or "",
-                record.lineno or 0,
-                self._worker_id,
-            )
-        except Exception:
-            # Never crash business logic due to logging. `handleError` is
-            # Python's own "I tried to log and it blew up" hook — it
-            # respects `logging.raiseExceptions` (False in production) and
-            # writes a diagnostic to sys.stderr with the failing record,
-            # which `pass` silently discarded. Upstream handlers on every
-            # stdlib logging class use this exact pattern.
-            self.handleError(record)
+# `RustLogHandler` and `root_level` come from `pyronova/_log_bridge.py`, which the
+# engine runs in this namespace just before this file. The handler writes to stderr
+# until it is connected to the engine, at the end of this file (after the isolation
+# machinery is installed, so the package's own imports go through it).
 
 _root = _logging.getLogger()
 _root.handlers.clear()
-_root.addHandler(_PyronovaRustHandler(WORKER_ID))
+_log_handler = RustLogHandler(WORKER_ID)
+_root.addHandler(_log_handler)
 # The root level is synced with Rust's filter at the end of this file, once the
 # engine is imported.
 
@@ -894,9 +852,6 @@ _builtins.__import__ = _iso_import
 from pyronova.engine import emit_python_log as _emit_python_log  # noqa: E402
 from pyronova.engine import _python_log_level  # noqa: E402
 
-# Sync Python's level gate with the level the main interpreter's `init_logger` applied:
-# a record below it is rejected *before* getMessage() formatting or the FFI crossing
-# (level=ERROR → logger.debug() returns immediately). Before any `init_logger` (a raw
-# engine app), every record goes to Rust, whose filter decides.
-_level = _python_log_level()
-_root.setLevel(_logging.DEBUG if _level is None else _level)
+_log_handler.connect(_emit_python_log)
+# Python's level gate is the level the main interpreter's `init_logger` applied.
+_root.setLevel(root_level(_python_log_level()))

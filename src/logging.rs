@@ -41,49 +41,130 @@ impl FromStr for LogFormat {
     }
 }
 
+/// The minimum level of what is logged. The one parser of a level's name: Python's
+/// `enable_logging(level=)` and `LogConfig["level"]` go through `LogLevel.parse`.
+#[pyclass(module = "pyronova.engine", eq, eq_int, frozen, hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum LogLevel {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+#[pymethods]
+impl LogLevel {
+    /// The level `name` spells, in any case: `OFF`, `ERROR`, `WARN` (or `WARNING`), `INFO`,
+    /// `DEBUG`, `TRACE`. Anything else raises `ValueError`.
+    #[staticmethod]
+    fn parse(name: &str) -> PyResult<Self> {
+        Ok(name.parse::<LogLevel>()?)
+    }
+
+    fn __str__(&self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::Error => "ERROR",
+            Self::Warn => "WARN",
+            Self::Info => "INFO",
+            Self::Debug => "DEBUG",
+            Self::Trace => "TRACE",
+        }
+    }
+}
+
 /// The levels `LogConfig["level"]` documents, plus Python's spelling `WARNING`.
 /// Stricter than `LevelFilter::from_str`, which also takes `""` and `0`–`5`, and far
 /// stricter than an `EnvFilter` directive, where any unknown word is a *target* name.
-fn parse_level(s: &str) -> Result<LevelFilter, LoggerError> {
-    match s.to_ascii_uppercase().as_str() {
-        "OFF" => Ok(LevelFilter::OFF),
-        "ERROR" => Ok(LevelFilter::ERROR),
-        "WARN" | "WARNING" => Ok(LevelFilter::WARN),
-        "INFO" => Ok(LevelFilter::INFO),
-        "DEBUG" => Ok(LevelFilter::DEBUG),
-        "TRACE" => Ok(LevelFilter::TRACE),
-        _ => Err(LoggerError::Level(s.to_string())),
+impl FromStr for LogLevel {
+    type Err = LoggerError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_uppercase().as_str() {
+            "OFF" => Ok(Self::Off),
+            "ERROR" => Ok(Self::Error),
+            "WARN" | "WARNING" => Ok(Self::Warn),
+            "INFO" => Ok(Self::Info),
+            "DEBUG" => Ok(Self::Debug),
+            "TRACE" => Ok(Self::Trace),
+            _ => Err(LoggerError::Level(s.to_string())),
+        }
+    }
+}
+
+impl LogLevel {
+    /// A `level=` argument: a `LogLevel`, or its name.
+    fn from_arg(arg: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(level) = arg.cast::<LogLevel>() {
+            return Ok(*level.get());
+        }
+        let name: &str = arg.extract().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(format!(
+                "level must be a pyronova.engine.LogLevel or a str, got {}",
+                arg.get_type()
+                    .name()
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|_| "an object".into())
+            ))
+        })?;
+        Ok(name.parse::<LogLevel>()?)
+    }
+
+    fn filter(self) -> LevelFilter {
+        match self {
+            Self::Off => LevelFilter::OFF,
+            Self::Error => LevelFilter::ERROR,
+            Self::Warn => LevelFilter::WARN,
+            Self::Info => LevelFilter::INFO,
+            Self::Debug => LevelFilter::DEBUG,
+            Self::Trace => LevelFilter::TRACE,
+        }
+    }
+
+    /// The Python `logging` level that lets through what this level logs.
+    fn python_level(self) -> i64 {
+        match self {
+            Self::Off => py_level::CRITICAL + 10,
+            Self::Error => py_level::ERROR,
+            Self::Warn => py_level::WARNING,
+            Self::Info => py_level::INFO,
+            // Python has no TRACE: DEBUG records are the finest it emits.
+            Self::Debug | Self::Trace => py_level::DEBUG,
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct LoggerConfig {
-    level: LevelFilter,
+    level: LogLevel,
     access_log: bool,
     format: LogFormat,
 }
 
 impl LoggerConfig {
-    fn parse(level: &str, access_log: bool, format: &str) -> Result<Self, LoggerError> {
+    fn new(level: LogLevel, access_log: bool, format: &str) -> Result<Self, LoggerError> {
         Ok(Self {
-            level: parse_level(level)?,
+            level,
             access_log,
             format: format.parse()?,
         })
     }
 
     fn filter(&self) -> Result<EnvFilter, LoggerError> {
+        let level = self.level.filter();
         let directives = if self.access_log {
-            self.level.to_string()
+            level.to_string()
         } else {
-            format!("{},pyronova::access=off", self.level)
+            format!("{level},pyronova::access=off")
         };
         EnvFilter::try_new(&directives).map_err(|source| LoggerError::Filter { directives, source })
     }
 }
 
 #[derive(Debug, thiserror::Error)]
-enum LoggerError {
+pub(crate) enum LoggerError {
     #[error("invalid log level {0:?}: expected one of OFF, ERROR, WARN, INFO, DEBUG, TRACE")]
     Level(String),
     #[error("invalid log format {0:?}: expected \"text\" or \"json\"")]
@@ -133,8 +214,9 @@ type FmtLayer = Box<dyn Layer<Filtered> + Send + Sync>;
 /// The guard MUST outlive the writer — if dropped, the background I/O thread stops and
 /// every subsequent log line is lost — so both live here for the life of the process.
 struct Installed {
-    /// The level the filter currently applies; workers gate their Python logging on it.
-    level: LevelFilter,
+    /// The level the filter currently applies; every interpreter gates its Python logging
+    /// on it.
+    level: LogLevel,
     filter: reload::Handle<EnvFilter, Registry>,
     fmt: reload::Handle<FmtLayer, Filtered>,
     writer: tracing_appender::non_blocking::NonBlocking,
@@ -195,7 +277,7 @@ fn apply(config: &LoggerConfig) -> Result<(), LoggerError> {
 
 /// Initialize the Rust tracing engine, or reconfigure it if already initialized.
 ///
-/// - `level`: "OFF", "ERROR", "WARN" (or "WARNING"), "INFO", "DEBUG", "TRACE" — any case
+/// - `level`: a `LogLevel`, or its name (see `LogLevel.parse`)
 /// - `access_log`: if false, suppresses all `pyronova::access` target logs
 /// - `format`: "text" (human-readable) or "json" (structured)
 ///
@@ -208,12 +290,12 @@ fn apply(config: &LoggerConfig) -> Result<(), LoggerError> {
 /// and never reaches a lock.
 #[pyfunction]
 #[pyo3(signature = (level, access_log, format))]
-pub fn init_logger(level: &str, access_log: bool, format: &str) -> PyResult<()> {
-    let config = LoggerConfig::parse(level, access_log, format)?;
+pub fn init_logger(level: &Bound<'_, PyAny>, access_log: bool, format: &str) -> PyResult<()> {
+    let config = LoggerConfig::new(LogLevel::from_arg(level)?, access_log, format)?;
     apply(&config)?;
     tracing::info!(
         target: "pyronova::server",
-        level = %config.level,
+        level = %config.level.filter(),
         access_log = config.access_log,
         format = ?config.format,
         "Pyronova tracing engine initialized"
@@ -222,20 +304,13 @@ pub fn init_logger(level: &str, access_log: bool, format: &str) -> PyResult<()> 
 }
 
 /// The Python `logging` level matching the level `init_logger` applied, or `None` before
-/// any `init_logger`. A worker's bootstrap sets its root logger to it, so records below
-/// the threshold are dropped before formatting or crossing into Rust. One source for the
-/// level: what the main interpreter parsed, never re-read from the environment.
+/// any `init_logger`. Every interpreter (main after `init_logger`, each worker in its
+/// bootstrap) sets its root logger to it, so records below the threshold are dropped
+/// before formatting or crossing into Rust. One source for the level: what `init_logger`
+/// parsed, never re-read from the environment or re-mapped in Python.
 #[pyfunction]
 pub fn _python_log_level() -> Option<i64> {
-    let level = LOGGER.lock().as_ref()?.level;
-    Some(match level {
-        LevelFilter::OFF => py_level::CRITICAL + 10,
-        LevelFilter::ERROR => py_level::ERROR,
-        LevelFilter::WARN => py_level::WARNING,
-        LevelFilter::INFO => py_level::INFO,
-        // Python has no TRACE: DEBUG records are the finest it emits.
-        _ => py_level::DEBUG,
-    })
+    Some(LOGGER.lock().as_ref()?.level.python_level())
 }
 
 // ---------------------------------------------------------------------------
@@ -387,14 +462,24 @@ mod tests {
 
     #[test]
     fn level_accepts_documented_names_only() {
-        assert_eq!(parse_level("warning").unwrap(), LevelFilter::WARN);
-        assert_eq!(parse_level("Off").unwrap(), LevelFilter::OFF);
+        assert_eq!("warning".parse::<LogLevel>().unwrap(), LogLevel::Warn);
+        assert_eq!("Off".parse::<LogLevel>().unwrap(), LogLevel::Off);
         for bad in ["", "3", "verbose", "pyronova=debug"] {
             assert!(
-                matches!(parse_level(bad), Err(LoggerError::Level(_))),
+                matches!(bad.parse::<LogLevel>(), Err(LoggerError::Level(_))),
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn python_level_lets_through_what_the_filter_logs() {
+        assert_eq!(LogLevel::Off.python_level(), 60);
+        assert_eq!(LogLevel::Error.python_level(), 40);
+        assert_eq!(LogLevel::Warn.python_level(), 30);
+        assert_eq!(LogLevel::Info.python_level(), 20);
+        assert_eq!(LogLevel::Debug.python_level(), 10);
+        assert_eq!(LogLevel::Trace.python_level(), 10);
     }
 
     #[test]
@@ -409,7 +494,7 @@ mod tests {
 
     #[test]
     fn access_log_off_adds_its_directive() {
-        let config = LoggerConfig::parse("info", false, "text").unwrap();
+        let config = LoggerConfig::new(LogLevel::Info, false, "text").unwrap();
         assert!(config
             .filter()
             .unwrap()
