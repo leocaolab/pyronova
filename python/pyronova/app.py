@@ -12,6 +12,7 @@ import os
 
 from pyronova.engine import PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log, _in_worker, _forgotten_workers
 from pyronova.mcp import MCPServer
+from pyronova import _reload
 import logging as _logging
 
 
@@ -196,6 +197,7 @@ class Pyronova:
         self._fast_routes_meta: list[dict] = []
         self._readiness_checks: list[tuple[str, Callable]] = []
         self._health_probes_enabled: bool = False
+        self._app_file_path: str | None = None
 
         # Resolve final logging config: debug mode defaults vs production defaults.
         # Actual init_logger call is deferred to run() so enable_logging() can
@@ -401,134 +403,9 @@ class Pyronova:
         return self._route(method.upper(), path, handler, gil=gil, model=model, stream=stream)
 
     def _route(self, method: str, path: str, handler: Callable | None, *, gil: bool = False, model: type | None = None, stream: bool = False) -> Callable:
-        def _maybe_inject_path_params(fn: Callable) -> Callable:
-            """Wrap *fn* so path-template params land in matching kwargs.
-
-            Hot path stays untouched: handlers whose signature is exactly
-            ``(req)`` are returned unchanged — no shim, no extra frame, no
-            new code path. Only when the signature declares additional
-            parameters do we build a wrapper that pulls them from
-            ``req.params``.
-            """
-            try:
-                sig = inspect.signature(fn)
-            except (TypeError, ValueError):
-                return fn
-            params = list(sig.parameters.values())
-            # First positional param is always the request — skip it.
-            extras = [
-                p for p in params[1:]
-                if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-            ]
-            if not extras:
-                return fn  # hot path — byte-identical to today
-            names = tuple(p.name for p in extras)
-            # Cross-check against the URL template so a typo'd kwarg fails
-            # loudly at registration instead of silently injecting None at
-            # request time. matchit accepts both `{id}` and `:id`; we strip
-            # the wrappers and collect param names from the path.
-            template_names = set()
-            i = 0
-            while i < len(path):
-                ch = path[i]
-                if ch == "{":
-                    end = path.find("}", i + 1)
-                    if end == -1:
-                        break
-                    template_names.add(path[i + 1 : end].split(":")[0])
-                    i = end + 1
-                elif ch == ":":
-                    j = i + 1
-                    while j < len(path) and (path[j].isalnum() or path[j] == "_"):
-                        j += 1
-                    if j > i + 1:
-                        template_names.add(path[i + 1 : j])
-                    i = j
-                else:
-                    i += 1
-            missing = [n for n in names if n not in template_names]
-            if missing:
-                raise ValueError(
-                    f"handler {fn.__name__!r} declares parameter(s) {missing!r} "
-                    f"that are not in the URL template {path!r}. Path-param "
-                    f"injection only fills names that appear as `{{name}}` "
-                    f"or `:name` in the route path."
-                )
-
-            is_async = inspect.iscoroutinefunction(fn)
-            if is_async:
-                async def shim(req):
-                    p = req.params
-                    return await fn(req, **{n: p.get(n) for n in names})
-            else:
-                def shim(req):
-                    p = req.params
-                    return fn(req, **{n: p.get(n) for n in names})
-            shim.__name__ = fn.__name__
-            shim.__qualname__ = fn.__qualname__
-            shim.__wrapped__ = fn  # Pylance / static analyzers see original sig
-            return shim
-
-        def _wrap_with_model(fn: Callable, mdl: type) -> Callable:
-            """Wrap handler to auto-validate request body with Pydantic model."""
-            # Imported here, only for routes that declare model=: importing pydantic at
-            # module level would load pydantic_core in every worker of every app. If it
-            # can't be imported, route registration fails with the ImportError.
-            from pydantic import ValidationError
-            import inspect
-            sig = inspect.signature(fn)
-            params = list(sig.parameters.values())
-            is_async = inspect.iscoroutinefunction(fn)
-
-            import logging as _logging
-            _vlog = _logging.getLogger("pyronova.validation")
-
-            def _validation_error_response(e: Exception) -> "Response":
-                _vlog.warning("request body validation failed: %s", type(e).__name__, exc_info=True)
-                if hasattr(e, "errors"):
-                    import json as _json
-                    try:
-                        errs = e.errors(include_url=False, include_input=False)
-                    except TypeError:
-                        errs = e.errors()
-                    return Response(
-                        body=_json.dumps({"detail": errs}),
-                        status_code=422,
-                        content_type="application/json",
-                    )
-                return Response(body="Request body validation failed", status_code=422, content_type="text/plain")
-
-            # model_validate_json raises ValidationError for schema
-            # mismatches, but malformed JSON syntax (or a non-decodable
-            # body) surfaces as json.JSONDecodeError / ValueError / TypeError.
-            # All of these are client-side "bad body" → 422, never 500.
-            # _validation_error_response degrades to a generic 422 for the
-            # non-pydantic cases via its hasattr(e, "errors") guard.
-            _BODY_ERRORS = (ValidationError, ValueError, TypeError)
-            if is_async:
-                async def wrapper(req):
-                    try:
-                        validated = mdl.model_validate_json(req.body)
-                    except _BODY_ERRORS as e:
-                        return _validation_error_response(e)
-                    if len(params) >= 2:
-                        return await fn(req, validated)
-                    return await fn(validated)
-            else:
-                def wrapper(req):
-                    try:
-                        validated = mdl.model_validate_json(req.body)
-                    except _BODY_ERRORS as e:
-                        return _validation_error_response(e)
-                    if len(params) >= 2:
-                        return fn(req, validated)
-                    return fn(validated)
-
-            wrapper.__name__ = fn.__name__
-            wrapper.__qualname__ = fn.__qualname__
-            return wrapper
-
-        def _record(fn: Callable) -> None:
+        def register(fn: Callable) -> Callable:
+            bound = _bind_handler(fn, path, model)
+            self._engine.route(method, path, bound, gil, stream)
             self._routes_meta.append({
                 "method": method,
                 "path": path,
@@ -538,29 +415,11 @@ class Pyronova:
                 "model": model.__name__ if model is not None else None,
                 "async": inspect.iscoroutinefunction(fn),
             })
+            # The bound callable, not fn: sub-interp workers find a route's
+            # handler by its module-global name, which must be what the route calls.
+            return bound
 
-        if handler is not None:
-            if model is not None:
-                handler = _wrap_with_model(handler, model)
-            else:
-                handler = _maybe_inject_path_params(handler)
-            self._engine.route(method, path, handler, gil, stream)
-            _record(handler)
-            return handler
-
-        def decorator(fn: Callable) -> Callable:
-            if model is not None:
-                wrapped = _wrap_with_model(fn, model)
-            else:
-                wrapped = _maybe_inject_path_params(fn)
-            self._engine.route(method, path, wrapped, gil, stream)
-            _record(fn)
-            # When wrapping was a no-op `wrapped is fn` — return fn for
-            # type hints. When we injected a shim, return the shim, so the
-            # module-global name refers to what the route calls.
-            return fn if wrapped is fn else wrapped
-
-        return decorator
+        return register(handler) if handler is not None else register
 
     # ------------------------------------------------------------------
     # Middleware
@@ -983,18 +842,7 @@ class Pyronova:
                 tag, lvl = "INFO ", 1
 
             if lvl >= _min_level:
-                # Extract error message from body if 500
-                err = ""
-                if status >= 500:
-                    body = getattr(resp, "body", "")
-                    if isinstance(body, str) and "error" in body:
-                        # Try to extract error from JSON response
-                        try:
-                            import json
-                            err = " " + json.loads(body).get("error", "")[:100]
-                        except Exception:
-                            pass
-
+                err = _error_detail(getattr(resp, "body", "")) if status >= 500 else ""
                 print(f"  {ts} [{tag}] {req.method} {req.path} → {status} ({elapsed:.1f}ms){err}", flush=True)
 
             return resp
@@ -1019,6 +867,23 @@ class Pyronova:
     # ------------------------------------------------------------------
     # Run
     # ------------------------------------------------------------------
+
+    def _set_app_file(self, path: str) -> None:
+        """The source file that defines this app: workers execute it, and the
+        reloader watches its directory. Defaults to ``__main__``'s file."""
+        self._app_file_path = path
+        self._engine.set_script_path(path)
+
+    def _app_file(self) -> str:
+        if self._app_file_path is not None:
+            return self._app_file_path
+        main_file = getattr(sys.modules["__main__"], "__file__", None)
+        if main_file is None:
+            raise RuntimeError(
+                "reload needs the app's source file, but __main__ has no __file__ "
+                "(interactive session?); start the app from a file or with `pyronova dev`"
+            )
+        return os.path.abspath(main_file)
 
     @property
     def routes(self) -> list[dict]:
@@ -1083,12 +948,6 @@ class Pyronova:
 
         if port is None:
             port = _env_int("PYRONOVA_PORT", "8000")
-        # Guarantee an int reaches the Rust FFI boundary. _env_int already
-        # has a "8000" default, but pin the invariant explicitly so a None
-        # can never flow into self._engine.run(port=...) and produce an
-        # opaque type error deep in Rust (arc finding app-39).
-        if port is None:
-            port = 8000
         if workers is None:
             workers = _env_int("PYRONOVA_WORKERS")
         if io_workers is None:
@@ -1123,10 +982,9 @@ class Pyronova:
                         ) from None
                 extra_tls_ports = parsed
 
-        # Hot reload: watch .py files, restart on change
         reload = reload or os.environ.get("PYRONOVA_RELOAD") == "1"
-        if reload and os.environ.get("_PYRONOVA_RELOAD_CHILD") != "1":
-            self._run_with_reload()
+        if reload and not _reload.is_reload_child():
+            _reload.run_with_reload(_reload.ReloadTarget.of_this_process(self._app_file()))
             return
 
         # Auto-enable logging if PYRONOVA_LOG=1 or debug=True.
@@ -1148,26 +1006,13 @@ class Pyronova:
             )
             _setup_python_logging_bridge(self._log_config["level"])
         # Auto-register /mcp endpoint if any MCP handlers exist
-        if self._mcp._tools or self._mcp._resources or self._mcp._prompts:
+        if not self._mcp.is_empty():
             mcp = self._mcp
 
             def _mcp_handler(req):
-                try:
-                    body = req.text()
-                    result = mcp.handle_request(body)
-                except Exception:
-                    _logging.getLogger("pyronova.mcp").exception("MCP handler error")
-                    result = _json_module.dumps({
-                        "jsonrpc": "2.0",
-                        "id": None,
-                        "error": {"code": -32603, "message": "Internal error"},
-                    })
-                return Response(
-                    body=result,
-                    content_type="application/json",
-                )
+                return Response(body=mcp.handle_request(req.body), content_type="application/json")
 
-            self._engine.route("POST", "/mcp", _mcp_handler, True)  # gil=True
+            self._route("POST", "/mcp", _mcp_handler, gil=True)
             print(f"  MCP: {len(mcp._tools)} tools, {len(mcp._resources)} resources, {len(mcp._prompts)} prompts → POST /mcp")
 
         # Auto-detect best mode if not explicitly set
@@ -1255,112 +1100,147 @@ class Pyronova:
         if run_error is not None:
             raise run_error
 
-    def _run_with_reload(self):
-        """Watch .py files and restart server on changes using OS-native events."""
-        import subprocess
 
-        script = sys.argv[0] if sys.argv else None
-        if not script:
-            print("  [reload] Cannot determine script path, running without reload")
-            return
+def _error_detail(body: object) -> str:
+    """The ``error`` field of a JSON 500 body, for the access-log line; "" when
+    the body has none (not a str, not JSON, or no string ``error`` field)."""
+    if not isinstance(body, str):
+        return ""
+    try:
+        parsed = _json_module.loads(body)
+    except ValueError:
+        return ""
+    detail = parsed.get("error") if isinstance(parsed, dict) else None
+    return f" {detail[:100]}" if isinstance(detail, str) else ""
 
-        watch_dir = os.path.dirname(os.path.abspath(script)) or "."
 
-        try:
-            import watchfiles
-        except ImportError:
-            print("  [reload] Install 'watchfiles' for efficient file watching:")
-            print("           pip install watchfiles")
-            print("  [reload] Falling back to polling mode...")
-            return self._run_with_reload_poll(watch_dir, script)
+def _bind_handler(fn: Callable, path: str, model: type | None) -> Callable:
+    """The callable the engine dispatches for a route: ``fn`` itself when it
+    takes only the request, else a wrapper that validates the body against
+    ``model`` and injects the path params ``fn`` declares. Signature mistakes
+    raise here, at registration, not on every request."""
+    if model is None:
+        return _bind_path_params(fn, path)
+    return _bind_model(fn, path, model)
 
-        print(f"  [reload] Watching {watch_dir} for .py changes (watchfiles)...")
 
-        while True:
-            env = {**os.environ, "_PYRONOVA_RELOAD_CHILD": "1"}
-            proc = subprocess.Popen([sys.executable, script], env=env)
+def _bind_path_params(fn: Callable, path: str) -> Callable:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn  # a builtin/C callable: nothing to inject
+    names = _path_param_names(fn, sig, path, leading=1)
+    if not names:
+        return fn  # hot path — the handler is registered as is
 
+    if inspect.iscoroutinefunction(fn):
+        async def bound(req):
+            p = req.params
+            return await fn(req, **{n: p.get(n) for n in names})
+    else:
+        def bound(req):
+            p = req.params
+            return fn(req, **{n: p.get(n) for n in names})
+    return _named_like(bound, fn)
+
+
+def _bind_model(fn: Callable, path: str, model: type) -> Callable:
+    """``fn(req, body, **path_params)`` or ``fn(body, **path_params)``."""
+    # Imported here, only for routes that declare model=: importing pydantic at
+    # module level would load pydantic_core in every worker of every app. If it
+    # can't be imported, route registration fails with the ImportError.
+    from pydantic import BaseModel, ValidationError
+
+    if not (isinstance(model, type) and issubclass(model, BaseModel)):
+        raise TypeError(f"model= must be a pydantic BaseModel subclass, got {model!r}")
+    sig = inspect.signature(fn)
+    positional = [
+        p for p in sig.parameters.values()
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    takes_request = len(positional) >= 2 and positional[1].name not in _path_template_names(path)
+    names = _path_param_names(fn, sig, path, leading=2 if takes_request else 1)
+
+    def args(req, body):
+        return (req, body) if takes_request else (body,)
+
+    def kwargs(req):
+        p = req.params
+        return {n: p.get(n) for n in names}
+
+    if inspect.iscoroutinefunction(fn):
+        async def bound(req):
             try:
-                for changes in watchfiles.watch(
-                    watch_dir,
-                    watch_filter=watchfiles.PythonFilter(),
-                    stop_event=None,
-                    debounce=500,  # 500ms debounce — wait for IDE to finish writing
-                ):
-                    changed = [os.path.basename(c[1]) for c in list(changes)[:3]]
-                    print(f"\n  [reload] File changed: {', '.join(changed)}")
-                    print(f"  [reload] Restarting...\n")
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                    break
-                else:
-                    break
-            except KeyboardInterrupt:
-                proc.terminate()
-                # Bound the wait so a child that ignores SIGTERM can't hang
-                # the reloader forever — escalate to SIGKILL like the
-                # file-change branch above (arc finding app-42).
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                break
-
-    def _run_with_reload_poll(self, watch_dir: str, script: str):
-        """Fallback polling watcher when watchfiles is not installed."""
-        import subprocess
-        import hashlib
-        import glob
-
-        print(f"  [reload] Watching {watch_dir} for .py changes (polling)...")
-
-        def _snapshot():
-            files = {}
-            for f in glob.glob(os.path.join(watch_dir, "**/*.py"), recursive=True):
-                # Skip common large directories
-                if "/.venv/" in f or "/node_modules/" in f or "/__pycache__/" in f:
-                    continue
-                try:
-                    with open(f, "rb") as fh:
-                        files[f] = hashlib.md5(fh.read()).hexdigest()
-                except Exception:
-                    pass
-            return files
-
-        while True:
-            env = {**os.environ, "_PYRONOVA_RELOAD_CHILD": "1"}
-            proc = subprocess.Popen([sys.executable, script], env=env)
-            snap = _snapshot()
-
+                body = model.model_validate_json(req.body)
+            except ValidationError as e:
+                return _validation_error_response(e)
+            return await fn(*args(req, body), **kwargs(req))
+    else:
+        def bound(req):
             try:
-                while proc.poll() is None:
-                    time.sleep(1)
-                    current = _snapshot()
-                    if current != snap:
-                        # Debounce: wait 0.5s for IDE to finish writing all files
-                        time.sleep(0.5)
-                        snap = _snapshot()  # Re-snapshot after debounce
-                        changed = [f for f in snap if snap.get(f) != current.get(f)]
-                        print(f"\n  [reload] File changed: {', '.join(os.path.basename(f) for f in changed[:3])}")
-                        print(f"  [reload] Restarting...\n")
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=3)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
-                        break
-                else:
-                    break
-            except KeyboardInterrupt:
-                proc.terminate()
-                # Bound the wait so a child that ignores SIGTERM can't hang
-                # the reloader forever — escalate to SIGKILL like the
-                # file-change branch above (arc finding app-42).
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+                body = model.model_validate_json(req.body)
+            except ValidationError as e:
+                return _validation_error_response(e)
+            return fn(*args(req, body), **kwargs(req))
+    return _named_like(bound, fn)
+
+
+def _validation_error_response(e) -> Response:
+    _logging.getLogger("pyronova.validation").warning(
+        "request body validation failed: %s", type(e).__name__, exc_info=True
+    )
+    return Response(
+        body=_json_module.dumps({"detail": e.errors(include_url=False, include_input=False)}),
+        status_code=422,
+        content_type="application/json",
+    )
+
+
+def _path_param_names(fn: Callable, sig: inspect.Signature, path: str, leading: int) -> tuple[str, ...]:
+    """The parameters after the ``leading`` ones the dispatcher fills (request,
+    body), each of which must name a param in the URL template."""
+    names = tuple(
+        p.name for p in list(sig.parameters.values())[leading:]
+        if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    )
+    template = _path_template_names(path)
+    missing = [n for n in names if n not in template]
+    if missing:
+        raise ValueError(
+            f"handler {fn.__name__!r} declares parameter(s) {missing!r} "
+            f"that are not in the URL template {path!r}. Path-param "
+            f"injection only fills names that appear as `{{name}}` "
+            f"or `:name` in the route path."
+        )
+    return names
+
+
+def _path_template_names(path: str) -> frozenset[str]:
+    """Param names in a route template; matchit accepts both ``{id}`` and ``:id``."""
+    names = set()
+    i = 0
+    while i < len(path):
+        ch = path[i]
+        if ch == "{":
+            end = path.find("}", i + 1)
+            if end == -1:
                 break
+            names.add(path[i + 1 : end].split(":")[0])
+            i = end + 1
+        elif ch == ":":
+            j = i + 1
+            while j < len(path) and (path[j].isalnum() or path[j] == "_"):
+                j += 1
+            if j > i + 1:
+                names.add(path[i + 1 : j])
+            i = j
+        else:
+            i += 1
+    return frozenset(names)
+
+
+def _named_like(wrapper: Callable, fn: Callable) -> Callable:
+    wrapper.__name__ = fn.__name__
+    wrapper.__qualname__ = fn.__qualname__
+    wrapper.__wrapped__ = fn  # Pylance / static analyzers see the original signature
+    return wrapper

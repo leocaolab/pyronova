@@ -40,6 +40,7 @@ intend to expose.
 
 import logging
 import re
+from dataclasses import dataclass
 from typing import Callable, TYPE_CHECKING
 
 from .app import Response
@@ -69,6 +70,25 @@ def _validate_ident(name: str, role: str) -> str:
             "(must match [A-Za-z_][A-Za-z0-9_]*)"
         )
     return name
+
+
+@dataclass(frozen=True)
+class _Rejected:
+    """A request refused before it reaches the database, with the reply."""
+
+    response: Response
+
+
+def _json_object(req) -> "dict | _Rejected":
+    try:
+        body = req.json()
+    except ValueError as e:
+        # The client's own bad input: tell it what is wrong; not a server error.
+        _log.info("rejected request body: %s", e)
+        return _Rejected(Response(body={"error": f"invalid JSON: {e}"}, status_code=400))
+    if not isinstance(body, dict):
+        return _Rejected(Response(body={"error": "body must be a JSON object"}, status_code=400))
+    return body
 
 
 def register_crud(
@@ -159,6 +179,22 @@ def register_crud(
             f"besides id_column {id_column!r} (PUT can only update non-PK columns)"
         )
 
+    def parse_id(req) -> "object | _Rejected":
+        raw_id = req.params.get("id")
+        if raw_id is None:
+            return _Rejected(Response(body={"error": "missing id"}, status_code=400))
+        try:
+            return id_type(raw_id)
+        except Exception:
+            # id_type is user-supplied and coerces an attacker-controlled
+            # path segment. A custom converter may raise something other
+            # than TypeError/ValueError (RuntimeError, OSError, KeyError);
+            # any failure here means "this id string is unacceptable" → 400,
+            # never a 500 (arc finding crud-83). Log so a genuinely broken
+            # converter is still diagnosable.
+            _log.warning("id_type(%r) raised; treating as invalid id", raw_id, exc_info=True)
+            return _Rejected(Response(body={"error": "invalid id"}, status_code=400))
+
     # --- GET /prefix --------------------------------------------------------
     # All routes pinned to gil=True. The original reason is gone: workers now
     # run the real PgPool, which never nests `block_on` in a Tokio context
@@ -202,20 +238,9 @@ def register_crud(
 
     @app.get(f"{prefix}/{{id}}", gil=True)
     def get_row(req):
-        raw_id = req.params.get("id")
-        if raw_id is None:
-            return Response(body={"error": "missing id"}, status_code=400)
-        try:
-            id_val = id_type(raw_id)
-        except Exception:
-            # id_type is user-supplied and coerces an attacker-controlled
-            # path segment. A custom converter may raise something other
-            # than TypeError/ValueError (RuntimeError, OSError, KeyError);
-            # any failure here means "this id string is unacceptable" → 400,
-            # never a 500 (arc finding crud-83). Log so a genuinely broken
-            # converter is still diagnosable.
-            _log.warning("id_type(%r) raised; treating as invalid id", raw_id, exc_info=True)
-            return Response(body={"error": "invalid id"}, status_code=400)
+        id_val = parse_id(req)
+        if isinstance(id_val, _Rejected):
+            return id_val.response
         try:
             row = pool.fetch_one(get_sql, id_val)
         except Exception:
@@ -231,13 +256,9 @@ def register_crud(
     # allowlist so the caller can't inject columns.
     @app.post(prefix, gil=True)
     def create_row(req):
-        try:
-            body = req.json()
-        except ValueError:
-            _log.exception("create_row: failed to parse request body")
-            return Response(body={"error": "invalid JSON"}, status_code=400)
-        if not isinstance(body, dict):
-            return Response(body={"error": "body must be a JSON object"}, status_code=400)
+        body = _json_object(req)
+        if isinstance(body, _Rejected):
+            return body.response
 
         present = [c for c in columns if c in body]
         if not present:
@@ -262,27 +283,12 @@ def register_crud(
     # --- PUT /prefix/{id} ---------------------------------------------------
     @app.put(f"{prefix}/{{id}}", gil=True)
     def update_row(req):
-        raw_id = req.params.get("id")
-        if raw_id is None:
-            return Response(body={"error": "missing id"}, status_code=400)
-        try:
-            id_val = id_type(raw_id)
-        except Exception:
-            # id_type is user-supplied and coerces an attacker-controlled
-            # path segment. A custom converter may raise something other
-            # than TypeError/ValueError (RuntimeError, OSError, KeyError);
-            # any failure here means "this id string is unacceptable" → 400,
-            # never a 500 (arc finding crud-83). Log so a genuinely broken
-            # converter is still diagnosable.
-            _log.warning("id_type(%r) raised; treating as invalid id", raw_id, exc_info=True)
-            return Response(body={"error": "invalid id"}, status_code=400)
-        try:
-            body = req.json()
-        except ValueError:
-            _log.exception("update_row: failed to parse request body")
-            return Response(body={"error": "invalid JSON"}, status_code=400)
-        if not isinstance(body, dict):
-            return Response(body={"error": "body must be a JSON object"}, status_code=400)
+        id_val = parse_id(req)
+        if isinstance(id_val, _Rejected):
+            return id_val.response
+        body = _json_object(req)
+        if isinstance(body, _Rejected):
+            return body.response
 
         # Only update non-PK columns.
         present = [c for c in non_id_cols if c in body]
@@ -312,20 +318,9 @@ def register_crud(
 
     @app.delete(f"{prefix}/{{id}}", gil=True)
     def delete_row(req):
-        raw_id = req.params.get("id")
-        if raw_id is None:
-            return Response(body={"error": "missing id"}, status_code=400)
-        try:
-            id_val = id_type(raw_id)
-        except Exception:
-            # id_type is user-supplied and coerces an attacker-controlled
-            # path segment. A custom converter may raise something other
-            # than TypeError/ValueError (RuntimeError, OSError, KeyError);
-            # any failure here means "this id string is unacceptable" → 400,
-            # never a 500 (arc finding crud-83). Log so a genuinely broken
-            # converter is still diagnosable.
-            _log.warning("id_type(%r) raised; treating as invalid id", raw_id, exc_info=True)
-            return Response(body={"error": "invalid id"}, status_code=400)
+        id_val = parse_id(req)
+        if isinstance(id_val, _Rejected):
+            return id_val.response
         try:
             affected = pool.execute(delete_sql, id_val)
         except Exception:

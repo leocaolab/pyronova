@@ -6,7 +6,6 @@ Client: RPCClient with __getattr__ magic for local-like calls.
 
 from __future__ import annotations
 
-import functools
 import json
 import logging
 import inspect
@@ -193,10 +192,15 @@ def rpc_decorator(app, path: str, proto_model=None):
                 _log.exception("RPC handler %s raised", fn.__qualname__)
                 return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-        handler = functools.wraps(fn)(async_wrapper if is_async else sync_wrapper)
+        handler = async_wrapper if is_async else sync_wrapper
+        # Name it after fn (sub-interp workers find a route's handler by name),
+        # but no __wrapped__: the route calls handler(req), not fn's signature.
+        handler.__name__ = fn.__name__
+        handler.__qualname__ = fn.__qualname__
+        handler.__doc__ = fn.__doc__
 
         # Register as POST route with gil=True (RPC typically needs full Python)
-        app._engine.route("POST", path, handler, True)
+        app._route("POST", path, handler, gil=True)
         return fn
 
     return decorator

@@ -3,8 +3,8 @@
 from pyronova.engine import PyronovaApp, Request, Response, WebSocket, SharedState, Stream, get_gil_metrics, init_logger, emit_python_log
 from pyronova.app import Pyronova
 from pyronova.rpc import RPCClient
-from pyronova.cookies import get_cookies, get_cookie, set_cookie, delete_cookie
-from pyronova.uploads import parse_multipart, UploadFile
+from pyronova.cookies import SameSite, get_cookies, get_cookie, set_cookie, delete_cookie
+from pyronova.uploads import parse_multipart, MultipartError, UploadFile
 from pyronova.cache import cached_json
 
 
@@ -48,8 +48,8 @@ __all__ = [
     "Pyronova", "PyronovaApp", "Request", "Response", "WebSocket", "SharedState", "Stream",
     "get_gil_metrics", "init_logger", "emit_python_log",
     "redirect", "RPCClient",
-    "get_cookies", "get_cookie", "set_cookie", "delete_cookie",
-    "parse_multipart", "UploadFile",
+    "SameSite", "get_cookies", "get_cookie", "set_cookie", "delete_cookie",
+    "parse_multipart", "MultipartError", "UploadFile",
     "cached_json",
 ]
 try:

@@ -192,7 +192,7 @@ def _iso_resolve_src(lib):
     internal _pydantic_core.so), and find_spec() raises ValueError on such an
     entry."""
     import sys, importlib.util, importlib.machinery
-    root = _os.path.realpath(_os.environ.get("PYRONOVA_ISOLATE_DIR", "/tmp/pyronova-isolate"))
+    root = _os.path.realpath(_iso_root())
     path = [p for p in sys.path
             if not (_os.path.realpath(p or ".") + _os.sep).startswith(root + _os.sep)]
     try:
@@ -216,6 +216,40 @@ def _iso_resolve_src(lib):
     return None
 
 
+class _IsoError(RuntimeError):
+    """Per-worker isolation could not prepare a library's private copy."""
+
+
+def _iso_root():
+    """Where the per-worker clones live: `PYRONOVA_ISOLATE_DIR`, else a directory
+    of this user's own in the temp dir."""
+    import tempfile
+    return _os.environ.get("PYRONOVA_ISOLATE_DIR") or _os.path.join(
+        tempfile.gettempdir(), "pyronova-isolate-%d" % _os.getuid()
+    )
+
+
+def _iso_claim_root(root):
+    """Create `root` private to this user, or check an existing one is. Workers
+    load `.so` files from under it, so a root another user can write to lets
+    them plant code that runs in this server."""
+    import stat
+    _os.makedirs(root, mode=0o700, exist_ok=True)
+    st = _os.lstat(root)
+    if not stat.S_ISDIR(st.st_mode):
+        raise _IsoError(f"isolate dir {root} is not a directory (a symlink?); refusing to load clones from it")
+    if st.st_uid != _os.getuid():
+        raise _IsoError(
+            f"isolate dir {root} is owned by uid {st.st_uid}, not this user ({_os.getuid()}); "
+            "refusing to load clones from it. Set PYRONOVA_ISOLATE_DIR to a directory you own."
+        )
+    if st.st_mode & 0o022:
+        raise _IsoError(
+            f"isolate dir {root} is writable by other users (mode {stat.S_IMODE(st.st_mode):o}); "
+            "refusing to load clones from it. chmod go-w it or set PYRONOVA_ISOLATE_DIR."
+        )
+
+
 def _iso_worker_dir(seed_libs):
     """Claim (once) this worker's private clone dir and add it to sys.path.
 
@@ -233,7 +267,8 @@ def _iso_worker_dir(seed_libs):
     if _ISO["worker_dir"] is not None:
         return _ISO["worker_dir"]
     import os, sys, fcntl, hashlib
-    root = os.environ.get("PYRONOVA_ISOLATE_DIR", "/tmp/pyronova-isolate")
+    root = _iso_root()
+    _iso_claim_root(root)
     if seed_libs:
         sig = hashlib.sha1()
         for lib in seed_libs:
@@ -310,24 +345,29 @@ def _iso_clone_lib(lib, worker_dir, pkg2dist):
                 with open(sig_path) as f:
                     if f.read() == cur_sig:
                         return  # up-to-date clone, inodes already verified
-            except OSError:
-                pass
-            shutil.rmtree(d, ignore_errors=True)  # stale (lib upgraded) — re-clone
+            except FileNotFoundError:
+                pass  # no manifest yet: treat the clone as stale
+            shutil.rmtree(d)  # stale (lib upgraded) — re-clone
         # Clone into a temp dir and atomically rename it into place, so a
         # first-ever concurrent boot never observes a half-written copy.
         tmp = "%s.tmp-%d" % (d, os.getpid())
-        subprocess.run(clone + [s, tmp], check=False,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        done = subprocess.run(clone + [s, tmp], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE, text=True)
+        if done.returncode != 0:
+            shutil.rmtree(tmp, ignore_errors=True)  # cp may leave a partial copy
+            raise _IsoError(
+                f"cloning {s} into {tmp} failed ({' '.join(clone)} exited "
+                f"{done.returncode}): {done.stderr.strip()}"
+            )
         try:
             os.replace(tmp, d)
         except OSError:
-            shutil.rmtree(tmp, ignore_errors=True)  # lost the race — use theirs
+            if not os.path.exists(d):
+                raise
+            shutil.rmtree(tmp)  # lost the race to another boot — use theirs
         if sig_path is not None:
-            try:
-                with open(sig_path, "w") as f:
-                    f.write(cur_sig)
-            except OSError:
-                pass
+            with open(sig_path, "w") as f:
+                f.write(cur_sig)
 
     base_name = os.path.basename(src)
     dst = os.path.join(worker_dir, base_name)

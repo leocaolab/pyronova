@@ -18,7 +18,10 @@ Usage::
 """
 
 from __future__ import annotations
-from typing import Optional, TYPE_CHECKING
+from datetime import datetime, timezone
+from email.utils import format_datetime
+from enum import StrEnum
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from pyronova.engine import Request, Response
@@ -30,7 +33,11 @@ if TYPE_CHECKING:
 # are also forbidden to prevent header value smuggling via the separator chars.
 _COOKIE_FORBIDDEN = ("\r", "\n", "\0", ";", ",")
 
-_SAMESITE_VALID = {"Strict", "Lax", "None"}
+
+class SameSite(StrEnum):
+    STRICT = "Strict"
+    LAX = "Lax"
+    NONE = "None"
 
 
 def _reject_control_chars(field: str, value: str) -> None:
@@ -92,18 +99,21 @@ def set_cookie(
     value: str,
     *,
     max_age: int | None = None,
-    expires: str | None = None,
+    expires: datetime | None = None,
     path: str = "/",
     domain: str | None = None,
     secure: bool = False,
     httponly: bool = False,
-    samesite: str | None = "Lax",
+    samesite: SameSite | None = SameSite.LAX,
 ) -> "Response":
     """Set a cookie on a Response.
 
     Returns a new Response with the Set-Cookie header appended.
     Multiple calls produce multiple Set-Cookie headers (required for
     sending more than one cookie in a single response).
+
+    ``expires`` is a timezone-aware ``datetime``; it is sent as an HTTP-date
+    in GMT (RFC 6265 §4.1.1).
     """
     from pyronova.engine import Response
 
@@ -118,8 +128,6 @@ def set_cookie(
         _reject_control_chars("domain", domain)
     if path:
         _reject_control_chars("path", path)
-    if expires is not None:
-        _reject_control_chars("expires", expires)
 
     parts = [f"{name}={value}"]
     if max_age is not None:
@@ -133,8 +141,8 @@ def set_cookie(
                 f"cookie max_age must be an int (got {type(max_age).__name__})"
             )
         parts.append(f"Max-Age={max_age}")
-    if expires:
-        parts.append(f"Expires={expires}")
+    if expires is not None:
+        parts.append(f"Expires={_http_date(expires)}")
     if path:
         parts.append(f"Path={path}")
     if domain:
@@ -144,17 +152,13 @@ def set_cookie(
     if httponly:
         parts.append("HttpOnly")
     if samesite is not None:
-        samesite_norm = str(samesite).strip().title()
-        if samesite_norm not in _SAMESITE_VALID:
-            raise ValueError(
-                f"invalid samesite={samesite!r}; must be 'Strict', 'Lax', or 'None'"
-            )
-        if samesite_norm == "None" and not secure:
+        samesite = SameSite(samesite)
+        if samesite is SameSite.NONE and not secure:
             raise ValueError(
                 "SameSite=None requires Secure=True; browsers silently drop "
                 "SameSite=None cookies that are not Secure (Chrome 80+, Firefox, Safari)"
             )
-        parts.append(f"SameSite={samesite_norm}")
+        parts.append(f"SameSite={samesite}")
 
     cookie_str = "; ".join(parts)
     # Build headers with case-normalised key to avoid duplicate set-cookie entries
@@ -178,6 +182,17 @@ def set_cookie(
     )
 
 
+def _http_date(when: datetime) -> str:
+    if not isinstance(when, datetime):
+        raise TypeError(f"cookie expires must be a datetime, got {type(when).__name__}")
+    if when.tzinfo is None:
+        raise ValueError(
+            f"cookie expires={when!r} has no timezone; pass an aware datetime "
+            "so the GMT time sent to the browser is unambiguous"
+        )
+    return format_datetime(when.astimezone(timezone.utc), usegmt=True)
+
+
 def delete_cookie(
     response: Response,
     name: str,
@@ -186,7 +201,7 @@ def delete_cookie(
     domain: str | None = None,
     secure: bool = False,
     httponly: bool = False,
-    samesite: str | None = "Lax",
+    samesite: SameSite | None = SameSite.LAX,
 ) -> Response:
     """Delete a cookie by setting it expired.
 
