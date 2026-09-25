@@ -112,6 +112,21 @@ jobs:
           # E2E drivers live under tests/e2e/ (not collected by pytest).
           pytest tests/ -q --ignore=tests/e2e
 
+      # The tests the default build skips: the bench harnesses (`bench`, decision D2) and
+      # the panic tests, which need the test-only `fault_injection` feature.
+      - name: Build (release, --features bench,fault_injection)
+        run: |
+          source .venv/bin/activate
+          maturin develop --release --features bench,fault_injection
+          # A build without the features would turn the steps below into skips.
+          python -c "import pyronova.engine as e; assert hasattr(e.PyronovaApp, 'bench_inmem') and hasattr(e, '_fault_panic')"
+
+      - name: Bench + fault-injection tests
+        run: |
+          source .venv/bin/activate
+          pytest tests/test_review_m6.py -v -k "test_bench_"
+          pytest tests/test_review_ra.py -v -k "panic"
+
   # ── Rust lint (blocking) ──────────────────────────────────────────
   rust-lint:
     name: Rust lint
@@ -138,3 +153,7 @@ jobs:
         env:
           PYO3_PYTHON: ${{ env.pythonLocation }}/bin/python
         run: cargo clippy --all-targets --features bench -- -D warnings
+      - name: cargo clippy --features fault_injection
+        env:
+          PYO3_PYTHON: ${{ env.pythonLocation }}/bin/python
+        run: cargo clippy --all-targets --features fault_injection -- -D warnings
