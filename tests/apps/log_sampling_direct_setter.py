@@ -6,7 +6,7 @@ from pyronova import Pyronova
 app = Pyronova()
 app.enable_logging()
 # Direct Rust setter — exercise the binding shape
-app._engine.set_request_log_sampling(50, 0)
+app._engine.set_request_log_sampling(50, None)
 app._engine.set_request_log_sampling(1, 500)
 
 

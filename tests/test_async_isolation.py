@@ -27,7 +27,7 @@ app.get("/slow", slow)
 app.get("/fast", fast)
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=9876, mode="async")
+    app.run(host="127.0.0.1", port=9876, mode="subinterp")
 """
 
 
