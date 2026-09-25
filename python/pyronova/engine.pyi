@@ -106,16 +106,41 @@ class Response:
     ) -> None: ...
 
 class WebSocket:
+    """One WebSocket connection, handed to an ``@app.websocket`` handler.
+
+    Every receive returns ``None`` once the connection has ended (the peer
+    closed it, or it was dropped after a read error, which the server logs).
+    """
+
+    def recv_message(self) -> Optional[str | bytes]:
+        """Receive the next message: ``str`` for text, ``bytes`` for binary."""
+        ...
     def recv(self) -> Optional[str]:
         """Receive the next text message.
 
-        Returns ``None`` when the peer has closed the connection (no more
-        messages). Protocol errors, transport failures, and non-UTF-8
-        frames surface as exceptions, not as ``None`` — distinguish a clean
-        close (``None``) from an error (raised) accordingly.
+        :raises TypeError: if the next message is binary; it stays queued for
+            ``recv_bytes()`` / ``recv_message()``.
         """
         ...
-    def send(self, msg: str) -> None: ...
+    def recv_bytes(self) -> Optional[bytes]:
+        """Receive the next binary message.
+
+        :raises TypeError: if the next message is text; it stays queued for
+            ``recv()`` / ``recv_message()``.
+        """
+        ...
+    def send(self, msg: str) -> None:
+        """Queue a text message. Never blocks.
+
+        :raises ValueError: the message exceeds ``max_websocket_message_size``.
+        :raises BlockingIOError: the send buffer is full (the client reads
+            slowly); retry after a pause.
+        :raises ConnectionError: the connection is closed.
+        """
+        ...
+    def send_bytes(self, data: bytes) -> None:
+        """Queue a binary message. Same errors as ``send``."""
+        ...
     def close(self) -> None: ...
 
 class SharedState:
@@ -175,6 +200,14 @@ class PyronovaApp:
     def after_request(self, handler: Callable[..., Any]) -> None: ...
     def fallback(self, handler: Callable[..., Any]) -> None: ...
     def websocket(self, path: str, handler: Callable[..., Any]) -> None: ...
+    def set_max_websocket_message_size(self, size: int) -> None:
+        """Process-wide; raises ``ValueError`` outside ``1..=2**32-65``."""
+        ...
+    def max_websocket_message_size(self) -> int: ...
+    def set_max_websocket_connections(self, count: int) -> None:
+        """Process-wide; raises ``ValueError`` below 1."""
+        ...
+    def max_websocket_connections(self) -> int: ...
     def static_dir(self, prefix: str, directory: str) -> None:
         """Serve files under ``directory`` at URL ``prefix``.
 
