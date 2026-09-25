@@ -69,8 +69,7 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<state::SharedState>()?;
     m.add_class::<python::stream::PyronovaStream>()?;
     m.add_class::<python::body_stream::PyronovaBodyStream>()?;
-    m.add_class::<db::PgPool>()?;
-    m.add_class::<db::PgCursor>()?;
+    db::register(m)?;
     m.add_function(pyo3::wrap_pyfunction!(monitor::get_gil_metrics, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(logging::init_logger, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(logging::emit_python_log, m)?)?;

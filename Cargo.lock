@@ -1371,6 +1371,7 @@ dependencies = [
  "serde_json",
  "socket2 0.5.10",
  "sqlx",
+ "thiserror",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
