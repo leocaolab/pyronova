@@ -247,6 +247,9 @@ def test_request_id_hooks_keep_interleaved_requests_apart():
     class _Req:
         def __init__(self, rid):
             self.headers = {"x-request-id": rid}
+            # The engine writes the id once, from the client's header (M4); the hooks
+            # read `req.request_id`.
+            self.request_id = rid
 
     app = _App()
     install_request_id(app, "X-Request-ID")

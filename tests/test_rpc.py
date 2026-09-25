@@ -66,15 +66,18 @@ def test_rpc_two_arg_handler(client):
 
 
 def test_rpc_error_envelope(client):
-    """Handler that raises → {"ok": false, "error": ...}."""
+    """Handler that raises → 500 with the generic envelope and the request id; the
+    exception text goes to the log, not to the client (D4)."""
     resp = client.post(
         "/rpc/error",
         body=b"{}",
         headers={"Content-Type": "application/json"},
     )
+    assert resp.status_code == 500
     data = resp.json()
-    assert data["ok"] is False
-    assert "intentional error" in data["error"]
+    rid = data.get("request_id")
+    assert isinstance(rid, str) and rid, data
+    assert data == {"ok": False, "error": "Internal Server Error", "request_id": rid}
 
 
 def test_rpc_empty_body(client):
