@@ -351,7 +351,17 @@ class PyronovaApp:
         The engine's environment variables (``PYRONOVA_TPC``, ``PYRONOVA_GC_*``,
         ``PYRONOVA_GIL_BRIDGE_*``, ``PYRONOVA_METRICS``, ``PYRONOVA_TPC_DARWIN``) are
         parsed once here; an invalid mode or value raises ``ValueError`` before
-        anything starts."""
+        anything starts.
+
+        With ``extra_tls_ports``, ``port`` serves plain HTTP and each extra port serves
+        TLS (``tls_cert``/``tls_key`` required); without them ``port`` serves TLS when a
+        certificate is given. Every listener is bound before any thread or worker
+        starts: a port in use raises ``OSError`` (``errno.EADDRINUSE``)."""
+        ...
+    def bound_port(self) -> Optional[int]:
+        """The port ``run()``'s server listens on (its first listener; a ``port=0``
+        resolved to the kernel's pick). ``None`` until its listeners are bound, and
+        after it stopped."""
         ...
     def shutdown(self) -> None:
         """Stop the server ``run()`` is serving, as SIGINT does: stop accepting, drain the

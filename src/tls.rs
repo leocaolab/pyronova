@@ -170,13 +170,13 @@ pub(crate) fn build_acceptor(
 
 /// Perform the TLS handshake and wrap the result in `MaybeTlsStream::Tls`.
 ///
-/// Bounded by a hard 10 s handshake timeout — defense against TLS
+/// Bounded by [`HANDSHAKE_TIMEOUT`] — defense against TLS
 /// Slowloris attacks where a peer opens a TCP connection then dribbles
 /// ClientHello bytes one per 30 s, pinning a file descriptor and an
 /// async task indefinitely. With 65k half-open connections a single
 /// laptop can exhaust the server's fd budget without ever finishing
 /// a handshake; the timeout closes the loop.
-pub(crate) async fn wrap_tls(
+async fn wrap_tls(
     acceptor: &TlsAcceptor,
     stream: TcpStream,
 ) -> Result<MaybeTlsStream, HandshakeError> {
@@ -187,8 +187,20 @@ pub(crate) async fn wrap_tls(
     }
 }
 
-pub(crate) fn wrap_plain(stream: TcpStream) -> MaybeTlsStream {
-    MaybeTlsStream::Plain { inner: stream }
+/// An accepted connection as the stream to serve: TLS-handshaken when its listener has
+/// an acceptor, plain otherwise. A failed handshake is logged here and gives `None` (the
+/// connection is dropped).
+pub(crate) async fn wrap(stream: TcpStream, tls: Option<&TlsAcceptor>) -> Option<MaybeTlsStream> {
+    match tls {
+        None => Some(MaybeTlsStream::Plain { inner: stream }),
+        Some(acceptor) => match wrap_tls(acceptor, stream).await {
+            Ok(stream) => Some(stream),
+            Err(e) => {
+                tracing::warn!(target: "pyronova::server", error = %e, "TLS handshake failed");
+                None
+            }
+        },
+    }
 }
 
 #[cfg(test)]

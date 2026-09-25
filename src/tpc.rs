@@ -3,9 +3,9 @@
 //! Each TPC thread owns a pinned OS thread, a
 //! `tokio::runtime::Builder::new_current_thread()` runtime, a
 //! `LocalSet` for spawn_local tasks, and its own `SO_REUSEPORT`
-//! listener; in sub-interpreter mode it also owns one worker and runs its
-//! handlers inline. `PYRONOVA_TPC=0` serves through the multi-thread pool
-//! instead (`app.rs`).
+//! listeners (bound before any thread exists); in sub-interpreter mode it
+//! also owns one worker and runs its handlers inline. `PYRONOVA_TPC=0`
+//! serves through the multi-thread pool instead (`app.rs`).
 //!
 //! Why no `Send` bounds on the per-connection future? Because
 //! `LocalSet::spawn_local` runs the task on the same OS thread that
@@ -13,45 +13,34 @@
 //! why we don't pay work-stealing cost on this path: there is no other
 //! worker to steal from.
 
-use std::net::SocketAddr;
+use std::future::Future;
+use std::rc::Rc;
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::Request;
-use hyper_util::rt::TokioIo;
-use hyper_util::server::conn::auto::Builder as AutoBuilder;
-use tokio::net::TcpListener;
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::task::LocalSet;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use crate::bridge::main_bridge::MainInterpBridge;
 use crate::config::{DarwinTopology, GcConfig, GC_MODE_ENV};
+use crate::handlers::error::panic_message;
 use crate::handlers::handle_request;
 use crate::python::interp::SubInterpreterWorker;
-use crate::server::listener::{create_reuseport_listener, handle_accept_error, setup_tcp_quickack};
+use crate::server::listener::{
+    AcceptSource, Accepted, Bound, BoundListeners, Listener, ListenerError,
+};
 use crate::site::{SharedSite, Site};
 use crate::websocket;
+use crate::worker::{drive_connection, drive_tcp_conn, LocalExec, TpcContext};
 
-/// Custom hyper executor that spawns onto the current thread's
-/// `LocalSet`. Required because `hyper_util::rt::TokioExecutor` uses
-/// `tokio::spawn` which needs a multi-thread runtime — on a
-/// current-thread runtime that call panics. `LocalExec` drops the Send
-/// bound on the future, keeping every spawn strictly on the TPC
-/// thread.
-#[derive(Clone, Copy)]
-struct LocalExec;
-
-impl<F> hyper::rt::Executor<F> for LocalExec
-where
-    F: std::future::Future + 'static,
-    F::Output: 'static,
-{
-    fn execute(&self, fut: F) {
-        tokio::task::spawn_local(fut);
-    }
-}
+/// How long a TPC thread's in-flight connections get to finish after a stop.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Pin the current OS thread to a specific CPU core if one is
 /// available. Silently no-ops on platforms where `core_affinity`
@@ -108,10 +97,10 @@ pub(crate) fn elevate_thread_qos_macos() {}
 
 /// Log line emitted once on startup so operators can see the TPC topology.
 ///
-/// `routes` is used to surface the gil / async / sub-interp split so the
+/// `site` is used to surface the gil / async / sub-interp split so the
 /// operator knows up front how many routes will go through the
-/// single-thread main_bridge versus the per-thread TPC fleet.
-fn log_startup(mode: &str, addr: &SocketAddr, n_threads: usize, n_cpus: usize, site: &Site) {
+/// main_bridge versus the per-thread TPC fleet.
+fn log_startup(mode: &str, bound: &[Bound], n_threads: usize, n_cpus: usize, site: &Site) {
     let shape = crate::router::RouteShape::of(&site.routes);
     let gil_count = shape.gil_count();
     let async_count = shape.async_count();
@@ -123,7 +112,7 @@ fn log_startup(mode: &str, addr: &SocketAddr, n_threads: usize, n_cpus: usize, s
         version = env!("CARGO_PKG_VERSION"),
         mode,
         tpc = true,
-        %addr,
+        listening = ?bound,
         tpc_threads = n_threads,
         cpus = n_cpus,
         routes_total = total,
@@ -137,7 +126,9 @@ fn log_startup(mode: &str, addr: &SocketAddr, n_threads: usize, n_cpus: usize, s
         "\n  Pyronova v{} [TPC mode, {mode}]",
         env!("CARGO_PKG_VERSION")
     );
-    println!("  Listening on http://{addr}");
+    for listener in bound {
+        println!("  Listening on {listener}");
+    }
     println!("  TPC threads: {n_threads} (CPUs: {n_cpus}, pinned)");
     println!(
         "  Routes: {subinterp_count} sub-interp + {gil_count} GIL + {async_count} async{stream_suffix}\n",
@@ -161,12 +152,14 @@ fn spawn_stop_watcher(stop: CancellationToken) -> Result<StopWatcher, ServeError
     let watched = stop.clone();
     let thread = std::thread::Builder::new()
         .name("pyronova-stop".into())
-        .spawn(move || {
-            let rt = RuntimeBuilder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("stop-watcher runtime");
-            rt.block_on(crate::app::until_stopped(watched));
+        .spawn(move || match RuntimeBuilder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt.block_on(crate::app::until_stopped(watched)),
+            Err(e) => {
+                // Without its runtime the watcher can't see SIGINT; stop rather than
+                // serve a server that ignores it.
+                tracing::error!(target: "pyronova::server", error = %e, "stop-watcher runtime could not be built; stopping");
+                watched.cancel();
+            }
         })
         .map_err(|source| ServeError::Spawn {
             thread: "pyronova-stop".into(),
@@ -182,189 +175,18 @@ impl Drop for StopWatcher {
     fn drop(&mut self) {
         self.stop.cancel();
         if let Some(thread) = self.thread.take() {
-            if thread.join().is_err() {
-                tracing::error!(target: "pyronova::server", "stop watcher thread panicked");
+            if let Err(payload) = thread.join() {
+                tracing::error!(
+                    target: "pyronova::server",
+                    panic = %panic_message(payload.as_ref()),
+                    "stop watcher thread panicked"
+                );
             }
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// GIL mode — every handler on the main interpreter
-// ---------------------------------------------------------------------------
-
-pub(crate) fn run_tpc_gil(
-    addr: SocketAddr,
-    n_threads: usize,
-    n_cpus: usize,
-    routes: SharedSite,
-    tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
-    shutdown: CancellationToken,
-) -> Result<(), ServeError> {
-    log_startup("gil", &addr, n_threads, n_cpus, &routes);
-
-    let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-    let _watcher = spawn_stop_watcher(shutdown.clone())?;
-
-    let mut handles = Vec::with_capacity(n_threads);
-    for i in 0..n_threads {
-        let core_id = core_ids.get(i).copied();
-        let routes = Arc::clone(&routes);
-        let shutdown_thread = shutdown.clone();
-        let tls = tls_acceptor.clone();
-
-        let handle = std::thread::Builder::new()
-            .name(format!("pyronova-tpc-{i}"))
-            .stack_size(crate::python::PYTHON_THREAD_STACK)
-            .spawn(move || {
-                try_pin_current(core_id);
-                elevate_thread_qos_macos();
-                let rt = RuntimeBuilder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("tpc current-thread runtime build");
-                let local = LocalSet::new();
-                local.block_on(&rt, async move {
-                    tpc_accept_loop_gil(addr, routes, shutdown_thread, tls).await;
-                });
-            });
-        match handle {
-            Ok(h) => handles.push(h),
-            Err(e) => {
-                shutdown.cancel();
-                return Err(ServeError::Spawn {
-                    thread: format!("pyronova-tpc-{i}"),
-                    source: e,
-                });
-            }
-        }
-    }
-
-    for h in handles {
-        if let Err(e) = h.join() {
-            let msg = e
-                .downcast_ref::<String>()
-                .map(|s| s.as_str())
-                .or_else(|| e.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown panic");
-            tracing::error!(target: "pyronova::server", panic = msg, "TPC GIL worker thread panicked");
-        }
-    }
-    Ok(())
-}
-
-async fn tpc_accept_loop_gil(
-    addr: SocketAddr,
-    routes: SharedSite,
-    shutdown: CancellationToken,
-    tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
-) {
-    let std_listener = match create_reuseport_listener(addr) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(target: "pyronova::server", error = %e, "TPC reuseport listener failed");
-            return;
-        }
-    };
-    let listener = match TcpListener::from_std(std_listener) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(target: "pyronova::server", error = %e, "TPC TcpListener::from_std failed");
-            return;
-        }
-    };
-
-    let tracker = TaskTracker::new();
-    loop {
-        tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => break,
-            res = listener.accept() => {
-                match res {
-                    Ok((stream, remote_addr)) => {
-                        let _ = stream.set_nodelay(true);
-                        setup_tcp_quickack(&stream);
-
-                        let routes = Arc::clone(&routes);
-                        let conn_token = shutdown.clone();
-                        let tls_acc_c = tls_acceptor.clone();
-                        tracker.spawn_local(async move {
-                            drive_gil_conn(stream, remote_addr, routes, conn_token, tls_acc_c).await;
-                        });
-                    }
-                    Err(e) => handle_accept_error(&e).await,
-                }
-            }
-        }
-    }
-    tracker.close();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), tracker.wait()).await;
-}
-
-async fn drive_gil_conn(
-    stream: tokio::net::TcpStream,
-    remote_addr: SocketAddr,
-    routes: SharedSite,
-    conn_token: CancellationToken,
-    tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
-) {
-    let tls_stream = match tls_acceptor {
-        Some(acc) => match crate::tls::wrap_tls(&acc, stream).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(target: "pyronova::server", error = %e, "TLS handshake failed");
-                return;
-            }
-        },
-        None => crate::tls::wrap_plain(stream),
-    };
-    let io = TokioIo::new(tls_stream);
-    let svc = service_fn(move |req: Request<Incoming>| {
-        let routes = Arc::clone(&routes);
-        let client_ip_addr = remote_addr.ip();
-        async move {
-            if websocket::is_websocket_upgrade(&req) {
-                websocket::handle_websocket(req, routes, client_ip_addr).await
-            } else {
-                handle_request(req, routes, client_ip_addr).await
-            }
-        }
-    });
-    let mut builder = AutoBuilder::new(LocalExec);
-    builder
-        .http1()
-        .timer(hyper_util::rt::TokioTimer::new())
-        .header_read_timeout(std::time::Duration::from_secs(10));
-    let conn = builder.serve_connection_with_upgrades(io, svc);
-    tokio::pin!(conn);
-    let mut graceful_sent = false;
-    loop {
-        tokio::select! {
-            res = conn.as_mut() => {
-                if let Err(e) = res {
-                    let msg = e.to_string();
-                    if !msg.contains("connection closed")
-                        && !msg.contains("reset by peer")
-                        && !msg.contains("broken pipe")
-                    {
-                        tracing::warn!(target: "pyronova::server", error = %e, "Connection error");
-                    }
-                }
-                break;
-            }
-            _ = conn_token.cancelled(), if !graceful_sent => {
-                conn.as_mut().graceful_shutdown();
-                graceful_sent = true;
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Sub-interpreter mode — dispatch still via the old pool for Phase 1
-// ---------------------------------------------------------------------------
-
-/// Why a TPC server run could not start (or stopped).
+/// Why a TPC server run could not start, or failed while serving.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ServeError {
     #[error("could not spawn thread {thread}: {source}")]
@@ -373,41 +195,203 @@ pub(crate) enum ServeError {
         #[source]
         source: std::io::Error,
     },
-    #[error("TPC worker count mismatch: expected {expected}, got {got}")]
-    WorkerCount { expected: usize, got: usize },
     #[error(transparent)]
-    Gc(#[from] GcModeError),
+    Listener(#[from] ListenerError),
+    #[error("thread {thread} could not build its runtime: {source}")]
+    Runtime {
+        thread: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("thread {thread} panicked: {payload}")]
+    Panicked { thread: String, payload: String },
+    #[error("{workers} TPC workers for {groups} listener groups")]
+    WorkerCount { workers: usize, groups: usize },
 }
 
-/// TPC inline mode (Phase 2) — each TPC thread owns its own sub-interp
-/// and executes handlers synchronously on the accept thread. No shared
-/// pool, no channel, no oneshot wake.
-///
-/// `workers` must have exactly `n_threads` entries; ownership transfers
-/// to the TPC threads. Constraint check: startup must have rejected any
-/// gil=True / async def / stream=True route — the inline handler has no
-/// path to handle those (see handle_request_tpc_inline).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_tpc_subinterp(
-    addr: SocketAddr,
-    n_threads: usize,
+impl From<ServeError> for pyo3::PyErr {
+    fn from(e: ServeError) -> Self {
+        match e {
+            ServeError::Listener(e) => e.into(),
+            other => pyo3::exceptions::PyRuntimeError::new_err(other.to_string()),
+        }
+    }
+}
+
+type ThreadHandle = (String, std::thread::JoinHandle<Result<(), ServeError>>);
+
+/// Runs `serve` on this (new) TPC thread: pinned to `core`, QoS raised, on a
+/// current-thread runtime and a `LocalSet`, both gone when this returns.
+fn serve_on_this_thread<Fut>(
+    thread: &str,
+    core: Option<core_affinity::CoreId>,
+    serve: impl FnOnce() -> Fut,
+) -> Result<(), ServeError>
+where
+    Fut: Future<Output = Result<(), ServeError>>,
+{
+    try_pin_current(core);
+    elevate_thread_qos_macos();
+    let rt = RuntimeBuilder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| ServeError::Runtime {
+            thread: thread.to_string(),
+            source,
+        })?;
+    let local = LocalSet::new();
+    let served = local.block_on(&rt, serve());
+    // Its tasks hold the thread's `Rc`s; they go before the caller ends the worker.
+    drop(local);
+    served
+}
+
+/// Joins every thread. Each failure is logged; the first one is returned.
+fn join_all(handles: Vec<ThreadHandle>) -> Result<(), ServeError> {
+    let mut first = None;
+    for (thread, handle) in handles {
+        let failure = match handle.join() {
+            Ok(Ok(())) => continue,
+            Ok(Err(e)) => e,
+            Err(payload) => ServeError::Panicked {
+                thread,
+                payload: panic_message(payload.as_ref()),
+            },
+        };
+        tracing::error!(target: "pyronova::server", error = %failure, "TPC thread failed");
+        first.get_or_insert(failure);
+    }
+    first.map_or(Ok(()), Err)
+}
+
+/// Lets the in-flight connections of a stopped accept loop finish, up to
+/// [`DRAIN_TIMEOUT`].
+async fn drain(tracker: TaskTracker) {
+    tracker.close();
+    if tokio::time::timeout(DRAIN_TIMEOUT, tracker.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            target: "pyronova::server",
+            open = tracker.len(),
+            "connections did not finish within {DRAIN_TIMEOUT:?} of the stop; closing them"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GIL mode — every handler on the main interpreter
+// ---------------------------------------------------------------------------
+
+/// One pinned TPC thread per listener group, each serving every handler on the main
+/// interpreter. A thread that fails stops the server; its error is returned.
+pub(crate) fn run_tpc_gil(
+    listeners: BoundListeners,
     n_cpus: usize,
-    mut workers: Vec<SubInterpreterWorker>,
-    routes: SharedSite,
-    tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
-    main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
-    extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
-    gc: GcConfig,
-    topology: DarwinTopology,
+    site: SharedSite,
     shutdown: CancellationToken,
 ) -> Result<(), ServeError> {
-    if workers.len() != n_threads {
-        return Err(ServeError::WorkerCount {
-            expected: n_threads,
-            got: workers.len(),
-        });
-    }
+    let n_threads = listeners.groups.len();
+    log_startup("gil", &listeners.bound, n_threads, n_cpus, &site);
 
+    let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+    let _watcher = spawn_stop_watcher(shutdown.clone())?;
+
+    let mut handles = Vec::with_capacity(n_threads);
+    for (i, group) in listeners.groups.into_iter().enumerate() {
+        let thread = format!("pyronova-tpc-{i}");
+        let core = core_ids.get(i).copied();
+        let (site, stop, label) = (Arc::clone(&site), shutdown.clone(), thread.clone());
+        let spawned = std::thread::Builder::new()
+            .name(thread.clone())
+            .stack_size(crate::python::PYTHON_THREAD_STACK)
+            .spawn(move || {
+                let served = serve_on_this_thread(&label, core, || {
+                    tpc_accept_loop_gil(group, site, stop.clone())
+                });
+                if served.is_err() {
+                    stop.cancel();
+                }
+                served
+            });
+        match spawned {
+            Ok(handle) => handles.push((thread, handle)),
+            Err(source) => {
+                shutdown.cancel();
+                // Their failures, if any, are logged there; the spawn is the cause.
+                let _logged = join_all(handles);
+                return Err(ServeError::Spawn { thread, source });
+            }
+        }
+    }
+    join_all(handles)
+}
+
+async fn tpc_accept_loop_gil(
+    group: Vec<Listener>,
+    site: SharedSite,
+    shutdown: CancellationToken,
+) -> Result<(), ServeError> {
+    let mut source = AcceptSource::new(group)?;
+    let tracker = TaskTracker::new();
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            accepted = source.accept() => {
+                tracker.spawn_local(serve_main_conn(accepted, Arc::clone(&site), shutdown.clone()));
+            }
+        }
+    }
+    drain(tracker).await;
+    Ok(())
+}
+
+/// A GIL-mode connection on a TPC thread: every request runs on the main interpreter.
+async fn serve_main_conn(accepted: Accepted, site: SharedSite, conn_token: CancellationToken) {
+    let client_ip = accepted.remote.ip();
+    let Some(stream) = crate::tls::wrap(accepted.stream, accepted.tls.as_deref()).await else {
+        return;
+    };
+    let svc = service_fn(move |req: Request<Incoming>| {
+        let site = Arc::clone(&site);
+        async move {
+            if websocket::is_websocket_upgrade(&req) {
+                websocket::handle_websocket(req, site, client_ip).await
+            } else {
+                handle_request(req, site, client_ip).await
+            }
+        }
+    });
+    drive_connection(stream, svc, LocalExec, conn_token).await;
+}
+
+// ---------------------------------------------------------------------------
+// Sub-interpreter mode — each TPC thread owns a worker and runs its handlers inline
+// ---------------------------------------------------------------------------
+
+/// A TPC sub-interpreter server: what `run_tpc_subinterp` serves with.
+pub(crate) struct TpcServer {
+    /// One per TPC thread, built on the main thread.
+    pub(crate) workers: Vec<SubInterpreterWorker>,
+    pub(crate) site: SharedSite,
+    /// Runs `gil=True` routes and the fallback on the main interpreter; `None` when the
+    /// table has none.
+    pub(crate) bridge: Option<Arc<MainInterpBridge>>,
+    pub(crate) gc: GcConfig,
+    pub(crate) topology: DarwinTopology,
+}
+
+/// Each TPC thread owns one worker and executes handlers synchronously on the accept
+/// thread: no shared pool, no channel, no oneshot wake. Every worker ends on the thread
+/// that served it, or here if it was never handed to one.
+pub(crate) fn run_tpc_subinterp(
+    listeners: BoundListeners,
+    n_cpus: usize,
+    server: TpcServer,
+    shutdown: CancellationToken,
+) -> Result<(), ServeError> {
     // Darwin: kqueue-backed SO_REUSEPORT routes ~all traffic to one
     // listener (last-socket-wins). We keep the per-thread-listener
     // default anyway because localhost benchmarking shows it still
@@ -416,178 +400,225 @@ pub(crate) fn run_tpc_subinterp(
     // benefit. The fanout topology stays behind an env opt-in for
     // real-NIC testing and hardware where the loopback isn't the
     // bottleneck. Set `PYRONOVA_TPC_DARWIN=fanout` to opt in.
-    match topology {
+    let groups = match server.topology {
+        DarwinTopology::PerThreadListener => server.workers.len(),
+        DarwinTopology::Fanout => 1,
+    };
+    if listeners.groups.len() != groups {
+        let err = ServeError::WorkerCount {
+            workers: server.workers.len(),
+            groups: listeners.groups.len(),
+        };
+        // SAFETY: on the main thread inside `py.detach` (no thread state current); none of
+        // the workers was rebound.
+        unsafe { SubInterpreterWorker::end_all(server.workers) };
+        return Err(err);
+    }
+    match server.topology {
         #[cfg(target_os = "macos")]
-        DarwinTopology::Fanout => run_tpc_subinterp_fanout(
-            addr,
-            n_threads,
-            n_cpus,
-            workers,
-            routes,
-            tls_acceptor,
-            main_bridge,
-            extra_tls,
-            shutdown,
-        ),
-        _ => run_tpc_subinterp_per_thread_listener(
-            addr,
-            n_threads,
-            n_cpus,
-            &mut workers,
-            routes,
-            tls_acceptor,
-            main_bridge,
-            extra_tls,
-            gc,
-            shutdown,
-        ),
+        DarwinTopology::Fanout => run_fanout(listeners, n_cpus, server, shutdown),
+        _ => run_per_thread_listener(listeners, n_cpus, server, shutdown),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_tpc_subinterp_per_thread_listener(
-    addr: SocketAddr,
-    n_threads: usize,
-    n_cpus: usize,
+/// The stop watcher, or the run's end: a server that can't watch for SIGINT doesn't
+/// start, and its workers end here.
+fn watch_or_end(
+    shutdown: &CancellationToken,
     workers: &mut Vec<SubInterpreterWorker>,
-    routes: SharedSite,
-    tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
-    main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
-    extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
-    gc: GcConfig,
+) -> Result<StopWatcher, ServeError> {
+    spawn_stop_watcher(shutdown.clone()).inspect_err(|_| {
+        // SAFETY: on the main thread inside `py.detach`; none of the workers was rebound.
+        unsafe { SubInterpreterWorker::end_all(workers.drain(..)) };
+    })
+}
+
+fn run_per_thread_listener(
+    listeners: BoundListeners,
+    n_cpus: usize,
+    mut server: TpcServer,
     shutdown: CancellationToken,
 ) -> Result<(), ServeError> {
-    log_startup("hybrid-inline", &addr, n_threads, n_cpus, &routes);
+    let n_threads = server.workers.len();
+    log_startup(
+        "hybrid-inline",
+        &listeners.bound,
+        n_threads,
+        n_cpus,
+        &server.site,
+    );
+    let _watcher = watch_or_end(&shutdown, &mut server.workers)?;
 
+    let gc = server.gc;
+    let handoffs = server.workers.into_iter().zip(listeners.groups).collect();
+    let handles = spawn_worker_threads(
+        "tpc",
+        handoffs,
+        &server.site,
+        &server.bridge,
+        &shutdown,
+        move |context, group, stop| tpc_accept_loop_inline(group, context, stop, gc),
+    )?;
+    join_all(handles)
+}
+
+/// One pinned thread per `(worker, payload)`. A worker is handed over only after its
+/// thread exists: the thread rebinds it, wraps it in its [`TpcContext`], runs `serve`,
+/// and ends it there. If a spawn fails, the threads already running are stopped and
+/// joined, and every worker not handed over — the failed thread's included — is ended
+/// here, on the thread that built them (FR-19). A thread whose `serve` fails stops the
+/// server.
+fn spawn_worker_threads<T, F, Fut>(
+    name: &str,
+    handoffs: Vec<(SubInterpreterWorker, T)>,
+    site: &SharedSite,
+    bridge: &Option<Arc<MainInterpBridge>>,
+    shutdown: &CancellationToken,
+    serve: F,
+) -> Result<Vec<ThreadHandle>, ServeError>
+where
+    T: Send + 'static,
+    F: Fn(Rc<TpcContext>, T, CancellationToken) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<(), ServeError>> + 'static,
+{
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-    let _watcher = spawn_stop_watcher(shutdown.clone())?;
-
-    // Lend one Arc as a `&'static Site` shared across workers, so
-    // per-request dispatch on the hot path does zero refcount ops.
-    // `Arc::into_raw` + deref is the stable-since-1.0 way to get this. The
-    // raw pointer is reclaimed once every thread that borrows it is joined,
-    // on the error path below and after the server stops, so repeated
-    // starts in one process (TestClient) don't accumulate Sites.
-    let routes_raw: *const Site = Arc::into_raw(Arc::clone(&routes));
-    let routes_static: &'static Site = unsafe { &*routes_raw };
-
-    let mut handles = Vec::with_capacity(n_threads);
-    for i in 0..n_threads {
-        let core_id = core_ids.get(i).copied();
-        let worker = workers.remove(0);
-        let routes_arc = Arc::clone(&routes);
-        let shutdown = shutdown.clone();
-        let tls = tls_acceptor.clone();
-
-        let bridge = main_bridge.clone();
-        let shutdown_thread = shutdown.clone();
-        let extra_tls_clone = extra_tls.clone();
-        let handle = std::thread::Builder::new()
-            .name(format!("pyronova-tpc-{i}"))
+    let mut handles = Vec::with_capacity(handoffs.len());
+    let mut pending = handoffs.into_iter().enumerate();
+    while let Some((i, handoff)) = pending.next() {
+        let thread = format!("pyronova-{name}-{i}");
+        let core = core_ids.get(i).copied();
+        let (tx, rx) = mpsc::sync_channel::<(SubInterpreterWorker, T)>(1);
+        let serve = serve.clone();
+        let (site, bridge, stop) = (Arc::clone(site), bridge.clone(), shutdown.clone());
+        let label = thread.clone();
+        let spawned = std::thread::Builder::new()
+            .name(thread.clone())
             .stack_size(crate::python::PYTHON_THREAD_STACK)
             .spawn(move || {
-                try_pin_current(core_id);
-                elevate_thread_qos_macos();
-                let rt = RuntimeBuilder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("tpc current-thread runtime build");
-                let local = LocalSet::new();
-                // Rebind the sub-interp's tstate to THIS OS thread so
-                // PyEval_RestoreThread during call_handler targets it.
-                // Must happen on the TPC thread itself, not on main.
-                let mut worker = worker;
+                // No worker means the spawner ended it after a failure of its own.
+                let Ok((mut worker, payload)) = rx.recv() else {
+                    return Ok(());
+                };
+                // SAFETY: this thread now owns the worker, which no other thread has bound.
                 worker.tstate = unsafe {
                     crate::python::interp::rebind_tstate_to_current_thread(worker.tstate)
                 };
-                let worker = std::rc::Rc::new(std::cell::RefCell::new(worker));
-                let worker_exit = std::rc::Rc::clone(&worker);
-                local.block_on(&rt, async move {
-                    tpc_accept_loop_inline(
-                        addr,
-                        extra_tls_clone,
-                        worker,
-                        routes_static,
-                        routes_arc,
-                        shutdown_thread,
-                        tls,
-                        bridge,
-                        gc,
-                    )
-                    .await;
+                let context = Rc::new(TpcContext {
+                    worker: std::cell::RefCell::new(worker),
+                    site,
+                    bridge,
                 });
-                // Tear down: drop the LocalSet (its tasks hold the other `Rc`s), then end the
-                // sub-interpreter on this thread, as the channel pool's workers do.
-                drop(local);
-                SubInterpreterWorker::end_shared(worker_exit);
-            });
-        match handle {
-            Ok(h) => handles.push(h),
-            Err(e) => {
-                // Tell the threads that did spawn to exit, join them so
-                // none still reference routes_static, then reclaim the
-                // leaked Arc before returning — otherwise repeated failed
-                // starts (restart, tests) accumulate leaked Sites.
-                shutdown.cancel();
-                for h in handles {
-                    let _ = h.join();
+                let served = serve_on_this_thread(&label, core, || {
+                    serve(Rc::clone(&context), payload, stop.clone())
+                });
+                TpcContext::end(context);
+                if served.is_err() {
+                    stop.cancel();
                 }
-                unsafe { drop(Arc::from_raw(routes_raw)) };
-                // End the workers not yet handed to a thread, on this (their creating)
-                // thread; none of them was rebound yet (FR-19). The one moved into the
-                // failed spawn is gone: its drop logs and leaks it.
-                // SAFETY: called from `run_tpc_subinterp` on the main thread inside
-                // `py.detach`, so no thread state is current.
-                unsafe { SubInterpreterWorker::end_all(workers.drain(..)) };
-                return Err(ServeError::Spawn {
-                    thread: format!("pyronova-tpc-{i}"),
-                    source: e,
-                });
+                served
+            });
+        match spawned {
+            Ok(handle) => {
+                handles.push((thread, handle));
+                // The thread's only receiver is waiting; a one-slot channel never blocks.
+                if let Err(mpsc::SendError(unsent)) = tx.send(handoff) {
+                    // SAFETY: on the creating thread inside `py.detach`; never rebound.
+                    unsafe { SubInterpreterWorker::end_all([unsent.0]) };
+                }
+            }
+            Err(source) => {
+                shutdown.cancel();
+                // Their failures, if any, are logged there; the spawn is the cause.
+                let _logged = join_all(handles);
+                let unsent = std::iter::once(handoff)
+                    .chain(pending.map(|(_, h)| h))
+                    .map(|(worker, _)| worker);
+                // SAFETY: on the creating thread inside `py.detach` (no thread state
+                // current); none of these was handed to a thread.
+                unsafe { SubInterpreterWorker::end_all(unsent) };
+                return Err(ServeError::Spawn { thread, source });
             }
         }
     }
+    Ok(handles)
+}
 
-    for h in handles {
-        if let Err(e) = h.join() {
-            let msg = e
-                .downcast_ref::<String>()
-                .map(|s| s.as_str())
-                .or_else(|| e.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown panic");
-            tracing::error!(target: "pyronova::server", panic = msg, "TPC inline worker thread panicked");
+/// Accepts on this TPC thread's listeners and serves each connection inline on
+/// `context`'s worker, until `shutdown`. In idle GC mode it also runs the idle tick.
+pub(crate) async fn tpc_accept_loop_inline(
+    group: Vec<Listener>,
+    context: Rc<TpcContext>,
+    shutdown: CancellationToken,
+    gc: GcConfig,
+) -> Result<(), ServeError> {
+    let mut source = AcceptSource::new(group)?;
+    // The worker counts requests as it runs them and fires its own count trigger (the
+    // threshold, or idle mode's OOM failsafe); this loop adds the idle tick.
+    let mut ticker = (gc.mode == GcMode::Idle).then(|| {
+        // First tick one period from now: nothing to collect before any request ran.
+        tokio::time::interval_at(tokio::time::Instant::now() + gc.idle_tick, gc.idle_tick)
+    });
+    let mut idle_gc = IdleGc::default();
+    let tracker = TaskTracker::new();
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            accepted = source.accept() => {
+                tracker.spawn_local(drive_tcp_conn(accepted, Rc::clone(&context), shutdown.clone()));
+            }
+            () = next_tick(&mut ticker) => idle_gc_tick(&mut idle_gc, &context.worker),
         }
     }
-    // SAFETY: every thread that borrowed `routes_static` is joined above.
-    unsafe { drop(Arc::from_raw(routes_raw)) };
+    drain(tracker).await;
     Ok(())
 }
 
+/// The idle GC tick, or never (count and off modes).
+async fn next_tick(ticker: &mut Option<tokio::time::Interval>) {
+    match ticker {
+        Some(ticker) => {
+            ticker.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// The idle tick: collect on `worker` if it went quiet (see [`IdleGc`]).
+fn idle_gc_tick(idle: &mut IdleGc, worker: &std::cell::RefCell<SubInterpreterWorker>) {
+    let due = {
+        let w = worker.borrow();
+        idle.on_tick(w.requests_served(), w.requests_since_collect())
+    };
+    if due {
+        // SAFETY: this TPC thread is the one the worker was rebound to, and the accept
+        // loop runs between requests, so no thread state is current.
+        unsafe { worker.borrow_mut().collect_garbage_between_requests() };
+    }
+}
+
+/// A connection the fanout acceptor hands to a worker thread.
+#[cfg(target_os = "macos")]
+type FannedOut = (
+    std::net::TcpStream,
+    std::net::SocketAddr,
+    Option<Arc<tokio_rustls::TlsAcceptor>>,
+);
+
 /// Darwin-only TPC topology: one accept thread feeds N worker threads
-/// through per-worker unbounded mpsc queues, round-robin. Preserves the
+/// through per-worker bounded mpsc queues, round-robin. Preserves the
 /// current-thread runtime + LocalSet + sub-interp-per-worker model; the
 /// only change is where the TcpStream comes from. Pays one cross-thread
 /// wake per TCP connection, which is amortized to ~0 under HTTP keep-
 /// alive (one wake serves the connection's full request lifetime).
+/// Count or off GC only (`GcServer::DarwinFanout`): there is no idle tick here.
 #[cfg(target_os = "macos")]
-#[allow(clippy::too_many_arguments)]
-fn run_tpc_subinterp_fanout(
-    addr: SocketAddr,
-    n_threads: usize,
+fn run_fanout(
+    listeners: BoundListeners,
     n_cpus: usize,
-    mut workers: Vec<SubInterpreterWorker>,
-    routes: SharedSite,
-    tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
-    main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
-    _extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
+    mut server: TpcServer,
     shutdown: CancellationToken,
 ) -> Result<(), ServeError> {
-    log_startup("hybrid-inline-fanout", &addr, n_threads, n_cpus, &routes);
-
-    let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-    let _watcher = spawn_stop_watcher(shutdown.clone())?;
-
-    type Conn = (std::net::TcpStream, SocketAddr);
-
     // Bounded per-worker inbox. Capacity is a load-shedding threshold:
     // when a worker falls behind and its inbox fills, the acceptor
     // drops new connections (TCP RST to the client) rather than
@@ -596,252 +627,147 @@ fn run_tpc_subinterp_fanout(
     // FD usage bounded at n_threads * 1024.
     const WORKER_INBOX_CAP: usize = 1024;
 
-    let mut worker_txs: Vec<tokio::sync::mpsc::Sender<Conn>> = Vec::with_capacity(n_threads);
-    let mut worker_rxs: Vec<Option<tokio::sync::mpsc::Receiver<Conn>>> =
-        Vec::with_capacity(n_threads);
-    for _ in 0..n_threads {
-        let (tx, rx) = tokio::sync::mpsc::channel(WORKER_INBOX_CAP);
-        worker_txs.push(tx);
-        worker_rxs.push(Some(rx));
-    }
+    let n_threads = server.workers.len();
+    log_startup(
+        "hybrid-inline-fanout",
+        &listeners.bound,
+        n_threads,
+        n_cpus,
+        &server.site,
+    );
+    let _watcher = watch_or_end(&shutdown, &mut server.workers)?;
 
-    // Lend once as a shared &'static, same rationale as the per-thread
-    // listener path: all workers read from the same static, no Arc ops,
-    // and the pointer is reclaimed once they are joined.
-    let routes_raw: *const Site = Arc::into_raw(Arc::clone(&routes));
-    let routes_static: &'static Site = unsafe { &*routes_raw };
+    let (txs, rxs): (Vec<_>, Vec<_>) = (0..n_threads)
+        .map(|_| tokio::sync::mpsc::channel::<FannedOut>(WORKER_INBOX_CAP))
+        .unzip();
+    let handoffs = server.workers.into_iter().zip(rxs).collect();
+    let mut handles = spawn_worker_threads(
+        "tpc",
+        handoffs,
+        &server.site,
+        &server.bridge,
+        &shutdown,
+        |context, rx, stop| fanout_worker_loop(rx, context, stop),
+    )?;
 
-    let mut handles = Vec::with_capacity(n_threads + 1);
-
-    for (i, rx_slot) in worker_rxs.iter_mut().enumerate().take(n_threads) {
-        let core_id = core_ids.get(i).copied();
-        let worker = workers.remove(0);
-        let routes_arc = Arc::clone(&routes);
-        let shutdown_w = shutdown.clone();
-        let tls = tls_acceptor.clone();
-        let bridge = main_bridge.clone();
-        let rx = rx_slot.take().expect("worker_rxs slot must be populated");
-
-        let handle = std::thread::Builder::new()
-            .name(format!("pyronova-tpc-{i}"))
-            .stack_size(crate::python::PYTHON_THREAD_STACK)
-            .spawn(move || {
-                try_pin_current(core_id);
-                elevate_thread_qos_macos();
-                let rt = RuntimeBuilder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("tpc current-thread runtime build");
-                let local = LocalSet::new();
-                let mut worker = worker;
-                worker.tstate = unsafe {
-                    crate::python::interp::rebind_tstate_to_current_thread(worker.tstate)
-                };
-                let worker = std::rc::Rc::new(std::cell::RefCell::new(worker));
-                let worker_exit = std::rc::Rc::clone(&worker);
-                local.block_on(&rt, async move {
-                    tpc_worker_loop_fanout(
-                        rx,
-                        worker,
-                        routes_static,
-                        routes_arc,
-                        shutdown_w,
-                        tls,
-                        bridge,
-                    )
-                    .await;
-                });
-                // Tear down: drop the LocalSet (its tasks hold the other `Rc`s), then end the
-                // sub-interpreter on this thread, as the channel pool's workers do.
-                drop(local);
-                SubInterpreterWorker::end_shared(worker_exit);
-            });
-        match handle {
-            Ok(h) => handles.push(h),
-            Err(e) => {
-                // Reclaim the leaked Arc on a failed start: cancel so the
-                // already-spawned threads exit, join them so none still
-                // reference routes_static, then drop the reclaimed Arc.
-                shutdown.cancel();
-                for h in handles {
-                    let _ = h.join();
-                }
-                unsafe { drop(Arc::from_raw(routes_raw)) };
-                // End the workers not yet handed to a thread, on this (their creating)
-                // thread; none of them was rebound yet (FR-19). The one moved into the
-                // failed spawn is gone: its drop logs and leaks it.
-                // SAFETY: called from `run_tpc_subinterp` on the main thread inside
-                // `py.detach`, so no thread state is current.
-                unsafe { SubInterpreterWorker::end_all(workers.drain(..)) };
-                return Err(ServeError::Spawn {
-                    thread: format!("pyronova-tpc-{i}"),
-                    source: e,
-                });
-            }
-        }
-    }
-
-    // Acceptor thread — dedicated OS thread with its own current_thread
-    // runtime so accept() polling doesn't contend with any worker.
-    let shutdown_a = shutdown.clone();
-    let acceptor = std::thread::Builder::new()
-        .name("pyronova-acceptor".into())
+    // Acceptor — dedicated OS thread with its own current_thread runtime so accept()
+    // polling doesn't contend with any worker. Pinned to the core after the workers'
+    // so TCP work doesn't fight handler execution for the same L1/L2.
+    let group = listeners
+        .groups
+        .into_iter()
+        .next()
+        .expect("run_tpc_subinterp checked: one listener group");
+    let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+    let core = (!core_ids.is_empty()).then(|| core_ids[n_threads % core_ids.len()]);
+    let stop = shutdown.clone();
+    let thread = "pyronova-acceptor".to_string();
+    let spawned = std::thread::Builder::new()
+        .name(thread.clone())
         .spawn(move || {
-            // Pin the acceptor to the last P-core if available — keeps
-            // it off the cores handling handlers so TCP softirq-style
-            // work doesn't fight for the same L1/L2 as handler execution.
-            if !core_ids.is_empty() {
-                try_pin_current(core_ids.get(n_threads % core_ids.len().max(1)).copied());
+            let served = serve_on_this_thread("pyronova-acceptor", core, || {
+                fanout_accept_loop(group, txs, stop.clone())
+            });
+            if served.is_err() {
+                stop.cancel();
             }
-            elevate_thread_qos_macos();
-            let rt = RuntimeBuilder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("acceptor runtime");
-            rt.block_on(async move {
-                let std_listener = match crate::server::listener::create_reuseport_listener(addr) {
-                    Ok(l) => l,
+            served
+        });
+    match spawned {
+        Ok(handle) => handles.push((thread, handle)),
+        Err(source) => {
+            shutdown.cancel();
+            let _logged = join_all(handles);
+            return Err(ServeError::Spawn { thread, source });
+        }
+    }
+    join_all(handles)
+}
+
+#[cfg(target_os = "macos")]
+async fn fanout_accept_loop(
+    group: Vec<Listener>,
+    txs: Vec<tokio::sync::mpsc::Sender<FannedOut>>,
+    shutdown: CancellationToken,
+) -> Result<(), ServeError> {
+    use tokio::sync::mpsc::error::TrySendError;
+
+    let mut source = AcceptSource::new(group)?;
+    let mut next: usize = 0;
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            accepted = source.accept() => {
+                // Nonblocking, as `TcpStream::from_std` on the worker requires.
+                let stream = match accepted.stream.into_std() {
+                    Ok(s) => s,
                     Err(e) => {
-                        tracing::error!(target: "pyronova::server", error = %e, "TPC fanout listener failed");
-                        return;
+                        tracing::warn!(target: "pyronova::server", error = %e, "into_std failed; dropping the connection");
+                        continue;
                     }
                 };
-                let listener = match TcpListener::from_std(std_listener) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        tracing::error!(target: "pyronova::server", error = %e, "TPC fanout TcpListener::from_std failed");
-                        return;
+                // Round-robin. try_send with load shedding: if the chosen worker's inbox
+                // is full, drop the connection (kernel sends RST). Sheds cleanly under
+                // overload instead of hoarding FDs or spawning unbounded pending work.
+                match txs[next].try_send((stream, accepted.remote, accepted.tls)) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            target: "pyronova::server",
+                            worker = next,
+                            "TPC worker inbox full — dropping connection (load shed)"
+                        );
                     }
-                };
-                let mut next: usize = 0;
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = shutdown_a.cancelled() => break,
-                        res = listener.accept() => match res {
-                            Ok((stream, remote_addr)) => {
-                                let _ = stream.set_nodelay(true);
-                                setup_tcp_quickack(&stream);
-                                let std_stream = match stream.into_std() {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        tracing::warn!(target: "pyronova::server", error = %e, "into_std failed");
-                                        continue;
-                                    }
-                                };
-                                // TcpStream::from_std requires nonblocking.
-                                if std_stream.set_nonblocking(true).is_err() {
-                                    continue;
-                                }
-                                // Round-robin. try_send with load shedding:
-                                // if the chosen worker's inbox is full, drop
-                                // the connection (kernel sends RST). Sheds
-                                // cleanly under overload instead of hoarding
-                                // FDs or spawning unbounded pending work.
-                                // See WORKER_INBOX_CAP comment above.
-                                use tokio::sync::mpsc::error::TrySendError;
-                                match worker_txs[next].try_send((std_stream, remote_addr)) {
-                                    Ok(()) => {}
-                                    Err(TrySendError::Full(_)) => {
-                                        tracing::warn!(
-                                            target: "pyronova::server",
-                                            worker = next,
-                                            "TPC worker inbox full — dropping connection (load shed)"
-                                        );
-                                    }
-                                    Err(TrySendError::Closed(_)) => {
-                                        // Worker channel closed — either a clean shutdown or a
-                                        // worker thread panic. Either way, trigger orderly
-                                        // shutdown so remaining workers are notified.
-                                        tracing::error!(
-                                            target: "pyronova::server",
-                                            worker = next,
-                                            "TPC worker channel closed unexpectedly — triggering shutdown"
-                                        );
-                                        shutdown_a.cancel();
-                                        break;
-                                    }
-                                }
-                                next += 1;
-                                if next >= worker_txs.len() {
-                                    next = 0;
-                                }
-                            }
-                            Err(e) => crate::server::listener::handle_accept_error(&e).await,
-                        }
+                    Err(TrySendError::Closed(_)) => {
+                        // Worker channel closed — either a clean shutdown or a worker
+                        // thread failure. Either way, stop so the other workers exit.
+                        tracing::error!(
+                            target: "pyronova::server",
+                            worker = next,
+                            "TPC worker channel closed unexpectedly — triggering shutdown"
+                        );
+                        shutdown.cancel();
+                        break;
                     }
                 }
-                // Dropping worker_txs here hangs up every receiver,
-                // giving workers a clean exit signal alongside the
-                // shutdown token.
-                drop(worker_txs);
-            });
-        });
-    match acceptor {
-        Ok(h) => handles.push(h),
-        Err(e) => {
-            shutdown.cancel();
-            return Err(ServeError::Spawn {
-                thread: "pyronova-tpc-acceptor".to_string(),
-                source: e,
-            });
+                next = (next + 1) % txs.len();
+            }
         }
     }
-
-    for h in handles {
-        if let Err(e) = h.join() {
-            let msg = e
-                .downcast_ref::<String>()
-                .map(|s| s.as_str())
-                .or_else(|| e.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown panic");
-            tracing::error!(target: "pyronova::server", panic = msg, "TPC fanout worker/acceptor thread panicked");
-        }
-    }
-    // SAFETY: every thread that borrowed `routes_static` is joined above.
-    unsafe { drop(Arc::from_raw(routes_raw)) };
+    // Dropping `txs` hangs up every receiver, the workers' exit alongside the token.
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-async fn tpc_worker_loop_fanout(
-    mut rx: tokio::sync::mpsc::Receiver<(std::net::TcpStream, SocketAddr)>,
-    worker: std::rc::Rc<std::cell::RefCell<SubInterpreterWorker>>,
-    routes_static: &'static Site,
-    routes_arc: SharedSite,
+async fn fanout_worker_loop(
+    mut rx: tokio::sync::mpsc::Receiver<FannedOut>,
+    context: Rc<TpcContext>,
     shutdown: CancellationToken,
-    tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
-    main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
-) {
+) -> Result<(), ServeError> {
     let tracker = TaskTracker::new();
     loop {
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => break,
-            maybe = rx.recv() => match maybe {
-                Some((std_stream, remote_addr)) => {
-                    let stream = match tokio::net::TcpStream::from_std(std_stream) {
+            received = rx.recv() => match received {
+                Some((stream, remote, tls)) => {
+                    let stream = match tokio::net::TcpStream::from_std(stream) {
                         Ok(s) => s,
                         Err(e) => {
-                            tracing::warn!(target: "pyronova::server", error = %e, "TcpStream::from_std failed");
+                            tracing::warn!(target: "pyronova::server", error = %e, "TcpStream::from_std failed; dropping the connection");
                             continue;
                         }
                     };
-                    let worker_clone = std::rc::Rc::clone(&worker);
-                    let routes_arc_c = Arc::clone(&routes_arc);
-                    let conn_token = shutdown.clone();
-                    let tls_acc_c = tls_acceptor.clone();
-                    let bridge_c = main_bridge.clone();
-                    tracker.spawn_local(async move {
-                        crate::worker::drive_tcp_conn(stream, remote_addr, worker_clone, routes_static, routes_arc_c, conn_token, tls_acc_c, bridge_c).await;
-                    });
+                    let accepted = Accepted { stream, remote, tls };
+                    tracker.spawn_local(drive_tcp_conn(accepted, Rc::clone(&context), shutdown.clone()));
                 }
                 None => break,
             }
         }
     }
-    tracker.close();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), tracker.wait()).await;
+    drain(tracker).await;
+    Ok(())
 }
 
 /// GC scheduling mode, parsed once at startup from `PYRONOVA_GC_MODE` (unset = count):
@@ -956,212 +882,6 @@ impl IdleGc {
         quiet && since_collect > 0
     }
 }
-
-/// The idle tick: collect on `worker` if it went quiet (see [`IdleGc`]).
-fn idle_gc_tick(idle: &mut IdleGc, worker: &std::rc::Rc<std::cell::RefCell<SubInterpreterWorker>>) {
-    let due = {
-        let w = worker.borrow();
-        idle.on_tick(w.requests_served(), w.requests_since_collect())
-    };
-    if due {
-        // SAFETY: this TPC thread is the one the worker was rebound to, and the accept
-        // loop runs between requests, so no thread state is current.
-        unsafe { worker.borrow_mut().collect_garbage_between_requests() };
-    }
-}
-
-/// Accept from `slot` if Some, otherwise pend forever.
-async fn tls_accept_or_pending(
-    slot: Option<&(TcpListener, Arc<tokio_rustls::TlsAcceptor>)>,
-) -> (
-    std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>,
-    Option<Arc<tokio_rustls::TlsAcceptor>>,
-) {
-    match slot {
-        Some((l, acc)) => (l.accept().await, Some(Arc::clone(acc))),
-        None => std::future::pending().await,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn tpc_accept_loop_inline(
-    addr: SocketAddr,
-    extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
-    worker: std::rc::Rc<std::cell::RefCell<SubInterpreterWorker>>,
-    routes_static: &'static Site,
-    routes_arc: SharedSite,
-    shutdown: CancellationToken,
-    tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
-    main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
-    gc: GcConfig,
-) {
-    let std_listener = match create_reuseport_listener(addr) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(target: "pyronova::server", error = %e, "TPC reuseport listener failed");
-            return;
-        }
-    };
-    let listener = match TcpListener::from_std(std_listener) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(target: "pyronova::server", error = %e, "TPC TcpListener::from_std failed");
-            return;
-        }
-    };
-
-    let extra_listeners: Vec<(TcpListener, Arc<tokio_rustls::TlsAcceptor>)> = extra_tls
-        .into_iter()
-        .filter_map(|(tls_addr, acc)| {
-            let std_sock = match create_reuseport_listener(tls_addr) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(target: "pyronova::server", error = %e, addr = %tls_addr, "TPC extra TLS listener failed");
-                    return None;
-                }
-            };
-            match TcpListener::from_std(std_sock) {
-                Ok(l) => Some((l, acc)),
-                Err(e) => {
-                    tracing::error!(target: "pyronova::server", error = %e, addr = %tls_addr, "TPC extra TLS TcpListener::from_std failed");
-                    None
-                }
-            }
-        })
-        .collect();
-    let tls_slot0 = extra_listeners.first();
-    let tls_slot1 = extra_listeners.get(1);
-
-    let tracker = TaskTracker::new();
-    match gc.mode {
-        GcMode::Idle => {
-            // The worker counts requests as it runs them and fires the OOM failsafe
-            // itself; this loop adds the idle tick.
-            let mut idle_gc = IdleGc::default();
-            let mut gc_timer = tokio::time::interval(gc.idle_tick);
-            // First tick fires immediately — skip it so we don't collect
-            // an empty heap before any requests have run.
-            gc_timer.tick().await;
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = shutdown.cancelled() => break,
-                    res = listener.accept() => {
-                        match res {
-                            Ok((stream, remote_addr)) => {
-                                let _ = stream.set_nodelay(true);
-                                setup_tcp_quickack(&stream);
-
-                                let worker_clone = std::rc::Rc::clone(&worker);
-                                let routes_arc_c = Arc::clone(&routes_arc);
-                                let conn_token = shutdown.clone();
-                                let tls_acc_c = tls_acceptor.clone();
-                                let bridge_c = main_bridge.clone();
-                                tracker.spawn_local(async move {
-                                    crate::worker::drive_tcp_conn(stream, remote_addr, worker_clone, routes_static, routes_arc_c, conn_token, tls_acc_c, bridge_c).await;
-                                });
-                            }
-                            Err(e) => handle_accept_error(&e).await,
-                        }
-                    }
-                    (res, tls_acc) = tls_accept_or_pending(tls_slot0) => {
-                        match res {
-                            Ok((stream, remote_addr)) => {
-                                let _ = stream.set_nodelay(true);
-                                setup_tcp_quickack(&stream);
-                                let worker_clone = std::rc::Rc::clone(&worker);
-                                let routes_arc_c = Arc::clone(&routes_arc);
-                                let conn_token = shutdown.clone();
-                                let bridge_c = main_bridge.clone();
-                                tracker.spawn_local(async move {
-                                    crate::worker::drive_tcp_conn(stream, remote_addr, worker_clone, routes_static, routes_arc_c, conn_token, tls_acc, bridge_c).await;
-                                });
-                            }
-                            Err(e) => handle_accept_error(&e).await,
-                        }
-                    }
-                    (res, tls_acc) = tls_accept_or_pending(tls_slot1) => {
-                        match res {
-                            Ok((stream, remote_addr)) => {
-                                let _ = stream.set_nodelay(true);
-                                setup_tcp_quickack(&stream);
-                                let worker_clone = std::rc::Rc::clone(&worker);
-                                let routes_arc_c = Arc::clone(&routes_arc);
-                                let conn_token = shutdown.clone();
-                                let bridge_c = main_bridge.clone();
-                                tracker.spawn_local(async move {
-                                    crate::worker::drive_tcp_conn(stream, remote_addr, worker_clone, routes_static, routes_arc_c, conn_token, tls_acc, bridge_c).await;
-                                });
-                            }
-                            Err(e) => handle_accept_error(&e).await,
-                        }
-                    }
-                    _ = gc_timer.tick() => idle_gc_tick(&mut idle_gc, &worker),
-                }
-            }
-        }
-        GcMode::Count | GcMode::Off => loop {
-            tokio::select! {
-                biased;
-                _ = shutdown.cancelled() => break,
-                res = listener.accept() => {
-                    match res {
-                        Ok((stream, remote_addr)) => {
-                            let _ = stream.set_nodelay(true);
-                            setup_tcp_quickack(&stream);
-
-                            let worker_clone = std::rc::Rc::clone(&worker);
-                            let routes_arc_c = Arc::clone(&routes_arc);
-                            let conn_token = shutdown.clone();
-                            let tls_acc_c = tls_acceptor.clone();
-                            let bridge_c = main_bridge.clone();
-                            tracker.spawn_local(async move {
-                                crate::worker::drive_tcp_conn(stream, remote_addr, worker_clone, routes_static, routes_arc_c, conn_token, tls_acc_c, bridge_c).await;
-                            });
-                        }
-                        Err(e) => handle_accept_error(&e).await,
-                    }
-                }
-                (res, tls_acc) = tls_accept_or_pending(tls_slot0) => {
-                    match res {
-                        Ok((stream, remote_addr)) => {
-                            let _ = stream.set_nodelay(true);
-                            setup_tcp_quickack(&stream);
-                            let worker_clone = std::rc::Rc::clone(&worker);
-                            let routes_arc_c = Arc::clone(&routes_arc);
-                            let conn_token = shutdown.clone();
-                            let bridge_c = main_bridge.clone();
-                            tracker.spawn_local(async move {
-                                crate::worker::drive_tcp_conn(stream, remote_addr, worker_clone, routes_static, routes_arc_c, conn_token, tls_acc, bridge_c).await;
-                            });
-                        }
-                        Err(e) => handle_accept_error(&e).await,
-                    }
-                }
-                (res, tls_acc) = tls_accept_or_pending(tls_slot1) => {
-                    match res {
-                        Ok((stream, remote_addr)) => {
-                            let _ = stream.set_nodelay(true);
-                            setup_tcp_quickack(&stream);
-                            let worker_clone = std::rc::Rc::clone(&worker);
-                            let routes_arc_c = Arc::clone(&routes_arc);
-                            let conn_token = shutdown.clone();
-                            let bridge_c = main_bridge.clone();
-                            tracker.spawn_local(async move {
-                                crate::worker::drive_tcp_conn(stream, remote_addr, worker_clone, routes_static, routes_arc_c, conn_token, tls_acc, bridge_c).await;
-                            });
-                        }
-                        Err(e) => handle_accept_error(&e).await,
-                    }
-                }
-            }
-        },
-    }
-    tracker.close();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), tracker.wait()).await;
-}
-
-// drive_inline_conn moved to worker::drive_tcp_conn.
 
 /// Count physical CPU cores to size the TPC pool.
 ///

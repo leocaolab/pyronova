@@ -1,37 +1,36 @@
-//! Generic per-connection driver for the TPC inline path.
+//! Per-connection drivers: every path that feeds a hyper connection converges here.
 //!
-//! Every path that feeds a hyper connection — real TCP accept loop,
-//! in-memory duplex bench, loopback bench — converges here. The heavy
-//! lifting is a single generic `drive_conn<IO>` that takes any
-//! `AsyncRead + AsyncWrite`, wraps it in `TokioIo`, and runs the
-//! hyper auto-builder on this worker's LocalSet.
-//!
-//! Why extract this out of `tpc.rs`: before this split, `tpc.rs` held
-//! three near-identical copies of the same service_fn closure + drive
-//! loop (`drive_inline_conn`, `drive_inmem_conn`, the GIL-only
-//! variant in `drive_gil_conn`). Any hot-path optimization had to be
-//! landed three times, and the bench path was a second source of
-//! truth for "what a request costs". One generic function = one hot
-//! path = measurements on the bench directly reflect the production
-//! cost.
-//!
-//! The `drive_tcp_conn` wrapper below is just TLS-wrap + call. Other
-//! transports (in-memory `DuplexStream`) call `drive_conn` directly.
+//! - [`drive_connection`] runs one HTTP/1+2 connection to completion on any executor —
+//!   the multi-thread pool paths (`TokioExecutor`) and the TPC threads ([`LocalExec`]) —
+//!   with the Slowloris header-read timeout and graceful drain on shutdown.
+//! - [`drive_conn`] / [`drive_tcp_conn`] serve a TPC sub-interpreter thread's
+//!   connections through its [`TpcContext`]: real TCP (after the TLS handshake), and the
+//!   in-memory bench's duplex streams. One hot path, so a bench number is the production
+//!   per-request cost.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
-use hyper_util::server::conn::auto::Builder as AutoBuilder;
+use hyper_util::server::conn::auto::{Builder as AutoBuilder, HttpServerConnExec};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 
-use crate::handlers::handle_request_tpc_inline;
+use crate::bridge::main_bridge::MainInterpBridge;
+use crate::handlers::{handle_request_tpc_inline, BoxBody};
 use crate::python::interp::SubInterpreterWorker;
-use crate::site::{SharedSite, Site};
+use crate::server::listener::Accepted;
+use crate::site::SharedSite;
 use crate::websocket;
+
+/// How long a client gets to finish sending a request's headers (HTTP/1). Without it a
+/// client that dribbles one header byte per minute holds a task and an fd forever.
+/// HTTP/2 has its own frame/settings timeouts in the h2 crate.
+pub(crate) const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// LocalSet-compatible hyper executor. `spawn_local` means the
 /// spawned future doesn't need `Send` — which is the whole point of
@@ -47,6 +46,31 @@ where
 {
     fn execute(&self, fut: F) {
         tokio::task::spawn_local(fut);
+    }
+}
+
+/// What one TPC sub-interpreter thread serves with: its worker, the site, the
+/// main-interpreter bridge. Shared (`Rc`) by the thread's connection tasks; never leaves
+/// the thread. One non-atomic `Rc` clone per request.
+pub(crate) struct TpcContext {
+    pub(crate) worker: RefCell<SubInterpreterWorker>,
+    pub(crate) site: SharedSite,
+    pub(crate) bridge: Option<Arc<MainInterpBridge>>,
+}
+
+impl TpcContext {
+    /// Ends the worker on this, its own, thread once every connection task holding the
+    /// context is gone (FR-19). A context still shared is leaked, with an error.
+    pub(crate) fn end(context: Rc<TpcContext>) {
+        match Rc::try_unwrap(context) {
+            Ok(context) => context.worker.into_inner().end_served(),
+            Err(still_shared) => tracing::error!(
+                target: "pyronova::server",
+                worker = still_shared.worker.borrow().worker_id,
+                "a worker is still referenced after its thread's runtime ended; leaking its \
+                 interpreter"
+            ),
+        }
     }
 }
 
@@ -90,137 +114,113 @@ fn is_benign_disconnect(err: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-/// Generic connection driver.
-///
-/// - `io`: any `AsyncRead + AsyncWrite + Unpin + 'static + Send`
-///   (TLS-wrapped TCP, plain TCP, duplex for bench).
-/// - `routes`: leaked `&'static Site` — zero atomic per request.
-/// - `routes_for_ws`: `Some(arc)` enables WS upgrades (production
-///   path); `None` for paths that don't need WS (bench). Stored in
-///   the closure at connection scope; an Arc clone only fires inside
-///   the `is_ws` branch, so the hot non-WS path is atomic-free.
-pub(crate) async fn drive_conn<IO>(
+/// Serves one HTTP/1+2 connection (with upgrades, for WebSocket) until it ends. When
+/// `conn_token` is cancelled, hyper stops taking new requests on it and the in-flight
+/// ones drain. A disconnect by the client is not an error; anything else is logged.
+pub(crate) async fn drive_connection<IO, S, E>(
     io: IO,
-    remote_addr: std::net::IpAddr,
-    worker: std::rc::Rc<std::cell::RefCell<SubInterpreterWorker>>,
-    routes: &'static Site,
-    routes_for_ws: Option<SharedSite>,
+    svc: S,
+    exec: E,
     conn_token: CancellationToken,
-    main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
 ) where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: hyper::service::Service<
+        Request<Incoming>,
+        Response = hyper::Response<BoxBody>,
+        Error = hyper::Error,
+    >,
+    S::Future: 'static,
+    E: HttpServerConnExec<S::Future, BoxBody>,
 {
-    let io = TokioIo::new(io);
-    let mut builder = AutoBuilder::new(LocalExec);
+    let mut builder = AutoBuilder::new(exec);
     builder
         .http1()
         .timer(hyper_util::rt::TokioTimer::new())
-        .header_read_timeout(std::time::Duration::from_secs(10));
-
-    // Drive-to-completion loop shared by both connection kinds. Macro
-    // rather than generic fn because hyper's Connection /
-    // UpgradeableConnection expose `graceful_shutdown` as inherent
-    // methods rather than through a common trait, and writing the
-    // trait wrapper costs more lines than a one-place macro.
-    macro_rules! drive_to_completion {
-        ($conn:ident) => {{
-            tokio::pin!($conn);
-            let mut graceful_sent = false;
-            loop {
-                tokio::select! {
-                    res = $conn.as_mut() => {
-                        if let Err(e) = res {
-                            if !is_benign_disconnect(e.as_ref()) {
-                                tracing::warn!(target: "pyronova::server", error = %e, "Connection error");
-                            }
-                        }
-                        break;
-                    }
-                    _ = conn_token.cancelled(), if !graceful_sent => {
-                        $conn.as_mut().graceful_shutdown();
-                        graceful_sent = true;
+        .header_read_timeout(HEADER_READ_TIMEOUT);
+    let conn = builder.serve_connection_with_upgrades(TokioIo::new(io), svc);
+    tokio::pin!(conn);
+    let mut graceful_sent = false;
+    loop {
+        tokio::select! {
+            res = conn.as_mut() => {
+                if let Err(e) = res {
+                    if !is_benign_disconnect(e.as_ref()) {
+                        tracing::warn!(target: "pyronova::server", error = %e, "Connection error");
                     }
                 }
+                break;
             }
-        }};
-    }
-
-    // Split by ws support at connection start so the per-request
-    // closure is fully specialized — no runtime `if ws_supported`
-    // branch, no `Option<SharedSite>` state to carry through every
-    // future. The bench path's closure is byte-identical to the old
-    // hand-written drive_inmem_conn, so no per-request regression.
-    match routes_for_ws {
-        Some(ws_routes_conn) => {
-            let svc = service_fn(move |req: Request<Incoming>| {
-                let worker = std::rc::Rc::clone(&worker);
-                let bridge = main_bridge.clone();
-                let is_ws = websocket::is_websocket_upgrade(&req);
-                let ws_routes = if is_ws {
-                    Some(Arc::clone(&ws_routes_conn))
-                } else {
-                    None
-                };
-                async move {
-                    if is_ws {
-                        websocket::handle_websocket(
-                            req,
-                            ws_routes.expect("ws routes set"),
-                            remote_addr,
-                        )
-                        .await
-                    } else {
-                        handle_request_tpc_inline(req, routes, worker, remote_addr, bridge).await
-                    }
-                }
-            });
-            let conn = builder.serve_connection_with_upgrades(io, svc);
-            drive_to_completion!(conn);
-        }
-        None => {
-            let svc = service_fn(move |req: Request<Incoming>| {
-                let worker = std::rc::Rc::clone(&worker);
-                let bridge = main_bridge.clone();
-                async move { handle_request_tpc_inline(req, routes, worker, remote_addr, bridge).await }
-            });
-            let conn = builder.serve_connection(io, svc);
-            drive_to_completion!(conn);
+            _ = conn_token.cancelled(), if !graceful_sent => {
+                conn.as_mut().graceful_shutdown();
+                graceful_sent = true;
+            }
         }
     }
 }
 
-/// TCP adapter: TLS handshake (if configured), then hand off to the
-/// generic driver. Keeps the TLS decision at the transport boundary
-/// so the inner driver stays transport-agnostic.
-#[allow(clippy::too_many_arguments)] // single-call adapter, args mirror the per-thread context
-pub(crate) async fn drive_tcp_conn(
-    stream: tokio::net::TcpStream,
-    remote_addr: std::net::SocketAddr,
-    worker: std::rc::Rc<std::cell::RefCell<SubInterpreterWorker>>,
-    routes: &'static Site,
-    routes_for_ws: SharedSite,
+/// Whether a TPC connection answers WebSocket upgrades: production does, the in-memory
+/// bench (no upgrades to serve) doesn't, so its per-request closure has no WS branch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Upgrades {
+    WebSocket,
+    #[cfg(feature = "bench")]
+    Off,
+}
+
+/// Serves one connection of a TPC sub-interpreter thread: worker routes run inline on
+/// `context`'s worker, main-interpreter calls go to its bridge.
+pub(crate) async fn drive_conn<IO>(
+    io: IO,
+    remote_addr: std::net::IpAddr,
+    context: Rc<TpcContext>,
+    upgrades: Upgrades,
     conn_token: CancellationToken,
-    tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
-    main_bridge: Option<Arc<crate::bridge::main_bridge::MainInterpBridge>>,
+) where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    // Split by upgrade support at connection start so the per-request closure is fully
+    // specialized: no runtime `if upgrades` branch on the bench path.
+    match upgrades {
+        Upgrades::WebSocket => {
+            let svc = service_fn(move |req: Request<Incoming>| {
+                let context = Rc::clone(&context);
+                async move {
+                    if websocket::is_websocket_upgrade(&req) {
+                        let site = Arc::clone(&context.site);
+                        websocket::handle_websocket(req, site, remote_addr).await
+                    } else {
+                        handle_request_tpc_inline(req, context, remote_addr).await
+                    }
+                }
+            });
+            drive_connection(io, svc, LocalExec, conn_token).await;
+        }
+        #[cfg(feature = "bench")]
+        Upgrades::Off => {
+            let svc = service_fn(move |req: Request<Incoming>| {
+                handle_request_tpc_inline(req, Rc::clone(&context), remote_addr)
+            });
+            drive_connection(io, svc, LocalExec, conn_token).await;
+        }
+    }
+}
+
+/// TCP adapter: TLS handshake (if the listener has an acceptor), then the generic
+/// driver. Keeps the TLS decision at the transport boundary.
+pub(crate) async fn drive_tcp_conn(
+    accepted: Accepted,
+    context: Rc<TpcContext>,
+    conn_token: CancellationToken,
 ) {
-    let tls_stream = match tls_acceptor {
-        Some(acc) => match crate::tls::wrap_tls(&acc, stream).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(target: "pyronova::server", error = %e, "TLS handshake failed");
-                return;
-            }
-        },
-        None => crate::tls::wrap_plain(stream),
+    let Some(stream) = crate::tls::wrap(accepted.stream, accepted.tls.as_deref()).await else {
+        return;
     };
     drive_conn(
-        tls_stream,
-        remote_addr.ip(),
-        worker,
-        routes,
-        Some(routes_for_ws),
+        stream,
+        accepted.remote.ip(),
+        context,
+        Upgrades::WebSocket,
         conn_token,
-        main_bridge,
     )
     .await;
 }

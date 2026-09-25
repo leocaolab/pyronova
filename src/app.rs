@@ -3,11 +3,9 @@ use std::sync::Arc;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::Request;
-use hyper_util::rt::TokioIo;
-use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use pyo3::prelude::*;
 use std::net::SocketAddr;
-use tokio::net::TcpListener;
+
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
@@ -16,10 +14,12 @@ use crate::config::{ConfigError, EnvConfig, Mode};
 use crate::handlers::{handle_request, handle_request_subinterp};
 use crate::python::interp;
 use crate::router::{Dispatch, HandlerKind, MutableRoutes, RequestBody, RouteTable, Sealed};
-use crate::server::listener::{create_reuseport_listener, handle_accept_error, setup_tcp_quickack};
+use crate::server::listener::{AcceptSource, Accepted, BoundListeners, Listener, ListenerSpec};
 use crate::site::{AccessLog, Cors, CorsSpec, Limits, SharedSite, Site, SiteConfig};
 use crate::state::SharedState;
 use crate::websocket;
+use crate::worker::drive_connection;
+use hyper_util::rt::TokioExecutor;
 
 /// The `PyronovaApp` a worker's script created: one per worker interpreter (Layer 2, C3).
 /// The worker takes its handlers from it after the script has run.
@@ -40,8 +40,16 @@ pub(crate) struct PyronovaApp {
     request_id_header: Option<hyper::header::HeaderName>,
     /// This app's request-body and WebSocket limits, served by its runs.
     limits: Limits,
-    /// The stop signal of the server `run` is serving; `None` while nothing is serving.
-    serving: parking_lot::Mutex<Option<CancellationToken>>,
+    /// The server `run` is serving; `None` while nothing is serving.
+    serving: parking_lot::Mutex<Option<Serving>>,
+}
+
+/// The server one `run()` call is serving.
+struct Serving {
+    /// Cancelled to stop it (`shutdown()`, or SIGINT through `until_stopped`).
+    stop: CancellationToken,
+    /// Where it listens; empty until its listeners are bound.
+    bound: Vec<crate::server::listener::Bound>,
 }
 
 #[pymethods]
@@ -509,52 +517,11 @@ impl PyronovaApp {
                 ))
             }
         };
-
-        // `Pyronova.run()` resolves PYRONOVA_TLS_PORTS into this argument (one parser).
-        let extra_tls_ports: Vec<u16> = extra_tls_ports.unwrap_or_default();
-
-        let extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)> =
-            if let Some(ref acc) = tls_acceptor {
-                extra_tls_ports
-                    .iter()
-                    .map(
-                        |&p| -> PyResult<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)> {
-                            // arc src-app-3: a TLS port that fails to parse must NOT
-                            // be silently dropped. A warn-and-drop leaves the operator
-                            // believing the port is TLS-protected when it was never
-                            // opened at all — a security-UX trap. Fail fast at startup
-                            // (mirrors the cert/key validation above) so the
-                            // misconfiguration is impossible to miss.
-                            let sa = format!("{host}:{p}").parse::<SocketAddr>().map_err(
-                                |e: std::net::AddrParseError| {
-                                    pyo3::exceptions::PyValueError::new_err(format!(
-                                        "extra TLS port {p} could not be parsed into a socket \
-                                     address (\"{host}:{p}\"): {e}. Refusing to start: an \
-                                     unparseable TLS port must never be silently dropped, \
-                                     since the operator expects this port to be TLS-protected."
-                                    ))
-                                },
-                            )?;
-                            Ok((sa, Arc::clone(acc)))
-                        },
-                    )
-                    .collect::<PyResult<Vec<_>>>()?
-            } else {
-                if !extra_tls_ports.is_empty() {
-                    // arc src-app-4: TLS ports configured but no cert =
-                    // ports would never be opened. Operators expect TLS on
-                    // these; a silent (or merely warned) no-op leaves them
-                    // believing the ports are protected when they are not.
-                    // This is a security misconfiguration — fail fast at
-                    // startup rather than serve in a misleading state.
-                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                        "extra_tls_ports {extra_tls_ports:?} configured but tls_cert/tls_key \
-                         not set; these ports cannot be opened as TLS. Provide tls_cert+tls_key \
-                         or remove the port list."
-                    )));
-                }
-                vec![]
-            };
+        // Every run path serves this one listener set. `Pyronova.run()` resolves
+        // PYRONOVA_TLS_PORTS into `extra_tls_ports` (one parser). Extra TLS ports without a
+        // certificate are refused: the operator would believe them protected.
+        let specs = ListenerSpec::set(addr, tls_acceptor, &extra_tls_ports.unwrap_or_default())
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
         // Thread-per-core serves every route shape (gil=True and response streams through
         // the main-interpreter bridge, async def on the worker's own loop, stream=True
@@ -577,48 +544,85 @@ impl PyronovaApp {
             workers
         };
 
-        let stop = CancellationToken::new();
-        *self.serving.lock() = Some(stop.clone());
-        let served = if mode == Mode::Subinterp {
-            if tpc_enabled {
-                // When extra_tls is non-empty the TLS ports are handled by
-                // those extra listeners; the main addr is plain HTTP.
-                let main_tls = if extra_tls.is_empty() {
-                    tls_acceptor
-                } else {
-                    None
-                };
-                self.run_tpc_subinterp(
-                    py, addr, workers, num_cpus, frozen, main_tls, extra_tls, &env, stop,
-                )
-            } else {
-                self.run_subinterp(
-                    py,
-                    addr,
-                    workers,
-                    io_workers,
-                    num_cpus,
-                    frozen,
-                    tls_acceptor,
-                    &env,
-                    stop,
-                )
+        // The GC modes a path can't run are refused now, before anything is bound or built.
+        let fanout = env.darwin_topology == crate::config::DarwinTopology::Fanout;
+        match (mode, tpc_enabled) {
+            (Mode::Subinterp, false) => {
+                env.gc
+                    .mode
+                    .supported_by(crate::tpc::GcServer::SubInterpreterPool)
+                    .map_err(ConfigError::from)?;
             }
-        } else if tpc_enabled {
-            self.run_tpc_gil(py, addr, workers, num_cpus, frozen, tls_acceptor, stop)
-        } else {
-            self.run_gil(py, addr, io_workers, num_cpus, frozen, tls_acceptor, stop)
+            #[cfg(target_os = "macos")]
+            (Mode::Subinterp, true) if fanout => {
+                env.gc
+                    .mode
+                    .supported_by(crate::tpc::GcServer::DarwinFanout)
+                    .map_err(ConfigError::from)?;
+            }
+            _ => {}
+        }
+
+        // One socket per listener for each accept loop: every TPC thread, the fanout
+        // acceptor, or the multi-thread runtime's accept tasks.
+        let accept_loops = match (mode, tpc_enabled) {
+            (Mode::Subinterp, true) if fanout => 1,
+            (_, true) => workers,
+            (_, false) => multi_thread_accept_loops(io_workers, num_cpus),
         };
+
+        let stop = CancellationToken::new();
+        *self.serving.lock() = Some(Serving {
+            stop: stop.clone(),
+            bound: Vec::new(),
+        });
+        let served = (|| -> PyResult<()> {
+            // Every listener is bound before any thread or worker exists: a port in use is
+            // this call's `OSError(EADDRINUSE)`, not a log line from a serving thread.
+            let listeners = BoundListeners::bind(&specs, accept_loops)?;
+            if let Some(serving) = self.serving.lock().as_mut() {
+                serving.bound = listeners.bound.clone();
+            }
+            let run = ServerRun {
+                listeners,
+                site: frozen,
+                stop,
+                workers,
+                io_workers,
+                num_cpus,
+            };
+            match (mode, tpc_enabled) {
+                (Mode::Subinterp, true) => self.run_tpc_subinterp(py, run, &env),
+                (Mode::Subinterp, false) => self.run_subinterp(py, run, &env),
+                (Mode::Gil, true) => py
+                    .detach(move || {
+                        crate::tpc::run_tpc_gil(run.listeners, run.num_cpus, run.site, run.stop)
+                    })
+                    .map_err(PyErr::from),
+                (Mode::Gil, false) => run_gil(py, run),
+            }
+        })();
         *self.serving.lock() = None;
         served
+    }
+
+    /// The port the server `run()` is serving listens on (its first listener's; a
+    /// `port=0` resolved to the one the kernel picked). `None` until the listeners are
+    /// bound, and after the server stopped.
+    fn bound_port(&self) -> Option<u16> {
+        self.serving
+            .lock()
+            .as_ref()
+            .and_then(|serving| serving.bound.first())
+            .map(|bound| bound.addr.port())
     }
 
     /// Stops the server `run()` is serving, the way SIGINT does: stop accepting, drain the
     /// in-flight connections, return from `run()`. Callable from any thread; a no-op while
     /// nothing is serving.
     fn shutdown(&self) {
-        if let Some(stop) = self.serving.lock().as_ref() {
-            stop.cancel();
+        if let Some(serving) = self.serving.lock().as_ref() {
+            serving.stop.cancel();
         }
     }
 
@@ -722,66 +726,146 @@ pub(crate) async fn until_stopped(stop: CancellationToken) {
     stop.cancel();
 }
 
-/// Drive a single HTTP/1+2 connection to completion, then drain it on
-/// shutdown. Shared by `run_gil` and `run_subinterp`: the accept layer
-/// and the per-request service closure differ, but the AutoBuilder setup
-/// (Slowloris header-read timeout) and the graceful-shutdown lifecycle
-/// loop are byte-identical. `tpc.rs::drive_gil_conn` runs the same shape
-/// on a `current_thread` runtime with `LocalExec` rather than
-/// `TokioExecutor`, so it cannot reuse this `TokioExecutor`-specialized
-/// helper without an executor-generic bound.
-async fn serve_connection<S>(
-    io: TokioIo<crate::tls::MaybeTlsStream>,
-    svc: S,
-    conn_token: tokio_util::sync::CancellationToken,
-) where
-    S: hyper::service::Service<
-            Request<Incoming>,
-            Response = hyper::Response<crate::handlers::BoxBody>,
-            Error = hyper::Error,
-        > + Send
-        + 'static,
-    S::Future: Send + 'static,
+/// One server run as `run()` resolved it: what each serving path starts from.
+struct ServerRun {
+    /// Bound before the path starts; one group per accept loop.
+    listeners: BoundListeners,
+    site: SharedSite,
+    /// Cancelled by `shutdown()` or SIGINT.
+    stop: CancellationToken,
+    /// TPC threads, or the pool's sub-interpreters.
+    workers: usize,
+    /// Tokio threads of the multi-thread paths.
+    io_workers: usize,
+    num_cpus: usize,
+}
+
+/// Accept loops of the multi-thread (`PYRONOVA_TPC=0`) server. Linux's `SO_REUSEPORT`
+/// load-balances connections across several loops; macOS's doesn't, so it gets one.
+fn multi_thread_accept_loops(io_workers: usize, num_cpus: usize) -> usize {
+    if cfg!(target_os = "linux") {
+        io_workers.min(num_cpus)
+    } else {
+        let _ = (io_workers, num_cpus);
+        1
+    }
+}
+
+/// How long the multi-thread server's in-flight connections get to finish after a stop.
+const MULTI_THREAD_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The multi-thread (`PYRONOVA_TPC=0`) server, for both modes: one accept loop per
+/// listener group on a Tokio runtime of `io_workers` threads; `serve_conn` serves each
+/// connection. Runs until SIGINT or `shutdown()` (`until_stopped`), then lets the
+/// in-flight connections drain for up to [`MULTI_THREAD_DRAIN_TIMEOUT`]: returning drops
+/// the runtime, which would abort them mid-request.
+fn serve_multi_thread<F, Fut>(
+    groups: Vec<Vec<Listener>>,
+    io_workers: usize,
+    stop: CancellationToken,
+    serve_conn: F,
+) -> PyResult<()>
+where
+    F: Fn(Accepted, CancellationToken) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    let mut builder = AutoBuilder::new(hyper_util::rt::TokioExecutor::new());
-    // Slowloris defense: cap how long hyper waits for the client to finish
-    // sending request headers. Without this a client that opens a TCP
-    // connection and dribbles one header byte per minute holds a Tokio
-    // task + fd forever. TLS handshake is already bounded in
-    // src/tls.rs::wrap_tls; this closes the analogous hole on the
-    // plaintext HTTP path (and on HTTP-after-TLS). HTTP/2 has its own
-    // internal frame/settings timeouts via the h2 crate, so we only
-    // configure H/1 here. Requires a Timer — TokioTimer ties it to the runtime.
-    builder
-        .http1()
-        .timer(hyper_util::rt::TokioTimer::new())
-        .header_read_timeout(std::time::Duration::from_secs(10));
-    let conn = builder.serve_connection_with_upgrades(io, svc);
-    tokio::pin!(conn);
-    let mut graceful_sent = false;
-    loop {
-        tokio::select! {
-            res = conn.as_mut() => {
-                if let Err(e) = res {
-                    let msg = e.to_string();
-                    if !msg.contains("connection closed")
-                        && !msg.contains("reset by peer")
-                        && !msg.contains("broken pipe")
-                    {
-                        tracing::warn!(target: "pyronova::server", error = %e, "Connection error");
+    let rt = RuntimeBuilder::new_multi_thread()
+        .worker_threads(io_workers)
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("tokio runtime error: {e}"))
+        })?;
+    rt.block_on(async move {
+        let conn_tracker = tokio_util::task::TaskTracker::new();
+        for group in groups {
+            let mut source = AcceptSource::new(group)?;
+            let (token, tracker, serve_conn) =
+                (stop.clone(), conn_tracker.clone(), serve_conn.clone());
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        accepted = source.accept() => {
+                            tracker.spawn(serve_conn(accepted, token.clone()));
+                        }
+                        _ = token.cancelled() => break,
                     }
                 }
-                break;
-            }
-            _ = conn_token.cancelled(), if !graceful_sent => {
-                // Shutdown: tell hyper to stop accepting new requests on
-                // this connection and drain in-flight ones. Keep driving
-                // the connection future until it completes.
-                conn.as_mut().graceful_shutdown();
-                graceful_sent = true;
-            }
+            });
         }
+
+        until_stopped(stop).await;
+        conn_tracker.close();
+        if tokio::time::timeout(MULTI_THREAD_DRAIN_TIMEOUT, conn_tracker.wait())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                target: "pyronova::server",
+                "{} in-flight connections did not drain within {:?} — exiting anyway",
+                conn_tracker.len(),
+                MULTI_THREAD_DRAIN_TIMEOUT,
+            );
+        }
+        Ok(())
+    })
+}
+
+/// The multi-thread GIL-mode server (`PYRONOVA_TPC=0`): every handler on the main
+/// interpreter.
+fn run_gil(py: Python<'_>, run: ServerRun) -> PyResult<()> {
+    let ServerRun {
+        listeners,
+        site,
+        stop,
+        io_workers,
+        num_cpus,
+        ..
+    } = run;
+    tracing::info!(
+        target: "pyronova::server",
+        version = env!("CARGO_PKG_VERSION"),
+        listening = ?listeners.bound,
+        io_workers,
+        cpus = num_cpus,
+        mode = "gil",
+        "Pyronova started"
+    );
+    println!("\n  Pyronova v{}", env!("CARGO_PKG_VERSION"));
+    for listener in &listeners.bound {
+        println!("  Listening on {listener}");
     }
+    println!("  IO workers: {io_workers} (CPUs: {num_cpus})\n");
+
+    py.detach(move || {
+        serve_multi_thread(
+            listeners.groups,
+            io_workers,
+            stop,
+            move |accepted, token| {
+                let site = Arc::clone(&site);
+                async move {
+                    let client_ip = accepted.remote.ip();
+                    let Some(stream) =
+                        crate::tls::wrap(accepted.stream, accepted.tls.as_deref()).await
+                    else {
+                        return;
+                    };
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let site = Arc::clone(&site);
+                        async move {
+                            if websocket::is_websocket_upgrade(&req) {
+                                websocket::handle_websocket(req, site, client_ip).await
+                            } else {
+                                handle_request(req, site, client_ip).await
+                            }
+                        }
+                    });
+                    drive_connection(stream, svc, TokioExecutor::new(), token).await;
+                }
+            },
+        )
+    })
 }
 
 /// The handlers and hooks of the app a worker's script registered on, indexed like main's
@@ -956,175 +1040,22 @@ impl PyronovaApp {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn run_gil(
-        &self,
-        py: Python<'_>,
-        addr: SocketAddr,
-        io_workers: usize,
-        num_cpus: usize,
-        routes: SharedSite,
-        tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
-        stop: CancellationToken,
-    ) -> PyResult<()> {
-        let scheme = if tls_acceptor.is_some() {
-            "https"
-        } else {
-            "http"
-        };
-        tracing::info!(
-            target: "pyronova::server",
-            version = env!("CARGO_PKG_VERSION"),
-            %addr,
+    /// The multi-thread sub-interpreter server (`PYRONOVA_TPC=0`): a channel pool of
+    /// workers behind Tokio accept loops.
+    fn run_subinterp(&self, py: Python<'_>, run: ServerRun, env: &EnvConfig) -> PyResult<()> {
+        let ServerRun {
+            listeners,
+            site: routes,
+            stop,
+            workers,
             io_workers,
-            cpus = num_cpus,
-            mode = "gil",
-            tls = tls_acceptor.is_some(),
-            "Pyronova started"
-        );
-        println!("\n  Pyronova v{}", env!("CARGO_PKG_VERSION"));
-        println!("  Listening on {scheme}://{addr}");
-        println!("  IO workers: {io_workers} (CPUs: {num_cpus})\n");
-
-        py.detach(move || -> PyResult<()> {
-            let rt = RuntimeBuilder::new_multi_thread()
-                .worker_threads(io_workers)
-                .enable_all()
-                .build()
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!("tokio runtime error: {e}"))
-                })?;
-
-            rt.block_on(async move {
-                // Multi-accept: N listeners on same port via SO_REUSEPORT.
-                // Linux kernel load-balances connections across accept loops.
-                // macOS SO_REUSEPORT doesn't do kernel LB, so use 1 acceptor.
-                #[cfg(target_os = "linux")]
-                let n_accept = io_workers.min(num_cpus);
-                #[cfg(not(target_os = "linux"))]
-                let n_accept = 1;
-                // TaskTracker: collects every per-connection spawn so we can
-                // `.wait()` for them on shutdown. Without this, `rt.block_on`
-                // returning after `stop` is cancelled drops the Tokio
-                // Runtime, which aborts every spawned connection mid-request
-                // (clients see TCP RST). graceful_shutdown() on each conn is
-                // necessary but insufficient — it only signals hyper to stop
-                // accepting NEW keep-alive requests; the drain still needs
-                // time on the runtime.
-                let conn_tracker = tokio_util::task::TaskTracker::new();
-
-                for _ in 0..n_accept {
-                    let std_listener = create_reuseport_listener(addr).map_err(|e| {
-                        pyo3::exceptions::PyOSError::new_err(e.to_string())
-                    })?;
-                    let listener = TcpListener::from_std(std_listener).map_err(|e| {
-                        pyo3::exceptions::PyOSError::new_err(format!("TcpListener::from_std error: {e}"))
-                    })?;
-                    let routes = Arc::clone(&routes);
-                    let token = stop.clone();
-                    let tracker = conn_tracker.clone();
-                    let tls_acc = tls_acceptor.clone();
-
-                    tokio::spawn(async move {
-                        loop {
-                            tokio::select! {
-                                result = listener.accept() => {
-                                    let (stream, remote_addr) = match result {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            handle_accept_error(&e).await;
-                                            continue;
-                                        }
-                                    };
-                                    let routes = Arc::clone(&routes);
-                                    let _ = stream.set_nodelay(true);
-                                    setup_tcp_quickack(&stream);
-
-                                    let conn_token = token.clone();
-                                    let tls_acc_c = tls_acc.clone();
-                                    tracker.spawn(async move {
-                                        // TLS handshake happens here (inside the
-                                        // spawned connection task) so it doesn't
-                                        // block the accept loop from taking more
-                                        // connections.
-                                        let tls_stream = match tls_acc_c {
-                                            Some(acc) => match crate::tls::wrap_tls(&acc, stream).await {
-                                                Ok(s) => s,
-                                                Err(e) => {
-                                                    tracing::warn!(target: "pyronova::server", error = %e, "TLS handshake failed");
-                                                    return;
-                                                }
-                                            },
-                                            None => crate::tls::wrap_plain(stream),
-                                        };
-                                        let io = TokioIo::new(tls_stream);
-                                        let svc = service_fn(move |req: Request<Incoming>| {
-                                            let routes = Arc::clone(&routes);
-                                            let client_ip_addr = remote_addr.ip();
-                                            async move {
-                                                if websocket::is_websocket_upgrade(&req) {
-                                                    websocket::handle_websocket(req, routes, client_ip_addr).await
-                                                } else {
-                                                    handle_request(req, routes, client_ip_addr).await
-                                                }
-                                            }
-                                        });
-                                        serve_connection(io, svc, conn_token).await;
-                                    });
-                                }
-                                _ = token.cancelled() => break,
-                            }
-                        }
-                    });
-                }
-
-                until_stopped(stop).await;
-                // Close the tracker (no more spawns) and wait for every
-                // in-flight connection to finish its hyper drain. Bound
-                // the wait at 30 s so a pathological client can't hold
-                // shutdown hostage forever.
-                conn_tracker.close();
-                const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-                if tokio::time::timeout(DRAIN_TIMEOUT, conn_tracker.wait()).await.is_err() {
-                    tracing::warn!(
-                        target: "pyronova::server",
-                        "{} in-flight connections did not drain within {:?} — exiting anyway",
-                        conn_tracker.len(),
-                        DRAIN_TIMEOUT,
-                    );
-                }
-
-                Ok(())
-            })
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn run_subinterp(
-        &self,
-        py: Python<'_>,
-        addr: SocketAddr,
-        workers: usize,
-        io_workers: usize,
-        num_cpus: usize,
-        routes: SharedSite,
-        tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
-        env: &EnvConfig,
-        stop: CancellationToken,
-    ) -> PyResult<()> {
+            num_cpus,
+        } = run;
         let script_path = self.worker_script_path(py)?;
 
         // What every worker's script must register (Layer 2, C3), as plain values.
         let expected = crate::router::RouteSignature::of(&routes.routes);
         let shape = crate::router::RouteShape::of(&routes.routes);
-
-        // The pool's workers keep their `PYRONOVA_GC_THRESHOLD` count trigger: count mode only.
-        let gc_mode = env
-            .gc
-            .mode
-            .supported_by(crate::tpc::GcServer::SubInterpreterPool)
-            .map_err(ConfigError::from)?;
-        debug_assert_eq!(gc_mode, crate::tpc::GcMode::Count);
         let split = interp::split_workers_for_routes(workers, &shape.gil, &shape.is_async)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
@@ -1137,7 +1068,7 @@ impl PyronovaApp {
             target: "pyronova::server",
             version = env!("CARGO_PKG_VERSION"),
             mode = mode_label,
-            %addr,
+            listening = ?listeners.bound,
             workers,
             cpus = num_cpus,
             subinterp_routes = subinterp_count,
@@ -1149,12 +1080,9 @@ impl PyronovaApp {
             "\n  Pyronova v{} [{mode_label} mode]",
             env!("CARGO_PKG_VERSION")
         );
-        let scheme = if tls_acceptor.is_some() {
-            "https"
-        } else {
-            "http"
-        };
-        println!("  Listening on {scheme}://{addr}");
+        for listener in &listeners.bound {
+            println!("  Listening on {listener}");
+        }
         println!("  Sub-interpreters: {workers} | IO threads: {io_workers} (CPUs: {num_cpus})");
         if split.async_workers > 0 {
             println!(
@@ -1185,199 +1113,82 @@ impl PyronovaApp {
         };
         let pool = Arc::new(pool);
 
-        py.detach(move || -> PyResult<()> {
-            let rt = RuntimeBuilder::new_multi_thread()
-                .worker_threads(io_workers)
-                .enable_all()
-                .build()
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!("tokio runtime error: {e}"))
-                })?;
-
-            rt.block_on(async move {
-                #[cfg(target_os = "linux")]
-                let n_accept = io_workers.min(num_cpus);
-                #[cfg(not(target_os = "linux"))]
-                let n_accept = 1;
-                // See comment in run_gil — same contract.
-                let conn_tracker = tokio_util::task::TaskTracker::new();
-
-                for _ in 0..n_accept {
-                    let std_listener = create_reuseport_listener(addr).map_err(|e| {
-                        pyo3::exceptions::PyOSError::new_err(e.to_string())
-                    })?;
-                    let listener = TcpListener::from_std(std_listener).map_err(|e| {
-                        pyo3::exceptions::PyOSError::new_err(format!("TcpListener::from_std error: {e}"))
-                    })?;
-                    let pool = Arc::clone(&pool);
-                    let routes = Arc::clone(&routes);
-                    let token = stop.clone();
-                    let tracker = conn_tracker.clone();
-                    let tls_acc = tls_acceptor.clone();
-
-                    tokio::spawn(async move {
-                        loop {
-                            tokio::select! {
-                                result = listener.accept() => {
-                                    let (stream, remote_addr) = match result {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            handle_accept_error(&e).await;
-                                            continue;
-                                        }
-                                    };
-                                    let pool = Arc::clone(&pool);
-                                    let routes = Arc::clone(&routes);
-                                    let _ = stream.set_nodelay(true);
-                                    setup_tcp_quickack(&stream);
-
-                                    let conn_token = token.clone();
-                                    let tls_acc_c = tls_acc.clone();
-                                    tracker.spawn(async move {
-                                        let tls_stream = match tls_acc_c {
-                                            Some(acc) => match crate::tls::wrap_tls(&acc, stream).await {
-                                                Ok(s) => s,
-                                                Err(e) => {
-                                                    tracing::warn!(target: "pyronova::server", error = %e, "TLS handshake failed");
-                                                    return;
-                                                }
-                                            },
-                                            None => crate::tls::wrap_plain(stream),
-                                        };
-                                        let io = TokioIo::new(tls_stream);
-                                        let svc = service_fn(move |req: Request<Incoming>| {
-                                            let pool = Arc::clone(&pool);
-                                            let routes = Arc::clone(&routes);
-                                            let client_ip_addr = remote_addr.ip();
-                                            async move {
-                                                if websocket::is_websocket_upgrade(&req) {
-                                                    websocket::handle_websocket(req, routes, client_ip_addr).await
-                                                } else {
-                                                    handle_request_subinterp(req, pool, routes, client_ip_addr).await
-                                                }
-                                            }
-                                        });
-                                        serve_connection(io, svc, conn_token).await;
-                                    });
+        py.detach(move || {
+            serve_multi_thread(
+                listeners.groups,
+                io_workers,
+                stop,
+                move |accepted, token| {
+                    let (pool, site) = (Arc::clone(&pool), Arc::clone(&routes));
+                    async move {
+                        let client_ip = accepted.remote.ip();
+                        let Some(stream) =
+                            crate::tls::wrap(accepted.stream, accepted.tls.as_deref()).await
+                        else {
+                            return;
+                        };
+                        let svc = service_fn(move |req: Request<Incoming>| {
+                            let (pool, site) = (Arc::clone(&pool), Arc::clone(&site));
+                            async move {
+                                if websocket::is_websocket_upgrade(&req) {
+                                    websocket::handle_websocket(req, site, client_ip).await
+                                } else {
+                                    handle_request_subinterp(req, pool, site, client_ip).await
                                 }
-                                _ = token.cancelled() => break,
                             }
-                        }
-                    });
-                }
-
-                until_stopped(stop).await;
-                conn_tracker.close();
-                const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-                if tokio::time::timeout(DRAIN_TIMEOUT, conn_tracker.wait()).await.is_err() {
-                    tracing::warn!(
-                        target: "pyronova::server",
-                        "{} in-flight connections did not drain within {:?} — exiting anyway",
-                        conn_tracker.len(),
-                        DRAIN_TIMEOUT,
-                    );
-                }
-
-                Ok(())
-            })
-        })
-    }
-
-    /// TPC GIL entry — Phase 1 scaffolding. Same dispatch semantics as
-    /// `run_gil` (every handler on the main interpreter), different
-    /// accept layer (N pinned OS threads × current_thread runtime ×
-    /// SO_REUSEPORT, no cross-core task migration).
-    #[allow(clippy::too_many_arguments)]
-    fn run_tpc_gil(
-        &self,
-        py: Python<'_>,
-        addr: SocketAddr,
-        io_workers: usize,
-        num_cpus: usize,
-        routes: SharedSite,
-        tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
-        stop: CancellationToken,
-    ) -> PyResult<()> {
-        py.detach(move || -> PyResult<()> {
-            crate::tpc::run_tpc_gil(addr, io_workers, num_cpus, routes, tls_acceptor, stop)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+                        });
+                        drive_connection(stream, svc, TokioExecutor::new(), token).await;
+                    }
+                },
+            )
         })
     }
 
     /// TPC sub-interp inline mode — each TPC thread owns its
     /// own sub-interp and runs handlers synchronously on the accept
     /// thread. No pool, no channel, no oneshot wake.
-    #[allow(clippy::too_many_arguments)]
-    fn run_tpc_subinterp(
-        &self,
-        py: Python<'_>,
-        addr: SocketAddr,
-        workers: usize,
-        num_cpus: usize,
-        routes: SharedSite,
-        tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
-        extra_tls: Vec<(SocketAddr, Arc<tokio_rustls::TlsAcceptor>)>,
-        env: &EnvConfig,
-        stop: CancellationToken,
-    ) -> PyResult<()> {
-        // gil=True routes: main-interp bridge (Phase 3).
-        // async def: sub-interp path already drives coroutines via the
-        //   persistent asyncio loop (SubInterpreterWorker::resolve_coroutine
-        //   fires when call_handler returns an awaitable — line 1768 in
-        //   interp.rs). Each sub-interp already has its own asyncio event
-        //   loop cached at init. No extra work needed for correctness.
-        //   Note: this is "blocking async" — the TPC thread is blocked
-        //   for the coroutine's entire execution. Awaits inside the
-        //   coroutine still run via asyncio's event loop on that same
-        //   thread, so `await asyncio.sleep()` or `await client.get()`
-        //   work correctly; they just don't yield to OTHER requests on
-        //   the same TPC thread. Since SO_REUSEPORT distributes new
-        //   connections across threads, this is fine for throughput —
-        //   a slow async handler only blocks its one thread.
-        // stream=True: already gated by gil=True in route registration,
-        //   so all stream routes flow through the main-interp bridge.
-        //   Phase 5 wires stream responses back through the bridge
-        //   oneshot (`MainReply::Stream`).
-        #[cfg(target_os = "macos")]
-        if env.darwin_topology == crate::config::DarwinTopology::Fanout {
-            // The fanout loop has no idle tick: count or off only.
-            env.gc
-                .mode
-                .supported_by(crate::tpc::GcServer::DarwinFanout)
-                .map_err(ConfigError::from)?;
-        }
-        let (gc, topology) = (env.gc, env.darwin_topology);
-        let n_threads = workers;
-        let sub_workers = self.build_workers(py, n_threads, &routes, gc.count_trigger())?;
+    fn run_tpc_subinterp(&self, py: Python<'_>, run: ServerRun, env: &EnvConfig) -> PyResult<()> {
+        let ServerRun {
+            listeners,
+            site: routes,
+            stop,
+            workers: n_threads,
+            num_cpus,
+            ..
+        } = run;
+        // gil=True routes and response streams: main-interp bridge.
+        // async def: the worker drives the coroutine on its own persistent asyncio loop.
+        //   This is "blocking async": the TPC thread is blocked for the coroutine's
+        //   entire execution. Awaits inside the coroutine still run on that loop, so
+        //   `await asyncio.sleep()` or `await client.get()` work; they just don't yield
+        //   to OTHER requests on the same TPC thread. SO_REUSEPORT spreads connections
+        //   across threads, so a slow async handler only blocks its one thread.
+        // stream=True: gated by gil=True at registration, so it flows through the bridge.
+        let workers = self.build_workers(py, n_threads, &routes, env.gc.count_trigger())?;
 
         // The main-interp bridge serves `gil=True` routes and the fallback with the main
         // GIL, while TPC threads handle the rest inline. See src/bridge/main_bridge.rs.
-        let main_bridge = routes.routes.uses_main().then(|| {
+        let bridge = routes.routes.uses_main().then(|| {
             crate::bridge::main_bridge::MainInterpBridge::spawn(Arc::clone(&routes), env.bridge)
         });
+        let server = crate::tpc::TpcServer {
+            workers,
+            site: routes,
+            bridge: bridge.clone(),
+            gc: env.gc,
+            topology: env.darwin_topology,
+        };
 
-        py.detach(move || -> PyResult<()> {
-            let bridge_to_join = main_bridge.clone();
-            let res = crate::tpc::run_tpc_subinterp(
-                addr,
-                n_threads,
-                num_cpus,
-                sub_workers,
-                routes,
-                tls_acceptor,
-                main_bridge,
-                extra_tls,
-                gc,
-                topology,
-                stop,
-            );
+        py.detach(move || {
+            let served = crate::tpc::run_tpc_subinterp(listeners, num_cpus, server, stop);
             // The TPC threads are joined, so this is the last bridge reference: close it and
             // wait for its threads to release their Python objects (FR-6).
-            if let Some(bridge) = bridge_to_join {
+            if let Some(bridge) = bridge {
                 crate::bridge::main_bridge::MainInterpBridge::shutdown_join(bridge);
             }
-            res.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+            served
         })
+        .map_err(PyErr::from)
     }
 
     /// The script workers execute: `set_script_path`'s, else `__main__.__file__`.

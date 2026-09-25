@@ -431,26 +431,15 @@ impl SubInterpreterWorker {
         self.ended = true;
     }
 
-    /// Ends the worker a TPC thread served through an `Rc<RefCell<_>>`, on that thread, once
-    /// its runtime and every task holding a clone are gone (FR-19).
-    pub(crate) fn end_shared(worker: std::rc::Rc<std::cell::RefCell<Self>>) {
-        match std::rc::Rc::try_unwrap(worker) {
-            Ok(cell) => {
-                let worker = cell.into_inner();
-                // A thread forgotten past shutdown may run this after `Py_Finalize`.
-                if unsafe { ffi::Py_IsInitialized() } != 0 {
-                    // SAFETY: on the worker's own thread, no thread state current.
-                    unsafe { worker.end() };
-                } else {
-                    worker.abandon();
-                }
-            }
-            Err(still_shared) => tracing::error!(
-                target: "pyronova::server",
-                worker = still_shared.borrow().worker_id,
-                "a worker is still referenced after its thread's runtime ended; leaking its \
-                 interpreter"
-            ),
+    /// Ends the worker a TPC thread served, on that thread, once its runtime and every task
+    /// that used it are gone (FR-19). A thread forgotten past shutdown may run this after
+    /// `Py_Finalize`; the worker is abandoned then.
+    pub(crate) fn end_served(self) {
+        if unsafe { ffi::Py_IsInitialized() } != 0 {
+            // SAFETY: on the worker's own thread, no thread state current.
+            unsafe { self.end() };
+        } else {
+            self.abandon();
         }
     }
 

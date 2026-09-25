@@ -10,6 +10,7 @@
 //! knobs (TCP_QUICKACK, TCP_DEFER_ACCEPT) lives in one file now.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 /// Enable TCP_QUICKACK on a stream (Linux only, no-op elsewhere).
 #[allow(unused_variables)]
@@ -139,6 +140,203 @@ pub(crate) fn create_reuseport_listener(
     Ok(socket.into())
 }
 
+impl ListenerError {
+    /// The OS error number, when the OS reported one (e.g. `EADDRINUSE`).
+    pub(crate) fn errno(&self) -> Option<i32> {
+        self.source.raw_os_error()
+    }
+}
+
+/// `OSError(errno, text)`, so Python sees e.g. `errno.EADDRINUSE` for a port in use.
+impl From<ListenerError> for pyo3::PyErr {
+    fn from(e: ListenerError) -> Self {
+        match e.errno() {
+            Some(errno) => pyo3::exceptions::PyOSError::new_err((errno, e.to_string())),
+            None => pyo3::exceptions::PyOSError::new_err(e.to_string()),
+        }
+    }
+}
+
+type Acceptor = Arc<tokio_rustls::TlsAcceptor>;
+
+/// One address the server listens on, and whether it speaks TLS there.
+#[derive(Clone)]
+pub(crate) struct ListenerSpec {
+    pub(crate) addr: SocketAddr,
+    pub(crate) tls: Option<Acceptor>,
+}
+
+impl ListenerSpec {
+    /// The listener set of one server: `addr`, then one TLS listener per extra port on
+    /// the same host. With extra TLS ports, `addr` serves plain HTTP and TLS is on the
+    /// extra ports; without them, `addr` speaks TLS when an acceptor is configured.
+    pub(crate) fn set(
+        addr: SocketAddr,
+        tls: Option<Acceptor>,
+        extra_tls_ports: &[u16],
+    ) -> Result<Vec<ListenerSpec>, ExtraTlsWithoutCert> {
+        match (tls, extra_tls_ports) {
+            (tls, []) => Ok(vec![ListenerSpec { addr, tls }]),
+            (Some(acceptor), ports) => Ok(std::iter::once(ListenerSpec { addr, tls: None })
+                .chain(ports.iter().map(|&port| ListenerSpec {
+                    addr: SocketAddr::new(addr.ip(), port),
+                    tls: Some(Arc::clone(&acceptor)),
+                }))
+                .collect()),
+            (None, ports) => Err(ExtraTlsWithoutCert(ports.to_vec())),
+        }
+    }
+}
+
+/// Extra TLS ports configured without a certificate: they could never be opened as TLS,
+/// and serving without them would leave the operator believing they are protected.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "extra_tls_ports {0:?} configured but tls_cert/tls_key not set; these ports cannot be \
+     opened as TLS. Provide tls_cert+tls_key or remove the port list."
+)]
+pub(crate) struct ExtraTlsWithoutCert(pub(crate) Vec<u16>);
+
+/// A bound, listening socket (not yet registered with a runtime) and its TLS.
+pub(crate) struct Listener {
+    pub(crate) socket: std::net::TcpListener,
+    /// The address it is bound to.
+    pub(crate) addr: SocketAddr,
+    pub(crate) tls: Option<Acceptor>,
+}
+
+/// Where one spec of a server listens, once bound (a port 0 resolved to the kernel's pick).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Bound {
+    pub(crate) addr: SocketAddr,
+    pub(crate) tls: bool,
+}
+
+impl std::fmt::Display for Bound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let scheme = if self.tls { "https" } else { "http" };
+        write!(f, "{scheme}://{}", self.addr)
+    }
+}
+
+/// Every socket of one server, bound before any serving thread exists.
+pub(crate) struct BoundListeners {
+    /// One group per accept loop; each group has one socket per spec, in spec order.
+    pub(crate) groups: Vec<Vec<Listener>>,
+    /// Where each spec is bound, in spec order.
+    pub(crate) bound: Vec<Bound>,
+}
+
+impl BoundListeners {
+    /// Binds `copies` `SO_REUSEPORT` sockets for each spec: one group per accept loop, so
+    /// the kernel spreads connections over the loops. A port 0 is bound once and its
+    /// copies join the port the kernel picked. Any failure (e.g. `AddrInUse`) is returned
+    /// here, before a thread or worker exists.
+    pub(crate) fn bind(specs: &[ListenerSpec], copies: usize) -> Result<Self, ListenerError> {
+        let mut groups: Vec<Vec<Listener>> = (0..copies).map(|_| Vec::new()).collect();
+        let mut bound = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let mut addr = spec.addr;
+            for group in &mut groups {
+                let socket = create_reuseport_listener(addr)?;
+                if addr.port() == 0 {
+                    addr = socket.local_addr().map_err(|source| ListenerError {
+                        step: "local_addr",
+                        addr,
+                        source,
+                    })?;
+                }
+                group.push(Listener {
+                    socket,
+                    addr,
+                    tls: spec.tls.clone(),
+                });
+            }
+            bound.push(Bound {
+                addr,
+                tls: spec.tls.is_some(),
+            });
+        }
+        Ok(BoundListeners { groups, bound })
+    }
+}
+
+/// A connection one of a group's listeners accepted, configured for serving.
+pub(crate) struct Accepted {
+    pub(crate) stream: tokio::net::TcpStream,
+    pub(crate) remote: SocketAddr,
+    /// The acceptor of the listener it arrived on; `None` for plain HTTP.
+    pub(crate) tls: Option<Acceptor>,
+}
+
+/// One accept loop's listeners (a group of [`BoundListeners`]) as one stream of
+/// connections. Replaces one `select!` arm per listener.
+pub(crate) struct AcceptSource {
+    listeners: Vec<(tokio::net::TcpListener, Option<Acceptor>)>,
+    /// Where the next poll starts, so a busy listener can't starve the others.
+    next: usize,
+}
+
+impl AcceptSource {
+    /// Registers the group's sockets with the current runtime; call on the thread (and
+    /// runtime) that accepts from them.
+    pub(crate) fn new(group: Vec<Listener>) -> Result<Self, ListenerError> {
+        let listeners = group
+            .into_iter()
+            .map(|l| {
+                let socket = tokio::net::TcpListener::from_std(l.socket).map_err(|source| {
+                    ListenerError {
+                        step: "register with the runtime",
+                        addr: l.addr,
+                        source,
+                    }
+                })?;
+                Ok((socket, l.tls))
+            })
+            .collect::<Result<_, ListenerError>>()?;
+        Ok(AcceptSource { listeners, next: 0 })
+    }
+
+    /// The next connection from any listener, with `TCP_NODELAY` (and `TCP_QUICKACK` on
+    /// Linux) set. An accept error is logged and backed off here
+    /// ([`handle_accept_error`]); it never ends the stream.
+    pub(crate) async fn accept(&mut self) -> Accepted {
+        loop {
+            let (result, index) = std::future::poll_fn(|cx| {
+                let n = self.listeners.len();
+                for k in 0..n {
+                    let i = (self.next + k) % n;
+                    if let std::task::Poll::Ready(r) = self.listeners[i].0.poll_accept(cx) {
+                        return std::task::Poll::Ready((r, i));
+                    }
+                }
+                std::task::Poll::Pending
+            })
+            .await;
+            self.next = (index + 1) % self.listeners.len();
+            match result {
+                Ok((stream, remote)) => {
+                    if let Err(e) = stream.set_nodelay(true) {
+                        tracing::warn!(
+                            target: "pyronova::server",
+                            error = %e,
+                            %remote,
+                            "set_nodelay failed; this connection keeps Nagle's algorithm"
+                        );
+                    }
+                    setup_tcp_quickack(&stream);
+                    return Accepted {
+                        stream,
+                        remote,
+                        tls: self.listeners[index].1.clone(),
+                    };
+                }
+                Err(e) => handle_accept_error(&e).await,
+            }
+        }
+    }
+}
+
 /// Back off when accept() fails. Critical for EMFILE/ENFILE (file-descriptor
 /// exhaustion) — a bare `continue` on these errors spins the accept loop at
 /// 100% CPU because the next accept() call fails immediately. Sleeping a few
@@ -197,6 +395,56 @@ fn is_resource_exhaustion(e: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn loopback(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    #[test]
+    fn copies_of_a_port_zero_listener_share_the_port_the_kernel_picked() {
+        let spec = ListenerSpec {
+            addr: loopback(0),
+            tls: None,
+        };
+        let bound = BoundListeners::bind(&[spec], 3).expect("loopback binds");
+        assert_eq!(bound.groups.len(), 3);
+        let port = bound.bound[0].addr.port();
+        assert_ne!(port, 0);
+        for group in &bound.groups {
+            assert_eq!(group.len(), 1);
+            assert_eq!(group[0].socket.local_addr().unwrap().port(), port);
+            assert_eq!(group[0].addr.port(), port);
+        }
+        assert_eq!(
+            bound.bound[0].to_string(),
+            format!("http://127.0.0.1:{port}")
+        );
+    }
+
+    #[test]
+    fn a_port_in_use_is_a_bind_error_with_its_errno() {
+        // No SO_REUSEPORT on the holder, so the server's socket can't join it.
+        let holder = std::net::TcpListener::bind(loopback(0)).unwrap();
+        let addr = holder.local_addr().unwrap();
+        let spec = ListenerSpec { addr, tls: None };
+        let err = BoundListeners::bind(&[spec], 2)
+            .err()
+            .expect("the port is taken");
+        assert_eq!(err.step, "bind");
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(err.errno(), Some(libc::EADDRINUSE));
+    }
+
+    #[test]
+    fn extra_tls_ports_need_a_certificate() {
+        let err = ListenerSpec::set(loopback(8000), None, &[8443])
+            .err()
+            .expect("no certificate");
+        assert_eq!(err.0, vec![8443]);
+        let plain = ListenerSpec::set(loopback(8000), None, &[]).unwrap();
+        assert_eq!(plain.len(), 1);
+        assert!(plain[0].tls.is_none());
+    }
 
     #[test]
     fn a_failed_bind_names_the_step_and_keeps_the_os_error() {

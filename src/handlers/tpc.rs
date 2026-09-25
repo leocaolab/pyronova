@@ -20,6 +20,7 @@ use crate::request_id::RequestId;
 use crate::router::{Call, Params, RequestBody, RouteId, Target};
 use crate::site::Site;
 use crate::types::PyronovaRequest;
+use crate::worker::TpcContext;
 
 use super::error::{HandlerError, RequestTag};
 use super::pipeline::{
@@ -30,19 +31,21 @@ use super::{build_main_http_response, http_response, stream_body_feeder, BoxBody
 
 pub(crate) async fn handle_request_tpc_inline(
     req: Request<Incoming>,
-    site: &'static Site,
-    worker: Rc<RefCell<SubInterpreterWorker>>,
+    context: Rc<TpcContext>,
     client_ip_addr: std::net::IpAddr,
-    main_bridge: Option<Arc<MainInterpBridge>>,
 ) -> Result<Response<BoxBody>, hyper::Error> {
+    let site = &*context.site;
     let prepared = match preprocess(req, site).await? {
         Preprocessed::Respond(r) => return Ok(r),
         Preprocessed::Dispatch(p) => p,
     };
     let resp = match prepared.call {
-        Call::Worker(route, _) => run_inline(site, &worker, prepared, route, client_ip_addr).await,
+        Call::Worker(route, _) => {
+            run_inline(site, &context.worker, prepared, route, client_ip_addr).await
+        }
         Call::Main(target, body) => {
-            run_on_bridge(site, main_bridge, prepared, target, body, client_ip_addr).await
+            let bridge = context.bridge.as_deref();
+            run_on_bridge(site, bridge, prepared, target, body, client_ip_addr).await
         }
     };
     Ok(resp)
@@ -56,7 +59,7 @@ pub(crate) async fn handle_request_tpc_inline(
 /// other paths, not its late result.
 async fn run_inline(
     site: &Site,
-    worker: &Rc<RefCell<SubInterpreterWorker>>,
+    worker: &RefCell<SubInterpreterWorker>,
     prepared: Prepared,
     route: RouteId,
     client_ip_addr: std::net::IpAddr,
@@ -127,7 +130,7 @@ impl InlineRequest<'_> {
 
 fn call_inline(
     site: &Site,
-    worker: &Rc<RefCell<SubInterpreterWorker>>,
+    worker: &RefCell<SubInterpreterWorker>,
     route: RouteId,
     request: InlineRequest<'_>,
     tag: &RequestTag<'_>,
@@ -159,7 +162,7 @@ fn call_inline(
 /// Runs a main-interpreter call (a `gil=True` route or the fallback) through the bridge.
 async fn run_on_bridge(
     site: &Site,
-    bridge: Option<Arc<MainInterpBridge>>,
+    bridge: Option<&MainInterpBridge>,
     prepared: Prepared,
     target: Target,
     body: RequestBody,
@@ -194,7 +197,7 @@ async fn run_on_bridge(
                 client_ip: client_ip_addr,
                 max_body: site.config.limits.max_body_bytes,
             };
-            dispatch_to_bridge(&bridge, &parts, incoming, call, &tag).await
+            dispatch_to_bridge(bridge, &parts, incoming, call, &tag).await
         }
         // The bridge is spawned whenever the table has a main-interpreter call.
         None => fail(

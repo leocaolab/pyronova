@@ -240,3 +240,142 @@ def test_two_apps_in_one_process_keep_their_own_websocket_cap():
             a.send("1")
             b.send("2")
             assert (a.recv(timeout=5), b.recv(timeout=5)) == ("1", "2")
+
+
+# ---------------------------------------------------------------------------
+# 3. One listener set, bound before anything starts, on every run path
+# ---------------------------------------------------------------------------
+
+# (label, mode, extra env)
+_RUN_PATHS = [
+    ("tpc-gil", "gil", {}),
+    ("tpc-subinterp", "subinterp", {}),
+    ("pool-gil", "gil", {"PYRONOVA_TPC": "0"}),
+    ("pool-subinterp", "subinterp", {"PYRONOVA_TPC": "0"}),
+]
+if sys.platform == "darwin":
+    _RUN_PATHS.append(("darwin-fanout", "subinterp", {"PYRONOVA_TPC_DARWIN": "fanout"}))
+
+_TLS_APP = """
+    import sys
+    from pyronova import Pyronova
+
+    app = Pyronova()
+
+    @app.get("/")
+    def root(req):
+        return "hello"
+
+    if __name__ == "__main__":
+        plain, tls, mode, cert, key = sys.argv[1:6]
+        app.run(host="127.0.0.1", port=int(plain), mode=mode, workers=2,
+                tls_cert=cert, tls_key=key, extra_tls_ports=[int(tls)])
+"""
+
+
+@pytest.fixture(scope="module")
+def cert_key(tmp_path_factory):
+    import shutil
+
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl CLI not available")
+    d = tmp_path_factory.mktemp("m5_tls")
+    cert, key = d / "cert.pem", d / "key.pem"
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key),
+         "-out", str(cert), "-days", "1", "-subj", "/CN=localhost"],
+        check=True, capture_output=True,
+    )
+    return str(cert), str(key)
+
+
+def _get(url: str, ctx=None, attempts: int = 1) -> bytes:
+    import time
+    import urllib.request
+
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(url, timeout=3, context=ctx) as r:
+                return r.read()
+        except OSError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.2)
+    raise AssertionError("unreachable")
+
+
+@pytest.mark.parametrize("label,mode,env", _RUN_PATHS, ids=[p[0] for p in _RUN_PATHS])
+def test_an_extra_tls_port_is_served_on_every_run_path(cert_key, tmp_path, label, mode, env):
+    import ssl
+
+    script = tmp_path / "tls_app.py"
+    script.write_text(textwrap.dedent(_TLS_APP))
+    plain, tls = _unused_port(), _unused_port()
+    proc = subprocess.Popen(
+        [sys.executable, str(script), str(plain), str(tls), mode, *cert_key],
+        env={**os.environ, **env}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        assert _get(f"http://127.0.0.1:{plain}/", attempts=150) == b"hello"
+        assert _get(f"https://127.0.0.1:{tls}/", ctx=ctx, attempts=5) == b"hello"
+    finally:
+        proc.terminate()
+        try:
+            out, _ = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, _ = proc.communicate()
+    assert f"https://127.0.0.1:{tls}" in out, out
+
+
+@pytest.mark.parametrize("label,mode,env", _RUN_PATHS, ids=[p[0] for p in _RUN_PATHS])
+def test_a_port_in_use_is_an_oserror_from_run(label, mode, env):
+    # A listener without SO_REUSEPORT: the server's SO_REUSEPORT bind can't join it.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as taken:
+        taken.bind((HOST, 0))
+        taken.listen()
+        port = taken.getsockname()[1]
+        r = _run(
+            f"""
+            import errno
+            from pyronova import Pyronova
+
+            app = Pyronova()
+
+            @app.get("/")
+            def root(req):
+                return "hello"
+
+            if __name__ == "__main__":
+                try:
+                    app.run(host="127.0.0.1", port={port}, mode={mode!r}, workers=2)
+                except OSError as e:
+                    print("OSERROR", e.errno == errno.EADDRINUSE, e, flush=True)
+                    raise SystemExit(3)
+                print("RETURNED-OK", flush=True)
+            """,
+            env=env,
+        )
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "OSERROR True" in r.stdout, r.stdout + r.stderr
+    assert f"127.0.0.1:{port}" in r.stdout, r.stdout
+
+
+_bound = Pyronova()
+
+
+@_bound.get("/")
+def _bound_root(req):
+    return "ok"
+
+
+def test_testclient_reports_the_port_the_engine_bound():
+    with TestClient(_bound, mode="gil") as c:
+        assert c._settings.port == 0
+        assert c.port == _bound._engine.bound_port()
+        assert c.port != 0
+        assert c.get("/").text == "ok"
+    assert _bound._engine.bound_port() is None
