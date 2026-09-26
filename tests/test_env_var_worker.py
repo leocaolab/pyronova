@@ -43,4 +43,4 @@ def compute_route(req):
     return {"result": compute_value(10)}
 
 if __name__ == "__main__":
-    my_server.run(host="127.0.0.1", port=8000, mode="subinterp")
+    my_server.run(host="127.0.0.1", port=0, mode="subinterp")

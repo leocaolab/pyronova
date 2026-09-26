@@ -22,7 +22,8 @@ import uuid
 import httpx
 import pytest
 
-from conftest import _free_port, fork_panic_lines
+from conftest import fork_panic_lines
+from tests._helpers import bound_port, listening_ports
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PG_DSN = os.environ.get("PYRONOVA_TEST_PG_DSN")
@@ -39,23 +40,33 @@ pytestmark = pytest.mark.skipif(
 
 class Server:
     def __init__(self, tmp_path, source: str, extra_env: dict | None = None, argv=None):
-        self.port = _free_port()
-        self.base = f"http://127.0.0.1:{self.port}"
+        self._port: int | None = None
         self.script = tmp_path / "app.py"
         self.script.write_text(textwrap.dedent(source))
         self.log_path = tmp_path / "server.log"
         env = dict(os.environ)
-        env["L2_PORT"] = str(self.port)
+        env["L2_PORT"] = "0"
         env.update(extra_env or {})
         cmd = argv or [sys.executable, str(self.script)]
         with open(self.log_path, "w") as log:
             self.proc = subprocess.Popen(
                 cmd, stdout=log, stderr=subprocess.STDOUT, env=env,
-                cwd=str(tmp_path), preexec_fn=os.setsid,
+                cwd=str(tmp_path), start_new_session=True,
             )
 
     def log(self) -> str:
         return self.log_path.read_text(errors="replace")
+
+    @property
+    def port(self) -> int:
+        """The port the server bound (it binds port 0), from its startup line."""
+        if self._port is None:
+            self._port = bound_port(self.log, self.proc)
+        return self._port
+
+    @property
+    def base(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
 
     def wait_up(self, path: str = "/ping", timeout: float = 90) -> None:
         deadline = time.time() + timeout
@@ -64,11 +75,15 @@ class Server:
                 raise AssertionError(
                     f"server exited early (code {self.proc.returncode}):\n{self.log()[-4000:]}"
                 )
-            try:
-                if httpx.get(self.base + path, timeout=1).status_code == 200:
-                    return
-            except httpx.HTTPError:
-                pass
+            if self._port is None:
+                ports = listening_ports(self.log())
+                self._port = ports[0] if ports else None
+            if self._port is not None:
+                try:
+                    if httpx.get(self.base + path, timeout=1).status_code == 200:
+                        return
+                except httpx.HTTPError:
+                    pass
             time.sleep(0.2)
         raise AssertionError(f"server not up in {timeout}s:\n{self.log()[-4000:]}")
 
@@ -337,7 +352,7 @@ def test_async_pool_request_ids_do_not_cross(tmp_path):
 _ENGINE_NAMES = [
     "PyronovaApp", "Request", "Response", "WebSocket", "SharedState", "Stream",
     "PgPool", "PgCursor", "get_gil_metrics", "init_logger", "emit_python_log", "_in_worker",
-    "_forgotten_workers", "_worker_recv", "_worker_send", "_worker_to_response",
+    "_worker_recv", "_worker_send", "_worker_to_response",
     "_worker_app_handlers", "_worker_app_hooks",
 ]
 
@@ -683,7 +698,8 @@ def test_stream_from_worker_is_a_loud_500(tmp_path):
     finally:
         rc = s.stop()
     assert r.status_code == 500
-    assert "gil=True, stream=True" in s.log(), s.log()[-3000:]
+    assert ("a Stream response is only served from the main interpreter, so register the "
+            "route with gil=True") in s.log(), s.log()[-3000:]
     assert rc == 0
     _no_panics(s)
 
@@ -814,12 +830,10 @@ def test_cli_run_serves_worker_routes(tmp_path):
         def ping(req):
             return {"worker": pyronova.engine._in_worker()}
     """))
-    port = _free_port()
     s = Server(tmp_path, "", argv=[
         sys.executable, "-m", "pyronova.cli", "run", "cliapp:app",
-        "--port", str(port), "--workers", "2",
+        "--port", "0", "--workers", "2",
     ])
-    s.port, s.base = port, f"http://127.0.0.1:{port}"
     try:
         s.wait_up()
         r = httpx.get(s.base + "/ping", timeout=10).json()

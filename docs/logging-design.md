@@ -96,7 +96,12 @@ app = Pyronova(log_config={"level": "OFF"})
 # 5. enable_logging() — 激活访问日志 + Python 钩子输出
 app = Pyronova()
 app.enable_logging()       # 将级别提升到 INFO，开启 access_log
+app.enable_logging(level="warn")  # 显式级别优先于 log_config / debug=True
 ```
+
+`enable_logging(level=...)` 是显式级别的唯一写入者：它覆盖 `log_config` 或 `debug=True`
+设定的级别，之后不带级别的调用（`PYRONOVA_LOG=1` 或 `run()` 时的 `debug=True`）保留它。
+不带级别时，`enable_logging()` 保留已配置的级别，若为 ERROR 或 OFF 则提升到 INFO（访问日志是 INFO）。
 
 ### 环境变量
 
@@ -115,32 +120,19 @@ Python 默认的 `logging.StreamHandler` 在持有 GIL 时同步 `write()` 到 s
 
 ### 解决方案
 
-Pyronova 在主解释器和每个子解释器中劫持 Python 的 root logger：
+主解释器和每个子解释器用同一个 handler 类 `RustLogHandler`（`python/pyronova/_log_bridge.py`）。
+主解释器直接 import（`app.py`）；worker 的 bootstrap 在能 import 包之前执行同一份源码，并带上 worker id：
 
-**主解释器** (`app.py`)：
 ```python
-class PyronovaRustHandler(logging.Handler):
+class RustLogHandler(logging.Handler):
     def emit(self, record):
-        emit_python_log(           # PyO3 FFI → Rust
-            level=record.levelname,
-            name=record.name,
-            message=record.getMessage(),
-            pathname=record.pathname,
-            lineno=record.lineno,
-        )
-```
-
-**子解释器** (`_bootstrap.py`)：
-```python
-class _PyronovaRustHandler(logging.Handler):
-    def emit(self, record):
-        _emit_python_log(              # 即 pyronova.engine.emit_python_log，与主解释器用的是同一个函数
-            record.levelname,
+        self._sink(                    # 即 pyronova.engine.emit_python_log
+            record.levelno,
             record.name,
-            record.getMessage(),
+            msg,                       # getMessage()，logger.exception 时附上 traceback
             record.pathname or "",
             record.lineno or 0,
-            self._worker_id,
+            self._worker_id,           # 主解释器为 None
         )
 ```
 
@@ -167,7 +159,6 @@ class _PyronovaRustHandler(logging.Handler):
 | `src/lib.rs` | 注册 `logging` 模块 + 函数 |
 | `src/app.rs` | 启动/关闭 → `tracing::info!`，连接错误 → `tracing::warn!` |
 | `src/handlers.rs` | 访问日志：`latency_us`、`method`、`path`、`status`、`mode` |
-| `src/interp.rs` | *（历史）* 子解释器用的 `pyronova_emit_log_cfunc` C-FFI —— Layer 2 已删除；worker 现在导入真 engine，直接调用 `emit_python_log` |
 | `src/monitor.rs` | GIL 看门狗 → `tracing::warn!` |
 | `src/websocket.rs` | WebSocket 错误 → `tracing::error!`/`tracing::warn!` |
 
@@ -179,7 +170,9 @@ class _PyronovaRustHandler(logging.Handler):
 
 3. **所有解释器用同一个函数** — 子解释器 worker 导入真正的 `pyronova.engine`（PyO3 fork 让模块按解释器各一份；Layer 2），worker 的日志 handler 带上自己的 worker id 调用 `pyronova.engine.emit_python_log`。*早期版本*当时无法在子解释器里导入 engine，所以注册了一个 C-FFI 内建函数 `_pyronova_emit_log`。
 
-4. **`init_logger` 延迟到 `run()`** — 允许 `enable_logging()` 在 tracing subscriber 锁定前修改日志配置。`tracing-subscriber` 每个进程只允许初始化一次。
+4. **`init_logger` 延迟到 `run()`；再次调用即重新配置** — 允许 `enable_logging()` 在 `run()` 之前修改日志配置。`tracing-subscriber` 每个进程只能有一个全局 subscriber，所以第一次 `init_logger` 安装它，并把 filter 和格式层放在 `reload` handle 后面；之后的调用（同一进程里的另一个 app）换上自己的级别、访问日志开关和格式。未知的级别或格式抛 `ValueError`；全局槽位已被外部 subscriber 占用则抛 `RuntimeError`。
+
+6. **Python 级别按数值映射** — `emit_python_log` 接收记录的 `levelno`，映射到它达到的最高标准阈值（≥40 ERROR，≥30 WARN，≥20 INFO，≥10 DEBUG，其余 TRACE），因此 `logging.addLevelName(25, "NOTICE")` 这类自定义级别按 INFO 输出。
 
 5. **启动横幅保留 `println!`** — 人类可读的启动横幅（`Pyronova v1.2.0 [hybrid mode]...`）与 `tracing::info!` 并存，因为它是始终可见的开发者体验，不是可过滤的日志输出。
 
@@ -191,7 +184,7 @@ class _PyronovaRustHandler(logging.Handler):
 
 | 测试 | 验证内容 |
 |---|---|
-| `test_gil_mode_logging` | GIL 模式下 Python 钩子输出（`[INFO ] GET / → 200`） |
+| `test_gil_mode_logging` | GIL 模式下的 `pyronova::access` 行（请求日志只由 Rust access log 写一次） |
 | `test_subinterp_rust_logging` | 子解释器模式下 Rust tracing 访问日志 |
 | `test_user_print_in_subinterp` | 子解释器中 `print()` 正常工作 |
 | `test_user_logging_in_subinterp` | Python `logging.info()` 桥接到 Rust tracing |

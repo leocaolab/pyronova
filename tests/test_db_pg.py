@@ -14,15 +14,16 @@ model is fine — all tests here use a module-scoped fixture that sets up
 a schema once.
 """
 
+import datetime
 import os
 import json
 import threading
 import time
 import urllib.request
+import uuid
 
 import pytest
 
-from pyronova import Pyronova
 from pyronova.db import PgPool
 from pyronova.testing import TestClient
 
@@ -38,7 +39,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture(scope="module")
 def pool():
     # Rust-side PgPool is a process global; connect() is idempotent.
-    p = PgPool.connect(PG_DSN, max_connections=4)
+    p = PgPool.connect(PG_DSN)
     # Fresh schema per test module.
     p.execute("DROP TABLE IF EXISTS pyronova_test_rows")
     p.execute("""
@@ -128,18 +129,8 @@ def test_handler_can_query(pool):
     pool.execute("DELETE FROM pyronova_test_rows")
     pool.execute("INSERT INTO pyronova_test_rows (name, value) VALUES ($1, $2)", "carol", 100)
 
-    app = Pyronova()
-
-    @app.get("/")
-    def root(req):
-        return "ok"
-
-    @app.get("/users/{name}", gil=True)
-    def get_user(req):
-        return pool.fetch_one(
-            "SELECT name, value FROM pyronova_test_rows WHERE name = $1",
-            req.params["name"],
-        ) or {"error": "not found"}
+    # Module level (workers rebuild the app by executing its module).
+    from tests.apps.db_pg_query import app
 
     with TestClient(app, port=None) as c:
         resp = c.get("/users/carol")
@@ -209,32 +200,30 @@ def test_async_execute(pool):
 
 
 def test_unknown_column_types_do_not_explode(pool):
-    """Regression for the DB-decode-fallback bug: the previous `_ =>`
-    fallback in `column_to_py` forced `<String as Decode>::decode` on the
-    raw binary value, which failed for every non-text Postgres type
-    (UUID, TIMESTAMP, INET, interval, …). Queries touching those types
-    blew up with PyRuntimeError.
+    """Regression for the DB-decode-fallback bug: the old `_ =>` fallback
+    in `column_to_py` forced `<String as Decode>::decode` on the raw binary
+    value, which failed for every non-text Postgres type (UUID, TIMESTAMP,
+    INET, interval, …). Queries touching those types blew up with
+    PyRuntimeError.
 
-    Post-fix the fallback returns raw bytes on a decode failure, so the
-    query succeeds and the caller can handle the bytes as they see fit.
+    Columns are now decoded by their Postgres type: UUID and timestamps
+    become `uuid.UUID` / `datetime.datetime`, and a type with no decoder
+    (INET) is always returned as its raw wire bytes, never guessed text.
     """
-    # UUID — 16-byte binary payload, no String decoder.
+    # UUID — decoded to uuid.UUID.
     row = pool.fetch_one("SELECT gen_random_uuid() AS u")
     assert row is not None
-    # Either a bytes fallback (UUID wire format) or a text rep from
-    # sqlx's text-format path — both are acceptable, neither is an
-    # exception.
-    assert isinstance(row["u"], (bytes, str))
+    assert isinstance(row["u"], uuid.UUID)
 
-    # TIMESTAMP — 8 bytes micros since 2000-01-01.
+    # TIMESTAMPTZ — decoded to datetime.datetime.
     row = pool.fetch_one("SELECT now() AS t")
     assert row is not None
-    assert isinstance(row["t"], (bytes, str))
+    assert isinstance(row["t"], datetime.datetime)
 
-    # INET — variable-length.
+    # INET — no decoder: raw wire bytes.
     row = pool.fetch_one("SELECT '10.0.0.1'::inet AS ip")
     assert row is not None
-    assert isinstance(row["ip"], (bytes, str))
+    assert isinstance(row["ip"], bytes)
 
 
 def test_uuid_text_cast_roundtrip(pool):

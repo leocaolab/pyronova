@@ -1,0 +1,255 @@
+//! What one server serves: the frozen route table and the app's settings (CORS, access
+//! log, limits, compression). Built once by `start()`; read-only after.
+
+use std::cell::Cell;
+use std::num::NonZeroU64;
+use std::sync::Arc;
+
+use hyper::header::{HeaderMap, HeaderName, HeaderValue};
+use hyper::StatusCode;
+
+use crate::router::RouteTable;
+
+pub(crate) struct Site {
+    pub(crate) routes: RouteTable,
+    pub(crate) config: SiteConfig,
+}
+
+pub(crate) type SharedSite = Arc<Site>;
+
+pub(crate) struct SiteConfig {
+    pub(crate) cors: Option<Cors>,
+    pub(crate) access_log: AccessLog,
+    /// Answer HttpArena's `benchmark.BenchmarkService/GetSum` gRPC method; off unless the
+    /// app enables it.
+    pub(crate) grpc_benchmark: bool,
+    /// The header a client's request id arrives in (`app.enable_request_id()`); `None`
+    /// means every request id is minted by the server.
+    pub(crate) request_id_header: Option<HeaderName>,
+    /// This app's request-body and WebSocket limits.
+    pub(crate) limits: Limits,
+    /// This app's response compression (`app.enable_compression()`); `None` = off.
+    pub(crate) compression: Option<crate::compression::Settings>,
+    /// The WebSocket connections this run has open, against `limits.ws.max_connections`.
+    pub(crate) ws_connections: crate::websocket::OpenConnections,
+}
+
+/// Default max request body size, in bytes (10 MiB); `app.max_body_size` sets it.
+const DEFAULT_MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// An app's limits. Each app has its own (set through its `PyronovaApp`), so two apps in
+/// one process never see each other's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Limits {
+    /// Largest request body, in bytes; a larger one is answered 413.
+    pub(crate) max_body_bytes: usize,
+    pub(crate) ws: crate::websocket::WsLimits,
+}
+
+impl Limits {
+    pub(crate) const DEFAULT: Self = Self {
+        max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+        ws: crate::websocket::WsLimits::DEFAULT,
+    };
+
+    /// One line per setter whose value in a worker's script (`in_worker`) differs from
+    /// the served app's (`self`, the main interpreter's), naming the call and both values;
+    /// empty when they agree. A worker's app is never served, so such a call has no effect
+    /// and the worker says so.
+    pub(crate) fn ignored_in_worker(&self, in_worker: &Limits) -> Vec<String> {
+        let mut ignored = Vec::new();
+        let mut differ = |call: &str, worker: usize, served: usize| {
+            if worker != served {
+                ignored.push(format!(
+                    "{call}({worker}) in a worker is ignored: limits are per app, and the app \
+                     served is the main interpreter's, which has {served}"
+                ));
+            }
+        };
+        differ(
+            "set_max_body_size",
+            in_worker.max_body_bytes,
+            self.max_body_bytes,
+        );
+        differ(
+            "set_max_websocket_message_size",
+            in_worker.ws.max_message_bytes as usize,
+            self.ws.max_message_bytes as usize,
+        );
+        differ(
+            "set_max_websocket_connections",
+            in_worker.ws.max_connections,
+            self.ws.max_connections,
+        );
+        ignored
+    }
+}
+
+/// CORS response headers, parsed once at configuration. Applied to every response, not
+/// only the OPTIONS preflight: `Access-Control-Allow-Credentials` and
+/// `Access-Control-Expose-Headers` must be on the actual response (W3C CORS).
+#[derive(Clone, Debug)]
+pub(crate) struct Cors {
+    headers: Vec<(HeaderName, HeaderValue)>,
+}
+
+/// The CORS settings as configured, before parsing.
+pub(crate) struct CorsSpec<'a> {
+    pub(crate) origin: &'a str,
+    pub(crate) methods: &'a str,
+    pub(crate) headers: &'a str,
+    pub(crate) expose_headers: Option<&'a str>,
+    pub(crate) allow_credentials: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid CORS {setting} {value:?}: {source}")]
+pub(crate) struct CorsError {
+    setting: &'static str,
+    value: String,
+    source: hyper::header::InvalidHeaderValue,
+}
+
+impl Cors {
+    pub(crate) fn parse(spec: &CorsSpec<'_>) -> Result<Self, CorsError> {
+        let value = |setting: &'static str, value: &str| {
+            HeaderValue::from_str(value).map_err(|source| CorsError {
+                setting,
+                value: value.to_string(),
+                source,
+            })
+        };
+        let mut headers = vec![
+            (
+                hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                value("origin", spec.origin)?,
+            ),
+            (
+                hyper::header::ACCESS_CONTROL_ALLOW_METHODS,
+                value("methods", spec.methods)?,
+            ),
+            (
+                hyper::header::ACCESS_CONTROL_ALLOW_HEADERS,
+                value("headers", spec.headers)?,
+            ),
+        ];
+        if spec.allow_credentials {
+            headers.push((
+                hyper::header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+                HeaderValue::from_static("true"),
+            ));
+        }
+        if let Some(expose) = spec.expose_headers {
+            headers.push((
+                hyper::header::ACCESS_CONTROL_EXPOSE_HEADERS,
+                value("expose_headers", expose)?,
+            ));
+        }
+        Ok(Cors { headers })
+    }
+
+    /// Sets (not appends) each header, so a handler's own value can't be duplicated.
+    #[inline]
+    pub(crate) fn apply(&self, map: &mut HeaderMap) {
+        for (name, value) in &self.headers {
+            map.insert(name.clone(), value.clone());
+        }
+    }
+}
+
+/// The `pyronova::access` log: whether it is on, and which responses it samples.
+#[derive(Clone, Debug)]
+pub(crate) struct AccessLog {
+    pub(crate) enabled: bool,
+    /// Log 1 in N responses; `1` logs every one.
+    pub(crate) sample_n: NonZeroU64,
+    /// Responses with a status at or above this always log, sampled or not.
+    pub(crate) always_status: Option<StatusCode>,
+}
+
+thread_local! {
+    /// This thread's sampling roll. Each thread keeps 1 in N of the responses it serves,
+    /// so the log keeps 1 in N overall, without every thread incrementing one shared
+    /// cache line per response.
+    static SAMPLE_ROLL: Cell<u64> = const { Cell::new(0) };
+}
+
+impl AccessLog {
+    pub(crate) fn disabled() -> Self {
+        AccessLog {
+            enabled: false,
+            sample_n: NonZeroU64::MIN,
+            always_status: None,
+        }
+    }
+
+    /// Cheapest check first: off, then the status floor, then the 1-in-N roll (`1` never
+    /// touches the roll).
+    #[inline]
+    pub(crate) fn samples(&self, status: StatusCode) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if self.always_status.is_some_and(|floor| status >= floor) {
+            return true;
+        }
+        let n = self.sample_n.get();
+        n == 1 || SAMPLE_ROLL.with(|roll| next_roll(roll).is_multiple_of(n))
+    }
+}
+
+/// The roll's current value, advancing it.
+fn next_roll(roll: &Cell<u64>) -> u64 {
+    let current = roll.get();
+    roll.set(current.wrapping_add(1));
+    current
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn one_in(n: u64) -> AccessLog {
+        AccessLog {
+            enabled: true,
+            sample_n: NonZeroU64::new(n).unwrap(),
+            always_status: None,
+        }
+    }
+
+    #[test]
+    fn each_thread_keeps_one_in_n_of_its_own_responses() {
+        let log = one_in(10);
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let log = log.clone();
+                std::thread::spawn(move || {
+                    // A fresh thread's roll starts at its own first response, whatever
+                    // the other threads did.
+                    let first = log.samples(StatusCode::OK);
+                    let rest = (0..99).filter(|_| log.samples(StatusCode::OK)).count();
+                    (first, rest)
+                })
+            })
+            .collect();
+        for t in threads {
+            // 100 responses on the thread: responses 0, 10, ..., 90 kept.
+            assert_eq!(t.join().unwrap(), (true, 9));
+        }
+    }
+
+    #[test]
+    fn the_status_floor_always_logs() {
+        let log = AccessLog {
+            always_status: Some(StatusCode::INTERNAL_SERVER_ERROR),
+            ..one_in(1000)
+        };
+        std::thread::spawn(move || {
+            assert!(log.samples(StatusCode::OK)); // the thread's roll 0
+            assert!(!log.samples(StatusCode::OK));
+            assert!(log.samples(StatusCode::BAD_GATEWAY));
+        })
+        .join()
+        .unwrap();
+    }
+}

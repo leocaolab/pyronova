@@ -9,54 +9,64 @@ from pyronova import Pyronova, Response
 from pyronova.testing import TestClient
 
 
+# Module level: TestClient serves it through sub-interpreter workers, which rebuild
+# it by executing this module.
+app = Pyronova()
+
+
+# before_request: inject custom header
+@app.before_request
+def inject_timing(req):
+    # Return None to continue — just verify req fields are accessible
+    _ = req.method
+    _ = req.path
+    _ = req.client_ip
+    return None
+
+
+# after_request: add response header using req info
+@app.after_request
+def add_request_info(req, resp):
+    headers = dict(getattr(resp, "headers", {}) or {})
+    headers["x-handled-path"] = req.path
+    headers["x-handled-method"] = req.method
+    headers["x-client-ip"] = req.client_ip
+    return Response(
+        body=resp.body,
+        status_code=resp.status_code,
+        content_type=resp.content_type,
+        headers=headers,
+    )
+
+
+@app.get("/")
+def index(req):
+    return {"ok": True}
+
+
+@app.get("/user/{name}")
+def user(req):
+    return {"name": req.params["name"]}
+
+
+@app.post("/echo")
+def echo(req):
+    return req.json()
+
+
+@app.get("/query")
+def query(req):
+    return {"q": req.query_params.get("q", "")}
+
+
+@app.get("/headers-echo")
+def headers_echo(req):
+    return {"ua": req.headers.get("user-agent", "none")}
+
+
 @pytest.fixture(scope="module")
 def client():
-    app = Pyronova()
-
-    # before_request: inject custom header
-    @app.before_request
-    def inject_timing(req):
-        # Return None to continue — just verify req fields are accessible
-        _ = req.method
-        _ = req.path
-        _ = req.client_ip
-        return None
-
-    # after_request: add response header using req info
-    @app.after_request
-    def add_request_info(req, resp):
-        headers = dict(getattr(resp, "headers", {}) or {})
-        headers["x-handled-path"] = req.path
-        headers["x-handled-method"] = req.method
-        headers["x-client-ip"] = req.client_ip
-        return Response(
-            body=resp.body,
-            status_code=resp.status_code,
-            content_type=resp.content_type,
-            headers=headers,
-        )
-
-    @app.get("/")
-    def index(req):
-        return {"ok": True}
-
-    @app.get("/user/{name}")
-    def user(req):
-        return {"name": req.params["name"]}
-
-    @app.post("/echo")
-    def echo(req):
-        return req.json()
-
-    @app.get("/query")
-    def query(req):
-        return {"q": req.query_params.get("q", "")}
-
-    @app.get("/headers-echo")
-    def headers_echo(req):
-        return {"ua": req.headers.get("user-agent", "none")}
-
-    c = TestClient(app, port=19883)
+    c = TestClient(app)
     yield c
     c.close()
 
@@ -124,26 +134,10 @@ def test_before_hook_passes_through(client):
 
 def test_before_hook_short_circuit():
     """before_request returning a response should short-circuit."""
-    app = Pyronova()
+    # Its own module: a worker serves one app per module.
+    from tests.apps.middleware_short_circuit import app
 
-    @app.before_request
-    def auth_check(req):
-        # Skip auth for health check route
-        if req.path == "/":
-            return None
-        if "x-token" not in req.headers:
-            return Response(body="unauthorized", status_code=401)
-        return None
-
-    @app.get("/")
-    def index(req):
-        return "ok"
-
-    @app.get("/protected")
-    def protected(req):
-        return {"secret": "data"}
-
-    c = TestClient(app, port=19884)
+    c = TestClient(app)
     try:
         # Without token — should get 401
         resp = c.get("/protected")
@@ -160,31 +154,10 @@ def test_before_hook_short_circuit():
 
 def test_multiple_after_hooks():
     """Multiple after_request hooks should chain correctly."""
-    app = Pyronova()
+    # Its own module: a worker serves one app per module.
+    from tests.apps.middleware_two_after_hooks import app
 
-    @app.after_request
-    def add_header_1(req, resp):
-        headers = dict(getattr(resp, "headers", {}) or {})
-        headers["x-hook-1"] = "yes"
-        return Response(
-            body=resp.body, status_code=resp.status_code,
-            content_type=resp.content_type, headers=headers,
-        )
-
-    @app.after_request
-    def add_header_2(req, resp):
-        headers = dict(getattr(resp, "headers", {}) or {})
-        headers["x-hook-2"] = "yes"
-        return Response(
-            body=resp.body, status_code=resp.status_code,
-            content_type=resp.content_type, headers=headers,
-        )
-
-    @app.get("/")
-    def index(req):
-        return "ok"
-
-    c = TestClient(app, port=19885)
+    c = TestClient(app)
     try:
         resp = c.get("/")
         assert resp.status_code == 200

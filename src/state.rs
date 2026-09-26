@@ -1,38 +1,51 @@
-//! SharedState — cross-sub-interpreter state sharing via DashMap.
-//!
-//! All sub-interpreters share the same Arc<DashMap> in Rust memory.
-//! Python code uses `app.state["key"] = value` / `app.state["key"]`.
-//! Values stored as `bytes::Bytes` (ref-counted, zero-cost clone).
+//! `SharedState` (`app.state`): a string/bytes key-value store every interpreter of one
+//! running app sees, held in Rust memory so no Python object crosses interpreters.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
 use dashmap::DashMap;
 use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyString};
 
-/// High-concurrency shared key-value store backed by DashMap.
-///
-/// Thread-safe, lock-free reads for different keys, nanosecond latency.
-/// All sub-interpreters share the same underlying DashMap via Arc.
-/// Values are `Bytes` — clone is atomic refcount bump, not deep copy.
-/// The map behind a `SharedState`.
+/// The map behind a `SharedState`: sharded locks, so different keys don't contend.
 pub(crate) type SharedMap = Arc<DashMap<String, Bytes>>;
 
 /// The running app's map, handed to a worker before its script runs; one value per
-/// interpreter (Layer 2, C2). Unset on main and in any interpreter pyronova didn't create.
+/// interpreter. Unset on main and in any interpreter pyronova didn't create.
 static WORKER_MAP: pyo3::sync::PyOnceLock<SharedMap> = pyo3::sync::PyOnceLock::new();
 
+/// Why a worker interpreter could not get the running app's map.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StateError {
+    /// A worker interpreter is created for one run, so its cell must be empty.
+    #[error("this worker interpreter already has a shared-state map")]
+    AlreadyHanded,
+}
+
 /// Gives the worker interpreter the calling thread is attached to the running app's map.
-pub(crate) fn hand_to_worker(py: Python<'_>, map: &SharedMap) -> Result<(), String> {
-    // A worker interpreter is created for one run, so the cell must be empty here.
+pub(crate) fn hand_to_worker(py: Python<'_>, map: &SharedMap) -> Result<(), StateError> {
     WORKER_MAP
         .set(py, Arc::clone(map))
-        .map_err(|_| "this worker interpreter already has a shared-state map".to_string())
+        .map_err(|_| StateError::AlreadyHanded)
+}
+
+/// A stored value as a Python `str`, copied once from the map. Values set with `set_bytes`
+/// need not be UTF-8; reading one as text is a `TypeError` naming the key, on every read
+/// (`[]`, `get`, `values`, `items`).
+fn text<'py>(py: Python<'py>, key: &str, value: &Bytes) -> PyResult<Bound<'py, PyString>> {
+    std::str::from_utf8(value)
+        .map(|s| PyString::new(py, s))
+        .map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(format!(
+                "state[{key:?}]: value is not valid UTF-8; use get_bytes() for raw access"
+            ))
+        })
 }
 
 /// The map a new `PyronovaApp` or `SharedState` uses: in a worker the running app's, so every
-/// interpreter sees the same values (FR-5); otherwise a fresh one, as before (TestClient apps
-/// in one process keep separate maps).
+/// interpreter sees the same values; otherwise a fresh one (TestClient apps in one process
+/// keep separate maps).
 pub(crate) fn map_for_new(py: Python<'_>) -> SharedMap {
     match WORKER_MAP.get(py) {
         Some(map) => Arc::clone(map),
@@ -46,7 +59,7 @@ pub(crate) struct SharedState {
 }
 
 impl SharedState {
-    /// Create a new SharedState with the given Arc (for sharing across workers).
+    /// A `SharedState` over an existing map (`app.state`).
     pub fn with_inner(inner: SharedMap) -> Self {
         SharedState { inner }
     }
@@ -66,13 +79,19 @@ impl SharedState {
         self.inner.insert(key, Bytes::from(value.into_bytes()));
     }
 
-    /// Get a string value. Returns ``default`` (None) if key doesn't exist.
+    /// Get a string value. Returns ``default`` (None) if the key doesn't exist; raises
+    /// ``TypeError`` if its value isn't UTF-8 text (use ``get_bytes``).
     #[pyo3(signature = (key, default=None))]
-    fn get(&self, key: &str, default: Option<String>) -> Option<String> {
-        self.inner
-            .get(key)
-            .and_then(|v| std::str::from_utf8(v.value()).ok().map(|s| s.to_string()))
-            .or(default)
+    fn get<'py>(
+        &self,
+        py: Python<'py>,
+        key: &str,
+        default: Option<Bound<'py, PyString>>,
+    ) -> PyResult<Option<Bound<'py, PyString>>> {
+        match self.inner.get(key) {
+            Some(v) => text(py, key, v.value()).map(Some),
+            None => Ok(default),
+        }
     }
 
     /// Set raw bytes value.
@@ -80,10 +99,9 @@ impl SharedState {
         self.inner.insert(key, Bytes::from(value));
     }
 
-    /// Get raw bytes value. Copies the stored bytes into a new ``Vec<u8>``
-    /// (required since the value is handed to Python as a ``bytes`` object).
-    fn get_bytes(&self, key: &str) -> Option<Vec<u8>> {
-        self.inner.get(key).map(|v| v.value().to_vec())
+    /// Get raw bytes value: one copy, into the ``bytes`` object handed to Python.
+    fn get_bytes<'py>(&self, py: Python<'py>, key: &str) -> Option<Bound<'py, PyBytes>> {
+        self.inner.get(key).map(|v| PyBytes::new(py, v.value()))
     }
 
     /// Delete a key. Returns True if it existed.
@@ -96,23 +114,23 @@ impl SharedState {
         self.inner.iter().map(|e| e.key().clone()).collect()
     }
 
-    /// Get all string values (keys with non-UTF-8 bytes are silently skipped).
-    fn values(&self) -> Vec<String> {
+    /// Get all string values; raises ``TypeError`` naming a key whose value isn't UTF-8.
+    fn values<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyString>>> {
         self.inner
             .iter()
-            .filter_map(|e| std::str::from_utf8(e.value()).ok().map(|s| s.to_string()))
+            .map(|e| text(py, e.key(), e.value()))
             .collect()
     }
 
-    /// Get all (key, value) pairs as a list of tuples.
-    fn items(&self) -> Vec<(String, String)> {
+    /// Get all (key, value) pairs as a list of tuples; raises ``TypeError`` naming a key
+    /// whose value isn't UTF-8.
+    fn items<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Vec<(Bound<'py, PyString>, Bound<'py, PyString>)>> {
         self.inner
             .iter()
-            .filter_map(|e| {
-                std::str::from_utf8(e.value())
-                    .ok()
-                    .map(|v| (e.key().clone(), v.to_string()))
-            })
+            .map(|e| Ok((PyString::new(py, e.key()), text(py, e.key(), e.value())?)))
             .collect()
     }
 
@@ -121,17 +139,10 @@ impl SharedState {
         self.inner.len()
     }
 
-    /// Check if key exists.
-    ///
-    /// Mirrors `__getitem__`: a key only counts as "in" the state if its
-    /// value is valid UTF-8, since `__getitem__` raises KeyError otherwise.
-    /// This preserves the dict invariant that `key in state` implies
-    /// `state[key]` succeeds. Use `get_bytes` for raw non-UTF-8 access.
+    /// Whether the key exists, whatever its value (a non-UTF-8 one reads as a `TypeError`,
+    /// not as absent).
     fn __contains__(&self, key: &str) -> bool {
-        self.inner
-            .get(key)
-            .map(|v| std::str::from_utf8(v.value()).is_ok())
-            .unwrap_or(false)
+        self.inner.contains_key(key)
     }
 
     /// dict-like: state["key"] = "value"
@@ -139,23 +150,12 @@ impl SharedState {
         self.set(key, value);
     }
 
-    /// dict-like: state["key"]
-    ///
-    /// Raises `KeyError` only when the key is genuinely absent. When the key
-    /// exists but holds non-UTF-8 bytes (e.g. via `set_bytes`) this raises
-    /// `TypeError` instead — masking it as `KeyError` would contradict
-    /// `__contains__` (which returns True) and hide the fact that the value
-    /// is present but not decodable as a string. Use `get_bytes` for raw access.
-    fn __getitem__(&self, key: &str) -> PyResult<String> {
+    /// dict-like: state["key"]. `KeyError` only when the key is absent; a non-UTF-8 value
+    /// raises `TypeError`, as every text read does.
+    fn __getitem__<'py>(&self, py: Python<'py>, key: &str) -> PyResult<Bound<'py, PyString>> {
         match self.inner.get(key) {
             None => Err(pyo3::exceptions::PyKeyError::new_err(key.to_string())),
-            Some(v) => std::str::from_utf8(v.value())
-                .map(|s| s.to_string())
-                .map_err(|_| {
-                    pyo3::exceptions::PyTypeError::new_err(format!(
-                        "state[{key:?}]: value is not valid UTF-8; use get_bytes() for raw access"
-                    ))
-                }),
+            Some(v) => text(py, key, v.value()),
         }
     }
 
@@ -170,10 +170,8 @@ impl SharedState {
 
     /// Atomic increment: returns the new value. Creates key with `amount` if missing.
     ///
-    /// If the existing value is not a valid UTF-8 integer this raises a
-    /// TypeError instead of silently resetting to 0 — overwriting opaque
-    /// bytes (e.g. a JSON blob someone stored with the same key) is a
-    /// trap that can corrupt application state irrecoverably.
+    /// An existing value that is not a UTF-8 integer raises `TypeError` rather than being
+    /// reset: it may be someone else's data under the same key.
     fn incr(&self, key: String, amount: i64) -> PyResult<i64> {
         let mut entry = self
             .inner

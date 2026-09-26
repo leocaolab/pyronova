@@ -10,6 +10,8 @@ import sys
 import os
 import signal
 
+from tests._helpers import bound_port, read_file
+
 SERVER_SCRIPT = """
 from pyronova import PyronovaApp
 
@@ -27,7 +29,7 @@ app.get("/slow", slow)
 app.get("/fast", fast)
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=9876, mode="async")
+    app.run(host="127.0.0.1", port=0, mode="subinterp")
 """
 
 
@@ -41,15 +43,18 @@ def test_async_isolation():
         f.write(SERVER_SCRIPT)
 
     # Start server
-    proc = subprocess.Popen(
-        [sys.executable, script_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        preexec_fn=os.setsid,
-    )
+    log_path = script_path + ".log"
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(
+            [sys.executable, script_path],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
     time.sleep(3)  # Wait for startup
 
     try:
+        base = f"http://127.0.0.1:{bound_port(read_file(log_path), proc)}"
         # Fire slow request in background (blocks for 1s)
         import threading
 
@@ -57,7 +62,7 @@ def test_async_isolation():
 
         def call_slow():
             try:
-                resp = urllib.request.urlopen("http://127.0.0.1:9876/slow", timeout=5)
+                resp = urllib.request.urlopen(base + "/slow", timeout=5)
                 slow_result["body"] = resp.read().decode()
                 slow_result["status"] = resp.status
             except Exception as e:
@@ -71,7 +76,7 @@ def test_async_isolation():
 
         # Now call fast route — should return instantly, not wait for slow
         t0 = time.perf_counter()
-        fast_resp = urllib.request.urlopen("http://127.0.0.1:9876/fast", timeout=2)
+        fast_resp = urllib.request.urlopen(base + "/fast", timeout=2)
         fast_body = fast_resp.read().decode()
         fast_time = time.perf_counter() - t0
 

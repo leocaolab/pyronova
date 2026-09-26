@@ -21,19 +21,25 @@ import urllib.error
 
 import pytest
 
+from tests._helpers import bound_port, read_file
 
-def start_server(script_path, port):
+
+def start_server(script_path):
+    """Starts the script (it binds port 0); returns the process and the bound port."""
     # Old pool 28s async-handler watchdog — no TPC equivalent, see
     # test_subinterp_timeout for the same rationale.
     env = dict(os.environ)
     env["PYRONOVA_TPC"] = "0"
-    proc = subprocess.Popen(
-        [sys.executable, script_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        preexec_fn=os.setsid,
-        env=env,
-    )
+    log_path = script_path + ".log"
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(
+            [sys.executable, script_path],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=env,
+        )
+    port = bound_port(read_file(log_path), proc)
     # Phase 1: wait for sync endpoint (confirms Rust accept loop is up).
     for _ in range(50):
         time.sleep(0.1)
@@ -42,12 +48,12 @@ def start_server(script_path, port):
             break
         except Exception:
             if proc.poll() is not None:
-                out = proc.stdout.read().decode(errors="replace")
+                out = read_file(log_path)()
                 raise RuntimeError(f"Server exited early:\n{out}")
     else:
-        # Stop it before reading: read() waits for EOF, which a live server never sends.
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        out = proc.communicate(timeout=10)[0].decode(errors="replace")
+        proc.wait(timeout=10)
+        out = read_file(log_path)()
         raise RuntimeError(f"Server failed to start:\n{out}")
     # Phase 2: wait for async workers (_async_engine.py init: asyncio event
     # loop + sub-interpreter bootstrap). Workers start lazily; on this hardware
@@ -59,7 +65,7 @@ def start_server(script_path, port):
         pass  # non-200 still means the worker responded
     except Exception:
         pass  # timed out — test will handle it
-    return proc
+    return proc, port
 
 
 def stop_server(proc, port):
@@ -99,7 +105,7 @@ async def fast_async(req):
     return {"fast": True}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=19893, mode="subinterp")
+    app.run(host="127.0.0.1", port=0, mode="subinterp")
 '''
 
 
@@ -108,16 +114,16 @@ def server():
     script = "/tmp/pyronova_test_async_timeout.py"
     with open(script, "w") as f:
         f.write(ASYNC_TIMEOUT_SCRIPT)
-    proc = start_server(script, 19893)
-    yield proc
-    stop_server(proc, 19893)
+    proc, port = start_server(script)
+    yield port
+    stop_server(proc, port)
 
 
 def test_fast_async_succeeds(server):
     """Fast async handlers complete normally."""
     try:
         resp = urllib.request.urlopen(
-            "http://127.0.0.1:19893/fast-async", timeout=10
+            f"http://127.0.0.1:{server}/fast-async", timeout=10
         )
         status = resp.status
         body = json.loads(resp.read())
@@ -132,7 +138,7 @@ def test_slow_async_times_out(server):
     """Async handler exceeding 28s Python timeout returns 504."""
     try:
         resp = urllib.request.urlopen(
-            "http://127.0.0.1:19893/slow-async", timeout=35
+            f"http://127.0.0.1:{server}/slow-async", timeout=35
         )
         status = resp.status
         body = resp.read()
@@ -146,7 +152,7 @@ def test_server_healthy_after_async_timeout(server):
     """After async timeout, server still handles requests normally."""
     try:
         resp = urllib.request.urlopen(
-            "http://127.0.0.1:19893/", timeout=5
+            f"http://127.0.0.1:{server}/", timeout=5
         )
         status = resp.status
         body = json.loads(resp.read())

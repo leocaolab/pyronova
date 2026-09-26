@@ -15,30 +15,35 @@ import json
 import urllib.request
 import urllib.error
 
+from tests._helpers import bound_port, read_file
+
 PYTHON = sys.executable
-PORT = 19886
 PASS = 0
 FAIL = 0
 
 
-def start_server(script_path, port=PORT):
-    proc = subprocess.Popen(
-        [PYTHON, script_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        preexec_fn=os.setsid,
-    )
+def start_server(script_path):
+    """Starts the script (it binds port 0); returns the process and the bound port."""
+    log_path = script_path + ".log"
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(
+            [PYTHON, script_path],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    port = bound_port(read_file(log_path), proc)
     for _ in range(50):
         time.sleep(0.1)
         try:
             urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=1)
-            return proc
+            return proc, port
         except Exception:
             pass
-    return proc
+    return proc, port
 
 
-def stop_server(proc, port=PORT):
+def stop_server(proc, port):
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
     except ProcessLookupError:
@@ -170,7 +175,7 @@ def echo_body(req):
     return req.json()
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port={PORT}, mode="subinterp")
+    app.run(host="127.0.0.1", port=0, mode="subinterp")
 '''
 
 
@@ -185,45 +190,45 @@ def main():
     with open(script, "w") as f:
         f.write(SUBINTERP_SERVER)
 
-    proc = start_server(script)
+    proc, port = start_server(script)
     try:
         print("\n  --- PATH PARAMS ---")
 
         # Single path param
-        status, body, _ = http_get(PORT, "/user/42")
+        status, body, _ = http_get(port, "/user/42")
         check("Single path param", json.loads(body).get("user_id") == "42")
 
         # Nested path params
-        status, body, _ = http_get(PORT, "/user/7/post/99")
+        status, body, _ = http_get(port, "/user/7/post/99")
         data = json.loads(body)
         check("Nested path params", data.get("user_id") == "7" and data.get("post_id") == "99")
 
         # Path param with special characters (matchit preserves URL encoding)
-        status, body, _ = http_get(PORT, "/user/hello%20world")
+        status, body, _ = http_get(port, "/user/hello%20world")
         uid = json.loads(body).get("user_id", "")
         check("URL-encoded path param", uid == "hello%20world" or uid == "hello world")
 
         # Path param + query param combo
-        status, body, _ = http_get(PORT, "/query-and-params/alice?q=search")
+        status, body, _ = http_get(port, "/query-and-params/alice?q=search")
         data = json.loads(body)
         check("Path + query params", data.get("name") == "alice" and data.get("q") == "search")
 
         print("\n  --- CLIENT IP ---")
 
         # client_ip on GET
-        status, body, _ = http_get(PORT, "/ip")
+        status, body, _ = http_get(port, "/ip")
         data = json.loads(body)
         check("client_ip on GET", data.get("client_ip") in ("127.0.0.1", "::1"))
 
         # client_ip on POST
-        status, body, _ = http_post(PORT, "/ip-post",
+        status, body, _ = http_post(port, "/ip-post",
                                      body='{"test":1}',
                                      headers={"Content-Type": "application/json"})
         data = json.loads(body)
         check("client_ip on POST", data.get("client_ip") in ("127.0.0.1", "::1"))
 
         # client_ip coexists with path + query params
-        status, body, _ = http_get(PORT, "/query-and-params/bob?q=hello")
+        status, body, _ = http_get(port, "/query-and-params/bob?q=hello")
         data = json.loads(body)
         check("client_ip with params",
               data.get("client_ip") in ("127.0.0.1", "::1")
@@ -231,7 +236,7 @@ def main():
               and data.get("q") == "hello")
 
         # All request fields populated
-        status, body, _ = http_get(PORT, "/all-fields?foo=bar")
+        status, body, _ = http_get(port, "/all-fields?foo=bar")
         data = json.loads(body)
         check("All request fields",
               data.get("method") == "GET"
@@ -243,7 +248,7 @@ def main():
         print("\n  --- LIFECYCLE HOOKS ---")
 
         # Startup hooks ran before first request
-        status, body, _ = http_get(PORT, "/startup-check")
+        status, body, _ = http_get(port, "/startup-check")
         data = json.loads(body)
         check("Startup hook ran", data.get("started") == "true")
         check("Multiple startup hooks", data.get("startup_count") == "2")
@@ -251,20 +256,20 @@ def main():
         print("\n  --- BODY HANDLING ---")
 
         # JSON body parsing
-        status, body, _ = http_post(PORT, "/echo-body",
+        status, body, _ = http_post(port, "/echo-body",
                                      body='{"key":"value","num":42}',
                                      headers={"Content-Type": "application/json"})
         data = json.loads(body)
         check("JSON body echo", data.get("key") == "value" and data.get("num") == 42)
 
         # Empty body
-        status, body, _ = http_post(PORT, "/echo-body",
+        status, body, _ = http_post(port, "/echo-body",
                                      body='{}',
                                      headers={"Content-Type": "application/json"})
         check("Empty JSON body", json.loads(body) == {})
 
     finally:
-        stop_server(proc)
+        stop_server(proc, port)
 
     print(f"\n{'=' * 60}")
     print(f"  Results: {PASS} passed, {FAIL} failed")

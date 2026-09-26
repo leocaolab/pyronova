@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=1.0,<2.0"]
+requires = ["maturin>=1.9.4,<2.0"]
 build-backend = "maturin"
 
 [project]
@@ -26,18 +26,20 @@ test = [
     "pytest>=8",
     "pytest-asyncio>=1",
     "httpx",
+    "h2",
     "websockets",
     "pydantic",
     "numpy",
     "msgpack",
     "pydantic-settings>=2",
+    "watchfiles",
+    "hypothesis",
 ]
 
 [project.scripts]
 pyronova = "pyronova.cli:main"
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
 python-source = "python"
 module-name = "pyronova.engine"
 

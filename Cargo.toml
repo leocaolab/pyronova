@@ -1,6 +1,6 @@
 [package]
 name = "pyronova-engine"
-version = "2.9.0"
+version = "2.10.0"
 edition = "2021"
 
 [lib]
@@ -8,29 +8,49 @@ name = "pyronova_engine"
 crate-type = ["cdylib"]
 
 [features]
-# Opt-in diagnostics for PyObject lifecycle leaks. Samples each
-# PyObjRef drop as a `metrics::counter!` call — under the hood that's
-# a lock-free atomic increment (the `metrics` crate compiles down to
-# one `lock xadd` per bump once the recorder's registered), so the
-# hot-path cost is a few nanoseconds per drop even at 400k req/s.
+# Opt-in diagnostics for sub-interpreter leaks: a worker samples the reference count of
+# each request's `Request` as it lets go of it into a `metrics` counter (one atomic
+# increment per sample once the recorder is registered).
 #
 # Build with:
 #   maturin develop --release --features leak_detect
 # Snapshot the histogram from Python (handler or shutdown) via
 #   pyronova.engine.leak_detect_dump()
-# See docs/memory-leak-investigation-2026-04-19.md for how we used
-# this to pin down the sub-interpreter finalizer bug.
+# See docs/memory-leak-investigation-2026-04-19.md for how it pinned down the
+# sub-interpreter finalizer bug.
 leak_detect = ["dep:metrics", "dep:metrics-util"]
 
+# In-process throughput harnesses: `PyronovaApp.bench_inmem` (virtual
+# connections, no TCP) and `PyronovaApp.bench_loopback` (real TCP, client in
+# the same process). Not compiled into the default build.
+#
+# Build with:
+#   maturin develop --release --features bench
+# then run the scripts in benchmarks/ (bench_inmem*.py, bench_loopback*.py).
+bench = ["dep:httparse"]
+
+# Test-only fault injection: `pyronova.engine._fault_panic(message)` panics in Rust, so a
+# handler that calls it drives a real panic through the dispatch path that runs it (bridge,
+# pool worker, TPC inline, GIL). Compiled out of every other build: a production wheel has
+# no way to reach it.
+#
+# Build with:
+#   maturin develop --release --features fault_injection
+# then run `pytest tests/test_review_ra.py -k panic`.
+fault_injection = []
+
 [dependencies]
-pyo3 = { version = "0.29", features = ["extension-module"] }
+# No `extension-module` feature (deprecated in PyO3 0.26+): maturin (>= 1.9.4, pinned in
+# pyproject.toml) sets PYO3_BUILD_EXTENSION_MODULE when it builds the wheel, which leaves
+# libpython unlinked there; a plain `cargo test` links libpython, so the unit-test binary
+# links on macOS as on Linux.
+pyo3 = "0.29"
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
 http-body-util = "0.1"
 bytes = "1"
 matchit = "0.8"
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 parking_lot = "0.12"
 form_urlencoded = "1"
@@ -50,6 +70,7 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 socket2 = { version = "0.5", features = ["all"] }
 libc = "0.2"
+thiserror = "2"
 core_affinity = "0.8"
 pythonize = "0.29"
 flate2 = "1"
@@ -58,8 +79,6 @@ tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "logging", "tls12"] }
 rustls-pemfile = "2"
 pin-project-lite = "0.2"
-itoa = "1"
-ryu = "1"
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio-rustls",
     "postgres",
@@ -70,6 +89,13 @@ sqlx = { version = "0.8", default-features = false, features = [
 # Optional — pulled in only by the `leak_detect` feature.
 metrics = { version = "0.24", optional = true }
 metrics-util = { version = "0.19", features = ["debugging"], optional = true }
+
+# Optional — pulled in only by the `bench` feature (the bench client parses response heads).
+httparse = { version = "1", optional = true }
+
+[dev-dependencies]
+proptest = "1"
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 lto = "fat"            # Cross-crate inlining: LLVM optimizes across hyper/tokio/pyo3 boundaries

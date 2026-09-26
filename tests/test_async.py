@@ -26,4 +26,4 @@ async def async_json(req):
 if __name__ == "__main__":
     import sys
     mode = sys.argv[1] if len(sys.argv) > 1 else "default"
-    app.run(host="127.0.0.1", port=8000, mode=mode)
+    app.run(host="127.0.0.1", port=0, mode=mode)

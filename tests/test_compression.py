@@ -11,48 +11,16 @@ import urllib.request
 
 import pytest
 
-from pyronova import Pyronova, Response
+from pyronova import Pyronova
 from pyronova.testing import TestClient
 
-
-LARGE_JSON = {"items": ["hello world" for _ in range(200)]}  # ~2.5 KB
-LARGE_TEXT = "abcdefghijklmnopqrstuvwxyz" * 200  # ~5 KB
+from tests.apps.compression_routes import LARGE_JSON, add_routes
 
 
-def _build_app() -> Pyronova:
-    app = Pyronova()
-
-    # TestClient readiness probe hits "/"; 404 would loop forever.
-    @app.get("/")
-    def root(req):
-        return {"ready": True}
-
-    @app.get("/small")
-    def small(req):
-        return {"ok": True}
-
-    @app.get("/big-json")
-    def big_json(req):
-        return LARGE_JSON
-
-    @app.get("/big-text")
-    def big_text(req):
-        return Response(LARGE_TEXT, content_type="text/plain; charset=utf-8")
-
-    @app.get("/big-binary")
-    def big_binary(req):
-        return Response(bytes([0] * 4096), content_type="image/png")
-
-    @app.get("/preset-encoding")
-    def preset_encoding(req):
-        # Handler already set Content-Encoding — framework must not re-compress
-        return Response(
-            LARGE_TEXT,
-            content_type="text/plain; charset=utf-8",
-            headers={"Content-Encoding": "identity"},
-        )
-
-    return app
+# Module level: TestClient serves it through sub-interpreter workers, which rebuild
+# it by executing this module.
+app = Pyronova()
+add_routes(app)
 
 
 def _raw_request(base_url: str, path: str, accept_encoding: str | None):
@@ -75,7 +43,7 @@ def _raw_request(base_url: str, path: str, accept_encoding: str | None):
 def default_client():
     # No enable_compression() call — framework must behave identically to
     # pre-compression build.
-    with TestClient(_build_app(), port=None) as client:
+    with TestClient(app, port=None) as client:
         yield client
 
 
@@ -96,9 +64,11 @@ def test_disabled_by_default_no_content_encoding(default_client):
 
 @pytest.fixture(scope="module")
 def compressed_client():
-    app = _build_app()
-    app.enable_compression(min_size=256)
-    with TestClient(app, port=None) as client:
+    # Its own module (a worker serves one app per module), imported here because
+    # compression settings are process-wide.
+    from tests.apps.compression_enabled import app as compressed_app
+
+    with TestClient(compressed_app, port=None) as client:
         yield client
 
 

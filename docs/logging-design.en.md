@@ -96,7 +96,13 @@ app = Pyronova(log_config={"level": "OFF"})
 # 5. enable_logging() — activates access log + Python hook output
 app = Pyronova()
 app.enable_logging()       # upgrades level to INFO, enables access_log
+app.enable_logging(level="warn")  # the explicit level wins over log_config / debug=True
 ```
+
+`enable_logging(level=...)` is the one writer of an explicit level: it replaces whatever
+`log_config` or `debug=True` set, and a later call without a level (`PYRONOVA_LOG=1` or
+`debug=True` at `run()`) keeps it. Without a level, `enable_logging()` keeps the configured
+level, raised to INFO when it is ERROR or OFF (the access lines are INFO).
 
 ### Environment Variables
 
@@ -115,32 +121,21 @@ Python's default `logging.StreamHandler` does synchronous `write()` to stderr wh
 
 ### Solution
 
-Pyronova hijacks Python's root logger in both the main interpreter and every sub-interpreter:
+Pyronova routes Python's root logger to Rust in the main interpreter and in every
+sub-interpreter, with one handler class, `RustLogHandler` (`python/pyronova/_log_bridge.py`).
+The main interpreter imports it (`app.py`); a worker's bootstrap runs the same source before
+the package can be imported, tagged with the worker's id:
 
-**Main interpreter** (`app.py`):
 ```python
-class PyronovaRustHandler(logging.Handler):
+class RustLogHandler(logging.Handler):
     def emit(self, record):
-        emit_python_log(           # PyO3 FFI → Rust
-            level=record.levelname,
-            name=record.name,
-            message=record.getMessage(),
-            pathname=record.pathname,
-            lineno=record.lineno,
-        )
-```
-
-**Sub-interpreters** (`_bootstrap.py`):
-```python
-class _PyronovaRustHandler(logging.Handler):
-    def emit(self, record):
-        _emit_python_log(              # pyronova.engine.emit_python_log, the same function main uses
-            record.levelname,
+        self._sink(                    # pyronova.engine.emit_python_log
+            record.levelno,
             record.name,
-            record.getMessage(),
+            msg,                       # getMessage(), plus the traceback of logger.exception
             record.pathname or "",
             record.lineno or 0,
-            self._worker_id,
+            self._worker_id,           # None on the main interpreter
         )
 ```
 
@@ -167,7 +162,6 @@ class _PyronovaRustHandler(logging.Handler):
 | `src/lib.rs` | Registered `logging` module + functions |
 | `src/app.rs` | Startup/shutdown → `tracing::info!`, conn errors → `tracing::warn!` |
 | `src/handlers.rs` | Access log with `latency_us`, `method`, `path`, `status`, `mode` |
-| `src/interp.rs` | *(historical)* `pyronova_emit_log_cfunc` C-FFI for sub-interpreters — removed in Layer 2; workers now import the real engine and call `emit_python_log` |
 | `src/monitor.rs` | GIL watchdog → `tracing::warn!` |
 | `src/websocket.rs` | WS errors → `tracing::error!`/`tracing::warn!` |
 
@@ -179,7 +173,9 @@ class _PyronovaRustHandler(logging.Handler):
 
 3. **Same function in every interpreter** — Sub-interpreter workers import the real `pyronova.engine` (the PyO3 fork makes the module per-interpreter; Layer 2), so the worker's logging handler calls `pyronova.engine.emit_python_log` with its worker id. *Earlier versions* registered a C-FFI built-in `_pyronova_emit_log` instead, because the engine could not then be imported in a sub-interpreter.
 
-4. **Deferred `init_logger` to `run()`** — Allows `enable_logging()` to modify log config before the tracing subscriber is locked in. `tracing-subscriber` only allows one initialization per process.
+4. **Deferred `init_logger` to `run()`; later calls reconfigure** — Allows `enable_logging()` to modify log config before `run()`. `tracing-subscriber` allows one global subscriber per process, so the first `init_logger` installs it with its filter and format layer behind `reload` handles, and a later call (another app in the same process) swaps in its own level, access-log switch and format. An unknown level or format raises `ValueError`; a foreign subscriber already holding the global slot raises `RuntimeError`.
+
+6. **Python levels map by number** — `emit_python_log` takes the record's `levelno` and maps it to the highest standard threshold it reaches (≥40 ERROR, ≥30 WARN, ≥20 INFO, ≥10 DEBUG, else TRACE), so custom levels such as `logging.addLevelName(25, "NOTICE")` log at INFO.
 
 5. **`println!` retained for startup banner** — The human-readable startup banner (`Pyronova v1.2.0 [hybrid mode]...`) is kept as `println!` alongside `tracing::info!` because it's always-visible DX, not filterable log output.
 
@@ -191,7 +187,7 @@ class _PyronovaRustHandler(logging.Handler):
 
 | Test | What it verifies |
 |---|---|
-| `test_gil_mode_logging` | Python hook output (`[INFO ] GET / → 200`) in GIL mode |
+| `test_gil_mode_logging` | `pyronova::access` line in GIL mode (the Rust access log is the only request log) |
 | `test_subinterp_rust_logging` | Rust tracing access log in subinterp mode |
 | `test_user_print_in_subinterp` | `print()` works in sub-interpreter handlers |
 | `test_user_logging_in_subinterp` | Python `logging.info()` bridges to Rust tracing |

@@ -9,20 +9,21 @@ Usage::
         form = parse_multipart(req)
         f = form["file"]
         return {"filename": f.filename, "size": len(f.data)}
+
+``UploadFile.filename`` is what the client sent, decoded but otherwise as is: it
+may hold ``../``, an absolute path, a drive letter, control characters or be
+empty. Never join it into a filesystem path; name stored files yourself (a
+UUID, a content hash) and keep the client's name only as data.
 """
 
 from __future__ import annotations
 from dataclasses import dataclass
+from urllib.parse import unquote_to_bytes
 
 
 def _split_header_params(value: str) -> list[str]:
-    """Split a header on top-level ``;`` separators, treating semicolons
-    inside a quoted-string as literal.
-
-    A naive ``value.split(";")`` corrupts any parameter whose quoted value
-    contains a semicolon, e.g. ``filename="report;2024.csv"`` (arc finding
-    uploads-71). RFC 2045 quoted-strings are honoured here.
-    """
+    """Split a header on top-level ``;`` separators; a ``;`` inside an RFC 2045
+    quoted-string (``filename="report;2024.csv"``) is literal."""
     parts: list[str] = []
     buf: list[str] = []
     in_quotes = False
@@ -51,7 +52,7 @@ def _split_header_params(value: str) -> list[str]:
 
 def _unquote_param(value: str) -> str:
     """Strip surrounding DQUOTEs and unescape ``\\"`` / ``\\\\`` per RFC 2045
-    quoted-string rules (arc finding uploads-73)."""
+    quoted-string rules."""
     value = value.strip()
     if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
         inner = value[1:-1]
@@ -76,27 +77,16 @@ def _unquote_param(value: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class UploadFile:
-    """A single uploaded file or form field.
-
-    Frozen because this is a DTO handed from the framework to user code.
-    A request's parsed `UploadFile` objects share memory with the raw
-    multipart buffer; letting a handler mutate `data` in place would
-    corrupt replay logging, after_request hooks, and any async task
-    still holding a reference. Immutable + slots is free and correct.
-    """
+    """A single uploaded file or form field."""
     name: str
+    # Client-controlled: see the module docstring before using it in a path.
     filename: str | None
     content_type: str
     data: bytes
 
     @property
     def text(self) -> str:
-        # Uploaded bytes are arbitrary user content — may not be valid
-        # UTF-8 (binary files, mojibake, partial buffers). Use `replace`
-        # so calling .text on a binary upload yields a lossy string
-        # instead of crashing the request with UnicodeDecodeError
-        # (arc finding uploads-1). Callers who need strict decoding
-        # should work with .data directly.
+        # Lossy on purpose: an upload may be any bytes. Strict decoding: use `.data`.
         return self.data.decode("utf-8", errors="replace")
 
     @property
@@ -104,128 +94,151 @@ class UploadFile:
         return len(self.data)
 
 
+# Longest run of transport padding (spaces/tabs) read after a delimiter when
+# telling CRLF from LF framing.
+_MAX_PADDING = 64
+
+
+class MultipartError(ValueError):
+    """The request body is not well-formed multipart/form-data."""
+
+
 def parse_multipart(req) -> "dict[str, UploadFile | list[UploadFile]]":
     """Parse multipart/form-data from request.
 
-    Returns dict mapping field name → UploadFile.
-    For file fields, filename and content_type are set.
-    For text fields, filename is None.
+    Returns a dict of field name → ``UploadFile``, or a list of them when the field
+    appears more than once. A text field's ``filename`` is None.
+
+    Raises MultipartError when the body is not well-formed multipart/form-data.
     """
-    ct = req.headers.get("content-type", "")
-    if "multipart/form-data" not in ct:
-        raise ValueError(f"Expected multipart/form-data, got: {ct}")
-
-    # Extract boundary. RFC 2045: Content-Type parameter names are
-    # case-insensitive — `BOUNDARY=` and `boundary=` are equivalent.
-    # Matching only lowercase rejects valid uppercase clients (arc
-    # finding uploads-3). Compare against the lowercased token.
-    boundary = None
-    for part in ct.split(";"):
-        part = part.strip()
-        lowered = part.lower()
-        if lowered.startswith("boundary="):
-            # Slice from the original `part` so casing in the value
-            # itself (boundaries are case-sensitive) is preserved.
-            # Use the RFC 2045 quoted-string unquoter (not a naive
-            # `.strip('"')`, which corrupts values that begin or end
-            # with a quote char) for consistency with the
-            # Content-Disposition param parsing below.
-            boundary = _unquote_param(part[len("boundary="):])
-            break
-
-    if not boundary:
-        raise ValueError("Missing boundary in Content-Type")
-
+    boundary = _boundary(req.headers.get("content-type", ""))
     raw = req.body
     if raw is None:
-        raise ValueError("parse_multipart: request body is empty")
+        raise MultipartError("request body is empty")
     body = raw if isinstance(raw, bytes) else raw.encode()
 
-    # RFC 2046: boundary markers MUST be line-anchored (preceded by
-    # CRLF). Splitting on the raw `--{boundary}` token false-splits
-    # when file content contains those bytes mid-stream — a
-    # data-corruption bug for any upload whose content happens to
-    # include the boundary sequence (CRITICAL, arc finding
-    # python-pyronova-uploads-2).
-    #
-    # Fix: prepend \r\n to the body so the very first boundary
-    # (which has no leading CRLF when the body starts directly
-    # with `--boundary`) is uniformly anchored, then split on
-    # \r\n--{boundary}. LF-only framing falls back to \n--{boundary}
-    # — matches the \n\n header-separator fallback below for
-    # clients/proxies that strip CRLF.
-    crlf_anchor = ("\r\n--" + boundary).encode()
-    lf_anchor = ("\n--" + boundary).encode()
-    if crlf_anchor in body:
-        parts = (b"\r\n" + body).split(crlf_anchor)
-    elif lf_anchor in body:
-        parts = (b"\n" + body).split(lf_anchor)
-    else:
-        # No line-anchored boundary marker found — body is malformed
-        # or degenerate. Return empty parts rather than the pre-fix
-        # behavior of splitting on raw `--{boundary}` (which produced
-        # subtly-wrong data instead of an empty result).
-        parts = []
-    result = {}
-
-    for part in parts:
-        if not part or part.strip() == b"--" or part.strip() == b"":
-            continue
-
-        # Split headers from body (separated by \r\n\r\n)
-        if b"\r\n\r\n" in part:
-            header_section, file_data = part.split(b"\r\n\r\n", 1)
-        elif b"\n\n" in part:
-            header_section, file_data = part.split(b"\n\n", 1)
+    nl = _line_break(body, boundary)
+    result: dict[str, UploadFile | list[UploadFile]] = {}
+    for upload in (_parse_part(part, nl) for part in _split_parts(body, boundary, nl)):
+        existing = result.get(upload.name)
+        if existing is None:
+            result[upload.name] = upload
+        elif isinstance(existing, list):
+            existing.append(upload)
         else:
-            continue
-
-        # Strip trailing \r\n
-        if file_data.endswith(b"\r\n"):
-            file_data = file_data[:-2]
-        elif file_data.endswith(b"\n"):
-            file_data = file_data[:-1]
-
-        # Parse headers
-        headers = {}
-        for line in header_section.decode("utf-8", errors="replace").split("\n"):
-            line = line.strip()
-            if ":" in line:
-                key, _, val = line.partition(":")
-                headers[key.strip().lower()] = val.strip()
-
-        # Parse Content-Disposition
-        disposition = headers.get("content-disposition", "")
-        field_name = None
-        filename = None
-
-        # RFC 2045 §5.1: parameter names are case-insensitive (NAME=,
-        # FileName= are valid), and quoted values may contain semicolons
-        # and escaped quotes. Use the quote-aware splitter + case-insensitive
-        # name match (arc findings uploads-70/71/73).
-        for param in _split_header_params(disposition):
-            param = param.strip()
-            lowered = param.lower()
-            if lowered.startswith("name="):
-                field_name = _unquote_param(param[5:])
-            elif lowered.startswith("filename="):
-                filename = _unquote_param(param[9:])
-
-        if field_name:
-            content_type = headers.get("content-type", "application/octet-stream" if filename else "text/plain")
-            upload = UploadFile(
-                name=field_name,
-                filename=filename,
-                content_type=content_type,
-                data=file_data,
-            )
-            if field_name in result:
-                existing = result[field_name]
-                if isinstance(existing, list):
-                    existing.append(upload)
-                else:
-                    result[field_name] = [existing, upload]
-            else:
-                result[field_name] = upload
-
+            result[upload.name] = [existing, upload]
     return result
+
+
+def _boundary(content_type: str) -> str:
+    media_type, *params = _split_header_params(content_type)
+    # RFC 9110 §8.3.1: the type, subtype and parameter names are case-insensitive; the
+    # boundary value is not. A quoted boundary may contain ";".
+    if media_type.strip().lower() != "multipart/form-data":
+        raise MultipartError(f"Expected multipart/form-data, got: {content_type}")
+    boundary = _header_params(params).get("boundary")
+    if not boundary:
+        raise MultipartError(f"Missing boundary in Content-Type: {content_type}")
+    return boundary
+
+
+def _header_params(params: list[str]) -> dict[str, str]:
+    """``name=value`` header parameters by lowercased name, values unquoted."""
+    out: dict[str, str] = {}
+    for param in params:
+        name, eq, value = param.partition("=")
+        if eq:
+            out[name.strip().lower()] = _unquote_param(value)
+    return out
+
+
+# RFC 8187 §3.2.1: recipients must support these two charsets.
+_EXT_VALUE_CHARSETS = {"utf-8": "utf-8", "iso-8859-1": "latin-1"}
+
+
+def _ext_value(value: str) -> str:
+    """An RFC 8187 (RFC 5987) ext-value, ``charset'language'pct-encoded``, decoded."""
+    charset, sep1, rest = value.partition("'")
+    _language, sep2, encoded = rest.partition("'")
+    codec = _EXT_VALUE_CHARSETS.get(charset.strip().lower())
+    if not (sep1 and sep2) or codec is None:
+        raise MultipartError(
+            f"filename*={value!r} is not charset'language'value with charset UTF-8 or "
+            "ISO-8859-1 (RFC 8187)"
+        )
+    try:
+        return unquote_to_bytes(encoded).decode(codec)
+    except UnicodeDecodeError as e:
+        raise MultipartError(f"filename*={value!r} is not valid {charset}: {e}") from None
+
+
+def _line_break(body: bytes, boundary: str) -> bytes:
+    """The line break the body is framed with, read off the first delimiter line:
+    CRLF per RFC 2046, or bare LF from clients/proxies that strip CR."""
+    dash = b"--" + boundary.encode()
+    start = body.find(dash)
+    if start == -1:
+        raise MultipartError(f"no delimiter line --{boundary} in the body")
+    line_end = body[start + len(dash):start + len(dash) + _MAX_PADDING].lstrip(b" \t")
+    return b"\r\n" if line_end.startswith(b"\r\n") else b"\n"
+
+
+def _split_parts(body: bytes, boundary: str, nl: bytes) -> list[bytes]:
+    """The content of every part, headers included.
+
+    RFC 2046 §5.1.1: a delimiter is ``CRLF--boundary``; the CRLF belongs to the
+    delimiter, not to the part before it, so a part's content ends right where
+    the delimiter begins. The body is prefixed with a line break so the first
+    delimiter (at the very start, with no line break before it) is anchored like
+    the rest.
+    """
+    segments = (nl + body).split(nl + b"--" + boundary.encode())
+    if len(segments) < 2:
+        raise MultipartError(f"no delimiter line --{boundary} in the body")
+
+    parts: list[bytes] = []
+    for segment in segments[1:]:  # segments[0] is the preamble
+        if segment.startswith(b"--"):
+            return parts
+        padding, sep, part = segment.partition(nl)
+        if not sep or padding.strip(b" \t"):
+            raise MultipartError(
+                f"delimiter --{boundary} is followed by {padding[:40]!r}, not a line break"
+            )
+        parts.append(part)
+    raise MultipartError(f"body ends without the closing delimiter --{boundary}--")
+
+
+def _parse_part(part: bytes, nl: bytes) -> UploadFile:
+    # A part with no header lines starts with the blank line itself.
+    header_section, sep, data = (
+        (b"", nl, part[len(nl):]) if part.startswith(nl) else part.partition(nl + nl)
+    )
+    if not sep:
+        raise MultipartError(f"part has no blank line after its headers: {part[:80]!r}")
+
+    headers = {}
+    for line in header_section.decode("utf-8", errors="replace").split("\n"):
+        key, colon, val = line.strip().partition(":")
+        if colon:
+            headers[key.strip().lower()] = val.strip()
+
+    # RFC 2045 §5.1: parameter names are case-insensitive (NAME=, FileName=),
+    # and quoted values may contain semicolons and escaped quotes. RFC 6266 §4.3:
+    # filename* (RFC 8187, non-ASCII names) wins over filename.
+    disposition = headers.get("content-disposition", "")
+    params = _header_params(_split_header_params(disposition)[1:])
+    field_name = params.get("name")
+    filename = _ext_value(params["filename*"]) if "filename*" in params else params.get("filename")
+    if not field_name:
+        raise MultipartError(
+            f"part has no field name in its Content-Disposition: {disposition!r}"
+        )
+
+    default_type = "application/octet-stream" if filename else "text/plain"
+    return UploadFile(
+        name=field_name,
+        filename=filename,
+        content_type=headers.get("content-type", default_type),
+        data=data,
+    )

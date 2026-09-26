@@ -44,24 +44,16 @@ def _load_pydantic_settings():
 
 
 _BaseSettings, _SettingsConfigDict = None, None
-# Cache the generated Settings class. PEP 562 module __getattr__ does NOT
-# memoize, so without this every `from pyronova.config import Settings`
-# minted a fresh class object — breaking `is` identity, isinstance/
-# issubclass, metaclass registration, and pickling across modules
-# (arc finding config-11). The lock makes the build-once check-then-set
-# atomic so concurrent first imports don't each run _load_pydantic_settings
-# or mint competing classes (arc finding config-12).
-_Settings = None  # cached Settings class — built exactly once
+_Settings = None
 _lock = threading.Lock()
 
 
 def _build_settings():
     """Build the Settings class once, under lock, and cache it.
 
-    Caching the class (rather than re-creating it on every attribute
-    access) preserves class identity so ``isinstance()`` checks and
-    class-level state behave correctly. The lock guards the
-    check-then-act on the module globals against concurrent callers.
+    PEP 562 ``__getattr__`` does not memoize: without the cache every import would
+    mint a new class, breaking ``isinstance``, class identity and pickling. The lock
+    keeps concurrent first imports from building two.
     """
     global _BaseSettings, _SettingsConfigDict, _Settings
     with _lock:

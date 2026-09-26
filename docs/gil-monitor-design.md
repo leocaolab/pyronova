@@ -183,23 +183,10 @@ let handler_us = t0.elapsed().as_micros() as u64;
 
 ### 场景 C：Rust 层 per-request 埋点
 
-在 `interp.rs` 的 `call_handler` 前后插入计时：
-
-```rust
-// 在 worker_thread_loop 中
-let t_gil_acquire = Instant::now();
-ffi::PyEval_RestoreThread(worker.tstate);
-let gil_wait_us = t_gil_acquire.elapsed().as_micros();
-
-let t_handler = Instant::now();
-let result = worker.call_handler(...);
-let handler_us = t_handler.elapsed().as_micros();
-
-worker.tstate = ffi::PyEval_SaveThread();
-let gil_hold_us = t_gil_acquire.elapsed().as_micros();
-
-// 汇总到 per-worker 统计
-```
+主解释器的每个请求在 `handlers.rs` 的 `call_handler_with_hooks` 里计时：进入
+`main_attach` 前后的差是 GIL 等待（`monitor::record_gil_wait`），handler 与 hooks 的执行时间
+是 GIL 持有（`GIL_HOLD_MAX_US`），排队线程数记在 `GIL_QUEUE_LENGTH`。子解释器 worker 各有
+自己的 GIL，不参与这组指标。
 
 ## 3. Metrics 端点设计
 
@@ -291,10 +278,10 @@ result = {
 | 阶段 | 内容 | 难度 | 文件 |
 |------|------|------|------|
 | **Stage 1** | 内存采样（psutil in runner.py） | 低 | `runner.py` |
-| **Stage 2** | per-request 耗时埋点（AtomicU64） | 低 | `interp.rs` |
+| **Stage 2** | per-request 耗时埋点（AtomicU64） | 低 | `handlers.rs`、`monitor.rs` |
 | **Stage 3** | GIL watchdog 探针线程 | 中 | `app.rs` 或新 `monitor.rs` |
 | **Stage 4** | `/__pyronova__/metrics` 端点 | 中 | `handlers.rs` |
-| **Stage 5** | Event loop lag 监控 | 与 Phase 7.2 合并 | `interp.rs` bootstrap |
+| **Stage 5** | Event loop lag 监控 | 与 Phase 7.2 合并 | `_async_engine.py` |
 
 ### 优先级
 
