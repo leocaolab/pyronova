@@ -60,7 +60,7 @@ def ws_server():
             [PYTHON, script],
             stdout=log,
             stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
+            start_new_session=True,
         )
     port = bound_port(read_file(log_path), proc)
     # Wait for server

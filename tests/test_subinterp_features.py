@@ -30,7 +30,7 @@ def start_server(script_path):
             [PYTHON, script_path],
             stdout=log,
             stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
+            start_new_session=True,
         )
     port = bound_port(read_file(log_path), proc)
     for _ in range(50):

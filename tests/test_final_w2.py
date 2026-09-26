@@ -100,7 +100,7 @@ class Server:
                 [PYTHON, self.script_path],
                 stdout=log,
                 stderr=subprocess.STDOUT,
-                preexec_fn=os.setsid,
+                start_new_session=True,
                 env=full_env,
             )
         if wait:
@@ -931,7 +931,7 @@ def test_lower_layers_do_not_import_the_handlers_layer():
         SRC / "error.rs",
         SRC / "body.rs",
         SRC / "request_head.rs",
-        SRC / "types.rs",
+        *sorted((SRC / "types").glob("*.rs")),
     ]
     offenders = [p.name for p in lower if "crate::handlers" in p.read_text()]
     assert offenders == [], offenders

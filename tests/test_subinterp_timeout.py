@@ -34,7 +34,7 @@ def start_server(script_path):
             [sys.executable, script_path],
             stdout=log,
             stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
+            start_new_session=True,
             env=env,
         )
     port = bound_port(read_file(log_path), proc)

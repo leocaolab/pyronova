@@ -44,7 +44,7 @@ def _start(script_path: str, log_path: str, extra_env: dict | None = None):
     log = open(log_path, "w")
     proc = subprocess.Popen(
         [sys.executable, script_path], stdout=log, stderr=subprocess.STDOUT,
-        env=env, cwd=HERE, preexec_fn=os.setsid,
+        env=env, cwd=HERE, start_new_session=True,
     )
     log.close()
     return proc

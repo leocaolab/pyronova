@@ -89,7 +89,7 @@ def _boot_server() -> tuple[subprocess.Popen, int]:
         proc = subprocess.Popen(
             [sys.executable, path],
             stdout=log, stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid, env=env,
+            start_new_session=True, env=env,
         )
     try:
         port = bound_port(read_file(log_path), proc, timeout=15)

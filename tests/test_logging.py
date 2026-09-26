@@ -35,7 +35,7 @@ def run_server_and_check(script: str, label: str, expected_strings: list[str]):
             [PYTHON, script_path],
             stdout=log,
             stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
+            start_new_session=True,
         )
     time.sleep(3)
 

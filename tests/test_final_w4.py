@@ -656,13 +656,16 @@ def test_shared_state_reads_return_str_and_bytes():
 
     state = SharedState()
     state["k"] = "välue"
+    assert dict(state.items())["k"] == "välue"
     state.set_bytes("raw", b"\xff\x00")
     assert state["k"] == "välue" and state.get("k") == "välue"
     assert state.get("nope", "dflt") == "dflt" and state.get("nope") is None
     assert state.get_bytes("raw") == b"\xff\x00" and state.get_bytes("nope") is None
-    assert dict(state.items())["k"] == "välue"
+    # A non-UTF-8 value fails every str read, the whole-map views included.
     with pytest.raises(TypeError, match="raw"):
         state["raw"]
+    with pytest.raises(TypeError, match="raw"):
+        state.items()
 
 
 def test_sse_event_lines_split_on_every_line_ending():

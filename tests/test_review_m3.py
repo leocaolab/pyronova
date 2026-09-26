@@ -86,7 +86,7 @@ class Server:
                 [PYTHON, self.script_path],
                 stdout=log,
                 stderr=subprocess.STDOUT,
-                preexec_fn=os.setsid,
+                start_new_session=True,
                 env=env,
             )
         deadline = time.time() + 20

@@ -51,7 +51,7 @@ class Server:
         with open(self.log_path, "w") as log:
             self.proc = subprocess.Popen(
                 cmd, stdout=log, stderr=subprocess.STDOUT, env=env,
-                cwd=str(tmp_path), preexec_fn=os.setsid,
+                cwd=str(tmp_path), start_new_session=True,
             )
 
     def log(self) -> str:

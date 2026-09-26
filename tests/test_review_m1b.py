@@ -40,7 +40,7 @@ class Server:
             self.proc = subprocess.Popen(
                 [sys.executable, str(self.script)],
                 stdout=log, stderr=subprocess.STDOUT,
-                preexec_fn=os.setsid, env=full_env,
+                start_new_session=True, env=full_env,
             )
         self.ready_path = ready_path
 

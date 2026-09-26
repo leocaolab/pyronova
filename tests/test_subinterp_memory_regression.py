@@ -189,7 +189,7 @@ def server():
             [sys.executable, script_path],
             stdout=log,
             stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
+            start_new_session=True,
             env=env,
         )
     try:

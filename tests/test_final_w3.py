@@ -74,7 +74,7 @@ class Server:
         with open(self.log_path, "w") as log:
             self.proc = subprocess.Popen(
                 [sys.executable, self.script_path], stdout=log, stderr=subprocess.STDOUT,
-                env=full_env, preexec_fn=os.setsid,
+                env=full_env, start_new_session=True,
             )
         self.base = None
         if wait:
