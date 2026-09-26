@@ -96,7 +96,51 @@ class Headers:
     def values(self) -> list[str]: ...
     def items(self) -> list[tuple[str, str]]: ...
 
+class BodyStream:
+    """A ``stream=True`` route's request body, read as it arrives (``req.stream``).
+
+    Iterating yields each chunk as ``bytes``, blocking until it arrives, and stops at the
+    body's end. A body the server rejects (larger than ``max_body_size``, too slow, a
+    failed read) raises ``BodyRejected``, and every later read raises it again. Two
+    threads reading one stream take chunks one at a time, in order.
+    """
+
+    def __iter__(self) -> BodyStream: ...
+    def __next__(self) -> bytes: ...
+    def read(self, n: Optional[int] = None) -> bytes:
+        """Reads whole chunks until at least ``n`` bytes, or to the end (all of it when
+        ``n`` is ``None``); ``b""`` at the end. Chunks are never split, so the result may
+        be longer than ``n``."""
+        ...
+    def drain_count(self) -> int:
+        """Reads the rest of the body without handing it to Python and returns its size
+        in bytes.
+
+        :raises BodyRejected: the server rejected the body.
+        :raises RuntimeError: the stream was already read to its end.
+        """
+        ...
+
 class Request:
+    """An HTTP request, as a handler and its hooks see it. Immutable."""
+
+    def __init__(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, str],
+        query: str,
+        body_bytes: bytes,
+        headers: dict[str, str],
+        client_ip: str,
+    ) -> None:
+        """Builds a request as the server does, with a fresh ``request_id``.
+
+        :raises ValueError: a method, path or query that is not valid in a request line,
+            a header that is not a valid field, or a ``client_ip`` that is not an IP
+            address.
+        """
+        ...
     method: str
     path: str
     params: dict[str, str]
@@ -110,13 +154,20 @@ class Request:
     """The request's correlation id: the client's own (``app.enable_request_id()``)
     or one the server minted. A 5xx body and the error's log line carry it."""
     body: bytes
+    """The whole body, copied into ``bytes``; ``memoryview(req)`` reads it in place."""
+    stream: Optional[BodyStream]
+    """The body as it arrives, on a ``stream=True`` route; ``None`` on any other. Taken
+    on first access: a second access in the same request raises ``RuntimeError``."""
     query_params: dict[str, str]
-    """Query parameters as Dict[str, str]. On duplicate keys, the FIRST
-    value wins (HTTP parameter pollution defense — aligns with common
-    WAF / reverse-proxy behavior). Use `query_params_all` for duplicates."""
-    query_params_all: dict[str, list[str]]
-    """Query parameters preserving all values per key. Use when the
-    handler legitimately accepts multiple occurrences of the same key."""
+    """Query parameters, a new dict on every access. On a duplicate key the FIRST value
+    wins (as most proxies and WAFs read it); ``query_params_all()`` keeps every value."""
+    def query_params_all(self) -> dict[str, list[str]]:
+        """Query parameters with every value of a repeated key, in order."""
+        ...
+    def query_param(self, key: str) -> Optional[str]:
+        """One query parameter (the first value of a repeated key), or ``None``."""
+        ...
+    def __buffer__(self, flags: int) -> memoryview: ...
     def text(self) -> str:
         """Decode the request body as UTF-8 text.
 
@@ -124,13 +175,10 @@ class Request:
         """
         ...
     def json(self) -> Any:
-        """Parse the request body as JSON.
+        """Parse the request body as JSON: an integer of any size stays an exact
+        ``int``, a float reads back as the value sent.
 
-        Raises ``ValueError`` if the body is not well-formed JSON. The
-        return is typed ``Any`` because the deserialized value depends on
-        the payload: a JSON object becomes a ``dict``, while a JSON
-        array/scalar body deserializes to the corresponding Python type
-        (``list``/``str``/``int``/...). Guard with try/except ``ValueError``.
+        :raises ValueError: the body is not well-formed JSON.
         """
         ...
 
@@ -205,6 +253,37 @@ class WebSocket:
         ...
     def close(self) -> None: ...
 
+class Stream:
+    """A streamed response body (e.g. server-sent events) a handler returns and then
+    writes to. Needs a ``gil=True`` route."""
+
+    status_code: int
+    content_type: str
+    headers: dict[str, str | list[str]]
+    def __init__(
+        self,
+        content_type: Optional[str] = None,
+        status_code: int = 200,
+        headers: Optional[dict[str, str | list[str]]] = None,
+    ) -> None:
+        """``content_type`` defaults to ``text/event-stream``; ``headers`` as for
+        ``Response``."""
+        ...
+    def send(self, data: str) -> None:
+        """Sends a raw chunk. Never blocks.
+
+        :raises BlockingIOError: the buffer is full (a slow client); retry after a pause.
+        :raises ConnectionError: the stream is closed.
+        """
+        ...
+    def send_event(self, data: str, event: Optional[str] = None, id: Optional[str] = None) -> None:
+        """Sends one SSE event: ``id:`` / ``event:`` lines if given, a ``data:`` line per
+        line of ``data``. ``ValueError`` for a line break in ``id`` or ``event``."""
+        ...
+    def close(self) -> None:
+        """Ends the response; a later ``send`` raises ``ConnectionError``."""
+        ...
+
 class SharedState:
     """Concurrent key-value store shared across all workers / sub-interpreters.
 
@@ -227,6 +306,9 @@ class SharedState:
       immediately after the snapshot is taken.
     """
 
+    def __init__(self) -> None:
+        """A new, empty map; in a sub-interpreter worker, the running app's map."""
+        ...
     def __getitem__(self, key: str) -> str:
         """``state[key]`` — raises ``KeyError`` if the key is absent
         (standard mapping semantics). Use ``get`` for a default instead.
@@ -243,10 +325,18 @@ class SharedState:
         """Whether the key exists, whatever its value."""
         ...
     def get(self, key: str, default: str | None = None) -> str | None: ...
+    def set(self, key: str, value: str) -> None: ...
+    def set_bytes(self, key: str, value: bytes) -> None: ...
+    def get_bytes(self, key: str) -> Optional[bytes]:
+        """The raw value, or ``None`` if the key is absent."""
+        ...
+    def delete(self, key: str) -> bool:
+        """Remove the key; whether it existed."""
+        ...
     def incr(self, key: str, amount: int) -> int:
-        """Atomically add ``amount`` and return the new value. Missing keys
-        start at 0. Raises ``TypeError`` if the stored value is not an
-        integer (it is never silently reset)."""
+        """Atomically add ``amount`` and return the new value; a missing key is created
+        with ``amount``. Raises ``TypeError`` if the stored value is not an integer (it is
+        never reset)."""
         ...
     def decr(self, key: str, amount: int) -> int:
         """Atomically subtract ``amount`` and return the new value."""
@@ -299,12 +389,33 @@ class Compression:
     def brotli_quality(self) -> int: ...
 
 class PyronovaApp:
+    """The engine app ``Pyronova`` wraps: routes, hooks, limits, and ``start``/``run``.
+
+    Route registration raises ``ValueError`` for a bad path, a duplicate route, or
+    ``stream=True`` without ``gil=True`` or on an ``async def`` handler (a streamed body
+    is fed only to a sync handler on the main interpreter); ``RegistrationSealed`` for a
+    route other than ``gil=True`` registered after the first server started.
+    """
+
     def __init__(self) -> None: ...
     def get(self, path: str, handler: Callable[..., Any], gil: bool = False) -> None: ...
-    def post(self, path: str, handler: Callable[..., Any], gil: bool = False) -> None: ...
-    def put(self, path: str, handler: Callable[..., Any], gil: bool = False) -> None: ...
+    def post(self, path: str, handler: Callable[..., Any], gil: bool = False, stream: bool = False) -> None: ...
+    def put(self, path: str, handler: Callable[..., Any], gil: bool = False, stream: bool = False) -> None: ...
     def delete(self, path: str, handler: Callable[..., Any], gil: bool = False) -> None: ...
-    def route(self, method: str, path: str, handler: Callable[..., Any], gil: bool = False) -> None: ...
+    def route(self, method: str, path: str, handler: Callable[..., Any], gil: bool = False, stream: bool = False) -> None: ...
+    def add_fast_response(
+        self,
+        method: str,
+        path: str,
+        body: bytes,
+        content_type: str = "text/plain",
+        status_code: int = 200,
+        headers: Optional[dict[str, str]] = None,
+    ) -> None:
+        """Serve a constant response for exactly ``(method, path)`` without entering
+        Python. ``ValueError`` for an invalid status or header, or a pair already
+        registered."""
+        ...
     def before_request(self, handler: Callable[..., Any]) -> None:
         """:raises RegistrationSealed: registered after the first server started."""
         ...
@@ -490,7 +601,6 @@ class PgCursor:
 
     def __iter__(self) -> "PgCursor": ...
     def __next__(self) -> Dict[str, Any]: ...
-    def to_list(self) -> List[Dict[str, Any]]: ...
 
 class PgPool:
     """The process's Postgres pool. Parameters are encoded as the statement declares
@@ -575,8 +685,12 @@ class WorkerException(Exception):
     ``RuntimeError`` otherwise)."""
 
 
-# Called by the async engine in sub-interpreter workers (Layer 2, C5); not a
-# public API.
+def workrequest_counts() -> Tuple[int, int]:
+    """``(created, completed)`` worker requests, for leak checks; ``(0, 0)`` unless the
+    engine was built with ``--features leak_detect``."""
+    ...
+
+# Called by the async engine in sub-interpreter workers; not a public API.
 class _AsyncInbox: ...
 class _AsyncJob:
     @property
