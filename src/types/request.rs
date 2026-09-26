@@ -126,6 +126,17 @@ impl PyronovaRequest {
         self.query_str()
     }
 
+    /// The `host[:port]` the request was sent to: the target's authority when it has one
+    /// (HTTP/2 `:authority`, an absolute-form target — RFC 9112 §3.2.2 has it win over
+    /// `Host`), else the `Host` header; `None` with neither.
+    #[getter]
+    fn authority(&self) -> Option<Cow<'_, str>> {
+        match self.uri.authority() {
+            Some(authority) => Some(Cow::Borrowed(authority.as_str())),
+            None => self.headers.get(hyper::header::HOST).map(field_text),
+        }
+    }
+
     /// A new `dict` of the path params on every access.
     #[getter]
     fn params<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {

@@ -101,6 +101,9 @@ class Request:
     path: str
     params: dict[str, str]
     query: str
+    authority: str | None
+    """The ``host[:port]`` the request was sent to: the HTTP/2 ``:authority`` or an
+    absolute-form target's authority, else the ``Host`` header; ``None`` with neither."""
     headers: Headers
     client_ip: str
     request_id: str

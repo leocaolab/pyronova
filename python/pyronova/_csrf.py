@@ -6,7 +6,8 @@ A web page can make a browser send a cross-site POST without a CORS preflight on
 endpoints take only the body types they decode (anything else is 415), and refuse a
 request whose ``Origin`` is another site (403) unless the app trusts it
 (``app.trusted_origins``). A request without ``Origin`` (curl, an SDK, a server) and one
-from the server's own host are admitted.
+from the server's own host are admitted. The host is the request's authority
+(``req.authority``): an HTTP/2 request may carry only ``:authority``, no ``Host``.
 """
 
 from __future__ import annotations
@@ -46,8 +47,8 @@ class Origin:
         return cls(parts.scheme, parts.hostname.lower(), port or default_port)
 
     def serves(self, host: str | None) -> bool:
-        """Whether this origin is the ``Host`` the request was sent to: same host and
-        port, a ``Host`` without a port meaning this origin's scheme default."""
+        """Whether this origin is the ``host[:port]`` the request was sent to: same host
+        and port, a host without a port meaning this origin's scheme default."""
         if not host:
             return False
         try:
@@ -116,7 +117,7 @@ def check(req, policy: OriginPolicy, accepted: Mapping[str, T]) -> T | Refused:
             f"{'none' if content_type is None else repr(content_type)}",
         )
     origin = req.headers.get("origin")
-    if not policy.admits(origin, req.headers.get("host")):
+    if not policy.admits(origin, req.authority):
         return Refused(
             403,
             f"Origin {origin!r} is not allowed: not this server's host and not in "
