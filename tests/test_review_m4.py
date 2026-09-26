@@ -375,7 +375,8 @@ def test_rpc_malformed_body_is_a_400_with_the_reason(srv):
     assert r.status == 400, (r.status, r.body)
     body = r.json()
     assert body["ok"] is False
-    assert "Expecting property name" in body["error"], body
+    # The decoder's reason, with where the body stops being JSON.
+    assert "line 1 column 2" in body["error"], body
 
 
 def test_validation_error_is_a_422_with_the_detail(srv):

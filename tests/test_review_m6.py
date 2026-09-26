@@ -294,7 +294,7 @@ def test_bench_worker_build_failure_ends_the_built_workers(call, tmp_path):
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
     assert "Fatal Python error" not in out, out
-    assert "caught:" in r.stdout and "sub-interp 1" in r.stdout, out
+    assert "caught:" in r.stdout and "worker 1:" in r.stdout, out
     assert "m6 injected failure at execution 3" in out, out
     # CPython's finalizer names interpreters nobody ended.
     assert "remaining subinterpreters" not in out, out
@@ -311,7 +311,7 @@ if __name__ == "__main__":
     out = r.stdout + r.stderr
     assert r.returncode == 1, out
     assert "Fatal Python error" not in out, out
-    assert "sub-interp 1" in out and "m6 injected failure at execution 3" in out, out
+    assert "worker 1:" in out and "m6 injected failure at execution 3" in out, out
     # CPython's finalizer names interpreters nobody ended.
     assert "remaining subinterpreters" not in out, out
 
