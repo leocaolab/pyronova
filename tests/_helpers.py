@@ -44,6 +44,32 @@ def poll_until(
         time.sleep(interval)
 
 
+def settle(
+    fetch: Callable[[], T],
+    done: Callable[[T], bool] = bool,
+    *,
+    timeout: float = 5.0,
+    interval: float = POLL_INTERVAL_S,
+) -> T:
+    """Calls `fetch` until `done` accepts its value or `timeout` seconds pass, and returns
+    the last value either way: for a check that asserts on what arrived (a server's log
+    writer is non-blocking, so a line may land after the response it belongs to)."""
+    deadline = time.monotonic() + timeout
+    while True:
+        value = fetch()
+        if done(value) or time.monotonic() > deadline:
+            return value
+        time.sleep(interval)
+
+
+def lines_with(read_output: Callable[[], str], needle: str, *, timeout: float = 5.0) -> list[str]:
+    """The lines of the output that contain `needle`, once at least one is there."""
+    return settle(
+        lambda: [line for line in read_output().splitlines() if needle in line],
+        timeout=timeout,
+    )
+
+
 def listening_ports(output: str) -> list[int]:
     """The ports of every "Listening on" line in `output`, in order."""
     return [int(m["port"]) for m in LISTENING.finditer(output)]

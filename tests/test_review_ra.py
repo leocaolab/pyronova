@@ -26,12 +26,13 @@ import sys
 import tempfile
 import textwrap
 import time
+import uuid
 from typing import Literal, Optional
 
 import pytest
 
 import pyronova.engine
-from tests._helpers import bound_port, listening_ports
+from tests._helpers import bound_port, listening_ports, settle
 
 PYTHON = sys.executable
 HOST = "127.0.0.1"
@@ -160,12 +161,23 @@ class Server:
     def wait_for_records(self, pred, count: int = 1, timeout: float = 5.0) -> list[dict]:
         """The log records matching `pred`, once at least `count` of them are written (the
         log writer is non-blocking)."""
-        deadline = time.time() + timeout
-        while True:
-            found = [r for r in self.records() if pred(r)]
-            if len(found) >= count or time.time() > deadline:
-                return found
-            time.sleep(0.1)
+        return settle(
+            lambda: [r for r in self.records() if pred(r)],
+            lambda found: len(found) >= count,
+            timeout=timeout,
+        )
+
+    def records_after_marker(self, pred) -> list[dict]:
+        """The log records matching `pred` once everything logged before now has been
+        written: a marker request (`GET /mark`, which the script logs) goes out after the
+        caller's requests, and the writer keeps order, so once its line is in, so is every
+        earlier one. For counting ("logged once"), where waiting for the first match would
+        miss a late duplicate."""
+        token = uuid.uuid4().hex
+        assert self.get(f"/mark?id={token}").status == 200
+        marked = self.wait_for_records(lambda r: f"ra-mark {token}" in _record_text(r))
+        assert marked, self.log()[-3000:]
+        return [r for r in self.records() if pred(r)]
 
     def stop(self) -> str:
         if self.proc.poll() is None:
@@ -247,6 +259,20 @@ def gil_panic(req):
 @app.get("/gil-ok", gil=True)
 def gil_ok(req):
     return "fine"
+
+@app.get("/async-panic")
+async def async_panic(req):
+    _fault_panic("ra-panic " + req.query_params.get("n", ""))
+
+@app.get("/async-ok")
+async def async_ok(req):
+    return "fine"
+
+@app.get("/mark", gil=True)
+def mark(req):
+    import logging
+    logging.getLogger("ra").error("ra-mark " + req.query_params["id"])
+    return "marked"
 """ + RUN
 
 BRIDGE_WORKERS = 2
@@ -258,12 +284,22 @@ PANIC_CASES = [
     ("pool", "/panic", "/ok"),  # pool sync worker
     ("pool", "/gil-panic", "/gil-ok"),  # pool's main-interpreter dispatch
     ("gil", "/panic", "/ok"),  # GIL mode
+    ("pool", "/async-panic", "/async-ok"),  # the async engine
+    ("tpc", "/async-panic", "/async-ok"),  # TPC's async pool
 ]
 
+# A Python exception answers the same generic 500; only this text proves the panic went
+# through Rust's catch and was logged as one. In the async engine the panic surfaces in
+# the handler's task as PyO3's PanicException, which the engine logs as the task's error.
+PANIC_TEXT = "a Rust panic while running the request: "
+ASYNC_PANIC_TEXT = "the request's async task raised PanicException: "
 
-def _assert_panic_logged_once(srv: Server, payload: str, request_id: str) -> None:
-    found = srv.wait_for_records(lambda r: payload in _record_text(r))
+
+def _assert_panic_logged_once(srv: Server, text: str, request_id: str) -> None:
+    payload = text.rsplit(": ", 1)[1]
+    found = srv.records_after_marker(lambda r: payload in _record_text(r))
     assert len(found) == 1, f"{payload!r} logged {len(found)} times: {found}"
+    assert text in _record_text(found[0]), found[0]
     fields = _fields(found[0])
     assert fields.get("request_id") == request_id, found[0]
     assert found[0].get("level") == "ERROR", found[0]
@@ -272,16 +308,18 @@ def _assert_panic_logged_once(srv: Server, payload: str, request_id: str) -> Non
 @needs_fault_injection
 @pytest.mark.parametrize("path,route,healthy", PANIC_CASES)
 def test_panic_is_a_logged_500_and_the_thread_survives(path, route, healthy):
-    # One worker / TPC thread (and BRIDGE_WORKERS bridge threads): the N+1 panics all land
-    # on the threads that must survive them.
+    # One thread of each kind (the pool has one sync and one async worker; BRIDGE_WORKERS
+    # bridge threads): the N+1 panics all land on the threads that must survive them.
     env = {"PYRONOVA_GIL_BRIDGE_WORKERS": str(BRIDGE_WORKERS)}
-    with serve(PANIC_SCRIPT, path, workers=1, env=env) as srv:
+    workers = 2 if path == "pool" else 1
+    with serve(PANIC_SCRIPT, path, workers=workers, env=env) as srv:
         for n in range(BRIDGE_WORKERS + 1):
             r = srv.get(f"{route}?n={n}")
             assert r.status == 500, (n, r.status, r.body)
             body = r.json()
             assert body["error"] == GENERIC_500
-            _assert_panic_logged_once(srv, f"ra-panic {n}", body["request_id"])
+            prefix = ASYNC_PANIC_TEXT if route == "/async-panic" else PANIC_TEXT
+            _assert_panic_logged_once(srv, f"{prefix}ra-panic {n}", body["request_id"])
         r = srv.get(healthy)
         assert (r.status, r.body) == (200, b"fine")
 
@@ -327,11 +365,18 @@ app.get("/async-gil", gil=True)(async_probe)
 CTX_ROUTES = ["/sync", "/async", "/sync-gil", "/async-gil"]
 
 
+# One thread per kind of dispatch, so every request after the first of its kind reuses a
+# thread: TPC one inline thread; pool one sync and one async worker; one bridge thread.
+CTX_WORKERS = {"tpc": 1, "pool": 2, "gil": 1}
+
+
 @pytest.mark.parametrize("path", ["tpc", "pool", "gil"])
 def test_async_hook_and_handler_ctx_writes_reach_the_rest_of_the_request(path):
-    with serve(CTX_SCRIPT, path, workers=2) as srv:
-        for route in CTX_ROUTES:
-            # Twice: the second request runs on a thread that already served one.
+    env = {"PYRONOVA_GIL_BRIDGE_WORKERS": "1"}
+    with serve(CTX_SCRIPT, path, workers=CTX_WORKERS[path], env=env) as srv:
+        # Twice over: the second round runs every route on a thread that already ran the
+        # async routes, whose writes must not leak into the sync ones.
+        for route in CTX_ROUTES * 2:
             for _ in range(2):
                 r = srv.get(route)
                 assert r.status == 200, (route, r.status, r.body)

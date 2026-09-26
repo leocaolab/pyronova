@@ -30,7 +30,7 @@ import urllib.request
 
 import pytest
 
-from tests._helpers import listening_ports, read_file
+from tests._helpers import listening_ports, read_file, settle
 
 PYTHON = sys.executable
 HOST = "127.0.0.1"
@@ -226,9 +226,11 @@ def test_pool_admission_rejects_large_bodies_past_the_permit_budget():
             s = socket.create_connection((HOST, srv.port), timeout=10)
             s.sendall(b"POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\n\r\n")
             held.append(s)
-        time.sleep(0.5)
-        status, body, headers = srv.request(
-            "/upload", method="POST", body=b"x" * 100000
+        # The held connections take their permits as their heads arrive.
+        status, body, headers = settle(
+            lambda: srv.request("/upload", method="POST", body=b"x" * 100000),
+            lambda reply: reply[0] == 503,
+            timeout=10,
         )
         assert status == 503, body
         assert headers.get("access-control-allow-origin") == "https://app.example"
@@ -346,7 +348,11 @@ def test_every_response_writes_one_access_line(path):
         assert srv.request("/nope-404")[0] == 404
         assert srv.request("/fast")[0] == 200
         assert srv.request("/handled")[0] == 200
-        time.sleep(0.5)
+        routes = ("/nope-404", "/fast", "/handled")
+        settle(
+            lambda: _access_lines(read_file(srv.log_path)()),
+            lambda lines: all(any(r in line for line in lines) for r in routes),
+        )
     finally:
         log = srv.stop()
     lines = _access_lines(log)
@@ -523,7 +529,7 @@ def test_invalid_handler_status_is_a_logged_500(path, route):
     srv = Server(STATUS_SCRIPT, path)
     try:
         assert srv.request(route)[0] == 500
-        time.sleep(0.3)
+        settle(lambda: "invalid HTTP status" in read_file(srv.log_path)())
     finally:
         log = srv.stop()
     assert re.search(r"invalid HTTP status.*1000|1000.*invalid HTTP status", log), log[-3000:]

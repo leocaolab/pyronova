@@ -31,6 +31,7 @@ import httpx
 import pytest
 
 import pyronova.engine
+from tests._helpers import poll_until
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
@@ -255,6 +256,7 @@ async def ok(req):
 
 @app.get("/slow")
 async def slow(req):
+    print("w3-slow-started", flush=True)
     await asyncio.sleep(20)
     return "late"
 
@@ -288,7 +290,7 @@ def test_async_engine_death_answers_its_waiters_at_once():
         slow = {}
         t = threading.Thread(target=lambda: slow.setdefault("r", srv.get("/slow", timeout=40)))
         t.start()
-        time.sleep(0.5)
+        poll_until(lambda: "w3-slow-started" in srv.log(), what="/slow running")
         killed_at = time.time()
         srv.get("/kill", timeout=10)
         t.join(timeout=40)
@@ -351,7 +353,7 @@ if __name__ == "__pyronova_worker__":
 """
     srv = Server(script, "pool", workers=2)
     try:
-        time.sleep(1)
+        poll_until(lambda: "RuntimeError: w3-recv-broken" in srv.log(), what="the engine's end")
     finally:
         out = srv.stop()
     stopped = [line for line in out.splitlines() if "RuntimeError: w3-recv-broken" in line]
@@ -418,13 +420,14 @@ def probe(req):
 
 @app.get("/stuck")
 def stuck(req):
+    print("w3-stuck-started", flush=True)
     time.sleep(120)
     return "late"
 """
     srv = Server(script, "pool", workers=2)
     try:
         threading.Thread(target=lambda: srv.get("/stuck", timeout=200), daemon=True).start()
-        time.sleep(1)
+        poll_until(lambda: "w3-stuck-started" in srv.log(), what="/stuck running")
         out = srv.stop(timeout=120)
     finally:
         if srv.proc.poll() is None:

@@ -22,7 +22,7 @@ import urllib.request
 
 import pytest
 
-from tests._helpers import listening_ports
+from tests._helpers import listening_ports, settle
 
 HOST = "127.0.0.1"
 STARTUP_TIMEOUT_S = 30
@@ -192,12 +192,11 @@ def test_idle_gc_runs_on_keep_alive_connection(server):
 
     for _ in range(3):
         assert _get(conn, "/work")[0] == 200
-    time.sleep(0.6)  # several quiet ticks
-    first = _gc_count(conn)
+    # Each count probe is a request too; a quiet tick after it collects.
+    first = settle(lambda: _gc_count(conn), lambda n: n >= 1)
 
     assert _get(conn, "/work")[0] == 200
-    time.sleep(0.6)
-    second = _gc_count(conn)
+    second = settle(lambda: _gc_count(conn), lambda n: n > first)
     conn.close()
 
     assert first >= 1

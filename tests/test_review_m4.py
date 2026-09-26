@@ -31,10 +31,11 @@ import sys
 import tempfile
 import textwrap
 import time
+import uuid
 
 import pytest
 
-from tests._helpers import listening_ports, read_file
+from tests._helpers import lines_with, listening_ports, read_file
 
 from pyronova import SharedState
 from pyronova.engine import Request
@@ -131,12 +132,17 @@ class Server:
     def log_lines_with(self, needle: str, timeout: float = 5.0) -> list[str]:
         """The log lines containing `needle`, once at least one has been written (the
         log writer is non-blocking)."""
-        deadline = time.time() + timeout
-        while True:
-            lines = [line for line in self.log().splitlines() if needle in line]
-            if lines or time.time() > deadline:
-                return lines
-            time.sleep(0.1)
+        return lines_with(self.log, needle, timeout=timeout)
+
+    def lines_after_marker(self, needle: str) -> list[str]:
+        """The log lines containing `needle` once everything logged before now has been
+        written: a marker request (`GET /mark`, which the script logs) goes out after the
+        caller's requests, and the writer keeps order. For counting ("logged once"),
+        where waiting for the first match would miss a late duplicate."""
+        token = uuid.uuid4().hex
+        assert self.request("GET", f"/mark?id={token}").status == 200
+        assert self.log_lines_with(f"m4-mark {token}"), self.log()[-3000:]
+        return [line for line in self.log().splitlines() if needle in line]
 
     def stop(self) -> str:
         if self.proc.poll() is None:
@@ -205,6 +211,11 @@ def after_raise(req):
 @app.get("/rid")
 def rid(req):
     return {"request_id": req.request_id}
+
+@app.get("/mark", gil=True)
+def mark(req):
+    logging.getLogger("m4.app").error("m4-mark " + req.query_params["id"])
+    return "marked"
 
 @app.get("/log-exception")
 def log_exception(req):
@@ -293,14 +304,20 @@ def _assert_generic_500(r: Reply, secret: str) -> str:
     return rid
 
 
+# A request id as a log line carries it. The servers are shared by the tests of a module,
+# so a secret may be in lines of other tests' requests, each with its own id.
+REQUEST_ID = re.compile(r"[0-9a-f]{32}")
+
+
 def _assert_logged_once(srv: Server, secret: str, rid: str) -> None:
     """One log line carries the exception: its text, its traceback and the request id.
     No other line mentions it (no second logger, no raw traceback on stderr)."""
-    lines = srv.log_lines_with(secret)
-    assert len(lines) == 1, "\n".join(lines) or srv.log()[-3000:]
-    line = lines[0]
-    assert rid in line, line
-    assert TRACEBACK in line, line
+    lines = srv.lines_after_marker(secret)
+    mine = [line for line in lines if rid in line]
+    assert len(mine) == 1, "\n".join(lines) or srv.log()[-3000:]
+    assert TRACEBACK in mine[0], mine[0]
+    stray = [line for line in lines if not REQUEST_ID.search(line)]
+    assert stray == [], stray
     assert "--- Logging error ---" not in srv.log()
 
 
@@ -451,8 +468,9 @@ def test_logged_exception_keeps_its_traceback(srv):
     # `logger.exception(...)` in any interpreter: the Python→Rust logging handler called
     # a `formatException` it doesn't have, so the traceback was replaced by a
     # "--- Logging error ---" dump on stderr.
+    before = len(srv.log_lines_with("m4 worker logged an exception", timeout=0))
     assert srv.request("GET", "/log-exception").status == 200
-    lines = srv.log_lines_with("m4 worker logged an exception")
+    lines = srv.lines_after_marker("m4 worker logged an exception")[before:]
     assert len(lines) == 1, lines or srv.log()[-3000:]
     assert "m4-secret-logged" in lines[0] and TRACEBACK in lines[0], lines[0]
     assert "--- Logging error ---" not in srv.log()

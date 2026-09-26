@@ -39,6 +39,8 @@ def test_module_app_importing_a_sibling_serves_on_workers():
         r = client.get("/import-env")
         assert r.status_code == 200
         assert r.json()["sibling"] == "tests.apps.m5_followup_sibling"
+        # Served by a sub-interpreter worker, which imported the sibling itself.
+        assert r.json()["in_worker"] is True
 
 
 def test_worker_sys_path_is_mains():
@@ -46,7 +48,9 @@ def test_worker_sys_path_is_mains():
     # time (here pytest's `tests/` and root dir), which a new interpreter never has.
     main_path = list(sys.path)
     with TestClient(app) as client:
-        assert client.get("/import-env").json()["sys_path"] == main_path
+        env = client.get("/import-env").json()
+        assert env["in_worker"] is True
+        assert env["sys_path"] == main_path
 
 
 HOST = "127.0.0.1"
