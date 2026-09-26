@@ -495,14 +495,16 @@ mod tests {
 
     #[test]
     fn a_failed_bind_names_the_step_and_keeps_the_os_error() {
-        // TEST-NET-1 (RFC 5737): never an address of this host.
-        let addr: SocketAddr = "192.0.2.1:0".parse().unwrap();
-        let err = create_reuseport_listener(addr).expect_err("not a local address");
+        // No SO_REUSEPORT on the holder, so a reuseport socket can't join its port.
+        let holder = std::net::TcpListener::bind(loopback(0)).unwrap();
+        let addr = holder.local_addr().unwrap();
+        let err = create_reuseport_listener(addr).expect_err("the port is taken");
         assert_eq!(err.step, "bind");
         assert_eq!(err.addr, addr);
-        assert_eq!(err.source.kind(), std::io::ErrorKind::AddrNotAvailable);
+        assert_eq!(err.source.kind(), std::io::ErrorKind::AddrInUse);
         assert!(
-            err.to_string().starts_with("bind for 192.0.2.1:0 failed: "),
+            err.to_string()
+                .starts_with(&format!("bind for {addr} failed: ")),
             "{err}"
         );
     }

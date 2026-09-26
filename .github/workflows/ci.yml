@@ -31,7 +31,7 @@ jobs:
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install maturin pytest pytest-asyncio websockets httpx h2 pydantic numpy msgpack watchfiles
+          pip install maturin pytest pytest-asyncio websockets httpx h2 pydantic numpy msgpack watchfiles hypothesis
 
       - name: cargo test (Rust compile check)
         env:
@@ -90,10 +90,10 @@ jobs:
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install maturin pytest pytest-asyncio websockets httpx h2 pydantic numpy msgpack watchfiles
+          pip install maturin pytest pytest-asyncio websockets httpx h2 pydantic numpy msgpack watchfiles hypothesis
 
-      # orjson 3.12.0 is the byte reference for tests/test_isojson_numpy_workers.py
-      # (isojson E2E-3); isojson>=0.2 comes with pyronova's own dependencies.
+      # orjson 3.12.0 is the byte reference for tests/test_isojson_numpy_workers.py;
+      # isojson>=0.2 comes with pyronova's own dependencies.
       - name: Install orjson 3.12.0
         run: |
           source .venv/bin/activate
@@ -112,8 +112,8 @@ jobs:
           # E2E drivers live under tests/e2e/ (not collected by pytest).
           pytest tests/ -q --ignore=tests/e2e
 
-      # The tests the default build skips: the bench harnesses (`bench`, decision D2) and
-      # the panic tests, which need the test-only `fault_injection` feature.
+      # The tests the default build skips: the bench harnesses (`bench` feature) and the
+      # panic tests, which need the test-only `fault_injection` feature.
       - name: Build (release, --features bench,fault_injection)
         run: |
           source .venv/bin/activate
@@ -126,6 +126,49 @@ jobs:
           source .venv/bin/activate
           pytest tests/test_review_m6.py -v -k "test_bench_"
           pytest tests/test_review_ra.py -v -k "panic"
+
+  # ── macOS ─────────────────────────────────────────────────────────
+  # The Darwin-only code (the TPC fanout topology and its guards, the Mach RSS sampler)
+  # compiles and runs only here.
+  test-macos:
+    name: macOS (Python 3.14)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          allow-prereleases: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install maturin pytest pytest-asyncio websockets httpx h2 pydantic numpy msgpack watchfiles hypothesis "pydantic-settings>=2"
+
+      - name: cargo clippy
+        env:
+          PYO3_PYTHON: ${{ env.pythonLocation }}/bin/python
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        env:
+          PYO3_PYTHON: ${{ env.pythonLocation }}/bin/python
+        run: cargo test
+
+      - name: Build (release)
+        run: |
+          source .venv/bin/activate
+          maturin develop --release
+
+      - name: Darwin-only topology tests
+        run: |
+          source .venv/bin/activate
+          pytest tests/test_review_m1b.py tests/test_review_m5.py tests/test_final_w1.py -v
 
   # ── Rust lint (blocking) ──────────────────────────────────────────
   rust-lint:
@@ -157,3 +200,7 @@ jobs:
         env:
           PYO3_PYTHON: ${{ env.pythonLocation }}/bin/python
         run: cargo clippy --all-targets --features fault_injection -- -D warnings
+      - name: cargo clippy --features leak_detect
+        env:
+          PYO3_PYTHON: ${{ env.pythonLocation }}/bin/python
+        run: cargo clippy --all-targets --features leak_detect -- -D warnings
