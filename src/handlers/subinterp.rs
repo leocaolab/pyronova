@@ -7,7 +7,7 @@ use hyper::{Request, Response};
 
 use crate::body::BoxBody;
 use crate::error::{refuse, Refusal, RequestTag};
-use crate::python::interp;
+use crate::python::pool::{SubmitError, WorkRequest};
 use crate::request_head::Body;
 use crate::router::{Call, HandlerKind, RouteId};
 use crate::site::{SharedSite, Site};
@@ -113,7 +113,7 @@ async fn run_on_pool(
     let _permit = admitted.permit;
 
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-    let submitted = pool.submit(interp::WorkRequest {
+    let submitted = pool.submit(WorkRequest {
         route: work.route,
         kind: work.kind,
         request: PyronovaRequest::new(head, Body::Buffered(admitted.body)),
@@ -121,12 +121,12 @@ async fn run_on_pool(
     });
     if let Err(e) = submitted {
         let refusal = match e {
-            interp::SubmitError::Full => Refusal::Overloaded("sub-interpreter work queue"),
-            interp::SubmitError::Closed => Refusal::PoolClosed("sub-interpreter pool"),
+            SubmitError::Full => Refusal::Overloaded("sub-interpreter work queue"),
+            SubmitError::Closed => Refusal::PoolClosed("sub-interpreter pool"),
         };
         return fail(refuse(refusal), tag);
     }
-    interp::WorkRequest::inc_created();
+    WorkRequest::inc_created();
 
     let lost = |_| {
         refuse(Refusal::WorkerLost(

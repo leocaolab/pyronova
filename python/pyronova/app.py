@@ -12,7 +12,7 @@ import json as _json_module
 
 import os
 
-from pyronova.engine import Compression, LogLevel, Mode, PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log, _in_worker, _forgotten_workers, _python_log_level, _route_params
+from pyronova.engine import Compression, LogLevel, Mode, PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log, _in_worker, _python_log_level, _route_params
 from pyronova._log_bridge import RustLogHandler, root_level
 from pyronova import _csrf
 from pyronova._csrf import OriginPolicy
@@ -449,22 +449,10 @@ class Pyronova:
         so disk is near-free; memory is ~one full lib set per worker
         (see docs/subinterp-c-extension-status.md).
         """
-        # This just RECORDS the libraries (via an env var). The actual per-worker
-        # cloning happens in _bootstrap.py at sub-interpreter init, before the
-        # script runs; a worker executing this again only re-records the same list.
-        if "pyronova" in libraries:
-            # One shared copy of pyronova and its engine is required (FR-11).
-            raise ValueError(
-                "pyronova cannot be isolated: one shared copy of pyronova and its "
-                "engine is required (it keeps process-wide state). Remove it from "
-                "app.isolate(...)."
-            )
-        import os
-        current = [x for x in os.environ.get("PYRONOVA_ISOLATE_LIBS", "").split(",") if x]
-        for lib in libraries:
-            if lib not in current:
-                current.append(lib)
-        os.environ["PYRONOVA_ISOLATE_LIBS"] = ",".join(current)
+        # This records the libraries on the engine app; the workers of its runs get the
+        # list at init, and their bootstrap clones them before the script runs. A worker
+        # executing this again records it on its own app, which nothing reads.
+        self._engine.isolate(list(libraries))
 
     # ------------------------------------------------------------------
     # Route registration (decorator + direct call)
@@ -1055,13 +1043,13 @@ class Pyronova:
         # A worker thread that outlived the shutdown grace period (a handler that ignores
         # shutdown) still has a live interpreter, and finalizing with one aborts. Say which;
         # the caller decides what the process does (`run()` exits, a TestClient raises).
-        forgotten = _forgotten_workers()
-        if forgotten:
+        abandoned = [str(w) for w in self._engine._take_abandoned_workers()]
+        if abandoned:
             _logging.getLogger("pyronova.app").error(
                 "worker(s) %s did not stop within the shutdown grace period",
-                ", ".join(forgotten),
+                ", ".join(abandoned),
             )
-            raise WorkersAbandoned(forgotten)
+            raise WorkersAbandoned(abandoned)
 
         # Not a graceful stop (real startup/run error): surface it normally.
         if run_error is not None:

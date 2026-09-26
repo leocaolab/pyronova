@@ -12,20 +12,18 @@ use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ConfigError, EnvConfig, Mode, Sizing, Topology};
+use crate::conn_driver::drive_connection;
 use crate::handlers::{handle_request, handle_request_subinterp};
-use crate::python::interp;
+use crate::python::pool::{AbandonedWorker, InterpreterPool, PoolThreads, WorkerSplit};
+use crate::python::worker::{SubInterpreterWorker, WorkerProgram, WorkerSpec};
+use crate::python::worker_app::{self, WorkerRoutes};
 use crate::router::{Dispatch, HandlerKind, MutableRoutes, RequestBody, RouteTable, Sealed};
 use crate::server::cpu::Cpus;
 use crate::server::listener::{AcceptSource, Accepted, BoundListeners, Listener, ListenerSpec};
 use crate::site::{AccessLog, Cors, CorsSpec, Limits, SharedSite, Site, SiteConfig};
 use crate::state::SharedState;
 use crate::websocket;
-use crate::worker::drive_connection;
 use hyper_util::rt::TokioExecutor;
-
-/// The `PyronovaApp` a worker's script created: one per worker interpreter (Layer 2, C3).
-/// The worker takes its handlers from it after the script has run.
-static WORKER_APP: pyo3::sync::PyOnceLock<Py<PyronovaApp>> = pyo3::sync::PyOnceLock::new();
 
 #[pyclass(module = "pyronova.engine")]
 pub(crate) struct PyronovaApp {
@@ -44,6 +42,12 @@ pub(crate) struct PyronovaApp {
     limits: Limits,
     /// This app's response compression, served by its runs; `None` = off.
     compression: Option<crate::compression::Settings>,
+    /// The libraries each worker loads from a private copy (`isolate`).
+    isolated: Vec<String>,
+    /// The worker threads this app's servers abandoned at their shutdown (still running
+    /// past the grace period), until taken (`_take_abandoned_workers`). Shared with each
+    /// server's run, which adds its own.
+    abandoned: Arc<parking_lot::Mutex<Vec<AbandonedWorker>>>,
 }
 
 pyo3::create_exception!(
@@ -70,7 +74,36 @@ impl PyronovaApp {
             request_id_header: None,
             limits: Limits::DEFAULT,
             compression: None,
+            isolated: Vec::new(),
+            abandoned: Arc::new(parking_lot::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Gives each sub-interpreter worker its own private copy of these C-extension
+    /// libraries, cloned by the worker's bootstrap before the script runs. `pyronova`
+    /// itself can't be isolated: one shared copy of it and its engine is required
+    /// (FR-11).
+    fn isolate(&mut self, libraries: Vec<String>) -> PyResult<()> {
+        if libraries.iter().any(|lib| lib == "pyronova") {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "pyronova cannot be isolated: one shared copy of pyronova and its engine is \
+                 required (it keeps process-wide state). Remove it from app.isolate(...).",
+            ));
+        }
+        for lib in libraries {
+            if !self.isolated.contains(&lib) {
+                self.isolated.push(lib);
+            }
+        }
+        Ok(())
+    }
+
+    /// The worker threads this app's servers abandoned (still running past the shutdown
+    /// grace period), taken: a second call returns none. Their interpreters are alive, and
+    /// finalizing with a live sub-interpreter aborts, so `Pyronova.run()` exits non-zero
+    /// without finalizing when there are any (Layer 2, N8).
+    fn _take_abandoned_workers(&self) -> Vec<AbandonedWorker> {
+        std::mem::take(&mut *self.abandoned.lock())
     }
 
     /// Set full per-instance CORS configuration. All fields are applied to
@@ -732,16 +765,31 @@ struct AppSource {
     /// built).
     script_path: Option<String>,
     shared_state: Arc<dashmap::DashMap<String, bytes::Bytes>>,
+    /// The libraries each worker loads from a private copy (`isolate`).
+    isolated: Vec<String>,
+    /// The app's abandoned workers, which this server's pools add theirs to.
+    abandoned: Arc<parking_lot::Mutex<Vec<AbandonedWorker>>>,
 }
 
 impl AppSource {
-    /// The program workers run: the script, with main's `sys.path` as it is now.
-    fn program(&self, py: Python<'_>) -> PyResult<interp::WorkerProgram> {
+    /// The program workers run: the script, with main's `sys.path` as it is now, and the
+    /// libraries to isolate.
+    fn program(&self, py: Python<'_>) -> PyResult<WorkerProgram> {
         let script_path = match &self.script_path {
             Some(path) => path.clone(),
             None => py.import("__main__")?.getattr("__file__")?.extract()?,
         };
-        interp::WorkerProgram::read(py, script_path)
+        WorkerProgram::read(py, script_path, self.isolated.clone())
+    }
+
+    /// Joins a pool's worker threads (every reference to the pool must be gone) and keeps
+    /// the ones still running past the grace period for the app's caller: kept, not only
+    /// returned, because a SIGINT's KeyboardInterrupt can land in Python before a return
+    /// value is stored, and the caller must still see them. Call detached.
+    fn join_pool(&self, threads: PoolThreads) -> Vec<AbandonedWorker> {
+        let abandoned = threads.join();
+        self.abandoned.lock().extend(abandoned.iter().cloned());
+        abandoned
     }
 }
 
@@ -923,69 +971,32 @@ fn run_gil(py: Python<'_>, run: ServerRun, io_threads: NonZeroUsize) -> PyResult
     })
 }
 
-/// The handlers and hooks of the app a worker's script registered on, indexed like main's
-/// table, with their signature (Layer 2, C3).
-pub(crate) struct WorkerRoutes {
-    pub(crate) signature: crate::router::RouteSignature,
-    pub(crate) handlers: Vec<Py<PyAny>>,
-    pub(crate) before_hooks: Vec<Py<PyAny>>,
-    pub(crate) after_hooks: Vec<Py<PyAny>>,
-    /// The limits the script set on its app (never served: main's app is).
-    pub(crate) limits: Limits,
-}
-
-impl WorkerRoutes {
-    /// A script that registered nothing (a main table with no routes either).
-    pub(crate) fn empty() -> Self {
-        WorkerRoutes {
-            signature: crate::router::RouteSignature::default(),
-            handlers: Vec::new(),
-            before_hooks: Vec::new(),
-            after_hooks: Vec::new(),
-            limits: Limits::DEFAULT,
-        }
-    }
-}
-
-/// The routes of the app this worker's script registered on, or `None` if it registered
-/// none. Meaningful only in a worker, after its script ran.
-pub(crate) fn worker_routes(py: Python<'_>) -> Option<WorkerRoutes> {
-    let app = WORKER_APP.get(py)?.bind(py).borrow();
-    let table = app.routes.read();
-    Some(WorkerRoutes {
-        signature: crate::router::RouteSignature::of(&table),
-        handlers: table
-            .routes()
-            .iter()
-            .map(|r| r.handler.clone_ref(py))
-            .collect(),
-        before_hooks: table.before_hooks.iter().map(|h| h.clone_ref(py)).collect(),
-        after_hooks: table.after_hooks.iter().map(|h| h.clone_ref(py)).collect(),
-        limits: app.limits,
-    })
-}
-
 impl PyronovaApp {
     /// In a worker, the app the script registers routes or hooks on is the one the worker
     /// serves: the first registration records it, and a registration on a second app is an
     /// error (Layer 2, FR-4; decision Q-2 (a)). Raw `PyronovaApp()` scripts and `Pyronova`
     /// apps work the same way. A no-op on the main interpreter.
     fn serve_in_worker(slf: &Bound<'_, Self>) -> PyResult<()> {
-        let py = slf.py();
-        if crate::run_context::on_main(py) {
-            return Ok(());
-        }
-        match WORKER_APP.get(py) {
-            Some(app) if app.bind(py).is(slf) => Ok(()),
-            Some(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "the script registers routes or hooks on a second app; a worker serves \
-                 exactly one app per script (create one Pyronova()/PyronovaApp() and register \
-                 everything on it)",
-            )),
-            None => WORKER_APP.set(py, slf.clone().unbind()).map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err("worker app already recorded")
-            }),
-        }
+        worker_app::record(slf.as_any(), Self::worker_routes)
+    }
+
+    /// The routes and limits of `app` (a `PyronovaApp`), as its worker serves them.
+    fn worker_routes<'py>(app: &Bound<'py, PyAny>) -> PyResult<WorkerRoutes<'py>> {
+        let py = app.py();
+        let app = app.cast::<Self>()?.borrow();
+        let table = app.routes.read();
+        let bind = |hooks: &[Py<PyAny>]| hooks.iter().map(|h| h.bind(py).clone()).collect();
+        Ok(WorkerRoutes {
+            signature: crate::router::RouteSignature::of(&table),
+            handlers: table
+                .routes()
+                .iter()
+                .map(|r| r.handler.bind(py).clone())
+                .collect(),
+            before_hooks: bind(&table.before_hooks),
+            after_hooks: bind(&table.after_hooks),
+            limits: app.limits,
+        })
     }
 
     fn register_route(
@@ -1007,6 +1018,8 @@ impl PyronovaApp {
         AppSource {
             script_path: self.script_path.clone(),
             shared_state: Arc::clone(&self.shared_state),
+            isolated: self.isolated.clone(),
+            abandoned: Arc::clone(&self.abandoned),
         }
     }
 
@@ -1112,7 +1125,7 @@ fn run_subinterp(
     let program = app.program(py)?;
 
     let shape = crate::router::RouteShape::of(&routes.routes);
-    let split = interp::split_workers_for_routes(workers, &shape.gil, &shape.is_async)
+    let split = crate::python::pool::split_workers_for_routes(workers, &shape.gil, &shape.is_async)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
     let gil_count = shape.gil_count();
@@ -1151,16 +1164,10 @@ fn run_subinterp(
     );
     println!("  Script: {}\n", program.script_path);
 
-    let pool = Arc::new(build_pool(
-        py,
-        split,
-        &routes,
-        env.gc.threshold,
-        &program,
-        &app,
-    )?);
+    let (pool, threads) = build_pool(py, split, &routes, env.gc.threshold, &program, &app)?;
+    let pool = Arc::new(pool);
 
-    py.detach(move || {
+    let served = py.detach(move || {
         serve_multi_thread(
             listeners.groups,
             io_workers,
@@ -1188,7 +1195,18 @@ fn run_subinterp(
                 }
             },
         )
-    })
+    });
+    // Every pool reference was in the serving closures, gone with them: the workers
+    // finish. The ones that don't within the grace period go to the app's caller.
+    let abandoned = py.detach(|| app.join_pool(threads));
+    if served.is_err() && !abandoned.is_empty() {
+        tracing::error!(
+            target: "pyronova::server",
+            "the server failed with worker(s) still running: {}",
+            abandoned.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+        );
+    }
+    served
 }
 
 /// A TPC sub-interpreter server: how it takes connections (`Topology`).
@@ -1230,15 +1248,25 @@ fn serve_tpc_workers(
     };
     // Built first: if the TPC workers then fail, dropping the pool ends its workers on
     // their own threads.
-    let async_pool = if async_workers > 0 {
-        let split = interp::WorkerSplit {
+    let (async_pool, async_threads) = if async_workers > 0 {
+        let split = WorkerSplit {
             sync_workers: 0,
             async_workers,
         };
-        let pool = build_pool(py, split, &routes, env.gc.count_trigger(), &program, &app)?;
-        Some(Arc::new(pool))
+        let (pool, threads) =
+            build_pool(py, split, &routes, env.gc.count_trigger(), &program, &app)?;
+        (Some(Arc::new(pool)), Some(threads))
     } else {
-        None
+        (None, None)
+    };
+    // Drops the async pool (its last reference) and joins its workers, the abandoned ones
+    // kept for the app's caller.
+    let end_async_pool = |async_pool: Option<crate::handlers::SharedPool>,
+                          threads: Option<PoolThreads>| {
+        drop(async_pool);
+        if let Some(threads) = threads {
+            app.join_pool(threads);
+        }
     };
     let workers = match build_workers(
         py,
@@ -1250,7 +1278,7 @@ fn serve_tpc_workers(
     ) {
         Ok(workers) => workers,
         Err(e) => {
-            py.detach(move || drop(async_pool));
+            py.detach(|| end_async_pool(async_pool, async_threads));
             return Err(e);
         }
     };
@@ -1264,8 +1292,8 @@ fn serve_tpc_workers(
         Ok(bridge) => bridge,
         Err(e) => {
             // SAFETY: on the main thread that built them; none was handed to a thread.
-            unsafe { interp::SubInterpreterWorker::end_all(workers) };
-            py.detach(move || drop(async_pool));
+            unsafe { SubInterpreterWorker::end_all(workers) };
+            py.detach(|| end_async_pool(async_pool, async_threads));
             return Err(e.into());
         }
     };
@@ -1278,11 +1306,11 @@ fn serve_tpc_workers(
         gc: env.gc,
     };
 
-    py.detach(move || {
+    py.detach(|| {
         let served = serve(listeners, cpus.logical.get(), server, stop);
         // The TPC threads are joined, so these are the last references: the async pool
         // joins its workers, the bridge its threads (FR-6).
-        drop(async_pool);
+        end_async_pool(async_pool, async_threads);
         if let Some(bridge) = bridge {
             crate::bridge::main_bridge::MainInterpBridge::shutdown_join(bridge);
         }
@@ -1294,38 +1322,35 @@ fn serve_tpc_workers(
 /// What every worker of a server is built from: the app's program, the routes it must
 /// register (`site`'s, up to the seal), the shared state and the served limits.
 fn worker_spec<'a>(
-    program: &'a interp::WorkerProgram,
+    program: &'a WorkerProgram,
     expected: &'a crate::router::RouteSignature,
     site: &Site,
     gc_threshold: u64,
     shared_state: &'a crate::state::SharedMap,
-) -> interp::WorkerSpec<'a> {
-    interp::WorkerSpec {
+) -> WorkerSpec<'a> {
+    WorkerSpec {
         program,
         expected,
-        // Each worker gets it as `POOL_ID` (the async engine's zombie guard).
-        pool_id: interp::next_pool_id(),
         shared_state,
         gc_threshold,
         limits: site.config.limits,
     }
 }
 
-/// A channel pool of `split` workers, each on its own thread, serving `site`.
+/// A channel pool of `split` workers, each on its own thread, serving `site`, and its
+/// threads, joined (`AppSource::join_pool`) once every reference to the pool is gone.
 fn build_pool(
     py: Python<'_>,
-    split: interp::WorkerSplit,
+    split: WorkerSplit,
     site: &Site,
     gc_threshold: u64,
-    program: &interp::WorkerProgram,
+    program: &WorkerProgram,
     app: &AppSource,
-) -> PyResult<interp::InterpreterPool> {
+) -> PyResult<(InterpreterPool, PoolThreads)> {
     let expected = crate::router::RouteSignature::of(&site.routes);
     let spec = worker_spec(program, &expected, site, gc_threshold, &app.shared_state);
     // SAFETY: called with the main interpreter attached (`py`), before `py.detach`.
-    unsafe { interp::InterpreterPool::new(split, py, &spec) }.map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("sub-interpreter pool error: {e}"))
-    })
+    unsafe { InterpreterPool::new(split, &spec) }.map_err(|e| e.into_pyerr(py))
 }
 
 /// Builds `n` TPC sub-interpreter workers, in order, on the main thread: each runs the
@@ -1338,9 +1363,9 @@ fn build_workers(
     n: usize,
     site: &Site,
     gc_threshold: u64,
-    program: &interp::WorkerProgram,
+    program: &WorkerProgram,
     shared_state: &crate::state::SharedMap,
-) -> PyResult<Vec<interp::SubInterpreterWorker>> {
+) -> PyResult<Vec<SubInterpreterWorker>> {
     if !crate::run_context::on_main(py) {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "sub-interpreter workers are built on the main interpreter only",
@@ -1351,15 +1376,13 @@ fn build_workers(
     let mut built = Vec::with_capacity(n);
     for i in 0..n {
         // SAFETY: on the main thread with main's thread state current (checked above).
-        let worker = unsafe { interp::SubInterpreterWorker::new(i, &spec) };
+        let worker = unsafe { SubInterpreterWorker::new(i, &spec) };
         match worker {
             Ok(w) => built.push(w),
             Err(e) => {
                 // SAFETY: as above; none of `built` was rebound to another thread.
-                unsafe { interp::SubInterpreterWorker::end_all(built) };
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "sub-interp {i} init: {e}"
-                )));
+                unsafe { SubInterpreterWorker::end_all(built) };
+                return Err(e.into_pyerr(py));
             }
         }
     }

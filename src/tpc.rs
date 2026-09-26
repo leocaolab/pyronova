@@ -30,16 +30,16 @@ use tokio_util::task::TaskTracker;
 
 use crate::bridge::main_bridge::MainInterpBridge;
 use crate::config::{GcConfig, GcMode};
+use crate::conn_driver::{drive_connection, drive_tcp_conn, LocalExec, TpcContext};
 use crate::error::panic_message;
 use crate::handlers::{handle_request, SharedPool};
-use crate::python::interp::SubInterpreterWorker;
+use crate::python::worker::SubInterpreterWorker;
 use crate::server::cpu::{elevate_thread_qos_macos, try_pin_current};
 use crate::server::listener::{
     AcceptSource, Accepted, Bound, BoundListeners, Listener, ListenerError,
 };
 use crate::site::{SharedSite, Site};
 use crate::websocket;
-use crate::worker::{drive_connection, drive_tcp_conn, LocalExec, TpcContext};
 
 /// How long a TPC thread's in-flight connections get to finish after a stop.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -454,9 +454,7 @@ where
                     return Ok(());
                 };
                 // SAFETY: this thread now owns the worker, which no other thread has bound.
-                worker.tstate = unsafe {
-                    crate::python::interp::rebind_tstate_to_current_thread(worker.tstate)
-                };
+                unsafe { worker.bind_to_this_thread() };
                 let context = Rc::new(shared.with_worker(worker));
                 let served = serve_on_this_thread(&label, core, || {
                     serve(Rc::clone(&context), payload, stop.clone())

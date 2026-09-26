@@ -9,8 +9,8 @@ use pyo3::prelude::*;
 
 use crate::body::{full_body, BoxBody};
 use crate::error::{catch_panic, HandlerError, Logged, ResponseError, Stage};
-use crate::python::interp;
-use crate::python::request_context::{in_request_context, Awaitable, RequestContext};
+use crate::python::hook_chain::{main_response, Chain, EventLoop};
+use crate::python::request_context::{in_request_context, RequestContext};
 use crate::python::stream::PyronovaStream;
 use crate::response::extract_response_data;
 use crate::router::Target;
@@ -19,7 +19,7 @@ use crate::types::{PyronovaRequest, ResponseData, ResponseHeaders};
 
 use pipeline::AcceptEncoding;
 
-pub(crate) type SharedPool = Arc<interp::InterpreterPool>;
+pub(crate) type SharedPool = Arc<crate::python::pool::InterpreterPool>;
 
 // Per-dispatch-path handlers live in submodules; the pipeline every path shares
 // (preprocess, collect_body, finish) is `pipeline`; helpers used by several paths stay
@@ -104,53 +104,46 @@ pub(crate) fn close_thread_event_loop(py: Python<'_>) {
     }
 }
 
-/// Runs what a hook or handler returned to a value: an awaitable is driven to completion
-/// on this thread's persistent asyncio event loop (cached per thread, so no loop is made
-/// and torn down per request), in the request's own context (`rc`) unless it is a
-/// `Future`, which runs in its own. A plain value is returned unchanged.
-///
-/// An exception the awaitable raises is `stage`'s; one creating the loop is setup's.
-fn resolve_coroutine(
-    py: Python<'_>,
-    rc: &RequestContext<'_>,
-    obj: Py<PyAny>,
-    stage: Stage,
-) -> Result<Py<PyAny>, HandlerError> {
-    let bound = obj.bind(py);
-    let Some(awaitable) = Awaitable::of(bound) else {
-        return Ok(obj);
-    };
+/// This thread's persistent asyncio event loop (cached per thread, so no loop is made and
+/// torn down per request), where a main-interpreter hook or handler's awaitable runs.
+pub(crate) struct ThreadLoop;
 
-    LOOP.with(|tl| {
-        let mut guard = tl.borrow_mut();
+impl EventLoop for ThreadLoop {
+    fn event_loop<'py>(&self, py: Python<'py>) -> Result<Bound<'py, PyAny>, HandlerError> {
+        LOOP.with(|tl| {
+            let mut guard = tl.borrow_mut();
 
-        let (loop_obj, loop_interp) = match &mut guard.0 {
-            Some(existing) => &*existing,
-            empty @ None => {
-                let new_loop =
-                    new_event_loop(py).map_err(|e| HandlerError::python(py, Stage::Setup, &e))?;
-                &*empty.insert((new_loop.unbind(), crate::run_context::Interp::current(py)))
+            let (loop_obj, loop_interp) = match &mut guard.0 {
+                Some(existing) => &*existing,
+                empty @ None => {
+                    let new_loop = new_event_loop(py)
+                        .map_err(|e| HandlerError::python(py, Stage::Setup, &e))?;
+                    &*empty.insert((new_loop.unbind(), crate::run_context::Interp::current(py)))
+                }
+            };
+            // The loop belongs to the interpreter that created it. Only main-side threads
+            // reach this path; running it from another interpreter would mix two
+            // interpreters' objects, so the request fails instead.
+            let current = crate::run_context::Interp::current(py);
+            if loop_interp.id() != current.id() {
+                return Err(HandlerError::ForeignEventLoop {
+                    loop_interp: loop_interp.id(),
+                    current: current.id(),
+                });
             }
-        };
-        // The loop belongs to the interpreter that created it. Only main-side threads reach
-        // this path; running it from another interpreter would mix two interpreters'
-        // objects, so the request fails instead.
-        let current = crate::run_context::Interp::current(py);
-        if loop_interp.id() != current.id() {
-            return Err(HandlerError::ForeignEventLoop {
-                loop_interp: loop_interp.id(),
-                current: current.id(),
-            });
-        }
-        let event_loop = loop_obj.bind(py);
-        let result = match awaitable {
-            Awaitable::InTask => rc.run_in_task(event_loop, bound),
-            Awaitable::Future => event_loop.call_method1("run_until_complete", (bound,)),
-        };
-        Ok(result
-            .map_err(|e| HandlerError::python(py, stage, &e))?
-            .unbind())
-    })
+            Ok(loop_obj.bind(py).clone())
+        })
+    }
+}
+
+/// The hook chain of a main-interpreter request: this thread's loop, and the full
+/// response mapping (a handler may return a `Stream`).
+pub(crate) fn main_chain<'a, 'py>(rc: &'a RequestContext<'py>) -> Chain<'a, 'py, ThreadLoop> {
+    Chain {
+        rc,
+        event_loop: &ThreadLoop,
+        to_response: main_response,
+    }
 }
 
 /// A new asyncio event loop, set as this thread's current one.
@@ -252,29 +245,22 @@ fn run_with_hooks(
     sky_req: PyronovaRequest,
 ) -> Result<MainReply, HandlerError> {
     let routes = &site.routes;
+    let chain = main_chain(rc);
     // One `Request` object for the hooks and the handler.
-    let req = Py::new(py, sky_req).map_err(|e| HandlerError::python(py, Stage::Setup, &e))?;
+    let req = Bound::new(py, sky_req).map_err(|e| HandlerError::python(py, Stage::Setup, &e))?;
 
-    if let Some(short_circuit) = run_before_hooks(py, rc, &routes.before_hooks, &req)? {
+    if let Some(short_circuit) = chain.before(&routes.before_hooks, &req)? {
         return Ok(MainReply::Response(short_circuit));
     }
-
-    let obj = routes
-        .handler(target)
-        .call1(py, (req.clone_ref(py),))
-        .map_err(|e| HandlerError::python(py, Stage::Handler, &e))?;
-    // If handler returned a coroutine (async def), run it via asyncio
-    let obj = resolve_coroutine(py, rc, obj, Stage::Handler)?;
+    let value = chain.handler(routes.handler(target), &req)?;
 
     // A `Stream` (SSE) goes out as a streaming body. `is_instance_of` is a single C
     // pointer compare, no string alloc.
-    let bound = obj.bind(py);
-    if bound.is_instance_of::<PyronovaStream>() {
-        return Ok(MainReply::Stream(stream_info(bound)?));
+    if value.is_instance_of::<PyronovaStream>() {
+        return Ok(MainReply::Stream(stream_info(&value)?));
     }
-
-    let data = extract_response_data(py, bound.clone())?;
-    let data = run_after_hooks(py, rc, &routes.after_hooks, &req, data)?;
+    let data = extract_response_data(py, value)?;
+    let data = chain.after(&routes.after_hooks, &req, data)?;
     Ok(MainReply::Response(data))
 }
 
@@ -292,51 +278,6 @@ fn stream_info(bound: &Bound<'_, PyAny>) -> Result<StreamInfo, ResponseError> {
         status,
         headers: stream.headers.clone(),
     })
-}
-
-/// The before-request hooks, in order, until one returns a response: `Ok(Some(resp))`
-/// short-circuits the request with it. An `async def` hook's coroutine is awaited, not
-/// taken for a response.
-pub(crate) fn run_before_hooks(
-    py: Python<'_>,
-    rc: &RequestContext<'_>,
-    hooks: &[Py<PyAny>],
-    req: &Py<PyronovaRequest>,
-) -> Result<Option<ResponseData>, HandlerError> {
-    for hook in hooks {
-        let result = hook
-            .call1(py, (req.clone_ref(py),))
-            .map_err(|e| HandlerError::python(py, Stage::BeforeHook, &e))?;
-        let result = resolve_coroutine(py, rc, result, Stage::BeforeHook)?;
-        let bound = result.bind(py);
-        if !bound.is_none() {
-            return Ok(Some(extract_response_data(py, bound.clone())?));
-        }
-    }
-    Ok(None)
-}
-
-/// The after-request hooks, in order: each gets the response so far and may replace it.
-/// One that raises fails the request (500), on every interpreter.
-fn run_after_hooks(
-    py: Python<'_>,
-    rc: &RequestContext<'_>,
-    hooks: &[Py<PyAny>],
-    req: &Py<PyronovaRequest>,
-    mut resp_data: ResponseData,
-) -> Result<ResponseData, HandlerError> {
-    for hook in hooks {
-        let current_resp = resp_data.to_py(py)?;
-        let result = hook
-            .call1(py, (req.clone_ref(py), current_resp))
-            .map_err(|e| HandlerError::python(py, Stage::AfterHook, &e))?;
-        let result = resolve_coroutine(py, rc, result, Stage::AfterHook)?;
-        let bound = result.bind(py);
-        if !bound.is_none() {
-            resp_data = extract_response_data(py, bound.clone())?;
-        }
-    }
-    Ok(resp_data)
 }
 
 /// Build a streaming SSE response from a channel receiver.

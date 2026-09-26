@@ -35,7 +35,7 @@ use crate::error::{
     refuse, HandlerError, Logged, PyException, Refusal, RequestLabel, RequestTag, Stage,
 };
 use crate::handlers::pipeline::{await_reply, fail, finish, AcceptEncoding, RequestLine, Served};
-use crate::handlers::{http_response, run_before_hooks};
+use crate::handlers::{http_response, main_chain};
 use crate::request_head::{Body, RequestHead};
 use crate::request_id::RequestId;
 use crate::site::{SharedSite, Site};
@@ -724,7 +724,9 @@ fn serve_connection(
     let hooks = Py::new(py, request)
         .map_err(|e| HandlerError::python(py, Stage::Setup, &e))
         .and_then(|request| {
-            run_before_hooks(py, rc, &site.routes.before_hooks, &request).map(|r| (request, r))
+            main_chain(rc)
+                .before(&site.routes.before_hooks, request.bind(py))
+                .map(|r| (request, r))
         });
     // A verdict goes unread only if the handshake already gave up.
     let request = match hooks {

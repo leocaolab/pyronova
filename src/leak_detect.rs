@@ -16,7 +16,7 @@
 //!     rc>=3 persistently on the same type → FFI refcount bug
 //!
 //! How it works:
-//!   The hot path samples every `PyObjRef::Drop` call into a
+//!   A worker samples each request's `Request` object as it lets go of it into a
 //!   `metrics::counter!("pyronova_drop_rc", "type" => T, "rc" => N)`.
 //!   The `metrics` facade compiles the per-label counter down to a
 //!   single pointer chase into a `DebuggingRecorder`-owned atomic — no
@@ -48,11 +48,6 @@
 //! instance attributes where that's expected) is the leak.
 
 use std::sync::OnceLock;
-
-// arc finding leak-detect-2: record_drop's mutex .unwrap() panics on
-// poisoning, cascading one panic in this diagnostic module into all
-// subsequent drops failing. Use unwrap_or_else(|e| e.into_inner()) at
-// every site that locks the per-type tally Mutex.
 
 use metrics_util::debugging::{DebuggingRecorder, Snapshotter};
 use pyo3::ffi;
@@ -100,30 +95,26 @@ fn ensure_recorder_installed() -> Option<&'static Snapshotter> {
         .as_ref()
 }
 
-/// Sample a PyObjRef drop. Called unconditionally from `PyObjRef::Drop`
-/// when the `leak_detect` feature is enabled.
+/// Sample the drop of a request's object in a worker (its `Request`, just before the
+/// worker lets go of it: refcount 1 is healthy).
 ///
 /// Hot-path cost after the first call with a given (type, rc) label
 /// pair: one static str compare + one atomic increment. The `metrics`
 /// facade intentionally avoids touching a mutex or a HashMap on the
 /// sampled path.
-///
-/// # Safety
-/// `ptr` must be a valid PyObject the caller owns a reference to, and
-/// the caller must hold the owning sub-interpreter's GIL.
 #[inline(never)] // keep cold — do not pollute icache of the real hot path
-pub unsafe fn record_drop(ptr: *mut ffi::PyObject) {
-    if ptr.is_null() {
-        return;
-    }
+pub fn record_drop(obj: &pyo3::Bound<'_, pyo3::PyAny>) {
     ensure_recorder_installed();
+    let ptr = obj.as_ptr();
 
-    let rc = ffi::Py_REFCNT(ptr);
+    // SAFETY: `obj` is a live object of an attached interpreter (the `Bound`'s token).
+    let rc = unsafe { ffi::Py_REFCNT(ptr) };
     // `tp_name` is a stable `const char*` owned by the type object —
     // the type object itself can't be deallocated while we hold a ref
     // to an instance of it, so the borrow is safe for the duration of
     // this call.
-    let type_name: &'static str = {
+    // SAFETY: as above.
+    let type_name: &'static str = unsafe {
         let t = ffi::Py_TYPE(ptr);
         if t.is_null() {
             "<null_type>"
@@ -243,17 +234,15 @@ unsafe fn type_name_bounded(ptr: *const std::os::raw::c_char) -> &'static str {
 /// enumerable — the worst case is a few dozen entries over a process
 /// lifetime, so a Mutex<HashMap<String, &'static str>> is cheap
 /// (contention is cold-path only; the hot path sees repeated lookups
-/// hit the same &'static str and skip the mutex).
+/// hit the same &'static str and skip the mutex). The critical section
+/// only reads and inserts, so a lock that doesn't poison loses nothing.
 fn intern(s: &str) -> &'static str {
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     static TABLE: OnceLock<Mutex<std::collections::HashMap<String, &'static str>>> =
         OnceLock::new();
     let t = TABLE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    // Recover from poisoning — leak diagnostics must not cascade a
-    // single panic into permanent failure of the whole module
-    // (arc leak-detect-2).
-    let mut g = t.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = t.lock();
     if let Some(&cached) = g.get(s) {
         return cached;
     }
