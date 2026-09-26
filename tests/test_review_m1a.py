@@ -393,7 +393,7 @@ def test_rpc_and_mcp_routes_are_listed_in_app_routes():
     from tests.apps.m1a_rpc_and_mcp import app
 
     with TestClient(app):
-        paths = {(r["method"], r["path"]) for r in app.routes}
+        paths = {(r.method, r.path) for r in app.routes}
     assert ("POST", "/rpc/echo") in paths
     assert ("POST", "/mcp") in paths
 

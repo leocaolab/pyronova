@@ -227,6 +227,12 @@ def _default_echo(ws):
         ws.send(msg)
 
 
+@_small.websocket("/echo")
+def _small_echo(ws):
+    while (msg := ws.recv()) is not None:
+        ws.send(msg)
+
+
 def test_two_apps_in_one_process_keep_their_own_max_body_size():
     with TestClient(_default, mode="gil") as big, TestClient(_small, mode="gil") as small:
         assert big.post("/len", body=b"x" * 5000).json() == {"len": 5000}
@@ -237,12 +243,21 @@ def test_two_apps_in_one_process_keep_their_own_max_body_size():
 
 
 def test_two_apps_in_one_process_keep_their_own_websocket_cap():
+    import websockets
+
     assert _default.max_websocket_connections == 1024
-    with TestClient(_default, mode="gil") as c:
-        with c.websocket_connect("/echo") as a, c.websocket_connect("/echo") as b:
+    with TestClient(_default, mode="gil") as big, TestClient(_small, mode="gil") as small:
+        with big.websocket_connect("/echo") as a, big.websocket_connect("/echo") as b:
             a.send("1")
             b.send("2")
             assert (a.recv(timeout=5), b.recv(timeout=5)) == ("1", "2")
+        # The small app's cap of 1 holds while the default app takes two.
+        with small.websocket_connect("/echo") as only:
+            only.send("3")
+            assert only.recv(timeout=5) == "3"
+            with pytest.raises(websockets.InvalidStatus) as refused:
+                small.websocket_connect("/echo")
+            assert refused.value.response.status_code == 503
 
 
 # ---------------------------------------------------------------------------
@@ -386,10 +401,13 @@ def _bound_root(req):
 def test_testclient_reports_the_port_the_engine_bound():
     with TestClient(_bound, mode="gil") as c:
         assert c._settings.port == 0
-        assert c.port == _bound._engine.bound_port()
+        assert c.port == c._server.port
         assert c.port != 0
         assert c.get("/").text == "ok"
-    assert _bound._engine.bound_port() is None
+        port = c.port
+    # Closed: nothing listens on the port any more.
+    with pytest.raises(OSError):
+        socket.create_connection(("127.0.0.1", port), timeout=2).close()
 
 
 # ---------------------------------------------------------------------------

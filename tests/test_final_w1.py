@@ -254,10 +254,22 @@ def test_abandoned_workers_raise_from_testclient_close(tmp_path):
     r = _run_script(
         tmp_path,
         """
-        import pyronova.app
         from pyronova import Pyronova
         from pyronova.app import WorkersAbandoned
         from pyronova.testing import TestClient
+
+        class AbandoningEngine:
+            # The app's engine, reporting the workers a pool shutdown gave up on.
+
+            def __init__(self, engine, abandoned):
+                self._engine, self._abandoned = engine, abandoned
+
+            def __getattr__(self, name):
+                return getattr(self._engine, name)
+
+            def _take_abandoned_workers(self):
+                taken, self._abandoned = self._abandoned, []
+                return taken
 
         app = Pyronova()
 
@@ -266,7 +278,7 @@ def test_abandoned_workers_raise_from_testclient_close(tmp_path):
             return "ok"
 
         # As a pool shutdown that gave up on a worker reports it.
-        pyronova.app._forgotten_workers = lambda: ["pyronova-worker-0 (running GET /)"]
+        app._engine = AbandoningEngine(app._engine, ["pyronova-worker-0 (running GET /)"])
 
         if __name__ == "__main__":
             c = TestClient(app, mode="gil")
@@ -286,8 +298,20 @@ def test_app_run_still_exits_when_workers_are_abandoned(tmp_path):
         tmp_path,
         """
         import threading, time, urllib.request
-        import pyronova.app
         from pyronova import Pyronova
+
+        class AbandoningEngine:
+            # The app's engine, reporting the workers a pool shutdown gave up on.
+
+            def __init__(self, engine, abandoned):
+                self._engine, self._abandoned = engine, abandoned
+
+            def __getattr__(self, name):
+                return getattr(self._engine, name)
+
+            def _take_abandoned_workers(self):
+                taken, self._abandoned = self._abandoned, []
+                return taken
 
         app = Pyronova()
 
@@ -295,7 +319,7 @@ def test_app_run_still_exits_when_workers_are_abandoned(tmp_path):
         def index(req):
             return "ok"
 
-        pyronova.app._forgotten_workers = lambda: ["pyronova-worker-0"]
+        app._engine = AbandoningEngine(app._engine, ["pyronova-worker-0"])
 
         def stop_when_up():
             for _ in range(200):

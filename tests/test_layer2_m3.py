@@ -303,7 +303,7 @@ def test_main_guard_logging_and_mcp_in_subinterp_mode(tmp_path):
         base = _bound_base(proc, log_path)
         _wait_up(base, "/w", proc, log_path)
         assert httpx.get(base + "/w", timeout=5).json() == {"ok": True}
-        r = httpx.post(base + "/mcp", timeout=5, content=json.dumps(
+        r = httpx.post(base + "/mcp", timeout=5, headers={"Content-Type": "application/json"}, content=json.dumps(
             {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
         assert r.status_code == 200
         assert [t["name"] for t in r.json()["result"]["tools"]] == ["add"]

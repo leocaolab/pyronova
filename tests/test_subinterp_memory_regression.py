@@ -9,7 +9,7 @@ Yesterday's fixes (v1.4.5 security + correctness):
   - etc. — see CHANGELOG v1.4.5
 
 Today's fixes (hot-path leak):
-  - PyObjRef::Drop uses PyThreadState_GetUnchecked (sub-interp aware)
+  - a reference is released with its own interpreter's thread state current
   - call_handler uses PyObject_Vectorcall (was PyObject_Call)
   - build_request uses PyObject_Vectorcall (was PyObject_Call)
   - build_request does manual Py_DECREF on each arg to compensate the
@@ -491,9 +491,9 @@ def test_sustained_concurrent_load_no_leak(server):
       - Normal allocator noise and legit working-set fill stays under.
 
     If this test fails:
-      - First check `rebind_tstate_to_current_thread` is still called
-        at the top of both worker_thread_loop and worker_thread_loop_async
-        in src/python/interp.rs.
+      - First check `rebind_tstate_to_current_thread` is still called by
+        `SubInterpreterWorker::bind_to_this_thread` (src/python/worker.rs)
+        before a worker thread serves.
       - Then run /tmp/pep684_repro/repro_threadstate_new.c to confirm
         the pure-C reproducer still shows 0 B/iter on the FRESH variant.
     """
@@ -528,6 +528,6 @@ def test_sustained_concurrent_load_no_leak(server):
         f"({completed} requests, ~{completed // 12} rps). "
         f"Expected < 15 MB. This almost certainly means the "
         f"rebind_tstate_to_current_thread fix has regressed — see "
-        f"src/python/interp.rs::rebind_tstate_to_current_thread and the test "
+        f"src/python/worker.rs::rebind_tstate_to_current_thread and the test "
         f"docstring for diagnosis steps."
     )

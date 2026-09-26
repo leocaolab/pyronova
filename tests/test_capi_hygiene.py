@@ -1,4 +1,4 @@
-"""Integration tests for CPython C-API hygiene in interp.rs.
+"""Integration tests for CPython C-API hygiene on the handler call path.
 
 These exercise edge cases that a Haskell-style linearity / exception-state
 audit flagged as latent SystemError / segfault bombs:

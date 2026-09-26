@@ -352,7 +352,7 @@ def test_async_pool_request_ids_do_not_cross(tmp_path):
 _ENGINE_NAMES = [
     "PyronovaApp", "Request", "Response", "WebSocket", "SharedState", "Stream",
     "PgPool", "PgCursor", "get_gil_metrics", "init_logger", "emit_python_log", "_in_worker",
-    "_forgotten_workers", "_worker_recv", "_worker_send", "_worker_to_response",
+    "_worker_recv", "_worker_send", "_worker_to_response",
     "_worker_app_handlers", "_worker_app_hooks",
 ]
 

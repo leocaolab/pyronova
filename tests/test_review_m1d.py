@@ -402,7 +402,7 @@ def test_logging_custom_level_between_info_and_warning_is_kept():
     """cced8c2 matched `levelname`; a custom level fell to TRACE and was dropped."""
     r = _run_script(_BRIDGE + """
 init_logger("INFO", False, "text")
-_setup_python_logging_bridge("INFO")
+_setup_python_logging_bridge()
 logging.addLevelName(25, "NOTICE")
 logging.getLogger("m1d").log(25, "custom-level-25")
 logging.getLogger("m1d").log(5, "below-debug-5")
@@ -443,7 +443,7 @@ def test_logging_second_init_reconfigures_instead_of_silently_keeping_the_first(
     r = _run_script(_BRIDGE + """
 init_logger("ERROR", False, "text")
 init_logger("INFO", False, "json")
-_setup_python_logging_bridge("INFO")
+_setup_python_logging_bridge()
 logging.getLogger("m1d").info("after-reinit")
 time.sleep(0.5)
 """)

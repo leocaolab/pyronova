@@ -1,9 +1,9 @@
 """No Python reference is dropped without its interpreter's thread state.
 
-`PyObjRef` leaks (and logs "no attached tstate") rather than DECREF on a thread
-with no thread state attached. Worker init used to hold its bootstrap and script
-module references past `PyEval_SaveThread`, so every worker leaked two module
-references at startup (2 per worker, in both dispatch modes).
+The PyO3 fork refuses to release a `Py<T>` on a thread with no thread state attached,
+and says so ("a Py<T> was dropped on a thread that has no Python thread state"). Worker
+init used to hold its bootstrap and script module references past `PyEval_SaveThread`,
+so every worker would drop two module references there at startup.
 """
 from __future__ import annotations
 
@@ -36,4 +36,4 @@ def test_no_reference_dropped_without_a_thread_state(tmp_path, tpc):
         rc = _sigint(proc)
     text = log.read_text(errors="replace")
     assert rc == 0, text[-3000:]
-    assert "no attached tstate" not in text, text[-3000:]
+    assert "was dropped on a thread that has no Python thread state" not in text, text[-3000:]

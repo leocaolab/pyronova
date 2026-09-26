@@ -9,14 +9,9 @@ Now the feeder uses `tokio::sync::mpsc::channel(CHANNEL_CAPACITY)` and
 window → client.
 
 The full DoS test needs a multi-GB-per-second peer that's not easy to
-simulate in pytest; instead we verify functional correctness (the
-handler still receives every chunk) and that the critical
-backpressure primitive is present in the source.
+simulate in pytest; this checks functional correctness (the handler still
+receives every chunk). The streamed-body budget is covered by test_final_w2.
 """
-
-import pathlib
-
-import pytest
 
 from pyronova import Pyronova
 from pyronova.testing import TestClient
@@ -39,23 +34,6 @@ def upload(req):
         total += len(chunk)
         chunks += 1
     return {"bytes": total, "chunks": chunks}
-
-
-def test_feeder_uses_bounded_async_channel():
-    src = pathlib.Path("src/python/body_stream.rs").read_text()
-    assert "tokio::sync::mpsc::Receiver" in src, (
-        "BodyStream must hold a tokio bounded receiver; the previous "
-        "std::sync::mpsc path was unbounded (OOM risk on large uploads)"
-    )
-    assert "CHANNEL_CAPACITY" in src, (
-        "the bound value should be a named constant (documented + tunable)"
-    )
-    handlers = pathlib.Path("src/handlers.rs").read_text()
-    assert ".send(ChunkMsg::Data(chunk)).await" in handlers, (
-        "feeder must use .send().await (awaits when buffer full) — "
-        "blocking send on a bounded channel is what produces the TCP-level "
-        "backpressure; sync send() would just return Err(Full)"
-    )
 
 
 def test_streaming_handler_receives_all_chunks():

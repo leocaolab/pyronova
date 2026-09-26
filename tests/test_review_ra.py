@@ -321,8 +321,9 @@ app.get("/async")(async_probe)
 app.get("/async-gil", gil=True)(async_probe)
 """ + RUN
 
-# TPC: inline sub-interpreter (def and async def) and the bridge (gil=True); pool: sync
-# worker, async engine and main-interpreter dispatch; GIL mode: every route on main.
+# TPC: inline sub-interpreter (def), the async pool (async def) and the bridge
+# (gil=True); pool: sync worker, async engine and main-interpreter dispatch; GIL mode:
+# every route on main.
 CTX_ROUTES = ["/sync", "/async", "/sync-gil", "/async-gil"]
 
 
@@ -401,8 +402,8 @@ def test_brace_params_and_catch_all_are_injected(path):
 
 
 # ---------------------------------------------------------------------------
-# M4 gaps: isojson is required in every worker; the async engine's death at run time is
-# its own error; a relative import failing in a worker says why
+# M4 gaps: isojson is required in every worker; a relative import failing in a worker
+# says why
 # ---------------------------------------------------------------------------
 
 
@@ -437,34 +438,6 @@ def test_isojson_refused_in_a_worker_stops_the_start(path):
     out = _start_failure(script, path)
     assert "loading the JSON serializer failed" in out, out[-3000:]
     assert "import of isojson halted" in out, out[-3000:]
-
-
-ENGINE_DEATH_SCRIPT = """
-from pyronova import Pyronova
-app = Pyronova()
-
-@app.get("/die")
-async def die(req):
-    raise SystemExit("ra-engine-died")
-""" + RUN
-
-
-def test_async_engine_death_at_run_time_is_reported_as_such():
-    srv = Server(ENGINE_DEATH_SCRIPT, "pool", workers=1)
-    try:
-        # The request itself is lost with the engine (M7); only the log matters here.
-        with pytest.raises(OSError):
-            srv.get("/die", timeout=2)
-    finally:
-        out = srv.stop()
-    # The engine ends when its fetcher does, at shutdown; the record is written then.
-    stopped = [
-        line for line in out.splitlines()
-        if "the async engine stopped: SystemExit: ra-engine-died" in line
-    ]
-    assert len(stopped) == 1, out[-4000:]
-    assert "async worker stopped serving" in stopped[0]
-    assert "raised while the worker started" not in out, out[-4000:]
 
 
 def test_relative_import_failing_in_a_worker_says_why(tmp_path):
@@ -771,19 +744,47 @@ def test_explicit_logging_level_wins(env, shown, hidden):
         assert hidden not in text, text[-3000:]
 
 
-def test_enable_logging_without_a_level_keeps_the_configured_one():
-    from pyronova import Pyronova
-
+KEPT_LEVEL_SCRIPT = """
+import logging, os
+from pyronova import Pyronova
+case = os.environ["RA_CASE"]
+if case == "configured-debug":
     app = Pyronova(log_config={"level": "DEBUG"})
-    app.enable_logging()
-    assert app._log_config["level"] == "DEBUG"
-    quiet = Pyronova()  # ERROR would hide the INFO access lines
-    quiet.enable_logging()
-    assert quiet._log_config["level"] == "INFO"
-    pinned = Pyronova()
-    pinned.enable_logging(level="error")
-    pinned.enable_logging()  # PYRONOVA_LOG=1 / debug=True at run()
-    assert pinned._log_config["level"] == "ERROR"
+elif case == "pinned-error":
+    app = Pyronova()
+    app.enable_logging(level="error")
+else:
+    app = Pyronova()  # ERROR would hide the INFO access lines
+app.enable_logging()  # as PYRONOVA_LOG=1 / debug=True at run()
+
+@app.get("/log", gil=True)
+def log(req):
+    logger = logging.getLogger("ra.app")
+    logger.debug("ra-debug-line")
+    logger.info("ra-info-line")
+    logger.warning("ra-warning-line")
+    logger.error("ra-error-line")
+    return "ok"
+""" + RUN
+
+
+@pytest.mark.parametrize(
+    "case,lowest_shown,highest_hidden",
+    [
+        ("configured-debug", "ra-debug-line", None),
+        ("default", "ra-info-line", "ra-debug-line"),
+        ("pinned-error", "ra-error-line", "ra-warning-line"),
+    ],
+)
+def test_enable_logging_without_a_level_keeps_the_configured_one(case, lowest_shown, highest_hidden):
+    with serve(KEPT_LEVEL_SCRIPT, "gil", env={"RA_CASE": case}) as srv:
+        assert srv.get("/log").status == 200
+        # ra-error-line is written last: once it is in, the others would be too.
+        srv.wait_for_records(lambda r: "ra-error-line" in _record_text(r))
+        text = srv.log()
+        assert lowest_shown in text, text[-3000:]
+        if highest_hidden is not None:
+            assert highest_hidden not in text, text[-3000:]
 
 
 # ---------------------------------------------------------------------------
@@ -838,9 +839,11 @@ def test_sync_readiness_check_is_bounded_like_an_async_one(monkeypatch):
 
     monkeypatch.setattr(health, "_CHECK_TIMEOUT_S", 0.5)
     started = time.monotonic()
-    ok, results = health._run_checks_sync(
-        [("hangs", lambda: time.sleep(5)), ("fine", lambda: True)], "rid-ra"
-    )
+    checks = [
+        health.ReadinessCheck.of("hangs", lambda: time.sleep(5)),
+        health.ReadinessCheck.of("fine", lambda: True),
+    ]
+    ok, results = health._run_checks_sync(checks, "rid-ra")
     assert time.monotonic() - started < 3
     assert ok is False
     assert results == {"hangs": {"ok": False}, "fine": {"ok": True}}

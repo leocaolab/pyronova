@@ -1,4 +1,4 @@
-"""FR-12 / E2E-9 (Layer 2, M0): no bare `Python::attach` outside an audited allowlist.
+"""No bare `Python::attach` outside an audited allowlist.
 
 Once more than one interpreter has executed the engine, a bare attach on a thread with no
 Python thread state is refused by the PyO3 fork, and on a thread bound to a worker it
@@ -26,8 +26,8 @@ ALLOWLIST = {
     ),
     "src/python/worker.rs": (
         1,
-        "call_handler: on a worker thread whose own thread state is current "
-        "(SubInterpGilGuard); a re-entrant attach",
+        "SubInterpreterWorker::with_gil: on the thread the worker is bound to, with its "
+        "own thread state current (SubInterpGilGuard); a re-entrant attach",
     ),
 }
 
@@ -75,7 +75,7 @@ def test_no_bare_attach_outside_allowlist():
 
 
 def test_gate_catches_a_seeded_bare_attach(tmp_path):
-    """E2E-9: the gate must fail on a new bare attach, not just pass on today's tree."""
+    """The gate fails on a new bare attach, not just passes on today's tree."""
     shutil.copytree(os.path.join(ROOT, "src"), tmp_path / "src")
     target = tmp_path / "src" / "handlers.rs"
     with open(target, "a", encoding="utf-8") as f:
