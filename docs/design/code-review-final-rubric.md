@@ -109,3 +109,18 @@ One fix wave, then a single full-suite run (human decision): these findings + R-
 6. Docstrings mentioning `interp.rs` / `PyObjRef` in `tests/test_subinterp_memory_regression.py`, `tests/test_capi_hygiene.py`.
 
 Also from the wave-A reports (edits to tests added in this effort): `test_review_m5.py:378,381` (`bound_port()` removed → `c._server.port`, port refused after close); `test_review_ra.py` logging/readiness tests (`LogLevel`, `ReadinessCheck.of`); `test_review_m1d.py` logging bridge call; `test_layer2_m3.py:304` `/mcp` POST needs `Content-Type: application/json`; `test_review_m1a.py:396`, `test_review_m8.py:201` route records (`r.method`, `r.path`); stale comment `test_review_ra.py:318`.
+
+## Final status (2026-09-26)
+
+All waves merged on `review/cced8c2-fixes` (W1–W5 + final edits). Verification on macOS arm64, Python 3.14.7, Postgres 16:
+
+- `cargo fmt --check`; `cargo clippy --all-targets -D warnings` for default / `bench` / `fault_injection` / `leak_detect`; `cargo test` (193) and `cargo test --features bench` — all green, `cargo test` links without workarounds.
+- Full suite, default build: **968 passed, 17 skipped, 0 failed** (16 min).
+- `--features bench,fault_injection` build: `test_review_m6 -k test_bench_` 6 passed; panic / spawn-failure tests 9 passed.
+
+Found during the full run and fixed: subprocess test servers started with `preexec_fn=os.setsid` segfaulted in the forked child once the pytest process held many threads and sub-interpreters → `start_new_session=True` (approved).
+
+Known and left as is:
+- `test_review_m2::test_pool_admission_rejects_large_bodies_past_the_permit_budget` is timing-sensitive under heavy load (failed once in the first full run, passed alone 3/3 and in the confirmation run).
+- isojson `exact_ints`: implemented on isojson `feat/exact-ints` + simd-json fork `feat/big-int-as-literal` (local, not pushed). Release deferred by the human; pyre keeps the wide-integer fallback in `src/json.rs` until isojson 0.3 ships.
+- Not yet verified: Linux CI (the `extension-module` removal needs libpython at test-binary runtime there), Windows.
