@@ -6,68 +6,38 @@ process's stderr fd. Under a 500k-rps flood that triggered many
 exceptions, every worker serialized on the kernel stdio lock and
 throughput collapsed.
 
-Now the hot path routes exceptions through `log_and_clear_py_exception`,
-which captures the exception string and emits it via Rust's `tracing`
-pipeline (non-blocking async writer).
-
-We verify:
-  1. The helper exists and is the primary error-reporting path.
-  2. Calling a handler that raises an exception does not spam stderr
-     (this would be the smoking gun for a regression).
+Now handler exceptions are taken as PyO3 errors and logged through Rust's
+`tracing` pipeline (non-blocking writer). We verify behaviourally that a
+handler that raises does not spam stderr.
 """
 
-import io
-import pathlib
+import os
+import signal
 import subprocess
 import sys
 import textwrap
 
+import httpx
 
-def test_log_helper_present_and_wired():
-    src = "\n".join(p.read_text() for p in pathlib.Path("src/python").glob("*.rs"))
-    assert "fn log_and_clear_py_exception" in src
-    # Hot-path call sites: handler errors, hook errors, json.dumps,
-    # run_until_complete, _Response construction, async engine exec.
-    assert src.count("log_and_clear_py_exception(") >= 5, (
-        "expected the new logger to cover every per-request exception "
-        "path; fewer than 5 call sites means we missed a PyErr_Print"
-    )
-    # Hot-path PyErr_Print calls should be gone from the per-request
-    # codepath. Allow a few remaining at startup (init_in_sub_interp,
-    # pre-flight checks that run once per sub-interp).
-    hot_paths = [
-        "handler raised an exception",
-        "before_request hook {hook_name",
-        "loop.run_until_complete() failed",
-        "json.dumps failed",
-        "failed to create _Response",
-    ]
-    for marker in hot_paths:
-        # Each marker is paired with log_and_clear_py_exception, not PyErr_Print.
-        idx = src.find(marker)
-        assert idx != -1, f"expected marker not found: {marker}"
-        window = src[max(0, idx - 400):idx]
-        assert "PyErr_Print" not in window, (
-            f"hot path near {marker!r} still calls PyErr_Print — "
-            "replace with log_and_clear_py_exception"
-        )
+from tests._helpers import bound_port, poll_until, read_file
 
 
-def test_raising_handler_does_not_spam_stderr():
+def test_raising_handler_does_not_spam_stderr(tmp_path):
     """Run a child Pyronova process that serves a route which raises, hit
-    it once, and verify stderr stays quiet. The child runs with
+    it a few times, and verify stderr stays quiet. The child runs with
     `mode="subinterp"` so the PyErr_Print path is the one that would
     have been hit before the fix.
+
+    The server runs from a script file, not `python -c`: workers re-run the
+    app's `__file__`, so `app.run()` needs one to serve at all.
 
     Tolerance: we don't require *zero* stderr bytes — Pyronova's startup
     prints a banner and the tracing subscriber may emit one-line
     warnings. We require that there's no raw Python traceback in
     stderr (those are the 10-20+ lines of noise the bug produced).
     """
-    script = textwrap.dedent("""
-        import os
-        os.environ["PYRONOVA_WORKER"] = ""
-        import threading, time, urllib.request
+    script = tmp_path / "raising_app.py"
+    script.write_text(textwrap.dedent("""
         from pyronova import Pyronova
 
         app = Pyronova()
@@ -80,43 +50,51 @@ def test_raising_handler_does_not_spam_stderr():
         def boom(req):
             raise RuntimeError("deliberate test failure")
 
-        def main():
-            t = threading.Thread(
-                target=lambda: app.run(host="127.0.0.1", port=19894, mode="subinterp"),
-                daemon=True,
-            )
-            t.start()
-            for _ in range(60):
-                time.sleep(0.1)
-                try:
-                    urllib.request.urlopen("http://127.0.0.1:19894/", timeout=1)
-                    break
-                except Exception:
-                    continue
-            # Trigger the raising handler a few times.
-            for _ in range(5):
-                try:
-                    urllib.request.urlopen("http://127.0.0.1:19894/boom", timeout=2).read()
-                except Exception:
-                    pass
+        if __name__ == "__main__":
+            app.run(host="127.0.0.1", port=0, mode="subinterp")
+    """))
+    stdout_path = tmp_path / "stdout.log"
+    stderr_path = tmp_path / "stderr.log"
+    with open(stdout_path, "w") as out, open(stderr_path, "w") as err:
+        proc = subprocess.Popen(
+            [sys.executable, str(script)],
+            stdout=out, stderr=err, cwd=str(tmp_path), start_new_session=True,
+        )
+    read_stdout, read_stderr = read_file(str(stdout_path)), read_file(str(stderr_path))
+    try:
+        port = bound_port(lambda: read_stdout() + read_stderr(), proc)
+        base = f"http://127.0.0.1:{port}"
 
-        main()
-    """)
+        def up():
+            try:
+                return httpx.get(base + "/", timeout=2).status_code == 200
+            except httpx.HTTPError:
+                return False
 
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        capture_output=True,
-        timeout=30,
-        text=True,
-    )
-    combined = result.stderr + result.stdout
+        poll_until(up, timeout=30, what="the server answering GET /")
+        # Trigger the raising handler a few times.
+        for _ in range(5):
+            assert httpx.get(base + "/boom", timeout=5).status_code == 500
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGINT)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=5)
+
+    combined = read_stderr() + read_stdout()
     # The signature of PyErr_Print is multi-line Python traceback:
     #   Traceback (most recent call last):
     #     File "...", line ...
     #   RuntimeError: deliberate test failure
     # If any of those appear raw (not JSON-encoded inside a tracing
     # record), the old path has leaked back in.
-    traceback_lines = combined.count("Traceback (most recent call last):")
+    traceback_lines = sum(
+        line.lstrip().startswith("Traceback (most recent call last):")
+        for line in combined.splitlines()
+    )
     # Allow 0–1 occurrences (CPython occasionally logs on interp
     # shutdown no matter what we do); > 1 is the regression.
     assert traceback_lines <= 1, (

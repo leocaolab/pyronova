@@ -1,10 +1,13 @@
 """In-process loopback bench: real TCP, but client runs in the same
 process as the server. Isolates kernel network stack cost from
 external-client CPU contention.
+
+Needs an engine built with `maturin develop --release --features bench`.
 """
 
 import sys
 from pyronova import Pyronova
+from _bench_build import require_bench
 
 app = Pyronova()
 
@@ -19,6 +22,7 @@ if __name__ == "__main__":
     conns = int(sys.argv[2]) if len(sys.argv) > 2 else 32
     duration = int(sys.argv[3]) if len(sys.argv) > 3 else 10
 
+    require_bench(app)
     total, elapsed, port = app._engine.bench_loopback(
         duration_s=duration, workers=workers, client_conns=conns
     )

@@ -81,7 +81,8 @@
     mock is active, a worker's `app.run()` is the mock's no-op, so this is inert too.)
   - FR-13: lazy pydantic import in `_wrap_with_model`.
   - FR-14: `observability.py` `_tls` → `ContextVar`s.
-  - FR-17: `set_max_body_size` / `configure_compression` main-only.
+  - FR-17: `set_max_body_size` / `configure_compression` main-only (superseded: both are
+    per app in `SiteConfig`, `src/site.rs`).
   - FR-18: `module = "pyronova.engine"` on every `#[pyclass]`.
   - C2's shared state: `init_in_sub_interp` sets a per-interpreter cell with the running
     app's map before the script executes; `PyronovaApp::new` / `SharedState::new` read it

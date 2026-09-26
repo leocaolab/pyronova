@@ -22,8 +22,9 @@ import httpx
 import pytest
 
 import pyronova.engine as engine
-from conftest import _free_port, fork_panic_lines
+from conftest import fork_panic_lines
 from pyronova import Pyronova
+from tests._helpers import bound_port, read_file
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -37,17 +38,21 @@ subinterp_only = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 
 
-def _start(script_path: str, port: int, log_path: str, extra_env: dict | None = None):
+def _start(script_path: str, log_path: str, extra_env: dict | None = None):
     env = dict(os.environ)
-    env["L2_PORT"] = str(port)
     env.update(extra_env or {})
     log = open(log_path, "w")
     proc = subprocess.Popen(
         [sys.executable, script_path], stdout=log, stderr=subprocess.STDOUT,
-        env=env, cwd=HERE, preexec_fn=os.setsid,
+        env=env, cwd=HERE, start_new_session=True,
     )
     log.close()
     return proc
+
+
+def _bound_base(proc: subprocess.Popen, log_path: str) -> str:
+    """The base URL of a server started on port 0, from its startup line."""
+    return f"http://127.0.0.1:{bound_port(read_file(log_path), proc)}"
 
 
 def _wait_up(base: str, path: str, proc: subprocess.Popen, log_path: str) -> None:
@@ -131,7 +136,6 @@ def test_seal_is_idempotent():
 
 
 def test_on_startup_non_gil_route_fails_startup(tmp_path):
-    port = _free_port()
     script = _write(tmp_path, "startup_route.py", f"""
         from pyronova import Pyronova
         app = Pyronova()
@@ -146,7 +150,7 @@ def test_on_startup_non_gil_route_fails_startup(tmp_path):
             def late(req):
                 return "no"
 
-        app.run(host="127.0.0.1", port={port}, mode="gil")
+        app.run(host="127.0.0.1", port=0, mode="gil")
     """)
     out = subprocess.run([sys.executable, script], capture_output=True, text=True, timeout=60)
     assert out.returncode != 0, out.stdout + out.stderr
@@ -171,18 +175,11 @@ def test_import_pyronova_does_not_import_pydantic():
 
 
 def test_model_route_still_validates():
-    pydantic = pytest.importorskip("pydantic")
+    pytest.importorskip("pydantic")
     from pyronova.testing import TestClient
 
-    class Item(pydantic.BaseModel):
-        name: str
-        qty: int
-
-    app = Pyronova()
-
-    @app.post("/items", model=Item)
-    def create(req, item):
-        return {"name": item.name, "qty": item.qty}
+    # Its own module: a worker serves one app per module.
+    from tests.apps.l2_model_route import app
 
     with TestClient(app) as client:
         ok = client.post("/items", body=json.dumps({"name": "a", "qty": 2}))
@@ -197,7 +194,6 @@ def test_model_route_still_validates():
 
 
 def test_request_id_is_per_request_under_concurrency(tmp_path):
-    port = _free_port()
     log_path = str(tmp_path / "server.log")
     script = _write(tmp_path, "request_id.py", f"""
         import asyncio, random
@@ -214,11 +210,11 @@ def test_request_id_is_per_request_under_concurrency(tmp_path):
             await asyncio.sleep(random.random() / 50)
             return "ok"
 
-        app.run(host="127.0.0.1", port={port}, mode="gil")
+        app.run(host="127.0.0.1", port=0, mode="gil")
     """)
-    base = f"http://127.0.0.1:{port}"
-    proc = _start(script, port, log_path)
+    proc = _start(script, log_path)
     try:
+        base = _bound_base(proc, log_path)
         _wait_up(base, "/ping", proc, log_path)
 
         def one(_):
@@ -254,6 +250,9 @@ def test_request_id_hooks_keep_interleaved_requests_apart():
     class _Req:
         def __init__(self, rid):
             self.headers = {"x-request-id": rid}
+            # The engine writes the id once, from the client's header (M4); the hooks
+            # read `req.request_id`.
+            self.request_id = rid
 
     app = _App()
     install_request_id(app, "X-Request-ID")
@@ -283,7 +282,6 @@ def test_request_id_hooks_keep_interleaved_requests_apart():
 
 @subinterp_only
 def test_main_guard_logging_and_mcp_in_subinterp_mode(tmp_path):
-    port = _free_port()
     log_path = str(tmp_path / "server.log")
     script = _write(tmp_path, "guarded.py", f"""
         from pyronova import Pyronova
@@ -298,14 +296,14 @@ def test_main_guard_logging_and_mcp_in_subinterp_mode(tmp_path):
             return a + b
 
         if __name__ == "__main__":
-            app.run(host="127.0.0.1", port={port}, workers=2)
+            app.run(host="127.0.0.1", port=0, workers=2)
     """)
-    base = f"http://127.0.0.1:{port}"
-    proc = _start(script, port, log_path, {"PYRONOVA_LOG": "1"})
+    proc = _start(script, log_path, {"PYRONOVA_LOG": "1"})
     try:
+        base = _bound_base(proc, log_path)
         _wait_up(base, "/w", proc, log_path)
         assert httpx.get(base + "/w", timeout=5).json() == {"ok": True}
-        r = httpx.post(base + "/mcp", timeout=5, content=json.dumps(
+        r = httpx.post(base + "/mcp", timeout=5, headers={"Content-Type": "application/json"}, content=json.dumps(
             {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
         assert r.status_code == 200
         assert [t["name"] for t in r.json()["result"]["tools"]] == ["add"]

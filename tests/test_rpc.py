@@ -6,28 +6,35 @@ from pyronova import Pyronova
 from pyronova.testing import TestClient
 
 
+# Module level: TestClient serves it through sub-interpreter workers, which rebuild
+# it by executing this module.
+app = Pyronova()
+
+
+@app.get("/")
+def health(req):
+    return {"ok": True}
+
+
+@app.rpc("/rpc/add")
+def add(data):
+    return {"sum": data["a"] + data["b"]}
+
+
+@app.rpc("/rpc/echo")
+def echo(req, data):
+    """Handler that takes (req, data) — 2-arg form."""
+    return {"echoed": data, "method": req.method}
+
+
+@app.rpc("/rpc/error")
+def fail(data):
+    raise ValueError("intentional error")
+
+
 @pytest.fixture(scope="module")
 def client():
-    app = Pyronova()
-
-    @app.get("/")
-    def health(req):
-        return {"ok": True}
-
-    @app.rpc("/rpc/add")
-    def add(data):
-        return {"sum": data["a"] + data["b"]}
-
-    @app.rpc("/rpc/echo")
-    def echo(req, data):
-        """Handler that takes (req, data) — 2-arg form."""
-        return {"echoed": data, "method": req.method}
-
-    @app.rpc("/rpc/error")
-    def fail(data):
-        raise ValueError("intentional error")
-
-    c = TestClient(app, port=19878)
+    c = TestClient(app)
     yield c
     c.close()
 
@@ -59,15 +66,18 @@ def test_rpc_two_arg_handler(client):
 
 
 def test_rpc_error_envelope(client):
-    """Handler that raises → {"ok": false, "error": ...}."""
+    """Handler that raises → 500 with the generic envelope and the request id; the
+    exception text goes to the log, not to the client (D4)."""
     resp = client.post(
         "/rpc/error",
         body=b"{}",
         headers={"Content-Type": "application/json"},
     )
+    assert resp.status_code == 500
     data = resp.json()
-    assert data["ok"] is False
-    assert "intentional error" in data["error"]
+    rid = data.get("request_id")
+    assert isinstance(rid, str) and rid, data
+    assert data == {"ok": False, "error": "Internal Server Error", "request_id": rid}
 
 
 def test_rpc_empty_body(client):

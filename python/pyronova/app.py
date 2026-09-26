@@ -4,28 +4,77 @@ from __future__ import annotations
 
 import time
 import sys
-from typing import Callable, TypedDict
+import threading
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable, Literal, TypedDict
 import inspect
 import json as _json_module
 
 import os
 
-from pyronova.engine import PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log, _in_worker, _forgotten_workers
+from pyronova.engine import Compression, LogLevel, Mode, PyronovaApp as _PyronovaApp, Response, SharedState, init_logger, emit_python_log, _in_worker, _python_log_level, _route_params
+from pyronova._log_bridge import RustLogHandler, root_level
+from pyronova import _csrf
+from pyronova._csrf import OriginPolicy
 from pyronova.mcp import MCPServer
+from pyronova import _reload
 import logging as _logging
+
+if TYPE_CHECKING:
+    from pyronova.health import ReadinessCheck
+
+
+# A level by name, in either case; `LogLevel.parse` reads it.
+LogLevelName = Literal[
+    "off", "error", "warn", "warning", "info", "debug", "trace",
+    "OFF", "ERROR", "WARN", "WARNING", "INFO", "DEBUG", "TRACE",
+]
 
 
 class LogConfig(TypedDict, total=False):
     """Logging configuration dictionary.
 
     Keys:
-        level: "OFF", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"
+        level: a ``LogLevel``, or its name ("OFF", "ERROR", "WARN", "INFO", "DEBUG",
+            "TRACE"); an unknown name raises ``ValueError`` in ``Pyronova()``
         access_log: Whether to log every HTTP request (method, path, status, latency)
         format: "text" (human-readable) or "json" (structured, for ELK/Datadog)
     """
-    level: str
+    level: LogLevel | LogLevelName
     access_log: bool
-    format: str
+    format: Literal["text", "json"]
+
+
+# `/mcp` takes a JSON-RPC body only (MCP's HTTP transport).
+_MCP_BODY_TYPES = {"application/json": "application/json"}
+
+
+def _log_level(level: LogLevel | LogLevelName) -> LogLevel:
+    return level if isinstance(level, LogLevel) else LogLevel.parse(level)
+
+@dataclass(frozen=True)
+class RouteInfo:
+    """A registered route, as ``app.routes`` lists it."""
+
+    method: str
+    path: str
+    handler: str  # the handler's qualified name
+    gil: bool
+    stream: bool
+    model: str | None  # the ``model=`` class's name
+    is_async: bool
+
+
+@dataclass(frozen=True)
+class FastRouteInfo:
+    """A route registered with ``add_fast_response``, as ``app.fast_routes`` lists it."""
+
+    method: str
+    path: str
+    status_code: int
+    content_type: str
+    body_bytes: int
+
 
 def _is_worker() -> bool:
     """Whether this code runs in a sub-interpreter worker (not the main interpreter)."""
@@ -76,74 +125,37 @@ def _limit_blas_threads() -> str:
     return "1 thread per worker"
 
 
-class _PyronovaRustHandler(_logging.Handler):
-    """logging.Handler that bridges to Rust tracing via FFI.
-
-    Defined at module level so the isinstance() dedup check in
-    _setup_python_logging_bridge works across repeated calls.
-    """
-
-    def emit(self, record: _logging.LogRecord) -> None:
-        try:
-            msg = record.getMessage()
-            # Preserve exception tracebacks (logger.exception / exc_info=True).
-            # Use a local variable rather than mutating record.exc_text so the
-            # same LogRecord can safely be routed to multiple handlers.
-            if record.exc_info:
-                exc_text = record.exc_text or self.formatException(record.exc_info)
-                msg = f"{msg}\n{exc_text}"
-            emit_python_log(
-                level=record.levelname,
-                name=record.name,
-                message=msg,
-                pathname=record.pathname or "",
-                lineno=record.lineno or 0,
-            )
-        except Exception:
-            # Fallback to Python's built-in error handler — prints to stderr
-            self.handleError(record)
+def _level_with_access_log(
+    current: LogLevel, requested: LogLevel | None, pinned: bool
+) -> LogLevel:
+    """The log level once the access log is on: the level asked for; else the current
+    one, raised to INFO when it would hide the access lines (ERROR, OFF), unless an
+    explicit ``enable_logging(level=...)`` chose it."""
+    if requested is not None:
+        return requested
+    if pinned or current not in (LogLevel.Error, LogLevel.Off):
+        return current
+    return LogLevel.Info
 
 
-_LOGGING_LEVEL_MAP = {
-    "TRACE": _logging.DEBUG,
-    "DEBUG": _logging.DEBUG,
-    "INFO": _logging.INFO,
-    "WARN": _logging.WARNING,
-    "WARNING": _logging.WARNING,
-    "ERROR": _logging.ERROR,
-    "CRITICAL": _logging.CRITICAL,
-    "OFF": _logging.CRITICAL + 10,  # above CRITICAL — blocks everything
-}
+def _require_int(name: str, value: object) -> None:
+    """``bool`` is an ``int`` subclass; a limit set to ``True`` is a bug, not 1."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{name} must be int, got {type(value).__name__}")
 
 
-def _setup_python_logging_bridge(rust_level: str = "DEBUG") -> None:
-    """Hijack Python's root logger to route all logs through Rust tracing.
+def _setup_python_logging_bridge() -> None:
+    """Route the root logger through Rust tracing, gated at the level ``init_logger``
+    applied (``_python_log_level()``, the same source every worker reads).
 
-    Replaces default StreamHandler (synchronous, GIL-blocking I/O) with a
-    lightweight handler that crosses FFI into Rust's tracing system.
-    The actual filtering, formatting, and I/O happen in Rust — Python only
-    does the minimal work of extracting the log record fields.
-
-    The ``rust_level`` parameter syncs Rust's EnvFilter level to Python's
-    root logger, so calls below the threshold (e.g. logger.debug() when
-    level=ERROR) are rejected by Python's own level check *before* any
-    getMessage() formatting or FFI crossing occurs.
+    Adds the one ``RustLogHandler`` (not twice), and keeps the user's other handlers
+    (Sentry, DataDog...). Filtering, formatting and I/O happen in Rust; a record below
+    the level is rejected by Python before ``getMessage()`` or the FFI call.
     """
     root = _logging.getLogger()
-    # Don't clear existing handlers — user may have Sentry, DataDog, etc.
-    # Only add Pyronova bridge if not already present.
-    if not any(isinstance(h, _PyronovaRustHandler) for h in root.handlers):
-        root.addHandler(_PyronovaRustHandler())
-    # Sync Python's level gate with Rust's EnvFilter — avoids wasted
-    # getMessage() + FFI calls for records that Rust would discard anyway
-    level_key = rust_level.upper()
-    if level_key not in _LOGGING_LEVEL_MAP:
-        import sys
-        print(
-            f"pyronova: unrecognized log level {rust_level!r}, defaulting to DEBUG",
-            file=sys.stderr,
-        )
-    root.setLevel(_LOGGING_LEVEL_MAP.get(level_key, _logging.DEBUG))
+    if not any(isinstance(h, RustLogHandler) for h in root.handlers):
+        root.addHandler(RustLogHandler(None, emit_python_log))
+    root.setLevel(root_level(_python_log_level()))
 
 
 class Pyronova:
@@ -192,10 +204,12 @@ class Pyronova:
         self.debug = debug
         self._startup_hooks: list[Callable] = []
         self._shutdown_hooks: list[Callable] = []
-        self._routes_meta: list[dict] = []
-        self._fast_routes_meta: list[dict] = []
-        self._readiness_checks: list[tuple[str, Callable]] = []
+        self._routes_meta: list[RouteInfo] = []
+        self._fast_routes_meta: list[FastRouteInfo] = []
+        self._readiness_checks: list[ReadinessCheck] = []
         self._health_probes_enabled: bool = False
+        self._app_file_path: str | None = None
+        self._origin_policy = OriginPolicy()
 
         # Resolve final logging config: debug mode defaults vs production defaults.
         # Actual init_logger call is deferred to run() so enable_logging() can
@@ -203,23 +217,30 @@ class Pyronova:
         user = log_config or {}
         if self.debug:
             self._log_config: LogConfig = {
-                "level": user.get("level", "DEBUG"),
+                "level": _log_level(user.get("level", LogLevel.Debug)),
                 "access_log": user.get("access_log", True),
                 "format": user.get("format", "text"),
             }
         else:
             self._log_config: LogConfig = {
-                "level": user.get("level", "ERROR"),
+                "level": _log_level(user.get("level", LogLevel.Error)),
                 "access_log": user.get("access_log", False),
                 "format": user.get("format", "json"),
             }
-        self._logger_initialized = False
-        # Guards the idempotency check-then-set in the enable_* helpers so
-        # concurrent startup hooks/threads can't both pass the "already
-        # enabled?" check and double-register routes/hooks (arc findings
-        # app-36/37/38).
-        import threading as _threading
-        self._enable_lock = _threading.Lock()
+        # Whether enable_logging(level=...) chose the level (it then keeps it).
+        self._log_level_pinned = False
+        # _prepare()'s state, under its lock: two servers of one app may start at once
+        # (nested TestClients), and each must find the app prepared exactly once.
+        self._prepare_lock = threading.Lock()
+        self._prepared = False
+        self._mcp_route_registered = False
+        # The servers this app is serving (engine `Server`s), for `_stop()`.
+        self._servers_lock = threading.Lock()
+        self._servers: set = set()
+        self._defined_in = _defining_module_file(self)
+        # Guards the enable_* helpers' check-then-set: two threads must not both pass
+        # "already enabled?" and register the routes/hooks twice.
+        self._enable_lock = threading.Lock()
 
     @property
     def mcp(self) -> MCPServer:
@@ -228,23 +249,64 @@ class Pyronova:
 
     @property
     def max_body_size(self) -> int:
-        """Max request body size in bytes. Default: 10 MB."""
-        return getattr(self, "_max_body_size", 10 * 1024 * 1024)
+        """Max request body size in bytes; a larger body is answered 413. Default: 10 MB.
+        Per app: another app in the same process keeps its own."""
+        return self._engine.max_body_size()
 
     @max_body_size.setter
     def max_body_size(self, size: int) -> None:
         """Set max request body size. Example: ``app.max_body_size = 50 * 1024 * 1024``"""
-        # Type hint is unenforced; explicit check so a non-int / negative
-        # value fails here (clear ValueError) instead of passing through
-        # to Rust and producing opaque behavior (arc finding app-10).
-        if not isinstance(size, int) or isinstance(size, bool):
-            raise TypeError(
-                f"max_body_size must be int, got {type(size).__name__}"
-            )
+        _require_int("max_body_size", size)
         if size < 0:
             raise ValueError(f"max_body_size must be non-negative, got {size}")
-        self._max_body_size = size
         self._engine.set_max_body_size(size)
+
+    @property
+    def trusted_origins(self) -> list[str]:
+        """Other sites whose pages may call ``/mcp`` and ``@app.rpc`` endpoints from a
+        browser, as ``scheme://host[:port]``. Default: none.
+
+        Those endpoints act on a JSON (or MsgPack / Protobuf) POST, so they refuse a
+        request whose ``Origin`` is another site with 403, and any other body type with
+        415: a page can't make a visitor's browser call them (CSRF). Requests without an
+        ``Origin`` (curl, SDKs, servers) and from this server's own host are always
+        admitted. A bad entry raises ``ValueError``.
+        """
+        return sorted(
+            f"{o.scheme}://{o.host}:{o.port}" for o in self._origin_policy.trusted
+        )
+
+    @trusted_origins.setter
+    def trusted_origins(self, origins: list[str]) -> None:
+        self._origin_policy = OriginPolicy.of(origins)
+
+    @property
+    def max_websocket_message_size(self) -> int:
+        """Largest WebSocket message, in bytes, in either direction. Default: 1 MiB.
+
+        A bigger client message closes the connection with 1009 (Message Too Big);
+        a bigger ``ws.send`` raises ``ValueError``. Each connection also buffers at
+        most about this many bytes per direction.
+        """
+        return self._engine.max_websocket_message_size()
+
+    @max_websocket_message_size.setter
+    def max_websocket_message_size(self, size: int) -> None:
+        _require_int("max_websocket_message_size", size)
+        self._engine.set_max_websocket_message_size(size)
+
+    @property
+    def max_websocket_connections(self) -> int:
+        """Concurrent WebSocket connections (one handler thread each). Default: 1024.
+
+        An upgrade beyond the cap is answered ``503 Service Unavailable``.
+        """
+        return self._engine.max_websocket_connections()
+
+    @max_websocket_connections.setter
+    def max_websocket_connections(self, count: int) -> None:
+        _require_int("max_websocket_connections", count)
+        self._engine.set_max_websocket_connections(count)
 
     def enable_compression(
         self,
@@ -255,13 +317,14 @@ class Pyronova:
         gzip_level: int = 6,
         brotli_quality: int = 4,
     ) -> None:
-        """Enable gzip / brotli response compression.
+        """Enable gzip / brotli response compression for this app.
 
-        Disabled by default; call once at startup to turn on. The server
-        negotiates with the client's ``Accept-Encoding`` header and prefers
-        brotli when both are enabled. Skips responses under ``min_size``,
-        non-text content types (images, octet-stream), streaming responses
-        (SSE), and responses that set ``Content-Encoding`` explicitly.
+        Disabled by default; call once at startup to turn on. Per app: another app in
+        the same process keeps its own setting. The server negotiates with the client's
+        ``Accept-Encoding`` header and prefers brotli when both are enabled. Skips
+        responses under ``min_size``, non-text content types (images, octet-stream),
+        streaming responses (SSE), and responses that set ``Content-Encoding``
+        explicitly. A large body is compressed off the I/O threads.
 
         Args:
             min_size: minimum body size (bytes) to compress. Default 512.
@@ -269,14 +332,34 @@ class Pyronova:
             brotli: enable brotli (``Content-Encoding: br``). Default True.
             gzip_level: 1..=9, default 6 (balanced speed/ratio).
             brotli_quality: 0..=11, default 4 (production sweet spot).
+
+        :raises ValueError: a level out of its range, a negative ``min_size``, or
+            ``gzip=False, brotli=False`` (nothing to enable; use
+            ``disable_compression()``).
         """
         self._engine.configure_compression(
-            True, min_size, gzip, brotli, gzip_level, brotli_quality
+            Compression(
+                min_size=min_size,
+                gzip=gzip,
+                brotli=brotli,
+                gzip_level=gzip_level,
+                brotli_quality=brotli_quality,
+            )
         )
 
     def disable_compression(self) -> None:
         """Disable response compression. No-op if already disabled."""
-        self._engine.configure_compression(False)
+        self._engine.configure_compression(None)
+
+    def enable_grpc_benchmark(self) -> None:
+        """Serve HttpArena's ``benchmark.BenchmarkService/GetSum`` gRPC method.
+
+        Off by default. When enabled, only a ``POST`` to exactly
+        ``/benchmark.BenchmarkService/GetSum`` with an ``application/grpc*``
+        content-type is answered by the built-in service; every other request,
+        gRPC or not, is routed to your handlers as usual.
+        """
+        self._engine.enable_grpc_benchmark()
 
     def add_fast_response(
         self,
@@ -305,6 +388,9 @@ class Pyronova:
                                   content_type="application/json")
             app.add_fast_response("GET", "/robots.txt",
                                   b"User-agent: *\\nDisallow: /\\n")
+
+        :raises ValueError: ``status_code`` is not an HTTP status (100-999),
+            or a header name or value (``content_type`` included) is invalid.
         """
         if isinstance(body, str):
             body = body.encode("utf-8")
@@ -316,13 +402,13 @@ class Pyronova:
             status_code=status_code,
             headers=headers,
         )
-        self._fast_routes_meta.append({
-            "method": method.upper(),
-            "path": path,
-            "status_code": status_code,
-            "content_type": content_type,
-            "bytes": len(body),
-        })
+        self._fast_routes_meta.append(FastRouteInfo(
+            method=method.upper(),
+            path=path,
+            status_code=status_code,
+            content_type=content_type,
+            body_bytes=len(body),
+        ))
 
     @property
     def state(self) -> SharedState:
@@ -336,7 +422,6 @@ class Pyronova:
         return self._engine.state
 
     # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
     # C-extension isolation (per-worker library copies)
     # ------------------------------------------------------------------
 
@@ -346,8 +431,8 @@ class Pyronova:
         ``orjson``), so extensions holding process-global state can run isolated
         across workers instead of colliding on "cannot load module more than once".
 
-        Call it at module top-level — it runs inside every sub-interpreter at
-        worker init (and is a no-op in the main interpreter). Declare a library's
+        Call it at module top-level, before ``run()``: each worker clones the
+        libraries recorded on the app before it runs the script. Declare a library's
         C dependencies too, e.g. ``app.isolate("numpy", "scipy", "scikit-learn")``,
         since each copy resolves imports from its own path first.
 
@@ -355,22 +440,10 @@ class Pyronova:
         so disk is near-free; memory is ~one full lib set per worker
         (see docs/subinterp-c-extension-status.md).
         """
-        # This just RECORDS the libraries (via an env var). The actual per-worker
-        # cloning happens in _bootstrap.py at sub-interpreter init, before the
-        # script runs; a worker executing this again only re-records the same list.
-        if "pyronova" in libraries:
-            # One shared copy of pyronova and its engine is required (FR-11).
-            raise ValueError(
-                "pyronova cannot be isolated: one shared copy of pyronova and its "
-                "engine is required (it keeps process-wide state). Remove it from "
-                "app.isolate(...)."
-            )
-        import os
-        current = [x for x in os.environ.get("PYRONOVA_ISOLATE_LIBS", "").split(",") if x]
-        for lib in libraries:
-            if lib not in current:
-                current.append(lib)
-        os.environ["PYRONOVA_ISOLATE_LIBS"] = ",".join(current)
+        # This records the libraries on the engine app; the workers of its runs get the
+        # list at init, and their bootstrap clones them before the script runs. A worker
+        # executing this again records it on its own app, which nothing reads.
+        self._engine.isolate(list(libraries))
 
     # ------------------------------------------------------------------
     # Route registration (decorator + direct call)
@@ -401,166 +474,23 @@ class Pyronova:
         return self._route(method.upper(), path, handler, gil=gil, model=model, stream=stream)
 
     def _route(self, method: str, path: str, handler: Callable | None, *, gil: bool = False, model: type | None = None, stream: bool = False) -> Callable:
-        def _maybe_inject_path_params(fn: Callable) -> Callable:
-            """Wrap *fn* so path-template params land in matching kwargs.
+        def register(fn: Callable) -> Callable:
+            bound = _bind_handler(fn, path, model)
+            self._engine.route(method, path, bound, gil, stream)
+            self._routes_meta.append(RouteInfo(
+                method=method,
+                path=path,
+                handler=getattr(fn, "__qualname__", getattr(fn, "__name__", repr(fn))),
+                gil=gil,
+                stream=stream,
+                model=model.__name__ if model is not None else None,
+                is_async=inspect.iscoroutinefunction(fn),
+            ))
+            # The bound callable, not fn: calling the decorated name does what the
+            # route does (model validation, path-param injection).
+            return bound
 
-            Hot path stays untouched: handlers whose signature is exactly
-            ``(req)`` are returned unchanged — no shim, no extra frame, no
-            new code path. Only when the signature declares additional
-            parameters do we build a wrapper that pulls them from
-            ``req.params``.
-            """
-            try:
-                sig = inspect.signature(fn)
-            except (TypeError, ValueError):
-                return fn
-            params = list(sig.parameters.values())
-            # First positional param is always the request — skip it.
-            extras = [
-                p for p in params[1:]
-                if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-            ]
-            if not extras:
-                return fn  # hot path — byte-identical to today
-            names = tuple(p.name for p in extras)
-            # Cross-check against the URL template so a typo'd kwarg fails
-            # loudly at registration instead of silently injecting None at
-            # request time. matchit accepts both `{id}` and `:id`; we strip
-            # the wrappers and collect param names from the path.
-            template_names = set()
-            i = 0
-            while i < len(path):
-                ch = path[i]
-                if ch == "{":
-                    end = path.find("}", i + 1)
-                    if end == -1:
-                        break
-                    template_names.add(path[i + 1 : end].split(":")[0])
-                    i = end + 1
-                elif ch == ":":
-                    j = i + 1
-                    while j < len(path) and (path[j].isalnum() or path[j] == "_"):
-                        j += 1
-                    if j > i + 1:
-                        template_names.add(path[i + 1 : j])
-                    i = j
-                else:
-                    i += 1
-            missing = [n for n in names if n not in template_names]
-            if missing:
-                raise ValueError(
-                    f"handler {fn.__name__!r} declares parameter(s) {missing!r} "
-                    f"that are not in the URL template {path!r}. Path-param "
-                    f"injection only fills names that appear as `{{name}}` "
-                    f"or `:name` in the route path."
-                )
-
-            is_async = inspect.iscoroutinefunction(fn)
-            if is_async:
-                async def shim(req):
-                    p = req.params
-                    return await fn(req, **{n: p.get(n) for n in names})
-            else:
-                def shim(req):
-                    p = req.params
-                    return fn(req, **{n: p.get(n) for n in names})
-            shim.__name__ = fn.__name__
-            shim.__qualname__ = fn.__qualname__
-            shim.__wrapped__ = fn  # Pylance / static analyzers see original sig
-            return shim
-
-        def _wrap_with_model(fn: Callable, mdl: type) -> Callable:
-            """Wrap handler to auto-validate request body with Pydantic model."""
-            # Imported here, only for routes that declare model=: importing pydantic at
-            # module level would load pydantic_core in every worker of every app. If it
-            # can't be imported, route registration fails with the ImportError.
-            from pydantic import ValidationError
-            import inspect
-            sig = inspect.signature(fn)
-            params = list(sig.parameters.values())
-            is_async = inspect.iscoroutinefunction(fn)
-
-            import logging as _logging
-            _vlog = _logging.getLogger("pyronova.validation")
-
-            def _validation_error_response(e: Exception) -> "Response":
-                _vlog.warning("request body validation failed: %s", type(e).__name__, exc_info=True)
-                if hasattr(e, "errors"):
-                    import json as _json
-                    try:
-                        errs = e.errors(include_url=False, include_input=False)
-                    except TypeError:
-                        errs = e.errors()
-                    return Response(
-                        body=_json.dumps({"detail": errs}),
-                        status_code=422,
-                        content_type="application/json",
-                    )
-                return Response(body="Request body validation failed", status_code=422, content_type="text/plain")
-
-            # model_validate_json raises ValidationError for schema
-            # mismatches, but malformed JSON syntax (or a non-decodable
-            # body) surfaces as json.JSONDecodeError / ValueError / TypeError.
-            # All of these are client-side "bad body" → 422, never 500.
-            # _validation_error_response degrades to a generic 422 for the
-            # non-pydantic cases via its hasattr(e, "errors") guard.
-            _BODY_ERRORS = (ValidationError, ValueError, TypeError)
-            if is_async:
-                async def wrapper(req):
-                    try:
-                        validated = mdl.model_validate_json(req.body)
-                    except _BODY_ERRORS as e:
-                        return _validation_error_response(e)
-                    if len(params) >= 2:
-                        return await fn(req, validated)
-                    return await fn(validated)
-            else:
-                def wrapper(req):
-                    try:
-                        validated = mdl.model_validate_json(req.body)
-                    except _BODY_ERRORS as e:
-                        return _validation_error_response(e)
-                    if len(params) >= 2:
-                        return fn(req, validated)
-                    return fn(validated)
-
-            wrapper.__name__ = fn.__name__
-            wrapper.__qualname__ = fn.__qualname__
-            return wrapper
-
-        def _record(fn: Callable) -> None:
-            self._routes_meta.append({
-                "method": method,
-                "path": path,
-                "handler": getattr(fn, "__qualname__", getattr(fn, "__name__", repr(fn))),
-                "gil": gil,
-                "stream": stream,
-                "model": model.__name__ if model is not None else None,
-                "async": inspect.iscoroutinefunction(fn),
-            })
-
-        if handler is not None:
-            if model is not None:
-                handler = _wrap_with_model(handler, model)
-            else:
-                handler = _maybe_inject_path_params(handler)
-            self._engine.route(method, path, handler, gil, stream)
-            _record(handler)
-            return handler
-
-        def decorator(fn: Callable) -> Callable:
-            if model is not None:
-                wrapped = _wrap_with_model(fn, model)
-            else:
-                wrapped = _maybe_inject_path_params(fn)
-            self._engine.route(method, path, wrapped, gil, stream)
-            _record(fn)
-            # When wrapping was a no-op `wrapped is fn` — return fn for
-            # type hints. When we injected a shim, return the shim, so the
-            # module-global name refers to what the route calls.
-            return fn if wrapped is fn else wrapped
-
-        return decorator
+        return register(handler) if handler is not None else register
 
     # ------------------------------------------------------------------
     # Middleware
@@ -643,7 +573,7 @@ class Pyronova:
         if max_age:
             cors_headers["access-control-max-age"] = str(max_age)
 
-        # Handle preflight OPTIONS + add CORS headers to all responses
+        # Answers a preflight; the engine adds the CORS headers to every response.
         def _cors_before(req):
             if req.method == "OPTIONS":
                 return Response(body="", status_code=204, headers=cors_headers)
@@ -651,10 +581,8 @@ class Pyronova:
 
         self._engine.before_request(_cors_before)
 
-        # CORS response headers are applied in Rust layer only (handlers.rs)
-        # to avoid duplicate headers which violate W3C CORS spec.
-        # Pass full config so allow_credentials + expose_headers appear on
-        # every response (GET/POST/etc.), not just OPTIONS preflight.
+        # Only the engine adds CORS headers to responses (a second copy from a hook
+        # would duplicate them, which browsers reject).
         self._engine.set_cors_config(
             allow_origins,
             allow_methods,
@@ -762,14 +690,17 @@ class Pyronova:
     def enable_request_id(self, header: str = "X-Request-ID") -> None:
         """Guarantee every response carries an ``X-Request-ID`` header.
 
-        If the client sent one, it's echoed back verbatim (so trace IDs
-        propagated from an upstream proxy survive). If not, a fresh UUID
-        v4 hex is minted. Idempotent.
+        If the client sent one (visible ASCII, at most 128 bytes), it's
+        echoed back verbatim, so trace IDs propagated from an upstream proxy
+        survive. If not, the server's own id (32 hex digits) is used. Either
+        way it is ``req.request_id``, and a 5xx response and its error log
+        line report the same id. Idempotent.
         """
         with self._enable_lock:
             if getattr(self, "_request_id_enabled", False):
                 return
             from pyronova.observability import install_request_id
+            self._engine.set_request_id_header(header)
             install_request_id(self, header)
             self._request_id_enabled = True
 
@@ -836,12 +767,14 @@ class Pyronova:
             def _db_ready():
                 pool.fetch_scalar("SELECT 1")
 
-        A check passes when it returns any value that isn't ``False`` and
-        doesn't raise. ``False`` or an exception → the check is reported
-        as failing in ``/readyz`` and the whole probe returns 503.
+        A check fails when it raises, takes longer than the probe timeout (10 s),
+        or returns ``False``; any other value, ``None`` included, passes. A failing
+        check is reported in ``/readyz`` and the whole probe returns 503.
         """
+        from pyronova.health import ReadinessCheck
+
         def decorator(fn: Callable) -> Callable:
-            self._readiness_checks.append((name, fn))
+            self._readiness_checks.append(ReadinessCheck.of(name, fn))
             return fn
 
         return decorator
@@ -909,120 +842,74 @@ class Pyronova:
 
     def enable_logging(
         self,
-        level: str = "info",
+        level: LogLevel | LogLevelName | None = None,
         sample: int = 1,
-        always_log_status: int = 0,
+        always_log_status: int | None = None,
     ) -> None:
-        """Enable structured request/response logging.
+        """Enable the per-request access log (``pyronova::access``).
 
-        This activates both:
-        - Rust-side access log (method, path, status, latency_us) via tracing
-        - Python-side formatted output for GIL mode (human-readable)
+        One line per request from the Rust side, in every mode and for every
+        response — including 404s, static files, fast-path routes and 5xx that
+        never reach a Python handler::
 
-        :param level: minimum log level — "debug" / "info" / "warn" / "error".
+            INFO  pyronova::access Request handled method=GET path=/ status=200 latency_us=198 mode="gil"
+
+        :param level: minimum log level — a ``LogLevel``, or its name ("debug" /
+            "info" / "warn" / "error" / ...). Given, it is the level, whatever
+            ``log_config`` or ``debug=True`` set, and a later call without one
+            (``PYRONOVA_LOG=1``, ``debug=True`` at ``run()``) keeps it. Left out, the
+            level stays as configured, raised to "info" when it is "error" or "off"
+            (the access lines are INFO). An unknown name raises ``ValueError`` here.
         :param sample: log 1 in every ``sample`` requests. ``1`` (default)
             logs every request. ``100`` keeps roughly 1% — production knob
             to recover the 25-30% throughput tax of full access logging
-            while retaining a usable observability sample. Per-route
-            atomic counter; sampling decision is global.
+            while retaining a usable observability sample. Each serving
+            thread keeps 1 in ``sample`` of its own responses (no shared
+            counter), so the log keeps about 1 in ``sample`` overall.
         :param always_log_status: bypass sampling for responses whose
             status is >= this value. ``400`` keeps full visibility of
-            4xx/5xx errors while sampling 2xx success traffic. ``0``
+            4xx/5xx errors while sampling 2xx success traffic. ``None``
             (default) applies sampling uniformly.
 
-        Output format (GIL mode, text format)::
-
-            2026-03-24 17:30:01 [INFO]  GET /api/trade → 200 (2.3ms)
-            2026-03-24 17:30:01 [ERROR] POST /rpc/add → 500 (0.4ms) TypeError: ...
-
-        Idempotent and thread-safe (matches the other ``enable_*`` helpers):
-        the before/after hooks below are *appended* to the engine, not
-        deduped, so a second call — e.g. a manual ``enable_logging()`` racing
-        the ``run()`` auto-enable, or two startup threads — would log every
-        request twice. Claim the right to initialize under ``_enable_lock``;
-        any subsequent call returns a no-op.
+        ``sample < 1`` or an ``always_log_status`` that isn't an HTTP status
+        raises ``ValueError``.
         """
-        with self._enable_lock:
-            if getattr(self, "_logging_enabled", False):
-                return
-            self._logging_enabled = True
-
-        from datetime import datetime
-
-        import threading as _threading
-
-        _timings: dict[int, float] = {}
-        _MAX_TIMINGS = 10000  # Cap to prevent memory leak from SSE/stream requests
-        # before/after hooks run concurrently across requests on multiple
-        # worker threads. The len()-then-clear() check-then-act and the
-        # set/pop interleave can race; serialize all _timings access so we
-        # never hit "dict changed size during iteration"/KeyError (arc app-40).
-        _timings_lock = _threading.Lock()
-        _min_level = {"debug": 0, "info": 1, "warn": 2, "error": 3}.get(level.lower(), 1)
-
-        def _log_before(req):
-            with _timings_lock:
-                if len(_timings) > _MAX_TIMINGS:
-                    _timings.clear()  # Emergency cleanup — stream requests skip after_hook
-                _timings[id(req)] = time.monotonic()
-            return None
-
-        def _log_after(req, resp):
-            with _timings_lock:
-                start = _timings.pop(id(req), None)
-            elapsed = (time.monotonic() - start) * 1000 if start else 0
-            status = getattr(resp, "status_code", 200)
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            # Determine log level by status code
-            if status >= 500:
-                tag, lvl = "ERROR", 3
-            elif status >= 400:
-                tag, lvl = "WARN ", 2
-            else:
-                tag, lvl = "INFO ", 1
-
-            if lvl >= _min_level:
-                # Extract error message from body if 500
-                err = ""
-                if status >= 500:
-                    body = getattr(resp, "body", "")
-                    if isinstance(body, str) and "error" in body:
-                        # Try to extract error from JSON response
-                        try:
-                            import json
-                            err = " " + json.loads(body).get("error", "")[:100]
-                        except Exception:
-                            pass
-
-                print(f"  {ts} [{tag}] {req.method} {req.path} → {status} ({elapsed:.1f}ms){err}", flush=True)
-
-            return resp
-
-        self._engine.before_request(_log_before)
-        self._engine.after_request(_log_after)
-
-        # Also enable Rust-level logging for sub-interpreter mode (per-instance)
+        # Validated first, so a bad value leaves the logging settings as they were.
+        requested = None if level is None else _log_level(level)
+        self._engine.set_request_log_sampling(sample, always_log_status)
         self._engine.enable_request_logging(True)
-        # Sampling / always-log knobs land on the Rust route table; the
-        # decision happens inside each handler's logging path.
-        if sample > 1 or always_log_status > 0:
-            self._engine.set_request_log_sampling(sample, always_log_status)
 
-        # Upgrade log config so the deferred init_logger picks up access_log
-        level_map = {"debug": "DEBUG", "info": "INFO", "warn": "WARN", "error": "ERROR"}
-        rust_level = level_map.get(level.lower(), "INFO")
-        if self._log_config.get("level", "ERROR") in ("ERROR", "OFF"):
-            self._log_config["level"] = rust_level
+        # The deferred init_logger picks these up.
+        self._log_level_pinned = self._log_level_pinned or requested is not None
+        self._log_config["level"] = _level_with_access_log(
+            self._log_config["level"], requested, self._log_level_pinned
+        )
         self._log_config["access_log"] = True
 
     # ------------------------------------------------------------------
     # Run
     # ------------------------------------------------------------------
 
+    def _set_app_file(self, path: str) -> None:
+        """The source file that defines this app: workers execute it, and the
+        reloader watches its directory. Defaults to ``__main__``'s file."""
+        self._app_file_path = path
+        self._engine.set_script_path(path)
+
+    def _app_file(self) -> str:
+        if self._app_file_path is not None:
+            return self._app_file_path
+        main_file = getattr(sys.modules["__main__"], "__file__", None)
+        if main_file is None:
+            raise RuntimeError(
+                "reload needs the app's source file, but __main__ has no __file__ "
+                "(interactive session?); start the app from a file or with `pyronova dev`"
+            )
+        return os.path.abspath(main_file)
+
     @property
-    def routes(self) -> list[dict]:
-        """List of registered routes (dicts with method/path/handler/gil/stream/async/model).
+    def routes(self) -> list[RouteInfo]:
+        """The registered routes, in registration order.
 
         Populated as routes are registered via decorators or direct calls.
         Fast-path routes (``add_fast_response``) appear in ``fast_routes``.
@@ -1030,7 +917,7 @@ class Pyronova:
         return list(self._routes_meta)
 
     @property
-    def fast_routes(self) -> list[dict]:
+    def fast_routes(self) -> list[FastRouteInfo]:
         """Routes registered via ``add_fast_response``."""
         return list(self._fast_routes_meta)
 
@@ -1060,35 +947,247 @@ class Pyronova:
         # In a worker the script only registers routes; the server runs on main.
         if _is_worker():
             return
-        # Everything registered from here on (/mcp, logging hooks, startup hooks) exists
-        # only on main. Idempotent: TestClient may call run() again.
-        self._engine._seal_registrations()
+        settings = _ServeSettings.resolve(
+            host=host,
+            port=port,
+            workers=workers,
+            mode=mode,
+            io_workers=io_workers,
+            tls_cert=tls_cert,
+            tls_key=tls_key,
+            extra_tls_ports=extra_tls_ports,
+        )
 
-        # Priority: param > env var > default
-        host = host or os.environ.get("PYRONOVA_HOST", "127.0.0.1")
+        reload = reload or os.environ.get("PYRONOVA_RELOAD") == "1"
+        if reload and not _reload.is_reload_child():
+            _reload.run_with_reload(_reload.ReloadTarget.of_this_process(self._app_file()))
+            return
 
-        # Env-var int parsing surfaces actionable errors. Bare int()
-        # raises "invalid literal for int()" — opaque about which env
-        # var was bad (arc findings app-1, app-7).
-        def _env_int(name: str, default: str | None = None) -> int | None:
-            v = os.environ.get(name, default)
-            if v is None:
-                return None
+        try:
+            self._serve(settings, self._start)
+        except WorkersAbandoned as e:
+            # A live sub-interpreter makes finalization abort: this process can only
+            # exit, non-zero, without finalizing.
+            print(f"pyronova: {e}; exiting without finalization", file=sys.stderr, flush=True)
+            sys.stdout.flush()
+            os._exit(1)
+
+    def _serve(self, settings: _ServeSettings, start: Callable[[_ServeSettings], None]) -> None:
+        """One server's lifetime: prepare the app (once), run the startup hooks, ``start``
+        it (bind and serve until it stops), run the shutdown hooks."""
+        self._prepare(settings)
+
+        graceful = False
+        run_error = None
+        try:
+            # Run startup hooks inside the try so shutdown hooks still run on failure
+            for hook in self._startup_hooks:
+                hook()
+            start(settings)
+            graceful = True  # engine returned after its own drain (SIGINT or _stop())
+        except KeyboardInterrupt:
+            # SIGINT reaches BOTH Rust (which drains connections and returns) and
+            # Python's main thread (which raises KeyboardInterrupt — here, or a
+            # few bytecodes later). Either way it's a graceful stop.
+            graceful = True
+        except BaseException as e:  # noqa: BLE001 — real failure, re-raised below
+            run_error = e
+
+        # On a graceful stop, neutralize the triggering SIGINT before running
+        # shutdown hooks. The pending signal from ctrl-C often fires only once
+        # we're back in Python bytecode (i.e. on the FIRST shutdown hook,
+        # interrupting it) or after run() has returned (a KeyboardInterrupt in the
+        # caller). Ignoring SIGINT here lets the hooks run to completion and
+        # run() return cleanly. Retry through a KeyboardInterrupt that fires
+        # while we're installing the handler (`signal.signal` delivers a pending
+        # signal first, so once it returns none is left). The previous handler is
+        # put back after the hooks: a program that goes on after run() returns
+        # (e.g. stopped with _stop()) still gets KeyboardInterrupt on ctrl-C.
+        import signal as _signal
+
+        previous_sigint = None
+        if graceful:
+            while True:
+                try:
+                    previous_sigint = _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
+                    break
+                except KeyboardInterrupt:
+                    continue
+                except (ValueError, OSError):
+                    break  # not the main thread / no handler slot — best effort
+
+        # Run shutdown hooks (best-effort teardown barrier): one hook failing
+        # (e.g. a pool already closed) must not stop the rest, so log each failure
+        # with its traceback and continue.
+        for hook in self._shutdown_hooks:
             try:
-                return int(v)
-            except ValueError:
-                raise ValueError(
-                    f"environment variable {name}={v!r} is not a valid integer"
-                ) from None
+                hook()
+            except Exception:
+                _logging.getLogger("pyronova.app").exception(
+                    "shutdown hook %s raised", getattr(hook, "__name__", repr(hook))
+                )
+        if previous_sigint is not None:
+            _signal.signal(_signal.SIGINT, previous_sigint)
 
+        # A worker thread that outlived the shutdown grace period (a handler that ignores
+        # shutdown) still has a live interpreter, and finalizing with one aborts. Say which;
+        # the caller decides what the process does (`run()` exits, a TestClient raises).
+        abandoned = [str(w) for w in self._engine._take_abandoned_workers()]
+        if abandoned:
+            _logging.getLogger("pyronova.app").error(
+                "worker(s) %s did not stop within the shutdown grace period",
+                ", ".join(abandoned),
+            )
+            raise WorkersAbandoned(abandoned)
+
+        # Not a graceful stop (real startup/run error): surface it normally.
+        if run_error is not None:
+            raise run_error
+
+    def _prepare(self, settings: _ServeSettings) -> None:
+        """Get the app ready for this server. Once per app, by its first server: seal the
+        script's registrations and set up logging. Per server, as that server needs it:
+        the ``/mcp`` route once there are MCP tools (a later server still gets it when the
+        first had none), and the process's BLAS thread limit when this server runs workers
+        (whatever the first server's mode was). Everything registered here exists only on
+        main. Locked: two servers of one app may start at once."""
+        with self._prepare_lock:
+            if not self._prepared:
+                self._engine._seal_registrations()
+
+                if os.environ.get("PYRONOVA_LOG") == "1" or self.debug:
+                    self.enable_logging()
+                # Deferred from __init__ so enable_logging() can adjust the config first.
+                # Main and every worker gate Python logging on the level applied here
+                # (`_python_log_level`).
+                init_logger(
+                    self._log_config["level"],
+                    self._log_config["access_log"],
+                    self._log_config["format"],
+                )
+                _setup_python_logging_bridge()
+                self._prepared = True
+
+            if not self._mcp_route_registered and not self._mcp.is_empty():
+                mcp = self._mcp
+
+                def _mcp_handler(req):
+                    refused = _csrf.check(req, self._origin_policy, _MCP_BODY_TYPES)
+                    if isinstance(refused, _csrf.Refused):
+                        return Response(
+                            body=mcp.refusal(refused.reason),
+                            status_code=refused.status,
+                            content_type="application/json",
+                        )
+                    return Response(
+                        body=mcp.handle_request(req.body, request_id=req.request_id),
+                        content_type="application/json",
+                    )
+
+                self._route("POST", "/mcp", _mcp_handler, gil=True)
+                self._mcp_route_registered = True
+                print(f"  MCP: {len(mcp._tools)} tools, {len(mcp._resources)} resources, {len(mcp._prompts)} prompts → POST /mcp")
+
+        if settings.mode.uses_workers and settings.workers != 1:
+            print(f"  BLAS: {_blas_threads_limited()} (override: set OPENBLAS_NUM_THREADS)", flush=True)
+
+    def _start(
+        self,
+        settings: _ServeSettings,
+        on_bound: Callable[[object], None] | None = None,
+    ) -> None:
+        """Bind a server (an ``OSError`` if its port is taken), hand it to ``on_bound``,
+        then serve until it stops: SIGINT, its ``shutdown()``, or ``_stop()``."""
+        server = self._engine.start(
+            host=settings.host,
+            port=settings.port,
+            workers=settings.workers,
+            mode=settings.mode,
+            io_workers=settings.io_workers,
+            tls_cert=settings.tls_cert,
+            tls_key=settings.tls_key,
+            extra_tls_ports=settings.extra_tls_ports,
+        )
+        with self._servers_lock:
+            self._servers.add(server)
+        try:
+            if on_bound is not None:
+                on_bound(server)
+            server.serve()
+        finally:
+            with self._servers_lock:
+                self._servers.discard(server)
+
+    def _stop(self) -> None:
+        """Stop every server this app is serving, as SIGINT does: each ``_start`` drains
+        and returns. A no-op while nothing is serving. To stop one server of several,
+        call that server's ``shutdown()``."""
+        with self._servers_lock:
+            servers = list(self._servers)
+        for server in servers:
+            server.shutdown()
+
+
+class WorkersAbandoned(RuntimeError):
+    """Worker threads outlived the shutdown grace period (a handler that ignores the
+    stop). Their interpreters are still alive, and finalizing the process with a live
+    sub-interpreter aborts, so the process must exit without finalizing
+    (``os._exit``): ``Pyronova.run()`` does; a ``TestClient`` raises this instead, and
+    the test process will abort at exit."""
+
+    def __init__(self, workers: list[str]):
+        self.workers = list(workers)
+        super().__init__(
+            "worker(s) " + ", ".join(self.workers) + " did not stop within the "
+            "shutdown grace period"
+        )
+
+
+# What `_limit_blas_threads` did, once per process: BLAS is process-wide, so the first
+# server that runs workers limits it and later ones report the same outcome.
+_BLAS_LOCK = threading.Lock()
+_blas_outcome: str | None = None
+
+
+def _blas_threads_limited() -> str:
+    global _blas_outcome
+    with _BLAS_LOCK:
+        if _blas_outcome is None:
+            _blas_outcome = _limit_blas_threads()
+        return _blas_outcome
+
+
+@dataclass(frozen=True)
+class _ServeSettings:
+    """Where and how one server runs, resolved once: explicit argument, else environment
+    variable, else default."""
+
+    host: str
+    port: int
+    mode: Mode
+    workers: int | None
+    io_workers: int | None
+    tls_cert: str | None
+    tls_key: str | None
+    extra_tls_ports: list[int] | None
+
+    @classmethod
+    def resolve(
+        cls,
+        *,
+        host: str | None = None,
+        port: int | None = None,
+        workers: int | None = None,
+        mode: str | Mode | None = None,
+        io_workers: int | None = None,
+        tls_cert: str | None = None,
+        tls_key: str | None = None,
+        extra_tls_ports: list[int] | None = None,
+    ) -> _ServeSettings:
+        if not isinstance(mode, Mode):
+            mode = Mode.parse(mode or "subinterp")
         if port is None:
             port = _env_int("PYRONOVA_PORT", "8000")
-        # Guarantee an int reaches the Rust FFI boundary. _env_int already
-        # has a "8000" default, but pin the invariant explicitly so a None
-        # can never flow into self._engine.run(port=...) and produce an
-        # opaque type error deep in Rust (arc finding app-39).
-        if port is None:
-            port = 8000
         if workers is None:
             workers = _env_int("PYRONOVA_WORKERS")
         if io_workers is None:
@@ -1106,261 +1205,241 @@ class Pyronova:
                 f"tls_key={'set' if tls_key else 'missing'}"
             )
         if extra_tls_ports is None:
-            _ep = os.environ.get("PYRONOVA_TLS_PORTS")
-            if _ep:
-                # Surface bad entries with the offending value, not a
-                # bare "invalid literal for int()" (arc app-7).
-                parsed = []
-                for p in _ep.split(","):
-                    p = p.strip()
-                    if not p:
-                        continue
-                    try:
-                        parsed.append(int(p))
-                    except ValueError:
-                        raise ValueError(
-                            f"PYRONOVA_TLS_PORTS contains non-integer port {p!r}"
-                        ) from None
-                extra_tls_ports = parsed
+            extra_tls_ports = _env_ports("PYRONOVA_TLS_PORTS")
+        else:
+            for p in extra_tls_ports:
+                _check_port("extra_tls_ports", p)
+        return cls(
+            host=host or os.environ.get("PYRONOVA_HOST", "127.0.0.1"),
+            port=port,
+            mode=mode,
+            workers=workers,
+            io_workers=io_workers,
+            tls_cert=tls_cert,
+            tls_key=tls_key,
+            extra_tls_ports=extra_tls_ports,
+        )
 
-        # Hot reload: watch .py files, restart on change
-        reload = reload or os.environ.get("PYRONOVA_RELOAD") == "1"
-        if reload and os.environ.get("_PYRONOVA_RELOAD_CHILD") != "1":
-            self._run_with_reload()
-            return
 
-        # Auto-enable logging if PYRONOVA_LOG=1 or debug=True.
-        # enable_logging() is itself idempotent + lock-guarded, so no
-        # external lock or flag bookkeeping is needed here.
-        if os.environ.get("PYRONOVA_LOG") == "1" or self.debug:
-            self.enable_logging()
+def _env_int(name: str, default: str | None = None) -> int | None:
+    """An integer environment variable; the error names the variable."""
+    v = os.environ.get(name, default)
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        raise ValueError(
+            f"environment variable {name}={v!r} is not a valid integer"
+        ) from None
 
-        # Initialize Rust tracing engine (deferred from __init__ so
-        # enable_logging() can adjust the config first)
-        if not self._logger_initialized:
-            self._logger_initialized = True
-            # Expose level to sub-interpreter bootstrap via env var
-            os.environ["PYRONOVA_LOG_LEVEL"] = self._log_config["level"]
-            init_logger(
-                self._log_config["level"],
-                self._log_config["access_log"],
-                self._log_config["format"],
-            )
-            _setup_python_logging_bridge(self._log_config["level"])
-        # Auto-register /mcp endpoint if any MCP handlers exist
-        if self._mcp._tools or self._mcp._resources or self._mcp._prompts:
-            mcp = self._mcp
 
-            def _mcp_handler(req):
-                try:
-                    body = req.text()
-                    result = mcp.handle_request(body)
-                except Exception:
-                    _logging.getLogger("pyronova.mcp").exception("MCP handler error")
-                    result = _json_module.dumps({
-                        "jsonrpc": "2.0",
-                        "id": None,
-                        "error": {"code": -32603, "message": "Internal error"},
-                    })
-                return Response(
-                    body=result,
-                    content_type="application/json",
-                )
-
-            self._engine.route("POST", "/mcp", _mcp_handler, True)  # gil=True
-            print(f"  MCP: {len(mcp._tools)} tools, {len(mcp._resources)} resources, {len(mcp._prompts)} prompts → POST /mcp")
-
-        # Auto-detect best mode if not explicitly set
-        if mode is None:
-            mode = "subinterp"
-
-        if mode in ("subinterp", "auto") and workers != 1:
-            print(f"  BLAS: {_limit_blas_threads()} (override: set OPENBLAS_NUM_THREADS)", flush=True)
-
-        import threading
-
-        graceful = False
-        run_error = None
+def _env_ports(name: str) -> list[int] | None:
+    """A comma-separated port list environment variable; a bad entry is named."""
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    ports = []
+    for p in raw.split(","):
+        p = p.strip()
+        if not p:
+            continue
         try:
-            # Run startup hooks inside the try so shutdown hooks still run on failure
-            for hook in self._startup_hooks:
-                hook()
+            port = int(p)
+        except ValueError:
+            raise ValueError(f"{name} contains non-integer port {p!r}") from None
+        ports.append(_check_port(name, port))
+    return ports
 
-            self._engine.run(
-                host=host,
-                port=port,
-                workers=workers,
-                mode=mode,
-                io_workers=io_workers,
-                tls_cert=tls_cert,
-                tls_key=tls_key,
-                extra_tls_ports=extra_tls_ports,
-            )
-            graceful = True  # engine returned after its own SIGINT drain
-        except KeyboardInterrupt:
-            # SIGINT reaches BOTH Rust (which drains connections and returns) and
-            # Python's main thread (which raises KeyboardInterrupt — here, or a
-            # few bytecodes later). Either way it's a graceful stop.
-            graceful = True
-        except BaseException as e:  # noqa: BLE001 — real failure, re-raised below
-            run_error = e
 
-        # On a graceful stop, neutralize the triggering SIGINT before running
-        # shutdown hooks. The pending signal from ctrl-C often fires only once
-        # we're back in Python bytecode (i.e. on the FIRST shutdown hook,
-        # interrupting it) or after run() has returned (a KeyboardInterrupt in the
-        # caller). Ignoring SIGINT here lets the hooks run to completion and
-        # run() return cleanly. Retry through a KeyboardInterrupt that fires
-        # while we're installing the handler.
-        if graceful:
-            while True:
-                try:
-                    import signal as _signal
-                    _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
-                    break
-                except KeyboardInterrupt:
-                    continue
-                except (ValueError, OSError):
-                    break  # not the main thread / no handler slot — best effort
+def _check_port(source: str, port: int) -> int:
+    """An extra listening port: 1-65535 (an ephemeral port 0 could not be reached)."""
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError(f"{source} contains {port!r}, which is not a port (1-65535)")
+    return port
 
-        # Run shutdown hooks (best-effort teardown barrier): one hook failing
-        # (e.g. a pool already closed) must not stop the rest, so log each failure
-        # with its traceback and continue.
-        for hook in self._shutdown_hooks:
+
+def _defining_module_file(app: object) -> str | None:
+    """The file whose module-level code created ``app`` — the script sub-interpreter
+    workers can execute to rebuild it — or None when a function created it."""
+    frame = sys._getframe(1)
+    # Step out of Pyronova.__init__ and any subclass __init__ that called it.
+    while frame is not None and frame.f_locals.get("self") is app:
+        frame = frame.f_back
+    if frame is None or frame.f_code.co_name != "<module>":
+        return None
+    file = frame.f_globals.get("__file__")
+    return os.path.abspath(file) if file else None
+
+
+def _bind_handler(fn: Callable, path: str, model: type | None) -> Callable:
+    """The callable the engine dispatches for a route: ``fn`` itself when it
+    takes only the request, else a wrapper that validates the body against
+    ``model`` and injects the path params ``fn`` declares. Signature mistakes
+    and a path the router would not take as written (``:name``) raise here, at
+    registration, not on every request."""
+    template = frozenset(_route_params(path))
+    if model is None:
+        return _bind_path_params(fn, path, template)
+    return _bind_model(fn, path, template, model)
+
+
+def _bind_path_params(fn: Callable, path: str, template: frozenset[str]) -> Callable:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn  # a builtin/C callable: nothing to inject
+    names = _path_param_names(fn, sig, path, template, leading=1)
+    if not names:
+        return fn  # hot path — the handler is registered as is
+    _require_accepts(fn, leading=1, names=names)
+
+    # Every name is in the template, so the router always fills it: `p[n]`, never a
+    # silent None.
+    if inspect.iscoroutinefunction(fn):
+        async def bound(req):
+            p = req.params
+            return await fn(req, **{n: p[n] for n in names})
+    else:
+        def bound(req):
+            p = req.params
+            return fn(req, **{n: p[n] for n in names})
+    return _named_like(bound, fn)
+
+
+def _bind_model(fn: Callable, path: str, template: frozenset[str], model: type) -> Callable:
+    """``fn(req, body, **path_params)`` or ``fn(body, **path_params)``, by the rule
+    ``_model_takes_request`` checks at registration."""
+    # Imported here, only for routes that declare model=: importing pydantic at
+    # module level would load pydantic_core in every worker of every app. If it
+    # can't be imported, route registration fails with the ImportError.
+    from pydantic import BaseModel, ValidationError
+
+    if not (isinstance(model, type) and issubclass(model, BaseModel)):
+        raise TypeError(f"model= must be a pydantic BaseModel subclass, got {model!r}")
+    sig = inspect.signature(fn)
+    takes_request = _model_takes_request(fn, sig, template, model)
+    names = _path_param_names(fn, sig, path, template, leading=2 if takes_request else 1)
+    if names:
+        _require_accepts(fn, leading=2 if takes_request else 1, names=names)
+
+    def args(req, body):
+        return (req, body) if takes_request else (body,)
+
+    def kwargs(req):
+        p = req.params
+        return {n: p[n] for n in names}
+
+    if inspect.iscoroutinefunction(fn):
+        async def bound(req):
             try:
-                hook()
-            except Exception:
-                _logging.getLogger("pyronova.app").exception(
-                    "shutdown hook %s raised", getattr(hook, "__name__", repr(hook))
-                )
-
-        # A worker thread that outlived the shutdown grace period (a handler that ignores
-        # shutdown) still has a live interpreter, and finalizing with one aborts. Say which,
-        # and exit non-zero without finalizing (Layer 2, design §12).
-        forgotten = _forgotten_workers()
-        if forgotten:
-            _logging.getLogger("pyronova.app").error(
-                "exiting without finalization: worker(s) %s did not stop within the "
-                "shutdown grace period", ", ".join(forgotten)
-            )
-            print(
-                "pyronova: worker(s) " + ", ".join(forgotten) + " did not stop within the "
-                "shutdown grace period; exiting without finalization",
-                file=sys.stderr, flush=True,
-            )
-            sys.stdout.flush()
-            os._exit(1)
-
-        # Not a graceful stop (real startup/run error): surface it normally.
-        if run_error is not None:
-            raise run_error
-
-    def _run_with_reload(self):
-        """Watch .py files and restart server on changes using OS-native events."""
-        import subprocess
-
-        script = sys.argv[0] if sys.argv else None
-        if not script:
-            print("  [reload] Cannot determine script path, running without reload")
-            return
-
-        watch_dir = os.path.dirname(os.path.abspath(script)) or "."
-
-        try:
-            import watchfiles
-        except ImportError:
-            print("  [reload] Install 'watchfiles' for efficient file watching:")
-            print("           pip install watchfiles")
-            print("  [reload] Falling back to polling mode...")
-            return self._run_with_reload_poll(watch_dir, script)
-
-        print(f"  [reload] Watching {watch_dir} for .py changes (watchfiles)...")
-
-        while True:
-            env = {**os.environ, "_PYRONOVA_RELOAD_CHILD": "1"}
-            proc = subprocess.Popen([sys.executable, script], env=env)
-
+                body = model.model_validate_json(req.body)
+            except ValidationError as e:
+                return _validation_error_response(e)
+            return await fn(*args(req, body), **kwargs(req))
+    else:
+        def bound(req):
             try:
-                for changes in watchfiles.watch(
-                    watch_dir,
-                    watch_filter=watchfiles.PythonFilter(),
-                    stop_event=None,
-                    debounce=500,  # 500ms debounce — wait for IDE to finish writing
-                ):
-                    changed = [os.path.basename(c[1]) for c in list(changes)[:3]]
-                    print(f"\n  [reload] File changed: {', '.join(changed)}")
-                    print(f"  [reload] Restarting...\n")
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                    break
-                else:
-                    break
-            except KeyboardInterrupt:
-                proc.terminate()
-                # Bound the wait so a child that ignores SIGTERM can't hang
-                # the reloader forever — escalate to SIGKILL like the
-                # file-change branch above (arc finding app-42).
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                break
+                body = model.model_validate_json(req.body)
+            except ValidationError as e:
+                return _validation_error_response(e)
+            return fn(*args(req, body), **kwargs(req))
+    return _named_like(bound, fn)
 
-    def _run_with_reload_poll(self, watch_dir: str, script: str):
-        """Fallback polling watcher when watchfiles is not installed."""
-        import subprocess
-        import hashlib
-        import glob
 
-        print(f"  [reload] Watching {watch_dir} for .py changes (polling)...")
+def _model_takes_request(
+    fn: Callable, sig: inspect.Signature, template: frozenset[str], model: type
+) -> bool:
+    """The ``model=`` rule: a handler's leading positional parameters that are not path
+    params are the request and the validated body, ``(req, body)``, or the body alone,
+    ``(body)``; every other parameter names a path param. Whether it takes the request
+    follows from that count, never from a guess. A signature the rule rejects raises here:
+    no parameter for the body, or the parameter annotated as ``model`` in the request's
+    place. (More than two is left to the path-param check, which names the extras.)"""
+    leading = []
+    for param in sig.parameters.values():
+        positional = param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD
+        )
+        if not positional or param.name in template:
+            break
+        leading.append(param)
+    if not leading:
+        raise TypeError(
+            f"handler {fn.__name__!r} has no parameter for the validated "
+            f"{model.__name__} body: with model=, a handler is "
+            f"fn(req, body, **path_params) or fn(body, **path_params)"
+        )
+    takes_request = len(leading) >= 2
+    if takes_request and _annotated_as(leading[0], model):
+        raise TypeError(
+            f"handler {fn.__name__!r}: parameter {leading[0].name!r} is annotated "
+            f"{model.__name__} but stands where the request goes (with model=, a handler "
+            f"is fn(req, body, **path_params) or fn(body, **path_params); is "
+            f"{leading[1].name!r} a path param missing from the URL template?)"
+        )
+    return takes_request
 
-        def _snapshot():
-            files = {}
-            for f in glob.glob(os.path.join(watch_dir, "**/*.py"), recursive=True):
-                # Skip common large directories
-                if "/.venv/" in f or "/node_modules/" in f or "/__pycache__/" in f:
-                    continue
-                try:
-                    with open(f, "rb") as fh:
-                        files[f] = hashlib.md5(fh.read()).hexdigest()
-                except Exception:
-                    pass
-            return files
 
-        while True:
-            env = {**os.environ, "_PYRONOVA_RELOAD_CHILD": "1"}
-            proc = subprocess.Popen([sys.executable, script], env=env)
-            snap = _snapshot()
+def _annotated_as(param: inspect.Parameter, cls: type) -> bool:
+    """Whether ``param`` is annotated as ``cls``: the class itself, or its name as a string
+    (``from __future__ import annotations``)."""
+    return param.annotation is cls or param.annotation in (cls.__name__, cls.__qualname__)
 
-            try:
-                while proc.poll() is None:
-                    time.sleep(1)
-                    current = _snapshot()
-                    if current != snap:
-                        # Debounce: wait 0.5s for IDE to finish writing all files
-                        time.sleep(0.5)
-                        snap = _snapshot()  # Re-snapshot after debounce
-                        changed = [f for f in snap if snap.get(f) != current.get(f)]
-                        print(f"\n  [reload] File changed: {', '.join(os.path.basename(f) for f in changed[:3])}")
-                        print(f"  [reload] Restarting...\n")
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=3)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
-                        break
-                else:
-                    break
-            except KeyboardInterrupt:
-                proc.terminate()
-                # Bound the wait so a child that ignores SIGTERM can't hang
-                # the reloader forever — escalate to SIGKILL like the
-                # file-change branch above (arc finding app-42).
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                break
+
+def _validation_error_response(e) -> Response:
+    _logging.getLogger("pyronova.validation").warning(
+        "request body validation failed: %s", type(e).__name__, exc_info=True
+    )
+    return Response(
+        body=_json_module.dumps({"detail": e.errors(include_url=False, include_input=False)}),
+        status_code=422,
+        content_type="application/json",
+    )
+
+
+def _path_param_names(
+    fn: Callable, sig: inspect.Signature, path: str, template: frozenset[str], leading: int
+) -> tuple[str, ...]:
+    """The parameters after the ``leading`` ones the dispatcher fills (request,
+    body), each of which must name a param in the URL template."""
+    names = tuple(
+        p.name for p in list(sig.parameters.values())[leading:]
+        if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    )
+    missing = [n for n in names if n not in template]
+    if missing:
+        raise ValueError(
+            f"handler {fn.__name__!r} declares parameter(s) {missing!r} "
+            f"that are not in the URL template {path!r}. Path-param "
+            f"injection only fills names that appear as `{{name}}` "
+            f"or `{{*name}}` in the route path."
+        )
+    return names
+
+
+def _require_accepts(fn: Callable, leading: int, names: tuple[str, ...]) -> None:
+    """The path params are read off ``inspect.signature(fn)``, which follows a decorator's
+    ``__wrapped__`` to the function it wraps. The call goes to ``fn`` itself, so it must take
+    them too: a wrapper that doesn't (``def wrapper(req)``) is a registration error here,
+    not a TypeError on every request."""
+    try:
+        own = inspect.signature(fn, follow_wrapped=False)
+    except (TypeError, ValueError):
+        return  # a builtin/C callable: its signature can't be read
+    try:
+        own.bind(*([None] * leading), **dict.fromkeys(names))
+    except TypeError as e:
+        raise TypeError(
+            f"handler {getattr(fn, '__qualname__', fn)!r} declares path param(s) "
+            f"{list(names)!r} through __wrapped__, but the wrapper the route calls has "
+            f"signature {own} and can't take them ({e}); have the wrapper accept and pass "
+            "them on (e.g. **path_params)"
+        ) from None
+
+
+def _named_like(wrapper: Callable, fn: Callable) -> Callable:
+    wrapper.__name__ = fn.__name__
+    wrapper.__qualname__ = fn.__qualname__
+    wrapper.__wrapped__ = fn  # Pylance / static analyzers see the original signature
+    return wrapper

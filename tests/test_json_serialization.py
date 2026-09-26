@@ -18,302 +18,394 @@ Covers all PyJsonError variants, path tracking, duck typing, and edge cases:
 - Server resilience after errors
 """
 
+import json
+import time
+
 import pytest
 from collections import defaultdict, OrderedDict, deque
 from pyronova import Pyronova
 from pyronova.testing import TestClient
 
 
+# Module level: TestClient serves it through sub-interpreter workers, which rebuild
+# it by executing this module.
+app = Pyronova()
+
+
+@app.get("/")
+def health(req):
+    return {"ok": True}
+
+
+# --- Primitives ---
+
+@app.get("/none")
+def return_none(req):
+    return None
+
+
+@app.get("/bool/true")
+def return_true(req):
+    return {"v": True}
+
+
+@app.get("/bool/false")
+def return_false(req):
+    return {"v": False}
+
+
+@app.get("/int/zero")
+def return_zero(req):
+    return {"v": 0}
+
+
+@app.get("/int/negative")
+def return_neg(req):
+    return {"v": -42}
+
+
+@app.get("/int/max64")
+def return_max64(req):
+    return {"v": 2**63 - 1}
+
+
+@app.get("/int/min64")
+def return_min64(req):
+    return {"v": -(2**63)}
+
+
+@app.get("/int/bigint")
+def return_bigint(req):
+    return {"v": 2**63}
+
+
+@app.get("/int/bigint_neg")
+def return_bigint_neg(req):
+    return {"v": -(2**63) - 1}
+
+
+@app.get("/int/huge")
+def return_huge(req):
+    return {"v": 10**100}
+
+
+@app.get("/float/normal")
+def return_float(req):
+    return {"v": 3.14}
+
+
+@app.get("/float/zero")
+def return_float_zero(req):
+    return {"v": 0.0}
+
+
+@app.get("/float/neg")
+def return_float_neg(req):
+    return {"v": -2.718}
+
+
+@app.get("/float/nan")
+def return_nan(req):
+    return {"v": float("nan")}
+
+
+@app.get("/float/inf")
+def return_inf(req):
+    return {"v": float("inf")}
+
+
+@app.get("/float/neg_inf")
+def return_neg_inf(req):
+    return {"v": float("-inf")}
+
+
+@app.get("/string/empty")
+def return_empty_str(req):
+    return {"v": ""}
+
+
+@app.get("/string/unicode")
+def return_unicode(req):
+    return {"v": "你好世界 🔥"}
+
+
+@app.get("/string/special")
+def return_special(req):
+    return {"v": 'tab\there\nnewline\r\n"quotes"\\backslash'}
+
+
+@app.get("/string/surrogate")
+def return_surrogate(req):
+    s = "hello\ud800world"
+    return {"v": s}
+
+
+# --- Bool/Int isolation ---
+
+@app.get("/bool_in_list")
+def return_bool_in_list(req):
+    return {"v": [True, False, 1, 0]}
+
+
+@app.get("/bool_int_dict")
+def return_bool_int_dict(req):
+    return {"bool_true": True, "bool_false": False, "int_one": 1, "int_zero": 0}
+
+
+# --- Tuple ---
+
+@app.get("/tuple/simple")
+def return_tuple(req):
+    return {"v": (1, 2, 3)}
+
+
+@app.get("/tuple/mixed")
+def return_tuple_mixed(req):
+    return {"v": (1, "two", 3.0, True, None)}
+
+
+@app.get("/tuple/nested")
+def return_tuple_nested(req):
+    return {"v": ((1, 2), (3, 4))}
+
+
+@app.get("/tuple/empty")
+def return_tuple_empty(req):
+    return {"v": ()}
+
+
+@app.get("/tuple/in_list")
+def return_tuple_in_list(req):
+    return {"v": [(1, 2), [3, 4]]}
+
+
+# --- List ---
+
+@app.get("/list/empty")
+def return_list_empty(req):
+    return {"v": []}
+
+
+@app.get("/list/nested")
+def return_list_nested(req):
+    return {"v": [[1, 2], [3, [4, 5]]]}
+
+
+# --- Dict ---
+
+@app.get("/dict/empty")
+def return_dict_empty(req):
+    return {}
+
+
+@app.get("/dict/nested")
+def return_dict_nested(req):
+    return {"a": {"b": {"c": 1}}}
+
+
+@app.get("/dict/mixed_values")
+def return_dict_mixed(req):
+    return {
+        "str": "hello",
+        "int": 42,
+        "float": 1.5,
+        "bool": True,
+        "none": None,
+        "list": [1, 2],
+        "tuple": (3, 4),
+        "dict": {"nested": True},
+    }
+
+
+# --- Dict key coercion ---
+
+@app.get("/dict/int_keys")
+def return_dict_int_keys(req):
+    return {1: "one", 2: "two"}
+
+
+@app.get("/dict/bool_keys")
+def return_dict_bool_keys(req):
+    return {True: "yes", False: "no"}
+
+
+@app.get("/dict/none_key")
+def return_dict_none_key(req):
+    return {None: "nothing"}
+
+
+@app.get("/dict/float_key")
+def return_dict_float_key(req):
+    return {3.14: "pi"}
+
+
+@app.get("/dict/unsupported_key")
+def return_dict_unsupported_key(req):
+    return {(1, 2): "tuple key"}
+
+
+@app.get("/dict/nan_key")
+def return_dict_nan_key(req):
+    return {float("nan"): "bad"}
+
+
+# --- Circular reference ---
+
+@app.get("/circular/list")
+def return_circular_list(req):
+    a = [1, 2]
+    a.append(a)
+    return {"v": a}
+
+
+@app.get("/circular/dict")
+def return_circular_dict(req):
+    d = {}
+    d["self"] = d
+    return d
+
+
+# --- Repeated (non-circular) references ---
+
+@app.get("/repeated_ref")
+def return_repeated_ref(req):
+    shared = [1, 2, 3]
+    return {"a": shared, "b": shared}
+
+
+# --- Unsupported types ---
+
+@app.get("/unsupported/set")
+def return_set(req):
+    return {"v": {1, 2, 3}}
+
+
+@app.get("/unsupported/bytes")
+def return_bytes(req):
+    return {"v": b"hello"}
+
+
+@app.get("/unsupported/complex")
+def return_complex(req):
+    return {"v": 1 + 2j}
+
+
+@app.get("/unsupported/custom_obj")
+def return_custom_obj(req):
+    class Foo:
+        pass
+    return {"v": Foo()}
+
+
+# --- Deep nesting ---
+
+@app.get("/deep/ok")
+def return_deep_ok(req):
+    d = {"v": 42}
+    for _ in range(50):
+        d = {"nested": d}
+    return d
+
+
+@app.get("/deep/exceed")
+def return_deep_exceed(req):
+    d = {"v": 42}
+    for _ in range(300):
+        d = {"nested": d}
+    return d
+
+
+# --- Path tracking: nested errors ---
+
+@app.get("/path/nested_nan")
+def return_nested_nan(req):
+    return {"users": [{"name": "alice", "score": float("nan")}]}
+
+
+@app.get("/path/nested_unsupported")
+def return_nested_unsupported(req):
+    return {"data": {"items": [1, 2, 3+4j]}}
+
+
+@app.get("/path/deep_circular")
+def return_deep_circular(req):
+    inner = []
+    inner.append(inner)
+    return {"a": {"b": [inner]}}
+
+
+# --- Duck typing: defaultdict, OrderedDict, deque ---
+
+@app.get("/duck/defaultdict")
+def return_defaultdict(req):
+    d = defaultdict(list)
+    d["x"].append(1)
+    d["y"].append(2)
+    return dict(d)  # Convert to dict for now; duck typing test below
+
+
+@app.get("/duck/ordereddict")
+def return_ordereddict(req):
+    d = OrderedDict()
+    d["first"] = 1
+    d["second"] = 2
+    d["third"] = 3
+    return d
+
+
+@app.get("/duck/deque")
+def return_deque(req):
+    return {"v": deque([1, 2, 3, 4, 5])}
+
+
+@app.get("/duck/deque_nested")
+def return_deque_nested(req):
+    return {"v": deque([(1, 2), deque([3, 4])])}
+
+
+@app.get("/duck/defaultdict_raw")
+def return_defaultdict_raw(req):
+    d = defaultdict(int)
+    d["a"] = 10
+    d["b"] = 20
+    return d  # Return raw defaultdict, not converted
+
+
 @pytest.fixture(scope="module")
 def client():
-    app = Pyronova()
-
-    @app.get("/")
-    def health(req):
-        return {"ok": True}
-
-    # --- Primitives ---
-
-    @app.get("/none")
-    def return_none(req):
-        return None
-
-    @app.get("/bool/true")
-    def return_true(req):
-        return {"v": True}
-
-    @app.get("/bool/false")
-    def return_false(req):
-        return {"v": False}
-
-    @app.get("/int/zero")
-    def return_zero(req):
-        return {"v": 0}
-
-    @app.get("/int/negative")
-    def return_neg(req):
-        return {"v": -42}
-
-    @app.get("/int/max64")
-    def return_max64(req):
-        return {"v": 2**63 - 1}
-
-    @app.get("/int/min64")
-    def return_min64(req):
-        return {"v": -(2**63)}
-
-    @app.get("/int/bigint")
-    def return_bigint(req):
-        return {"v": 2**63}
-
-    @app.get("/int/bigint_neg")
-    def return_bigint_neg(req):
-        return {"v": -(2**63) - 1}
-
-    @app.get("/int/huge")
-    def return_huge(req):
-        return {"v": 10**100}
-
-    @app.get("/float/normal")
-    def return_float(req):
-        return {"v": 3.14}
-
-    @app.get("/float/zero")
-    def return_float_zero(req):
-        return {"v": 0.0}
-
-    @app.get("/float/neg")
-    def return_float_neg(req):
-        return {"v": -2.718}
-
-    @app.get("/float/nan")
-    def return_nan(req):
-        return {"v": float("nan")}
-
-    @app.get("/float/inf")
-    def return_inf(req):
-        return {"v": float("inf")}
-
-    @app.get("/float/neg_inf")
-    def return_neg_inf(req):
-        return {"v": float("-inf")}
-
-    @app.get("/string/empty")
-    def return_empty_str(req):
-        return {"v": ""}
-
-    @app.get("/string/unicode")
-    def return_unicode(req):
-        return {"v": "你好世界 🔥"}
-
-    @app.get("/string/special")
-    def return_special(req):
-        return {"v": 'tab\there\nnewline\r\n"quotes"\\backslash'}
-
-    @app.get("/string/surrogate")
-    def return_surrogate(req):
-        s = "hello\ud800world"
-        return {"v": s}
-
-    # --- Bool/Int isolation ---
-
-    @app.get("/bool_in_list")
-    def return_bool_in_list(req):
-        return {"v": [True, False, 1, 0]}
-
-    @app.get("/bool_int_dict")
-    def return_bool_int_dict(req):
-        return {"bool_true": True, "bool_false": False, "int_one": 1, "int_zero": 0}
-
-    # --- Tuple ---
-
-    @app.get("/tuple/simple")
-    def return_tuple(req):
-        return {"v": (1, 2, 3)}
-
-    @app.get("/tuple/mixed")
-    def return_tuple_mixed(req):
-        return {"v": (1, "two", 3.0, True, None)}
-
-    @app.get("/tuple/nested")
-    def return_tuple_nested(req):
-        return {"v": ((1, 2), (3, 4))}
-
-    @app.get("/tuple/empty")
-    def return_tuple_empty(req):
-        return {"v": ()}
-
-    @app.get("/tuple/in_list")
-    def return_tuple_in_list(req):
-        return {"v": [(1, 2), [3, 4]]}
-
-    # --- List ---
-
-    @app.get("/list/empty")
-    def return_list_empty(req):
-        return {"v": []}
-
-    @app.get("/list/nested")
-    def return_list_nested(req):
-        return {"v": [[1, 2], [3, [4, 5]]]}
-
-    # --- Dict ---
-
-    @app.get("/dict/empty")
-    def return_dict_empty(req):
-        return {}
-
-    @app.get("/dict/nested")
-    def return_dict_nested(req):
-        return {"a": {"b": {"c": 1}}}
-
-    @app.get("/dict/mixed_values")
-    def return_dict_mixed(req):
-        return {
-            "str": "hello",
-            "int": 42,
-            "float": 1.5,
-            "bool": True,
-            "none": None,
-            "list": [1, 2],
-            "tuple": (3, 4),
-            "dict": {"nested": True},
-        }
-
-    # --- Dict key coercion ---
-
-    @app.get("/dict/int_keys")
-    def return_dict_int_keys(req):
-        return {1: "one", 2: "two"}
-
-    @app.get("/dict/bool_keys")
-    def return_dict_bool_keys(req):
-        return {True: "yes", False: "no"}
-
-    @app.get("/dict/none_key")
-    def return_dict_none_key(req):
-        return {None: "nothing"}
-
-    @app.get("/dict/float_key")
-    def return_dict_float_key(req):
-        return {3.14: "pi"}
-
-    @app.get("/dict/unsupported_key")
-    def return_dict_unsupported_key(req):
-        return {(1, 2): "tuple key"}
-
-    @app.get("/dict/nan_key")
-    def return_dict_nan_key(req):
-        return {float("nan"): "bad"}
-
-    # --- Circular reference ---
-
-    @app.get("/circular/list")
-    def return_circular_list(req):
-        a = [1, 2]
-        a.append(a)
-        return {"v": a}
-
-    @app.get("/circular/dict")
-    def return_circular_dict(req):
-        d = {}
-        d["self"] = d
-        return d
-
-    # --- Repeated (non-circular) references ---
-
-    @app.get("/repeated_ref")
-    def return_repeated_ref(req):
-        shared = [1, 2, 3]
-        return {"a": shared, "b": shared}
-
-    # --- Unsupported types ---
-
-    @app.get("/unsupported/set")
-    def return_set(req):
-        return {"v": {1, 2, 3}}
-
-    @app.get("/unsupported/bytes")
-    def return_bytes(req):
-        return {"v": b"hello"}
-
-    @app.get("/unsupported/complex")
-    def return_complex(req):
-        return {"v": 1 + 2j}
-
-    @app.get("/unsupported/custom_obj")
-    def return_custom_obj(req):
-        class Foo:
-            pass
-        return {"v": Foo()}
-
-    # --- Deep nesting ---
-
-    @app.get("/deep/ok")
-    def return_deep_ok(req):
-        d = {"v": 42}
-        for _ in range(50):
-            d = {"nested": d}
-        return d
-
-    @app.get("/deep/exceed")
-    def return_deep_exceed(req):
-        d = {"v": 42}
-        for _ in range(300):
-            d = {"nested": d}
-        return d
-
-    # --- Path tracking: nested errors ---
-
-    @app.get("/path/nested_nan")
-    def return_nested_nan(req):
-        return {"users": [{"name": "alice", "score": float("nan")}]}
-
-    @app.get("/path/nested_unsupported")
-    def return_nested_unsupported(req):
-        return {"data": {"items": [1, 2, 3+4j]}}
-
-    @app.get("/path/deep_circular")
-    def return_deep_circular(req):
-        inner = []
-        inner.append(inner)
-        return {"a": {"b": [inner]}}
-
-    # --- Duck typing: defaultdict, OrderedDict, deque ---
-
-    @app.get("/duck/defaultdict")
-    def return_defaultdict(req):
-        d = defaultdict(list)
-        d["x"].append(1)
-        d["y"].append(2)
-        return dict(d)  # Convert to dict for now; duck typing test below
-
-    @app.get("/duck/ordereddict")
-    def return_ordereddict(req):
-        d = OrderedDict()
-        d["first"] = 1
-        d["second"] = 2
-        d["third"] = 3
-        return d
-
-    @app.get("/duck/deque")
-    def return_deque(req):
-        return {"v": deque([1, 2, 3, 4, 5])}
-
-    @app.get("/duck/deque_nested")
-    def return_deque_nested(req):
-        return {"v": deque([(1, 2), deque([3, 4])])}
-
-    @app.get("/duck/defaultdict_raw")
-    def return_defaultdict_raw(req):
-        d = defaultdict(int)
-        d["a"] = 10
-        d["b"] = 20
-        return d  # Return raw defaultdict, not converted
-
-    c = TestClient(app, port=19895)
+    c = TestClient(app)
     yield c
     c.close()
+
+
+def _assert_generic_500(resp) -> str:
+    """A serialization failure is a 5xx: the body is generic plus the request id (D4);
+    returns the id."""
+    assert resp.status_code == 500, (resp.status_code, resp.text)
+    body = resp.json()
+    rid = body.get("request_id")
+    assert isinstance(rid, str) and rid, body
+    assert body == {"error": "Internal Server Error", "request_id": rid}, body
+    return rid
+
+
+def _logged_error(capfd, rid: str, timeout: float = 5.0) -> str:
+    """The `error` field of the process-log line carrying `rid`. The server runs in this
+    process and its log writer is non-blocking, so the line lands on stderr a moment
+    after the response."""
+    seen = ""
+    deadline = time.time() + timeout
+    while True:
+        seen += capfd.readouterr().err
+        for line in seen.splitlines():
+            try:
+                fields = json.loads(line).get("fields", {})
+            except ValueError:
+                continue
+            if fields.get("request_id") == rid:
+                return fields["error"]
+        assert time.time() < deadline, f"no log line with request_id={rid}:\n{seen[-3000:]}"
+        time.sleep(0.05)
 
 
 # ========================
@@ -501,9 +593,11 @@ class TestDictKeyCoercion:
         resp = client.get("/dict/nan_key")
         assert resp.status_code == 500
 
-    def test_unsupported_key_error_message(self, client):
-        body = client.get("/dict/unsupported_key").text
-        assert "key" in body.lower() or "tuple" in body.lower()
+    def test_unsupported_key_error_message(self, client, capfd):
+        """The client gets the generic 500; the serializer's message is in the log."""
+        rid = _assert_generic_500(client.get("/dict/unsupported_key"))
+        error = _logged_error(capfd, rid)
+        assert "key" in error.lower() or "tuple" in error.lower(), error
 
 
 class TestCircularReference:
@@ -513,10 +607,12 @@ class TestCircularReference:
     def test_circular_dict_returns_500(self, client):
         assert client.get("/circular/dict").status_code == 500
 
-    def test_circular_error_message(self, client):
-        """orjson raises 'Recursion limit reached' for circular refs."""
-        body = client.get("/circular/list").text
-        assert "ecursion" in body or "ircular" in body
+    def test_circular_error_message(self, client, capfd):
+        """orjson raises 'Recursion limit reached' for circular refs. The client gets the
+        generic 500; that message is in the log."""
+        rid = _assert_generic_500(client.get("/circular/list"))
+        error = _logged_error(capfd, rid)
+        assert "ecursion" in error or "ircular" in error, error
 
 
 class TestRepeatedReference:
@@ -545,9 +641,11 @@ class TestUnsupportedTypes:
     def test_custom_obj_rejected(self, client):
         assert client.get("/unsupported/custom_obj").status_code == 500
 
-    def test_unsupported_error_message(self, client):
-        body = client.get("/unsupported/complex").text
-        assert "complex" in body.lower() or "serialize" in body.lower()
+    def test_unsupported_error_message(self, client, capfd):
+        """The client gets the generic 500; the serializer's message is in the log."""
+        rid = _assert_generic_500(client.get("/unsupported/complex"))
+        error = _logged_error(capfd, rid)
+        assert "complex" in error.lower() or "serialize" in error.lower(), error
 
 
 class TestDepthLimiting:
@@ -562,10 +660,12 @@ class TestDepthLimiting:
     def test_300_levels_rejected(self, client):
         assert client.get("/deep/exceed").status_code == 500
 
-    def test_depth_error_message(self, client):
-        """orjson raises 'Recursion limit reached' for deeply nested objects."""
-        body = client.get("/deep/exceed").text
-        assert "ecursion" in body or "depth" in body.lower() or "limit" in body.lower()
+    def test_depth_error_message(self, client, capfd):
+        """orjson raises 'Recursion limit reached' for deeply nested objects. The client
+        gets the generic 500; that message is in the log."""
+        rid = _assert_generic_500(client.get("/deep/exceed"))
+        error = _logged_error(capfd, rid)
+        assert "ecursion" in error or "depth" in error.lower() or "limit" in error.lower(), error
 
 
 class TestPathTracking:
@@ -580,10 +680,8 @@ class TestPathTracking:
         assert client.get("/path/nested_unsupported").status_code == 500
 
     def test_deep_circular_raises_error(self, client):
-        """Circular ref raises Recursion limit reached → 500."""
-        r = client.get("/path/deep_circular")
-        assert r.status_code == 500
-        assert "ecursion" in r.text or "ircular" in r.text
+        """Circular ref raises Recursion limit reached → generic 500 with a request id."""
+        _assert_generic_500(client.get("/path/deep_circular"))
 
 
 class TestResilience:

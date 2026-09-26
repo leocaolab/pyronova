@@ -108,6 +108,6 @@ class MyTradeService(TradeServiceBase):
 | 0 | Pyronova Web 发布 PyPI | ← **当前优先** |
 | 1 | 16B framer + prost 集成 | Pyronova 稳定 |
 | 2 | skyrpc-gen 代码生成器 | Proto 解析器 |
-| 3 | O(1) 路由 + 子解释器调度 | 复用 Pyronova interp.rs |
+| 3 | O(1) 路由 + 子解释器调度 | 复用 Pyronova 的子解释器 worker（`src/python/`） |
 | 4 | gRPC 兼容层 (HTTP/2 + Proto) | HTTP/2 已有 |
 | 5 | Monoio thread-per-core 引擎 | Linux 机器 |

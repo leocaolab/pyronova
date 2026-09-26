@@ -1,4 +1,4 @@
-"""FR-12 / M4 review N4 (Layer 2): no `Python::assume_attached` outside an audited allowlist.
+"""No `Python::assume_attached` outside an audited allowlist.
 
 `assume_attached` hands out a token without telling PyO3 the thread is attached, so a
 `Py<T>` dropped under it is deferred instead of decref'd, and nothing checks that the
@@ -22,8 +22,9 @@ ASSUME = re.compile(r"assume_attached\s*\(")
 ALLOWLIST = {
     "src/python/worker.rs": (
         1,
-        "init_in_sub_interp: runs on the main OS thread with the new worker's thread state "
-        "current; Python::attach there would go through main's gilstate thread state",
+        "with_current_tstate: a worker's init, on the main OS thread with the new worker's "
+        "thread state current (Python::attach there would switch to main's gilstate thread "
+        "state), and its end; Py<T> released in it goes through drop_ref",
     ),
 }
 

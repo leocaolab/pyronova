@@ -11,7 +11,6 @@ a clear Python error.
 
 import http.client
 import shutil
-import socket
 import ssl
 import subprocess
 import threading
@@ -19,6 +18,8 @@ import time
 from pathlib import Path
 
 import pytest
+
+from tests._helpers import poll_until
 
 from pyronova import Pyronova
 
@@ -46,18 +47,9 @@ def cert_key(tmp_path_factory):
     return cert, key
 
 
-def _free_port() -> int:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
 @pytest.fixture(scope="module")
 def tls_server(cert_key):
     cert, key = cert_key
-    port = _free_port()
 
     app = Pyronova()
 
@@ -71,12 +63,14 @@ def tls_server(cert_key):
 
     t = threading.Thread(
         target=lambda: app.run(
-            host="127.0.0.1", port=port, mode="default",
+            host="127.0.0.1", port=0, mode="default",
             tls_cert=str(cert), tls_key=str(key),
         ),
         daemon=True,
     )
     t.start()
+    # Bound on port 0: the app's server reports the port it got.
+    port = poll_until(lambda: [srv.port for srv in list(app._servers)], what="TLS bind")[0]
 
     # Wait for TLS listener. Plain TCP connect succeeds the instant the
     # listener binds; we need to actually complete a TLS handshake to
@@ -140,7 +134,7 @@ def test_only_cert_raises(cert_key, tmp_path):
     # run() must raise before accepting any connection
     with pytest.raises((ValueError, TypeError)):
         app.run(
-            host="127.0.0.1", port=_free_port(),
+            host="127.0.0.1", port=0,
             tls_cert=str(cert),  # tls_key missing
         )
 
@@ -150,7 +144,7 @@ def test_missing_cert_file_raises(tmp_path):
     app = Pyronova()
     with pytest.raises((ValueError, OSError)):
         app.run(
-            host="127.0.0.1", port=_free_port(),
+            host="127.0.0.1", port=0,
             tls_cert=str(tmp_path / "missing.pem"),
             tls_key=str(tmp_path / "missing.pem"),
         )

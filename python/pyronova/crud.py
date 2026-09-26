@@ -40,9 +40,12 @@ intend to expose.
 
 import logging
 import re
+from dataclasses import dataclass
 from typing import Callable, TYPE_CHECKING
 
 from .app import Response
+from ._errors import log_server_error, server_error_body
+from .db import IntegrityError, ParamError
 
 _log = logging.getLogger("pyronova.crud")
 
@@ -55,20 +58,65 @@ __all__ = ["register_crud"]
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# Longest ?limit= / ?offset= value parsed: a legitimate one has a handful of digits, and
+# int() on a million-digit string is a cheap way to burn server CPU.
+_MAX_QUERY_INT_DIGITS = 18
+
 
 def _validate_ident(name: str, role: str) -> str:
-    """Reject anything that could break out of an SQL identifier context.
-
-    Postgres will happily quote an identifier with ``"..."`` — even one with
-    nasty chars — but we'd rather fail loudly at registration than ship a
-    surprise later. Caller must whitelist the name themselves.
-    """
+    """Refuse, at registration, a name that is not a plain identifier: it is
+    interpolated into the SQL unquoted."""
     if not _IDENT_RE.match(name):
         raise ValueError(
             f"invalid SQL identifier for {role}: {name!r} "
             "(must match [A-Za-z_][A-Za-z0-9_]*)"
         )
     return name
+
+
+@dataclass(frozen=True)
+class _Rejected:
+    """A request refused before it reaches the database, with the reply."""
+
+    response: Response
+
+
+def _json_object(req) -> "dict | _Rejected":
+    try:
+        body = req.json()
+    except ValueError as e:
+        # The client's own bad input: tell it what is wrong; not a server error.
+        _log.info("rejected request body: %s", e)
+        return _Rejected(Response(body={"error": f"invalid JSON: {e}"}, status_code=400))
+    if not isinstance(body, dict):
+        return _Rejected(Response(body={"error": "body must be a JSON object"}, status_code=400))
+    return body
+
+
+def _query(req, what: str, call: Callable, *args) -> object:
+    """Run one pool call for `req`. A failure the client caused is refused with
+    the database's reason; any other failure is logged with the request id and
+    answered with a generic 500 carrying that id.
+
+    - ``IntegrityError`` (SQLSTATE class 23: duplicate key, NOT NULL, CHECK,
+      foreign key; ``UniqueViolation`` is a subclass) → 409.
+    - ``ParamError``: the pool refused a body value the column's type cannot
+      take, before sending the query → 422.
+    - anything else (``DatabaseError``, pool timeout, a bug — including a
+      ``TypeError`` / ``ValueError`` of our own) → 500. It is caught here rather
+      than left to the framework so the client never sees exception text.
+    """
+    try:
+        return call(*args)
+    except IntegrityError as e:
+        _log.info("%s: refused by a constraint: %s", what, e)
+        return _Rejected(Response(body={"error": str(e)}, status_code=409))
+    except ParamError as e:
+        _log.info("%s: refused a value: %s", what, e)
+        return _Rejected(Response(body={"error": str(e)}, status_code=422))
+    except Exception:
+        log_server_error(_log, req.request_id, "%s failed", what)
+        return _Rejected(Response(body=server_error_body(req.request_id), status_code=500))
 
 
 def register_crud(
@@ -106,25 +154,12 @@ def register_crud(
         raise ValueError("prefix must not end with '/'")
 
     if not columns:
-        # Fail fast at registration. Without this, col_list = ", ".join([])
-        # produces "" and SQL becomes "SELECT  FROM {table}" — runtime DB
-        # syntax error far from the misconfig site (arc finding crud-5).
         raise ValueError("columns must not be empty")
     if len(set(columns)) != len(columns):
-        # Duplicates would generate `SELECT id, name, id FROM ...` and
-        # fail at query time (arc finding crud-6).
         raise ValueError(f"columns must be unique, got duplicates in {columns!r}")
     if not callable(id_type):
-        # id_type's Callable type hint isn't runtime-enforced. Catch
-        # the misconfig at registration instead of failing in every
-        # request handler with cryptic 'X object is not callable'
-        # (arc findings crud-9, crud-2).
         raise TypeError(f"id_type must be callable, got {type(id_type).__name__}")
-    # default_limit / max_limit hints aren't runtime-enforced either. A
-    # non-int (e.g. max_limit="1000") makes min(int(...), "1000") raise in
-    # *every* request, which the limit/offset except block then mislabels as
-    # a client "invalid limit/offset" 400 — blaming the caller for a
-    # registration-time misconfig (arc finding crud-84).
+    # A non-int limit would fail every request, reported as the client's bad ?limit=.
     if not isinstance(default_limit, int) or isinstance(default_limit, bool):
         raise TypeError(f"default_limit must be int, got {type(default_limit).__name__}")
     if not isinstance(max_limit, int) or isinstance(max_limit, bool):
@@ -149,34 +184,37 @@ def register_crud(
 
     col_list = ", ".join(columns)
     non_id_cols = [c for c in columns if c != id_column]
-    # The PUT handler can only update non-PK columns. If columns is just the
-    # PK, every PUT would hit the "include at least one of []" 422 with no way
-    # for a client to satisfy it — the route is permanently broken. Reject at
-    # registration so the misconfig surfaces at startup, not per-request.
+    # With only the PK no PUT could ever succeed.
     if not non_id_cols:
         raise ValueError(
             f"columns={columns!r} must include at least one non-PK column "
             f"besides id_column {id_column!r} (PUT can only update non-PK columns)"
         )
 
+    def parse_id(req) -> "object | _Rejected":
+        raw_id = req.params.get("id")
+        if raw_id is None:
+            return _Rejected(Response(body={"error": "missing id"}, status_code=400))
+        try:
+            return id_type(raw_id)
+        except (TypeError, ValueError) as e:
+            # A converter's way of saying "not an id" (`int("abc")`, `UUID("x")`): the
+            # client's error. Anything else it raises is a bug in the converter and takes
+            # the 500 path, logged with the request id.
+            return _Rejected(Response(body={"error": f"invalid id: {e}"}, status_code=400))
+
     # --- GET /prefix --------------------------------------------------------
-    # All routes pinned to gil=True. The original reason is gone: workers now
-    # run the real PgPool, which never nests `block_on` in a Tokio context
-    # (Layer 2). Moving CRUD into workers is a separate change (design
-    # docs/design/real-engine-in-workers.md, non-goals).
+    # Every route runs on main (gil=True); running them in workers is out of scope of
+    # docs/design/real-engine-in-workers.md (non-goals).
     list_sql = f"SELECT {col_list} FROM {table} ORDER BY {id_column} LIMIT $1 OFFSET $2"
 
     @app.get(prefix, gil=True)
     def list_rows(req):
         q = req.query_params
         try:
-            # Bound the raw string length before parsing so a hostile client
-            # can't make us allocate / parse an arbitrarily huge integer
-            # (e.g. ?limit=9999...repeated millions of times). Any legitimate
-            # limit/offset fits comfortably in a handful of digits.
             raw_limit = q.get("limit", default_limit)
             raw_offset = q.get("offset", 0)
-            if len(str(raw_limit)) > 18 or len(str(raw_offset)) > 18:
+            if max(len(str(raw_limit)), len(str(raw_offset))) > _MAX_QUERY_INT_DIGITS:
                 raise ValueError("limit/offset too long")
             limit = max(1, min(int(raw_limit), max_limit))
             offset = max(int(raw_offset), 0)
@@ -185,16 +223,9 @@ def register_crud(
                 body={"error": "invalid limit/offset"},
                 status_code=400,
             )
-        try:
-            rows = pool.fetch_all(list_sql, limit, offset)
-        except Exception:
-            # PgPool raises RuntimeError for DB errors per its contract, but a
-            # contract violation (pool closed, internal bug, a future driver
-            # raising a different type) must still surface as a clean logged
-            # 500 here rather than escaping to the framework's top-level
-            # handler, which may leak a full traceback to the client.
-            _log.exception("list_rows: fetch_all failed")
-            return Response(body={"error": "database error"}, status_code=500)
+        rows = _query(req, "list_rows", pool.fetch_all, list_sql, limit, offset)
+        if isinstance(rows, _Rejected):
+            return rows.response
         return rows
 
     # --- GET /prefix/{id} ---------------------------------------------------
@@ -202,42 +233,24 @@ def register_crud(
 
     @app.get(f"{prefix}/{{id}}", gil=True)
     def get_row(req):
-        raw_id = req.params.get("id")
-        if raw_id is None:
-            return Response(body={"error": "missing id"}, status_code=400)
-        try:
-            id_val = id_type(raw_id)
-        except Exception:
-            # id_type is user-supplied and coerces an attacker-controlled
-            # path segment. A custom converter may raise something other
-            # than TypeError/ValueError (RuntimeError, OSError, KeyError);
-            # any failure here means "this id string is unacceptable" → 400,
-            # never a 500 (arc finding crud-83). Log so a genuinely broken
-            # converter is still diagnosable.
-            _log.warning("id_type(%r) raised; treating as invalid id", raw_id, exc_info=True)
-            return Response(body={"error": "invalid id"}, status_code=400)
-        try:
-            row = pool.fetch_one(get_sql, id_val)
-        except Exception:
-            _log.exception("get_row: fetch_one failed")
-            return Response(body={"error": "database error"}, status_code=500)
+        id_val = parse_id(req)
+        if isinstance(id_val, _Rejected):
+            return id_val.response
+        row = _query(req, "get_row", pool.fetch_one, get_sql, id_val)
+        if isinstance(row, _Rejected):
+            return row.response
         if row is None:
             return Response(body={"error": "not found"}, status_code=404)
         return row
 
     # --- POST /prefix -------------------------------------------------------
-    # Insert with an arbitrary subset of columns from body. We build the
-    # column list dynamically from the intersection of body keys and the
-    # allowlist so the caller can't inject columns.
+    # The columns inserted are the body's keys that are in `columns`: the client can't
+    # name any other.
     @app.post(prefix, gil=True)
     def create_row(req):
-        try:
-            body = req.json()
-        except ValueError:
-            _log.exception("create_row: failed to parse request body")
-            return Response(body={"error": "invalid JSON"}, status_code=400)
-        if not isinstance(body, dict):
-            return Response(body={"error": "body must be a JSON object"}, status_code=400)
+        body = _json_object(req)
+        if isinstance(body, _Rejected):
+            return body.response
 
         present = [c for c in columns if c in body]
         if not present:
@@ -252,37 +265,20 @@ def register_crud(
             f"RETURNING {col_list}"
         )
         args = [body[c] for c in present]
-        try:
-            row = pool.fetch_one(insert_sql, *args)
-        except Exception:
-            _log.exception("create_row: DB error on INSERT into %s", table)
-            return Response(body={"error": "database error"}, status_code=500)
+        row = _query(req, f"create_row: INSERT into {table}", pool.fetch_one, insert_sql, *args)
+        if isinstance(row, _Rejected):
+            return row.response
         return Response(body=row, status_code=201)
 
     # --- PUT /prefix/{id} ---------------------------------------------------
     @app.put(f"{prefix}/{{id}}", gil=True)
     def update_row(req):
-        raw_id = req.params.get("id")
-        if raw_id is None:
-            return Response(body={"error": "missing id"}, status_code=400)
-        try:
-            id_val = id_type(raw_id)
-        except Exception:
-            # id_type is user-supplied and coerces an attacker-controlled
-            # path segment. A custom converter may raise something other
-            # than TypeError/ValueError (RuntimeError, OSError, KeyError);
-            # any failure here means "this id string is unacceptable" → 400,
-            # never a 500 (arc finding crud-83). Log so a genuinely broken
-            # converter is still diagnosable.
-            _log.warning("id_type(%r) raised; treating as invalid id", raw_id, exc_info=True)
-            return Response(body={"error": "invalid id"}, status_code=400)
-        try:
-            body = req.json()
-        except ValueError:
-            _log.exception("update_row: failed to parse request body")
-            return Response(body={"error": "invalid JSON"}, status_code=400)
-        if not isinstance(body, dict):
-            return Response(body={"error": "body must be a JSON object"}, status_code=400)
+        id_val = parse_id(req)
+        if isinstance(id_val, _Rejected):
+            return id_val.response
+        body = _json_object(req)
+        if isinstance(body, _Rejected):
+            return body.response
 
         # Only update non-PK columns.
         present = [c for c in non_id_cols if c in body]
@@ -298,11 +294,9 @@ def register_crud(
             f"RETURNING {col_list}"
         )
         args = [body[c] for c in present] + [id_val]
-        try:
-            row = pool.fetch_one(update_sql, *args)
-        except Exception:
-            _log.exception("update_row: DB error on UPDATE in %s", table)
-            return Response(body={"error": "database error"}, status_code=500)
+        row = _query(req, f"update_row: UPDATE in {table}", pool.fetch_one, update_sql, *args)
+        if isinstance(row, _Rejected):
+            return row.response
         if row is None:
             return Response(body={"error": "not found"}, status_code=404)
         return row
@@ -312,25 +306,12 @@ def register_crud(
 
     @app.delete(f"{prefix}/{{id}}", gil=True)
     def delete_row(req):
-        raw_id = req.params.get("id")
-        if raw_id is None:
-            return Response(body={"error": "missing id"}, status_code=400)
-        try:
-            id_val = id_type(raw_id)
-        except Exception:
-            # id_type is user-supplied and coerces an attacker-controlled
-            # path segment. A custom converter may raise something other
-            # than TypeError/ValueError (RuntimeError, OSError, KeyError);
-            # any failure here means "this id string is unacceptable" → 400,
-            # never a 500 (arc finding crud-83). Log so a genuinely broken
-            # converter is still diagnosable.
-            _log.warning("id_type(%r) raised; treating as invalid id", raw_id, exc_info=True)
-            return Response(body={"error": "invalid id"}, status_code=400)
-        try:
-            affected = pool.execute(delete_sql, id_val)
-        except Exception:
-            _log.exception("delete_row: DB error on DELETE from %s", table)
-            return Response(body={"error": "database error"}, status_code=500)
+        id_val = parse_id(req)
+        if isinstance(id_val, _Rejected):
+            return id_val.response
+        affected = _query(req, f"delete_row: DELETE from {table}", pool.execute, delete_sql, id_val)
+        if isinstance(affected, _Rejected):
+            return affected.response
         if affected == 0:
             return Response(body={"error": "not found"}, status_code=404)
         return Response(body=b"", status_code=204)

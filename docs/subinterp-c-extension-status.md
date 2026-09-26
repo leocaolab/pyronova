@@ -104,7 +104,7 @@ def compute(req):
 - **纯数值 kernel**：用 PyO3 0.29 写 `#[pyfunction]`（方便、同 raw C-API 速度），子解释器 script 里 override 后 import。
 - **要建 Python 类型 / 要严格模式无 override**：raw C-API 手写、声明 `PER_INTERPRETER_GIL_SUPPORTED`（如 `pyronova_request_type.rs` 的 `_Request`）。
 - **numpy / orjson / lxml**：每 worker 一份物理副本（损失内存换隔离）；这对 free-threading 也是最优隔离手段（不用担心共享 bug）。
-- **override 的代价**：它是进程级开关，会顺带放行 numpy 等不安全扩展去*尝试*加载（numpy 仍会因自身全局态失败）。生产里配合 crash isolation（子解释器崩不带垮 supervisor）。
+- **override 的代价**：它是整个解释器范围的开关，一直开着会顺带放行 numpy 等不安全扩展去*尝试*加载（numpy 仍会因自身全局态失败）。生产里配合 crash isolation（子解释器崩不带垮 supervisor）。
 
 ## 七、16-worker soak test —— 实测稳定性 + 内存
 

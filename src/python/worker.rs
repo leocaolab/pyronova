@@ -1,23 +1,37 @@
-//! `SubInterpreterWorker` — owns one CPython sub-interpreter and runs
-//! request handlers inside it. This is the densest concentration of
-//! `unsafe` + raw `pyo3::ffi` in the codebase.
+//! `SubInterpreterWorker` — owns one CPython sub-interpreter and runs requests in it. This
+//! is the densest concentration of `unsafe` + raw `pyo3::ffi` in the codebase: creating and
+//! ending the interpreter, and moving its thread state between OS threads.
 //!
-//! A worker runs the same program as the main interpreter (Layer 2): its bootstrap sets up
+//! A worker runs the same program as the main interpreter: its bootstrap sets up
 //! logging, the GC policy and C-extension isolation, then the user's script executes as a
 //! real module and imports the real `pyronova` package and engine. The worker takes its
 //! handlers from the app that script registered routes on, checked index by index against
 //! the main interpreter's table.
+//!
+//! What a worker holds for serving is its [`Role`]: an [`Inline`] worker (the TPC threads,
+//! the pool's sync workers) runs the hook chain from Rust on its own event loop; an
+//! [`AsyncEngine`] worker runs the async engine, which takes the handlers from the app
+//! itself. The role's references belong to the worker's interpreter and are released only
+//! by [`SubInterpreterWorker::end`], with its thread state current.
 
-use std::collections::HashMap;
+use std::cell::Cell;
 use std::ffi::{CStr, CString};
+use std::mem::ManuallyDrop;
+use std::time::Duration;
 
+use pyo3::exceptions::{PyImportError, PyModuleNotFoundError, PyRuntimeError};
 use pyo3::ffi;
 use pyo3::prelude::*;
+use pyo3::types::{PyList, PyModule, PyString, PyTraceback, PyTuple};
 
-use super::convert::*;
-use super::ffi::*;
-use super::pool::*;
-use crate::router::RouteSignature;
+use super::hook_chain::{worker_response, Chain, EventLoop};
+use super::request_context::{in_request_context, RequestContext};
+use super::worker_api::AsyncInbox;
+use super::worker_app::{self, WorkerRoutes};
+use crate::body::REQUEST_BUDGET;
+use crate::error::{panic_message, HandlerError, PyException, Stage};
+use crate::router::{RouteId, RouteSignature};
+use crate::types::{PyronovaRequest, ResponseData};
 
 /// Name of the module the user's script executes as in a worker. Not `__main__`, so a script's
 /// `if __name__ == "__main__": app.run()` does not run in workers.
@@ -27,82 +41,544 @@ const BOOTSTRAP_MODULE: &CStr = c"__pyronova_bootstrap__";
 /// Name of the module the async engine executes as.
 const ASYNC_ENGINE_MODULE: &CStr = c"__pyronova_async_engine__";
 
+/// How much sooner than the caller the async engine gives up on a request's task: it
+/// cancels the task and answers 504 itself, instead of leaving it computing a result the
+/// caller, already answered, never takes.
+const ASYNC_TASK_MARGIN: Duration = Duration::from_secs(2);
+/// The async engine's budget per request task (its `TASK_TIMEOUT`).
+const ASYNC_TASK_BUDGET: Duration = REQUEST_BUDGET.saturating_sub(ASYNC_TASK_MARGIN);
+
 // ---------------------------------------------------------------------------
-// Safe sub-interpreter
+// Start errors
 // ---------------------------------------------------------------------------
 
-pub(crate) struct SubInterpreterWorker {
-    /// Thread state (saved after releasing GIL)
-    pub(crate) tstate: *mut ffi::PyThreadState,
-    /// This worker's index: `WORKER_ID` in its bootstrap (log records) and async engine
-    /// (its slot in `WORKER_STATES`).
-    pub(crate) worker_id: usize,
-    /// Handlers, indexed like the main interpreter's route table (owned references).
-    handlers: Vec<*mut ffi::PyObject>,
-    /// `before_request` / `after_request` hooks, in registration order (owned references).
-    before_hooks: Vec<*mut ffi::PyObject>,
-    after_hooks: Vec<*mut ffi::PyObject>,
-    /// Cached: persistent asyncio event loop for this sub-interpreter
-    asyncio_loop: *mut ffi::PyObject,
-    /// Cached: loop.run_until_complete method
-    loop_run_func: *mut ffi::PyObject,
-    /// Pool instance id (see `POOL_ID_COUNTER`). Exposed to the async
-    /// engine as `POOL_ID` so it can be passed into every
-    /// `_worker_recv` / `_worker_send` call for the zombie-worker guard.
-    pub(crate) pool_id: u64,
-    /// Cached `gc.collect` function pointer. `_bootstrap.py` runs
-    /// `gc.disable()` at sub-interp init so CPython's threshold-based
-    /// automatic triggers never fire. Instead we call this manually at
-    /// a request-count cadence (see `gc_threshold` + `gc_counter`),
-    /// pushing all cycle-collection work off the hot path and into
-    /// deterministic slots between requests.
-    pub(crate) gc_collect_func: *mut ffi::PyObject,
-    /// Trigger interval in requests. 0 disables scheduled collection
-    /// entirely (use when you've verified your handler graph creates no
-    /// cycles — ref-counting handles everything else instantly).
-    /// Default 5000, overridable via `PYRONOVA_GC_THRESHOLD=N`.
-    pub(crate) gc_threshold: u64,
-    /// Request counter for the GC scheduler. Incremented at the end of
-    /// each `call_handler`; every `gc_threshold` ticks we invoke
-    /// `gc.collect()`. Per-worker = per-thread, so no atomics needed.
-    gc_counter: u64,
-    /// Set once the interpreter is ended (or deliberately abandoned). `Drop` checks it.
-    ended: bool,
+/// `Py_NewInterpreterFromConfig` refused, with what its `PyStatus` said.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Py_NewInterpreterFromConfig failed{}: {}",
+    .func.as_deref().map(|f| format!(" in {f}")).unwrap_or_default(),
+    .message.as_deref().unwrap_or("it returned no error message and no thread state")
+)]
+pub(crate) struct NewInterpreterError {
+    func: Option<String>,
+    message: Option<String>,
 }
 
-unsafe impl Send for SubInterpreterWorker {}
+impl NewInterpreterError {
+    /// What `status` reports.
+    ///
+    /// # Safety
+    /// `status.func` and `status.err_msg` are NULL or point to NUL-terminated strings (as
+    /// CPython's `PyStatus` guarantees).
+    unsafe fn from_status(status: &ffi::PyStatus) -> Self {
+        let text = |p: *const std::ffi::c_char| {
+            (!p.is_null()).then(|| CStr::from_ptr(p).to_string_lossy().into_owned())
+        };
+        NewInterpreterError {
+            func: text(status.func),
+            message: text(status.err_msg),
+        }
+    }
+}
 
-impl Drop for SubInterpreterWorker {
-    fn drop(&mut self) {
-        // The interpreter and the references above belong to it; they can only be released
-        // with its thread state current, which `end` does. A worker dropped without `end`
-        // leaks them rather than decref'ing into whatever interpreter is current here
-        // (Layer 2, FR-19).
-        if !self.ended && !self.tstate.is_null() {
-            tracing::error!(
+pyo3::create_exception!(
+    pyronova.engine,
+    WorkerException,
+    pyo3::exceptions::PyException,
+    "An exception a sub-interpreter worker raised, as the traceback it printed there: the \
+     exception object itself belongs to the worker's interpreter. The `__cause__` of the \
+     error a failed worker start raises on the main interpreter."
+);
+
+/// The exception classes the main interpreter re-raises a worker's start failure as;
+/// anything else is a `RuntimeError` there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExceptionClass {
+    ModuleNotFound,
+    Import,
+    Other,
+}
+
+impl ExceptionClass {
+    fn of(py: Python<'_>, err: &PyErr) -> Self {
+        if err.is_instance_of::<PyModuleNotFoundError>(py) {
+            ExceptionClass::ModuleNotFound
+        } else if err.is_instance_of::<PyImportError>(py) {
+            ExceptionClass::Import
+        } else {
+            ExceptionClass::Other
+        }
+    }
+}
+
+/// A Python exception a worker raised while it started: its text (the object itself
+/// belongs to the worker's interpreter) and its class, for the main interpreter to re-raise.
+#[derive(Debug, thiserror::Error)]
+#[error("{exception}")]
+pub(crate) struct StartException {
+    exception: PyException,
+    class: ExceptionClass,
+}
+
+impl StartException {
+    fn capture(py: Python<'_>, err: &PyErr) -> Self {
+        StartException {
+            exception: PyException::capture(py, err),
+            class: ExceptionClass::of(py, err),
+        }
+    }
+}
+
+/// What a failed import in the user's script was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScriptFailure {
+    /// A relative import (`from . import x`): a worker executes the script outside its
+    /// package, where it can't resolve.
+    RelativeImport,
+    Other,
+}
+
+impl std::fmt::Display for ScriptFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScriptFailure::RelativeImport => f.write_str(
+                "\n(A worker executes the script as a module of its own, \
+                 `__pyronova_worker__`, outside any package, so a relative import in it \
+                 (`from . import x`, `from .models import X`) cannot resolve there. Import by \
+                 absolute name (`from mypkg.models import X`), with the package importable \
+                 from sys.path.)",
+            ),
+            ScriptFailure::Other => Ok(()),
+        }
+    }
+}
+
+/// Why a worker could not start.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum WorkerStartError {
+    #[error(transparent)]
+    NewInterpreter(#[from] NewInterpreterError),
+    #[error(transparent)]
+    State(#[from] crate::state::StateError),
+    #[error("worker {worker}: {file} raised while the worker started: {raised}{failure}")]
+    Script {
+        worker: usize,
+        file: String,
+        raised: StartException,
+        failure: ScriptFailure,
+    },
+    #[error("worker {worker}: {step} failed: {raised}")]
+    Setup {
+        worker: usize,
+        step: &'static str,
+        raised: StartException,
+    },
+    #[error("worker {worker}: {file} can't be compiled: it contains a NUL byte ({source})")]
+    Nul {
+        worker: usize,
+        file: String,
+        source: std::ffi::NulError,
+    },
+    #[error(
+        "worker {worker}: the script registered a different route table than the main \
+         interpreter (a script must register the same routes in every interpreter; routes \
+         that exist only on main are registered after app.run() starts and must be \
+         gil=True).\n{mismatch}"
+    )]
+    RouteMismatch { worker: usize, mismatch: String },
+    #[error(
+        "worker {worker}: the script registered no routes in the worker, but the main \
+         interpreter has {expected} route(s). A worker executes the whole script and serves \
+         the app it registers routes on; don't register routes only in the main interpreter."
+    )]
+    NoRoutes { worker: usize, expected: usize },
+}
+
+impl WorkerStartError {
+    /// A module's source did not run.
+    fn exec(worker: usize, file: &str, error: ExecError) -> Self {
+        match error {
+            ExecError::Nul(source) => WorkerStartError::Nul {
+                worker,
+                file: file.to_string(),
+                source,
+            },
+            ExecError::Raised { raised, failure } => WorkerStartError::Script {
+                worker,
+                file: file.to_string(),
+                raised,
+                failure,
+            },
+        }
+    }
+
+    /// The exception the worker raised, if a Python exception is why it didn't start.
+    fn raised(&self) -> Option<&StartException> {
+        match self {
+            WorkerStartError::Script { raised, .. } | WorkerStartError::Setup { raised, .. } => {
+                Some(raised)
+            }
+            _ => None,
+        }
+    }
+
+    /// This error as the main interpreter raises it: an import failure in the worker is an
+    /// `ImportError` (`ModuleNotFoundError`) there too, anything else a `RuntimeError`. The
+    /// worker's exception, with its traceback, is the `__cause__` ([`WorkerException`]).
+    pub(crate) fn into_pyerr(self, py: Python<'_>) -> PyErr {
+        let text = self.to_string();
+        let Some(raised) = self.raised() else {
+            return PyRuntimeError::new_err(text);
+        };
+        let err = match raised.class {
+            ExceptionClass::ModuleNotFound => PyModuleNotFoundError::new_err(text),
+            ExceptionClass::Import => PyImportError::new_err(text),
+            ExceptionClass::Other => PyRuntimeError::new_err(text),
+        };
+        let traceback = raised.exception.traceback().to_owned();
+        err.set_cause(py, Some(WorkerException::new_err(traceback)));
+        err
+    }
+}
+
+/// Why a worker's async engine stopped serving. The engine runs for the worker's whole
+/// life, so an exception it ends with happened at run time, not while the worker started.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AsyncEngineError {
+    #[error("worker {worker}: creating the async engine module failed: {exception}\n{}", .exception.traceback())]
+    Setup {
+        worker: usize,
+        exception: PyException,
+    },
+    #[error("worker {worker}: the async engine source contains a NUL byte ({source})")]
+    Nul {
+        worker: usize,
+        source: std::ffi::NulError,
+    },
+    #[error("worker {worker}: the async engine stopped: {exception}\n{}", .exception.traceback())]
+    Stopped {
+        worker: usize,
+        exception: PyException,
+    },
+    #[error("worker {worker}: a Rust panic in the async engine: {payload}")]
+    Panic { worker: usize, payload: String },
+}
+
+// ---------------------------------------------------------------------------
+// What workers are built from
+// ---------------------------------------------------------------------------
+
+/// The program every worker of one server runs, read on main when the workers are built.
+pub(crate) struct WorkerProgram {
+    pub(crate) script_path: String,
+    /// The app's script (`script_path`'s text), which each worker executes.
+    pub(crate) script: String,
+    /// Main's `sys.path`. A new interpreter's own `sys.path` is only what the process
+    /// started with; whatever main added since (the CLI's working directory, a test
+    /// runner's root, the program's own inserts) would be missing, and the script's
+    /// imports would not resolve as they do on main.
+    pub(crate) import_path: Vec<String>,
+    /// The libraries each worker loads from a private copy (`app.isolate(...)`), cloned by
+    /// its bootstrap before the script runs.
+    pub(crate) isolate: Vec<String>,
+}
+
+impl WorkerProgram {
+    /// Reads `script_path` and main's `sys.path` now. An unreadable script is an error.
+    pub(crate) fn read(
+        py: Python<'_>,
+        script_path: String,
+        isolate: Vec<String>,
+    ) -> PyResult<Self> {
+        let script = std::fs::read_to_string(&script_path)
+            .map_err(|e| PyRuntimeError::new_err(format!("read script '{script_path}': {e}")))?;
+        let import_path = import_path(py)?;
+        Ok(WorkerProgram {
+            script_path,
+            script,
+            import_path,
+            isolate,
+        })
+    }
+}
+
+/// Main's `sys.path` as text a worker can take. An entry is whatever `os.fsdecode` makes a
+/// path of (`str`, `bytes`, a `pathlib.Path`); anything else can't be a path in a worker
+/// (the object belongs to main), and is left out with a warning.
+fn import_path(py: Python<'_>) -> PyResult<Vec<String>> {
+    let fsdecode = py.import("os")?.getattr("fsdecode")?;
+    let entries = py.import("sys")?.getattr("path")?;
+    let mut path = Vec::new();
+    for entry in entries.try_iter()? {
+        let entry = entry?;
+        match fsdecode
+            .call1((&entry,))
+            .and_then(|p| p.extract::<String>())
+        {
+            Ok(p) => path.push(p),
+            Err(e) => tracing::warn!(
                 target: "pyronova::server",
-                worker = self.worker_id,
-                "sub-interpreter worker dropped without being ended; leaking its interpreter"
+                entry = %entry.repr().map(|r| r.to_string()).unwrap_or_else(|re| re.to_string()),
+                error = %e,
+                "a sys.path entry that is not a path is left out of the workers' sys.path"
+            ),
+        }
+    }
+    Ok(path)
+}
+
+/// What every worker of one server is built from.
+#[derive(Clone, Copy)]
+pub(crate) struct WorkerSpec<'a> {
+    pub(crate) program: &'a WorkerProgram,
+    /// The routes the script must register: main's table up to its seal.
+    pub(crate) expected: &'a RouteSignature,
+    pub(crate) shared_state: &'a crate::state::SharedMap,
+    /// Collect once this many requests ran since the last collect; 0 disables the count
+    /// trigger. `GcConfig::count_trigger`: the threshold in count mode, the OOM failsafe in
+    /// idle mode, 0 in off mode.
+    pub(crate) gc_threshold: u64,
+    /// The served app's limits; a worker whose script set others says they are ignored.
+    pub(crate) limits: crate::site::Limits,
+}
+
+// ---------------------------------------------------------------------------
+// Roles
+// ---------------------------------------------------------------------------
+
+/// What a worker holds for the requests it serves.
+pub(crate) trait Role: Send + Sized {
+    /// Built last in the worker's init, in its interpreter, from the routes its script
+    /// registered. `routes` and everything built before an error are `Bound`, so an
+    /// error releases them at once.
+    fn build(
+        py: Python<'_>,
+        worker: usize,
+        routes: WorkerRoutes<'_>,
+        gc_threshold: u64,
+    ) -> Result<Self, WorkerStartError>;
+
+    /// Releases every reference it holds, with this interpreter's thread state current.
+    fn release(self, py: Python<'_>);
+}
+
+/// A worker that runs the hook chain from Rust: the TPC threads and the pool's sync
+/// workers.
+pub(crate) struct Inline {
+    /// Indexed like the main interpreter's route table.
+    handlers: Vec<Py<PyAny>>,
+    /// `before_request` / `after_request` hooks, in registration order.
+    before_hooks: Vec<Py<PyAny>>,
+    after_hooks: Vec<Py<PyAny>>,
+    /// This interpreter's persistent asyncio event loop, which `async def` hooks and
+    /// handlers run on.
+    event_loop: Py<PyAny>,
+    gc: GcSchedule,
+}
+
+/// A worker that runs the async engine (`_async_engine.py`), which takes the handlers and
+/// hooks from the app itself (`_worker_app_handlers` / `_worker_app_hooks`) and runs on
+/// its own loop: it holds nothing here.
+pub(crate) struct AsyncEngine;
+
+impl Role for Inline {
+    fn build(
+        py: Python<'_>,
+        worker: usize,
+        routes: WorkerRoutes<'_>,
+        gc_threshold: u64,
+    ) -> Result<Self, WorkerStartError> {
+        let setup = |step| {
+            move |e: PyErr| WorkerStartError::Setup {
+                worker,
+                step,
+                raised: StartException::capture(py, &e),
+            }
+        };
+        let event_loop = new_event_loop(py).map_err(setup("creating the asyncio event loop"))?;
+        // `_bootstrap.py` has already called gc.disable(): this is the worker's only
+        // cycle collection.
+        let collect = py
+            .import("gc")
+            .and_then(|gc| gc.getattr("collect"))
+            .map_err(setup("looking up gc.collect"))?;
+
+        let owned = |v: Vec<Bound<'_, PyAny>>| -> Vec<Py<PyAny>> {
+            v.into_iter().map(Bound::unbind).collect()
+        };
+        Ok(Inline {
+            handlers: owned(routes.handlers),
+            before_hooks: owned(routes.before_hooks),
+            after_hooks: owned(routes.after_hooks),
+            event_loop: event_loop.unbind(),
+            gc: GcSchedule {
+                collect: collect.unbind(),
+                threshold: gc_threshold,
+                served: 0,
+                collected_at: 0,
+            },
+        })
+    }
+
+    fn release(self, py: Python<'_>) {
+        let owned = self
+            .handlers
+            .into_iter()
+            .chain(self.before_hooks)
+            .chain(self.after_hooks)
+            .chain([self.event_loop, self.gc.collect]);
+        for reference in owned {
+            reference.drop_ref(py);
+        }
+    }
+}
+
+impl Role for AsyncEngine {
+    fn build(
+        _py: Python<'_>,
+        _worker: usize,
+        _routes: WorkerRoutes<'_>,
+        _gc_threshold: u64,
+    ) -> Result<Self, WorkerStartError> {
+        Ok(AsyncEngine)
+    }
+
+    fn release(self, _py: Python<'_>) {}
+}
+
+impl EventLoop for Inline {
+    fn event_loop<'py>(&self, py: Python<'py>) -> Result<Bound<'py, PyAny>, HandlerError> {
+        Ok(self.event_loop.bind(py).clone())
+    }
+}
+
+impl Inline {
+    /// Runs `route` for `request`: its hooks and handler in one fresh `contextvars.Context`.
+    fn serve(
+        &mut self,
+        py: Python<'_>,
+        route: RouteId,
+        request: PyronovaRequest,
+    ) -> Result<ResponseData, HandlerError> {
+        self.gc.served += 1;
+        in_request_context(py, |rc| self.run(rc, route, request))
+            .unwrap_or_else(|e| Err(HandlerError::python(py, Stage::Setup, &e)))
+    }
+
+    fn run(
+        &self,
+        rc: &RequestContext<'_>,
+        route: RouteId,
+        request: PyronovaRequest,
+    ) -> Result<ResponseData, HandlerError> {
+        let py = rc.py();
+        let chain = Chain {
+            rc,
+            event_loop: self,
+            to_response: worker_response,
+        };
+        let req =
+            Bound::new(py, request).map_err(|e| HandlerError::python(py, Stage::Setup, &e))?;
+
+        let short_circuit = chain.before(&self.before_hooks, &req)?;
+        let response = match short_circuit {
+            Some(response) => response,
+            // The worker's table was checked index by index against main's at init, and
+            // the route came from main's table.
+            None => {
+                let value = chain.handler(&self.handlers[route.index()], &req)?;
+                chain.after(&self.after_hooks, &req, worker_response(value)?)?
+            }
+        };
+
+        #[cfg(feature = "leak_detect")]
+        crate::leak_detect::record_drop(req.as_any());
+        Ok(response)
+    }
+}
+
+/// When a worker runs `gc.collect()`: every `threshold` requests (0: never by count).
+struct GcSchedule {
+    /// This interpreter's `gc.collect`, so a collection doesn't re-import.
+    collect: Py<PyAny>,
+    threshold: u64,
+    /// Requests this worker has run, counted as each is dispatched.
+    served: u64,
+    /// `served` at the last collection.
+    collected_at: u64,
+}
+
+impl GcSchedule {
+    fn since_collect(&self) -> u64 {
+        self.served - self.collected_at
+    }
+
+    fn due(&self) -> bool {
+        self.threshold > 0 && self.since_collect() >= self.threshold
+    }
+
+    /// One full `gc.collect()`. A failure is logged with its real error and taken off the
+    /// interpreter, so the next request starts with no exception set.
+    fn collect(&mut self, py: Python<'_>, worker: usize) {
+        self.collected_at = self.served;
+        if let Err(err) = self.collect.bind(py).call0() {
+            let exception = PyException::capture(py, &err);
+            tracing::error!(
+                target: "pyronova::app",
+                worker_id = worker,
+                error = %exception,
+                traceback = exception.traceback(),
+                "gc.collect() raised; the worker keeps serving, but this signals OOM, heap \
+                 corruption or interpreter damage"
             );
         }
     }
 }
 
-impl SubInterpreterWorker {
+// ---------------------------------------------------------------------------
+// The worker
+// ---------------------------------------------------------------------------
+
+pub(crate) struct SubInterpreterWorker<R: Role = Inline> {
+    /// Its thread state, saved while nothing runs on it.
+    tstate: *mut ffi::PyThreadState,
+    /// This worker's index: `WORKER_ID` in its bootstrap (log records) and async engine.
+    worker_id: usize,
+    /// References into this interpreter: released only by [`Self::end`], with its thread
+    /// state current. A worker dropped without `end` leaks them rather than decref'ing
+    /// into whatever interpreter is current there.
+    role: ManuallyDrop<R>,
+}
+
+// SAFETY: a worker moves between threads only before it serves: from the thread that built
+// it to the one that serves it, which rebinds `tstate` to itself first
+// (`bind_to_this_thread`), or back to the building thread's `end_all`. Its thread state and
+// the `Py<T>`s in `role` are only used with that thread state current, by one thread at a
+// time (`&mut self`).
+unsafe impl<R: Role> Send for SubInterpreterWorker<R> {}
+
+impl<R: Role> Drop for SubInterpreterWorker<R> {
+    fn drop(&mut self) {
+        // `end` and `abandon` consume the worker without running this.
+        tracing::error!(
+            target: "pyronova::server",
+            worker = self.worker_id,
+            "sub-interpreter worker dropped without being ended; leaking its interpreter"
+        );
+    }
+}
+
+impl<R: Role> SubInterpreterWorker<R> {
     /// Create a new sub-interpreter, run the bootstrap and the user's script in it, and
-    /// bind the handlers of the app the script registered routes on.
+    /// build its role from the app the script registered routes on.
     ///
     /// # Safety
     /// Must be called while the main interpreter's thread state is current.
     /// Switches to the new sub-interpreter and back to main on completion.
     pub(crate) unsafe fn new(
         worker_id: usize,
-        script: &str,
-        script_path: &str,
-        expected: &RouteSignature,
-        pool_id: u64,
-        shared_state: &crate::state::SharedMap,
-    ) -> Result<Self, String> {
+        spec: &WorkerSpec<'_>,
+    ) -> Result<Self, WorkerStartError> {
         let main_tstate = ffi::PyThreadState_Get();
 
         let mut new_tstate: *mut ffi::PyThreadState = std::ptr::null_mut();
@@ -119,206 +595,44 @@ impl SubInterpreterWorker {
         let status = ffi::Py_NewInterpreterFromConfig(&mut new_tstate, &config);
         if ffi::PyStatus_IsError(status) != 0 || new_tstate.is_null() {
             ffi::PyThreadState_Swap(main_tstate);
-            return Err("Py_NewInterpreterFromConfig failed".to_string());
+            return Err(NewInterpreterError::from_status(&status).into());
         }
 
-        // Past this point we own a live sub-interpreter. Any early error
-        // must Py_EndInterpreter it before returning, or the sub-interp
-        // (and the thread resources it pins) leak permanently. The half-built
-        // worker's references are released inside `init_in_sub_interp`, while
-        // this interpreter is still current.
-        match Self::init_in_sub_interp(
-            worker_id,
-            script,
-            script_path,
-            expected,
-            pool_id,
-            shared_state,
-        ) {
-            Ok(worker) => {
-                ffi::PyThreadState_Swap(main_tstate);
-                Ok(worker)
-            }
+        // Past this point we own a live sub-interpreter: an error ends it before
+        // returning. Everything the init built is `Bound` until it succeeded, so an error
+        // has released it by the time the interpreter ends.
+        let built = with_current_tstate(|py| prepare::<R>(py, worker_id, spec));
+        let result = match built {
+            Ok(role) => Ok(SubInterpreterWorker {
+                tstate: ffi::PyEval_SaveThread(),
+                worker_id,
+                role: ManuallyDrop::new(role),
+            }),
             Err(e) => {
                 ffi::Py_EndInterpreter(ffi::PyThreadState_Get());
-                ffi::PyThreadState_Swap(main_tstate);
                 Err(e)
             }
-        }
+        };
+        ffi::PyThreadState_Swap(main_tstate);
+        result
     }
 
-    /// Run every init step that executes INSIDE the freshly-created
-    /// sub-interpreter. Returns a worker whose `tstate` is already saved
-    /// via PyEval_SaveThread (GIL released). Caller is responsible for
-    /// swapping back to the main tstate, and for Py_EndInterpreter on error.
+    pub(crate) fn worker_id(&self) -> usize {
+        self.worker_id
+    }
+
+    /// Binds this worker's thread state to the calling thread, which serves it from now on
+    /// (see `rebind_tstate_to_current_thread`).
     ///
     /// # Safety
-    /// Must be called with a sub-interpreter's thread state current.
-    unsafe fn init_in_sub_interp(
-        worker_id: usize,
-        script: &str,
-        script_path: &str,
-        expected: &RouteSignature,
-        pool_id: u64,
-        shared_state: &crate::state::SharedMap,
-    ) -> Result<Self, String> {
-        // NOT `Python::attach`: this runs on the main OS thread, whose gilstate thread
-        // state is main's, while this sub-interpreter's thread state is current and holds
-        // its GIL (`Py_NewInterpreterFromConfig` in `new`). Take the token for it directly.
-        let py = Python::assume_attached();
-
-        // Before the script runs: a `PyronovaApp` or `SharedState` it creates in this
-        // interpreter must see the running app's map (Layer 2, C2 / FR-5).
-        crate::state::hand_to_worker(py, shared_state)?;
-
-        // 1. The bootstrap (logging bridge, GC policy, C-extension isolation) in its own
-        //    namespace, with this worker's id (FR-20).
-        let bootstrap = new_module(BOOTSTRAP_MODULE, None, Some((worker_id, pool_id)))?;
-        exec_in(
-            include_str!("../../python/pyronova/_bootstrap.py"),
-            "pyronova/_bootstrap.py",
-            &bootstrap,
-            worker_id,
-        )?;
-
-        // 2. The user's script as a real module, compiled with its own path so tracebacks
-        //    point at it, `from __future__` imports work, and `typing.get_type_hints` finds
-        //    the module in `sys.modules` (FR-20).
-        let script_module = new_module(SCRIPT_MODULE, Some(script_path), None)?;
-        exec_in(script, script_path, &script_module, worker_id)?;
-
-        // 3. The handlers of the app the script registered routes on, index by index
-        //    against main's table (FR-3, FR-4).
-        let routes = crate::app::worker_routes(py);
-        let (handlers, before_hooks, after_hooks) = match routes {
-            Some(r) if r.signature == *expected => (r.handlers, r.before_hooks, r.after_hooks),
-            Some(r) => {
-                return Err(format!(
-                    "worker {worker_id}: the script registered a different route table than \
-                     the main interpreter (a script must register the same routes in every \
-                     interpreter; routes that exist only on main are registered after \
-                     app.run() starts and must be gil=True).\n{}",
-                    RouteSignature::describe_mismatch(expected, &r.signature)
-                ))
-            }
-            None if expected.is_empty() => (Vec::new(), Vec::new(), Vec::new()),
-            None => {
-                return Err(format!(
-                    "worker {worker_id}: the script registered no routes in the worker, but \
-                     the main interpreter has {} route(s). A worker executes the whole script \
-                     and serves the app it registers routes on; don't register routes only \
-                     in the main interpreter.",
-                    expected.routes.len()
-                ))
-            }
-        };
-        let owned = |v: Vec<Py<PyAny>>| -> Vec<*mut ffi::PyObject> {
-            v.into_iter().map(|h| h.into_ptr()).collect()
-        };
-        let handlers = owned(handlers);
-        let before_hooks = owned(before_hooks);
-        let after_hooks = owned(after_hooks);
-
-        // Create persistent asyncio event loop for this sub-interpreter
-        let (asyncio_loop, loop_run_func) = {
-            let asyncio_mod = ffi::PyImport_ImportModule(c"asyncio".as_ptr());
-            if !asyncio_mod.is_null() {
-                let loop_obj = ffi::PyObject_CallMethod(
-                    asyncio_mod,
-                    c"new_event_loop".as_ptr(),
-                    std::ptr::null(),
-                );
-                let run_func = if !loop_obj.is_null() {
-                    // Set as current loop; Py_DECREF the None return value.
-                    let set_result = ffi::PyObject_CallMethod(
-                        asyncio_mod,
-                        c"set_event_loop".as_ptr(),
-                        c"O".as_ptr(),
-                        loop_obj,
-                    );
-                    if !set_result.is_null() {
-                        ffi::Py_DECREF(set_result);
-                    } else {
-                        ffi::PyErr_Clear();
-                    }
-                    ffi::PyObject_GetAttrString(loop_obj, c"run_until_complete".as_ptr())
-                } else {
-                    ffi::PyErr_Clear();
-                    std::ptr::null_mut()
-                };
-                ffi::Py_DECREF(asyncio_mod);
-                (loop_obj, run_func)
-            } else {
-                ffi::PyErr_Clear();
-                (std::ptr::null_mut(), std::ptr::null_mut())
-            }
-        };
-
-        // Cache gc.collect so the scheduled-GC path doesn't re-import
-        // per tick. `_bootstrap.py` has already called gc.disable() at
-        // this point; the function pointer is just for manual triggers.
-        let gc_collect_func = {
-            let gc_mod = ffi::PyImport_ImportModule(c"gc".as_ptr());
-            if !gc_mod.is_null() {
-                let f = ffi::PyObject_GetAttrString(gc_mod, c"collect".as_ptr());
-                ffi::Py_DECREF(gc_mod);
-                if f.is_null() {
-                    ffi::PyErr_Clear();
-                }
-                f
-            } else {
-                ffi::PyErr_Clear();
-                std::ptr::null_mut()
-            }
-        };
-
-        // Read the threshold env var once at sub-interp init (it's set
-        // on the main process before any sub-interp spawns). 0 disables
-        // scheduled collection.
-        // Default 100_000 — conservative. At 100k rps/thread that's one
-        // scheduled collect per second, which is invisible in P99. The
-        // old CPython-default threshold-based auto-trigger fired at
-        // ~hundreds of collects per second under the same load → P99
-        // jumps to 2-10ms. Measurement: on the baseline test,
-        // threshold=5000 gave p99=2.0ms; threshold=100_000 gave
-        // p99≈300µs; threshold=0 (disabled) gave p99=240µs.
-        //
-        // Workloads that verified they create no cycles can set
-        // PYRONOVA_GC_THRESHOLD=0 for best P99. Workloads with
-        // known-high cycle churn may want threshold=10_000.
-        let gc_threshold: u64 = std::env::var("PYRONOVA_GC_THRESHOLD")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100_000);
-
-        // The module references are released while this interpreter's thread state is
-        // still current: dropped after `PyEval_SaveThread` they would find none attached,
-        // and `PyObjRef` leaks rather than DECREFs (the modules stay in `sys.modules`).
-        drop(bootstrap);
-        drop(script_module);
-
-        // Release this sub-interpreter's GIL. Outer `new()` swaps back to
-        // the main interpreter after we return.
-        let saved = ffi::PyEval_SaveThread();
-
-        Ok(SubInterpreterWorker {
-            tstate: saved,
-            worker_id,
-            handlers,
-            before_hooks,
-            after_hooks,
-            asyncio_loop,
-            loop_run_func,
-            pool_id,
-            gc_collect_func,
-            gc_threshold,
-            gc_counter: 0,
-            ended: false,
-        })
+    /// On the thread that will serve the worker, with no thread state current, before
+    /// anything else runs on the worker there.
+    pub(crate) unsafe fn bind_to_this_thread(&mut self) {
+        self.tstate = rebind_tstate_to_current_thread(self.tstate);
     }
 
     /// Ends this worker's sub-interpreter: with its thread state current, release every
-    /// reference the worker holds, then `Py_EndInterpreter` (Layer 2, FR-19).
+    /// reference the worker holds, then `Py_EndInterpreter`.
     ///
     /// Works from the worker's own thread (normal shutdown, no thread state current) and
     /// from the thread that created it (a failed start, possibly with main's thread state
@@ -328,69 +642,43 @@ impl SubInterpreterWorker {
     /// The runtime must not be finalized (see [`Self::abandon`]), and `tstate` must be
     /// usable on the calling thread: the worker's rebound thread state on its own thread,
     /// or the creator thread state on the creating thread.
-    pub(crate) unsafe fn end(mut self) {
-        self.ended = true;
-        if self.tstate.is_null() {
-            return;
-        }
+    pub(crate) unsafe fn end(self) {
+        let mut this = ManuallyDrop::new(self);
         let previous = ffi::PyThreadState_GetUnchecked();
         if !previous.is_null() {
             ffi::PyEval_SaveThread();
         }
-        ffi::PyEval_RestoreThread(self.tstate);
-        let owned = self
-            .handlers
-            .drain(..)
-            .chain(self.before_hooks.drain(..))
-            .chain(self.after_hooks.drain(..))
-            .chain([self.loop_run_func, self.asyncio_loop, self.gc_collect_func]);
-        for p in owned {
-            if !p.is_null() {
-                ffi::Py_DECREF(p);
-            }
-        }
-        self.loop_run_func = std::ptr::null_mut();
-        self.asyncio_loop = std::ptr::null_mut();
-        self.gc_collect_func = std::ptr::null_mut();
+        ffi::PyEval_RestoreThread(this.tstate);
+        let role = ManuallyDrop::take(&mut this.role);
+        with_current_tstate(|py| role.release(py));
         ffi::Py_EndInterpreter(ffi::PyThreadState_Get());
-        self.tstate = std::ptr::null_mut();
         if !previous.is_null() {
             ffi::PyEval_RestoreThread(previous);
         }
     }
 
     /// Gives up on this worker without touching Python: for a worker whose thread outlived
-    /// `Py_Finalize` (forgotten after the shutdown grace period), where restoring its thread
-    /// state would be a use-after-free. The OS reclaims its memory at exit.
-    pub(crate) fn abandon(mut self) {
-        self.ended = true;
+    /// `Py_Finalize` (abandoned after the shutdown grace period), where restoring its
+    /// thread state would be a use-after-free. The OS reclaims its memory at exit.
+    pub(crate) fn abandon(self) {
+        std::mem::forget(self);
     }
 
-    /// Ends the worker a TPC thread served through an `Rc<RefCell<_>>`, on that thread, once
-    /// its runtime and every task holding a clone are gone (FR-19).
-    pub(crate) fn end_shared(worker: std::rc::Rc<std::cell::RefCell<Self>>) {
-        match std::rc::Rc::try_unwrap(worker) {
-            Ok(cell) => {
-                let worker = cell.into_inner();
-                // A thread forgotten past shutdown may run this after `Py_Finalize`.
-                if unsafe { ffi::Py_IsInitialized() } != 0 {
-                    // SAFETY: on the worker's own thread, no thread state current.
-                    unsafe { worker.end() };
-                } else {
-                    worker.abandon();
-                }
-            }
-            Err(still_shared) => tracing::error!(
-                target: "pyronova::server",
-                worker = still_shared.borrow().worker_id,
-                "a worker is still referenced after its thread's runtime ended; leaking its \
-                 interpreter"
-            ),
+    /// Ends the worker on the thread that served it, once nothing on that thread uses it
+    /// any more. A thread abandoned past shutdown may run this after
+    /// `Py_Finalize`; the worker is abandoned then.
+    pub(crate) fn end_on_own_thread(self) {
+        // SAFETY: always safe to call.
+        if unsafe { ffi::Py_IsInitialized() } != 0 {
+            // SAFETY: on the worker's own thread, no thread state current.
+            unsafe { self.end() };
+        } else {
+            self.abandon();
         }
     }
 
     /// Ends every worker in `workers` on the calling (creating) thread: the clean-up of a
-    /// start that failed after some workers were built (FR-19).
+    /// start that failed after some workers were built.
     ///
     /// # Safety
     /// As for [`Self::end`], on the thread that created the workers, before any of them was
@@ -405,907 +693,511 @@ impl SubInterpreterWorker {
         }
     }
 
-    /// Runs the async engine in this worker's interpreter until its request channel closes.
+    /// Runs `f` on this worker's interpreter: acquires its GIL, runs `f`, releases the GIL.
+    /// A panic in `f` comes back as its payload, the thread state put back all the same.
     ///
     /// # Safety
-    /// Must be called with this worker's thread state current.
-    pub(crate) unsafe fn run_async_engine(&self) -> Result<(), String> {
-        // Its own namespace, not the script's globals (M4 review N1d); `WORKER_ID` and
-        // `POOL_ID` identify this worker's slot in `WORKER_STATES`.
-        let engine = new_module(
-            ASYNC_ENGINE_MODULE,
-            None,
-            Some((self.worker_id, self.pool_id)),
-        )?;
-        exec_in(
-            include_str!("../../python/pyronova/_async_engine.py"),
-            "pyronova/_async_engine.py",
-            &engine,
-            self.worker_id,
-        )
-    }
-
-    /// Build a fresh `Request` instance for this request.
-    ///
-    /// Returns a NEW owned reference (caller must DECREF). Constructs a
-    /// `PyronovaRequest` pyclass via `Py::new`; PyO3's generated
-    /// `tp_dealloc` Rust-drops every field when the returned object's
-    /// refcount reaches zero, so no `SlotClearer` / instance recycling is
-    /// needed and there is nothing to leak under PEP 684 sub-interpreters.
-    #[allow(clippy::too_many_arguments)]
-    fn build_request(
-        py: Python<'_>,
-        method: &str,
-        path: &str,
-        params: &[(String, String)],
-        query: &str,
-        body: &[u8],
-        headers: &HashMap<String, String>,
-        client_ip: std::net::IpAddr,
-    ) -> Result<*mut ffi::PyObject, String> {
-        // `headers` is already converted to a HashMap (the Tokio side
-        // extracted the hyper HeaderMap off the worker thread), so use the
-        // pre-converted variant. params → dict and body → bytes are still
-        // materialized lazily by the pyclass getters, so a handler that
-        // never touches `.params` / `.headers` / `.body` pays nothing for
-        // them — same laziness the old raw type had, minus the hand-written
-        // FFI.
-        let req = new_request(
-            method,
-            path,
-            params.to_vec(),
-            query,
-            bytes::Bytes::copy_from_slice(body),
-            headers.clone(),
-            client_ip,
-        );
-        Py::new(py, req)
-            .map(|obj| obj.into_ptr())
-            .map_err(|e| format!("Py::new(Request) failed: {e}"))
-    }
-
-    /// If obj is awaitable (coroutine / Task / Future / custom __await__),
-    /// drive it via the persistent event loop. Otherwise return unchanged.
-    ///
-    /// Detection is a C-level type-slot probe:
-    ///   1. Fast path `PyCoro_CheckExact` — one tag compare, catches
-    ///      the common `async def` case.
-    ///   2. Fallback: read `Py_TYPE(obj)->tp_as_async->am_await` —
-    ///      any real awaitable (Task, Future, user class with
-    ///      `__await__`) has this slot populated. One pointer chase +
-    ///      null check. Nanoseconds, L1-resident.
-    ///
-    /// We avoid `PyObject_HasAttrString(obj, "__await__")` here: that
-    /// path would intern the string, walk the MRO, and potentially
-    /// trigger descriptor protocol — μs-level, and at 400k rps on the
-    /// hot hook path it showed up as a measurable 5% throughput loss.
-    unsafe fn resolve_coroutine(&self, obj: PyObjRef) -> Result<PyObjRef, String> {
-        let ptr = obj.as_ptr();
-        let is_awaitable = if ffi::PyCoro_CheckExact(ptr) == 1 {
-            true
-        } else {
-            let tp = ffi::Py_TYPE(ptr);
-            if tp.is_null() {
-                false
-            } else {
-                let async_slots = (*tp).tp_as_async;
-                !async_slots.is_null() && (*async_slots).am_await.is_some()
-            }
-        };
-        if !is_awaitable {
-            return Ok(obj); // Plain value — pass through
-        }
-        if self.loop_run_func.is_null() {
-            return Err("async handler used but asyncio event loop not available".to_string());
-        }
-        // Call loop.run_until_complete(awaitable)
-        let args =
-            PyObjRef::from_owned(ffi::PyTuple_New(1)).ok_or("failed to create args tuple")?;
-        ffi::PyTuple_SetItem(args.as_ptr(), 0, obj.into_raw());
-        let result = PyObjRef::from_owned(ffi::PyObject_Call(
-            self.loop_run_func,
-            args.as_ptr(),
-            std::ptr::null_mut(),
-        ));
-        match result {
-            Some(r) => Ok(r),
-            None => {
-                log_and_clear_py_exception("loop.run_until_complete");
-                Err("loop.run_until_complete() failed".to_string())
-            }
-        }
-    }
-
-    /// Call a handler function and return the response.
-    ///
-    /// # Safety
-    /// Must be called with this sub-interpreter's GIL held.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) unsafe fn call_handler(
+    /// On the thread `bind_to_this_thread` bound this worker to, with no thread state
+    /// current.
+    unsafe fn with_gil<T>(
         &mut self,
-        handler_idx: usize,
-        method: &str,
-        path: &str,
-        params: &[(String, String)],
-        query: &str,
-        body: &[u8],
-        headers: &HashMap<String, String>,
-        client_ip: std::net::IpAddr,
-    ) -> Result<SubInterpResponse, String> {
-        // Re-entrant: this worker's thread state is current (SubInterpGilGuard), and it is
-        // the thread's gilstate one (`rebind_tstate_to_current_thread`), so this registers
-        // the attach with PyO3 without switching thread states.
-        Python::attach(|py| {
-            self.call_handler_attached(
-                py,
-                handler_idx,
-                method,
-                path,
-                params,
-                query,
-                body,
-                headers,
-                client_ip,
-            )
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn call_handler_attached(
-        &mut self,
-        py: Python<'_>,
-        handler_idx: usize,
-        method: &str,
-        path: &str,
-        params: &[(String, String)],
-        query: &str,
-        body: &[u8],
-        headers: &HashMap<String, String>,
-        client_ip: std::net::IpAddr,
-    ) -> Result<SubInterpResponse, String> {
-        let func = *self.handlers.get(handler_idx).ok_or_else(|| {
-            format!(
-                "handler index {handler_idx} out of range ({} handlers)",
-                self.handlers.len()
-            )
-        })?;
-
-        // Fresh `Request` (new owned ref). The Rust-backed type's
-        // `tp_dealloc` synchronously DECREFs all slot fields when this
-        // PyObjRef drops at scope end — no SlotClearer / instance
-        // recycling needed, no PEP 684 finalizer bug to work around.
-        // ── Leak-hunt bisection hook (leak_detect feature only) ──────
-        // PYRONOVA_BISECT values:
-        //   "skip_all"     — no build_request, no handler call; return a
-        //                    fixed SubInterpResponse. Exercises hyper +
-        //                    channel only. If this still leaks, the
-        //                    leak is NOT in the Python side at all.
-        //   "skip_handler" — build_request + dealloc runs, but handler
-        //                    is not invoked. Isolates request-object
-        //                    construction from handler/response path.
-        //   "skip_build"   — handler runs with Py_None as the request
-        //                    arg (user code will crash, but we only
-        //                    care about memory — use a handler that
-        //                    ignores its arg, e.g. `def h(req): return "ok"`).
-        // Unset / any other value: normal execution.
-        #[cfg(feature = "leak_detect")]
-        let bisect_mode = std::env::var("PYRONOVA_BISECT").ok();
-        #[cfg(not(feature = "leak_detect"))]
-        let bisect_mode: Option<String> = None;
-
-        if bisect_mode.as_deref() == Some("skip_all") {
-            return Ok(SubInterpResponse {
-                body: b"ok".to_vec(),
-                status: 200,
-                content_type: None,
-                headers: Vec::new(),
-                is_json: false,
-            });
-        }
-
-        let request_ref: Option<PyObjRef> = if bisect_mode.as_deref() == Some("skip_build") {
-            // Hand the handler Py_None instead of a built request.
-            Some(PyObjRef::from_borrowed(ffi::Py_None()).unwrap())
-        } else {
-            Some(
-                PyObjRef::from_owned(Self::build_request(
-                    py, method, path, params, query, body, headers, client_ip,
-                )?)
-                .ok_or("build_request returned null")?,
-            )
-        };
-        let request = request_ref.unwrap();
-        let request_ptr = request.as_ptr();
-
-        if bisect_mode.as_deref() == Some("skip_handler") {
-            // Drop request (triggers tp_dealloc) and return a fixed
-            // response — skips hooks, Vectorcall, parse_result.
-            drop(request);
-            return Ok(SubInterpResponse {
-                body: b"ok".to_vec(),
-                status: 200,
-                content_type: None,
-                headers: Vec::new(),
-                is_json: false,
-            });
-        }
-
-        // Run before_request hooks
-        for &hook_func in &self.before_hooks {
-            let hook_args =
-                PyObjRef::from_owned(ffi::PyTuple_New(1)).ok_or("failed to create hook args")?;
-            ffi::Py_INCREF(request_ptr);
-            ffi::PyTuple_SetItem(hook_args.as_ptr(), 0, request_ptr);
-
-            let hook_result = PyObjRef::from_owned(ffi::PyObject_Call(
-                hook_func,
-                hook_args.as_ptr(),
-                std::ptr::null_mut(),
-            ));
-
-            match hook_result {
-                Some(r) => {
-                    // Drive async hooks through the event loop so
-                    // `async def` middleware doesn't leak a bare
-                    // coroutine object as a "short-circuit response".
-                    let resolved = self.resolve_coroutine(r)?;
-                    if resolved.as_ptr() != ffi::Py_None() {
-                        return parse_result(py, resolved);
-                    }
-                }
-                None => {
-                    // Hook raised an exception. We previously logged
-                    // with PyErr_Print and fell through to the main
-                    // handler — a critical bypass for auth / ACL hooks
-                    // that signal denial by raising. Return an error
-                    // so the caller serves 500 instead of the
-                    // unprotected handler output.
-                    log_and_clear_py_exception("before_request hook");
-                    let hook_name = callable_name(hook_func);
-                    return Err(format!(
-                        "before_request hook {hook_name:?} raised an exception"
-                    ));
-                }
-            }
-        }
-
-        // Call handler(request). We don't own a ref to request_ptr
-        // (worker struct does) — pass it through directly.
-        let args_arr = [request_ptr];
-        let result_obj = PyObjRef::from_owned(ffi::PyObject_Vectorcall(
-            func,
-            args_arr.as_ptr(),
-            1,
-            std::ptr::null_mut(),
-        ));
-
-        let mut response = match result_obj {
-            Some(r) => {
-                let resolved = self.resolve_coroutine(r)?;
-                parse_result(py, resolved)?
-            }
-            None => {
-                // req_for_hooks dropped here automatically → DECREF
-                log_and_clear_py_exception("sub-interp handler");
-                return Err("handler raised an exception".to_string());
-            }
-        };
-
-        // Run after_request hooks: hook(request, response) → response.
-        for &hook_func in &self.after_hooks {
-            // Build a Response from the current response
-            let resp_obj = build_response(py, &response)?;
-
-            let hook_args =
-                PyObjRef::from_owned(ffi::PyTuple_New(2)).ok_or("failed to create hook args")?;
-            ffi::Py_INCREF(request_ptr);
-            ffi::PyTuple_SetItem(hook_args.as_ptr(), 0, request_ptr);
-            ffi::PyTuple_SetItem(hook_args.as_ptr(), 1, resp_obj.into_raw());
-
-            let hook_result = PyObjRef::from_owned(ffi::PyObject_Call(
-                hook_func,
-                hook_args.as_ptr(),
-                std::ptr::null_mut(),
-            ));
-
-            match hook_result {
-                Some(r) => {
-                    // Drive async after_hooks through the event loop.
-                    let resolved = self.resolve_coroutine(r)?;
-                    if resolved.as_ptr() != ffi::Py_None() {
-                        response = parse_result(py, resolved)?;
-                    }
-                }
-                None => {
-                    log_and_clear_py_exception("after_request hook");
-                }
-            }
-        }
-
-        // Smart GC: count requests and trigger `gc.collect()` at the
-        // configured interval. gc.disable() was called at sub-interp
-        // init (see _bootstrap.py) so this is the only cycle collector
-        // running — Python's threshold-based auto-trigger never fires.
-        // Cost per request is a single u64 increment + compare; the
-        // collect itself fires at most once per `gc_threshold` calls
-        // and runs under the GIL we already hold.
-        if self.gc_threshold > 0 && !self.gc_collect_func.is_null() {
-            self.gc_counter = self.gc_counter.wrapping_add(1);
-            if self.gc_counter.is_multiple_of(self.gc_threshold) {
-                // `PyObject_CallNoArgs` skips the empty-tuple alloc that
-                // `PyObject_Call` would require; saves a small per-tick
-                // cost and is the idiomatic 3.9+ invocation. `gc.collect()`
-                // with no args = full 3-generation collection — cheap
-                // when there are few cycles, which is the common case
-                // under our ref-count-first request lifecycle.
-                let res = ffi::PyObject_CallNoArgs(self.gc_collect_func);
-                if !res.is_null() {
-                    ffi::Py_DECREF(res);
-                } else {
-                    // Clear any exception raised during the collect so
-                    // we don't leak it into the handler's return path
-                    // (handler already succeeded).
-                    ffi::PyErr_Clear();
-                }
-            }
-        }
-
-        Ok(response)
+        f: impl for<'py> FnOnce(&mut R, Python<'py>) -> T,
+    ) -> std::thread::Result<T> {
+        // The guard writes the thread state back here even while a panic unwinds.
+        let tstate = Cell::new(self.tstate);
+        let role = &mut *self.role;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _gil = SubInterpGilGuard::acquire(tstate.get(), &tstate);
+            // Re-entrant: this worker's thread state is current, and it is the thread's
+            // gilstate one (`bind_to_this_thread`), so this registers the attach with PyO3
+            // without switching thread states.
+            Python::attach(|py| f(role, py))
+        }));
+        self.tstate = tstate.get();
+        result
     }
 }
 
+impl SubInterpreterWorker<Inline> {
+    /// Runs `route` for `request` on this worker's interpreter: the hooks and the handler,
+    /// then a `gc.collect()` if one is due. A panic comes back as [`HandlerError::Panic`]
+    /// with its payload.
+    ///
+    /// # Safety
+    /// On the thread `bind_to_this_thread` bound this worker to, with no thread state
+    /// current.
+    pub(crate) unsafe fn serve(
+        &mut self,
+        route: RouteId,
+        request: PyronovaRequest,
+    ) -> Result<ResponseData, HandlerError> {
+        let worker = self.worker_id;
+        self.with_gil(|inline, py| {
+            let response = inline.serve(py, route, request);
+            if inline.gc.due() {
+                inline.gc.collect(py, worker);
+            }
+            response
+        })
+        .unwrap_or_else(|payload| Err(HandlerError::panic(payload)))
+    }
+
+    /// Runs `gc.collect()` between requests, from the thread this worker is bound to (TPC
+    /// idle mode).
+    ///
+    /// # Safety
+    /// As for [`Self::serve`].
+    pub(crate) unsafe fn collect_garbage_between_requests(&mut self) {
+        let worker = self.worker_id;
+        if let Err(payload) = self.with_gil(|inline, py| inline.gc.collect(py, worker)) {
+            tracing::error!(
+                target: "pyronova::server",
+                worker,
+                panic = %panic_message(&*payload),
+                "a Rust panic in an idle gc.collect()"
+            );
+        }
+    }
+
+    /// Requests this worker has run.
+    pub(crate) fn requests_served(&self) -> u64 {
+        self.role.gc.served
+    }
+
+    /// Requests this worker has run since its last `gc.collect()`.
+    pub(crate) fn requests_since_collect(&self) -> u64 {
+        self.role.gc.since_collect()
+    }
+}
+
+impl SubInterpreterWorker<AsyncEngine> {
+    /// Runs the async engine in this worker's interpreter until `inbox` closes or the
+    /// engine stops. What it ends with is returned: its exception with its traceback, or a
+    /// Rust panic's payload.
+    ///
+    /// # Safety
+    /// On the thread `bind_to_this_thread` bound this worker to, with no thread state
+    /// current.
+    pub(crate) unsafe fn run_async_engine(
+        &mut self,
+        inbox: AsyncInbox,
+    ) -> Result<(), AsyncEngineError> {
+        let worker = self.worker_id;
+        self.with_gil(|_, py| run_engine(py, worker, inbox))
+            .unwrap_or_else(|payload| {
+                Err(AsyncEngineError::Panic {
+                    worker,
+                    payload: panic_message(&*payload),
+                })
+            })
+    }
+}
+
+/// Executes the async engine as its own module, with this worker's id, its request inbox
+/// (`CHANNEL`) and its task budget (`TASK_TIMEOUT`, seconds).
+fn run_engine(py: Python<'_>, worker: usize, inbox: AsyncInbox) -> Result<(), AsyncEngineError> {
+    let setup = |e: PyErr| AsyncEngineError::Setup {
+        worker,
+        exception: PyException::capture(py, &e),
+    };
+    let engine = new_module(py, ASYNC_ENGINE_MODULE, None)
+        .and_then(|m| {
+            m.setattr("WORKER_ID", worker)?;
+            m.setattr("CHANNEL", Bound::new(py, inbox)?)?;
+            m.setattr("TASK_TIMEOUT", ASYNC_TASK_BUDGET.as_secs_f64())?;
+            Ok(m)
+        })
+        .map_err(setup)?;
+    exec_in(
+        py,
+        include_str!("../../python/pyronova/_async_engine.py"),
+        "pyronova/_async_engine.py",
+        &engine,
+    )
+    .map_err(|e| match e {
+        ExecError::Nul(source) => AsyncEngineError::Nul { worker, source },
+        ExecError::Raised { raised, .. } => AsyncEngineError::Stopped {
+            worker,
+            exception: raised.exception,
+        },
+    })
+}
+
 // ---------------------------------------------------------------------------
-// Worker init helpers
+// Worker init
 // ---------------------------------------------------------------------------
 
-/// A new module named `name`, registered in `sys.modules`, with builtins, `__file__` and,
-/// for the bootstrap and async engine, `WORKER_ID` / `POOL_ID`.
-///
-/// # Safety
-/// The interpreter the module belongs to must have its thread state current.
-unsafe fn new_module(
+/// The init, in the new worker's interpreter (`py` is its token): the bootstrap, the
+/// script, the JSON serializer, then the role from the app the script registered on,
+/// checked index by index against main's table.
+fn prepare<R: Role>(
+    py: Python<'_>,
+    worker: usize,
+    spec: &WorkerSpec<'_>,
+) -> Result<R, WorkerStartError> {
+    let setup = |step| {
+        move |e: PyErr| WorkerStartError::Setup {
+            worker,
+            step,
+            raised: StartException::capture(py, &e),
+        }
+    };
+    let program = spec.program;
+
+    // Before the script runs: a `PyronovaApp` or `SharedState` it creates in this
+    // interpreter must see the running app's map.
+    crate::state::hand_to_worker(py, spec.shared_state)?;
+
+    // Before anything is imported: the bootstrap and the script resolve their imports
+    // as they do on main.
+    PyList::new(py, &program.import_path)
+        .and_then(|path| py.import("sys")?.setattr("path", path))
+        .map_err(setup("setting sys.path to main's"))?;
+
+    // The bootstrap (logging bridge, GC policy, C-extension isolation) in its own
+    // namespace, with this worker's id (for its log records) and the libraries to isolate.
+    const BOOTSTRAP_FILE: &str = "pyronova/_bootstrap.py";
+    let bootstrap = new_module(py, BOOTSTRAP_MODULE, None)
+        .and_then(|m| {
+            m.setattr("WORKER_ID", worker)?;
+            m.setattr("ISOLATE_LIBS", PyTuple::new(py, &program.isolate)?)?;
+            Ok(m)
+        })
+        .map_err(setup("creating the bootstrap module"))?;
+    // The log handler's source runs in the same namespace first: the bootstrap installs
+    // it before the package can be imported.
+    const LOG_BRIDGE_FILE: &str = "pyronova/_log_bridge.py";
+    exec_in(
+        py,
+        include_str!("../../python/pyronova/_log_bridge.py"),
+        LOG_BRIDGE_FILE,
+        &bootstrap,
+    )
+    .map_err(|e| WorkerStartError::exec(worker, LOG_BRIDGE_FILE, e))?;
+    exec_in(
+        py,
+        include_str!("../../python/pyronova/_bootstrap.py"),
+        BOOTSTRAP_FILE,
+        &bootstrap,
+    )
+    .map_err(|e| WorkerStartError::exec(worker, BOOTSTRAP_FILE, e))?;
+
+    // The user's script as a real module, compiled with its own path so tracebacks
+    // point at it, `from __future__` imports work, and `typing.get_type_hints` finds
+    // the module in `sys.modules`.
+    let script_module = new_module(py, SCRIPT_MODULE, Some(&program.script_path))
+        .map_err(setup("creating the script module"))?;
+    exec_in(py, &program.script, &program.script_path, &script_module)
+        .map_err(|e| WorkerStartError::exec(worker, &program.script_path, e))?;
+
+    // The JSON serializer (isojson, a hard dependency).
+    crate::response::require_json(py).map_err(setup("loading the JSON serializer"))?;
+
+    let routes = registered_routes(py, worker, spec)?;
+    R::build(py, worker, routes, spec.gc_threshold)
+}
+
+/// The routes of the app the script registered on, which must be main's table.
+fn registered_routes<'py>(
+    py: Python<'py>,
+    worker: usize,
+    spec: &WorkerSpec<'_>,
+) -> Result<WorkerRoutes<'py>, WorkerStartError> {
+    let registered = worker_app::worker_routes(py).map_err(|e| WorkerStartError::Setup {
+        worker,
+        step: "reading the app the script registered",
+        raised: StartException::capture(py, &e),
+    })?;
+    let expected = spec.expected;
+    let routes = match registered {
+        Some(r) if r.signature == *expected => r,
+        Some(r) => {
+            return Err(WorkerStartError::RouteMismatch {
+                worker,
+                mismatch: RouteSignature::describe_mismatch(expected, &r.signature),
+            })
+        }
+        None if expected.is_empty() => WorkerRoutes::empty(),
+        None => {
+            return Err(WorkerStartError::NoRoutes {
+                worker,
+                expected: expected.routes.len(),
+            })
+        }
+    };
+    for ignored in spec.limits.ignored_in_worker(&routes.limits) {
+        tracing::warn!(target: "pyronova::server", worker, "{ignored}");
+    }
+    Ok(routes)
+}
+
+/// A new asyncio event loop, set as this interpreter's current one.
+fn new_event_loop(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    let asyncio = py.import("asyncio")?;
+    let event_loop = asyncio.call_method0("new_event_loop")?;
+    asyncio.call_method1("set_event_loop", (&event_loop,))?;
+    Ok(event_loop)
+}
+
+/// A new module named `name`, registered in `sys.modules`, with builtins and, for the
+/// script, `__file__`.
+fn new_module<'py>(
+    py: Python<'py>,
     name: &CStr,
     file: Option<&str>,
-    ids: Option<(usize, u64)>,
-) -> Result<PyObjRef, String> {
-    let module = PyObjRef::from_owned(ffi::PyModule_New(name.as_ptr())).ok_or_else(|| {
-        log_and_clear_py_exception("PyModule_New");
-        format!("failed to create module {name:?}")
-    })?;
-    let dict = ffi::PyModule_GetDict(module.as_ptr()); // borrowed
-    let set = |key: &CStr, value: *mut ffi::PyObject| -> Result<(), String> {
-        if value.is_null() || ffi::PyDict_SetItemString(dict, key.as_ptr(), value) != 0 {
-            log_and_clear_py_exception("module setup");
-            return Err(format!("failed to set {key:?} on module {name:?}"));
-        }
-        Ok(())
-    };
-    set(c"__builtins__", ffi::PyEval_GetBuiltins())?;
+) -> PyResult<Bound<'py, PyModule>> {
+    let module = PyModule::new(py, &name.to_string_lossy())?;
+    // SAFETY: attached (`py`); `PyEval_GetBuiltins` returns a borrowed reference to the
+    // current frame's (or the interpreter's) builtins dict, never NULL.
+    let builtins = unsafe { Bound::from_borrowed_ptr(py, ffi::PyEval_GetBuiltins()) };
+    module.setattr("__builtins__", builtins)?;
     if let Some(path) = file {
-        let py_file = py_str(path).ok_or("failed to create __file__ str")?;
-        set(c"__file__", py_file.as_ptr())?;
+        module.setattr("__file__", PyString::new(py, path))?;
     }
-    if let Some((worker_id, pool_id)) = ids {
-        let wid = PyObjRef::from_owned(ffi::PyLong_FromSize_t(worker_id)).ok_or("WORKER_ID")?;
-        set(c"WORKER_ID", wid.as_ptr())?;
-        let pid =
-            PyObjRef::from_owned(ffi::PyLong_FromUnsignedLongLong(pool_id)).ok_or("POOL_ID")?;
-        set(c"POOL_ID", pid.as_ptr())?;
-    }
-    let modules = ffi::PyImport_GetModuleDict(); // borrowed
-    if ffi::PyDict_SetItemString(modules, name.as_ptr(), module.as_ptr()) != 0 {
-        log_and_clear_py_exception("sys.modules registration");
-        return Err(format!("failed to register {name:?} in sys.modules"));
-    }
+    py.import("sys")?
+        .getattr("modules")?
+        .set_item(module.name()?, &module)?;
     Ok(module)
 }
 
-/// Compiles `src` as `filename` and executes it in `module`'s namespace. On an exception,
-/// prints its traceback (to the process's stderr) and returns its text.
-///
-/// # Safety
-/// The interpreter `module` belongs to must have its thread state current.
-unsafe fn exec_in(
+/// Why a module's source did not run.
+#[derive(Debug)]
+enum ExecError {
+    /// The source or its file name contains a NUL byte, so it can't be compiled.
+    Nul(std::ffi::NulError),
+    /// It raised, with this exception.
+    Raised {
+        raised: StartException,
+        failure: ScriptFailure,
+    },
+}
+
+/// Compiles `src` as `filename` and executes it in `module`'s namespace. An exception is
+/// returned with its text and traceback (nothing is printed).
+fn exec_in(
+    py: Python<'_>,
     src: &str,
     filename: &str,
-    module: &PyObjRef,
-    worker_id: usize,
-) -> Result<(), String> {
-    let src_c = CString::new(src).map_err(|e| format!("{filename}: {e}"))?;
-    let file_c = CString::new(filename).map_err(|e| format!("{filename}: {e}"))?;
-    let dict = ffi::PyModule_GetDict(module.as_ptr()); // borrowed
-    let code = PyObjRef::from_owned(ffi::Py_CompileString(
-        src_c.as_ptr(),
-        file_c.as_ptr(),
-        ffi::Py_file_input,
-    ));
-    let result = match code {
-        Some(code) => PyObjRef::from_owned(ffi::PyEval_EvalCode(code.as_ptr(), dict, dict)),
-        None => None,
-    };
-    if result.is_some() {
-        return Ok(());
-    }
-    // Keep the exception's own text for the startup error, and print the full traceback.
-    let exc = ffi::PyErr_GetRaisedException();
-    let text = if exc.is_null() {
-        "no exception set".to_string()
-    } else {
-        let s = PyObjRef::from_owned(ffi::PyObject_Str(exc));
-        let ty = ffi::Py_TYPE(exc);
-        let ty_name = if ty.is_null() {
-            String::new()
-        } else {
-            CStr::from_ptr((*ty).tp_name).to_string_lossy().into_owned()
-        };
-        let msg = s
-            .and_then(|s| pyobj_to_string(s.as_ptr()).ok())
-            .unwrap_or_default();
-        ffi::PyErr_Clear();
-        ffi::PyErr_SetRaisedException(exc);
-        ffi::PyErr_Print();
-        format!("{ty_name}: {msg}")
-    };
-    Err(format!(
-        "worker {worker_id}: {filename} raised while the worker started: {text}"
-    ))
-}
-
-/// A `Request` for one incoming request; shared by the sync worker path and the async
-/// engine's `_worker_recv`.
-pub(crate) fn new_request(
-    method: &str,
-    path: &str,
-    params: Vec<(String, String)>,
-    query: &str,
-    body: bytes::Bytes,
-    headers: HashMap<String, String>,
-    client_ip: std::net::IpAddr,
-) -> crate::types::PyronovaRequest {
-    use crate::types::{LazyHeaders, PyronovaRequest};
-    PyronovaRequest {
-        method: std::sync::Arc::from(method),
-        path: std::sync::Arc::from(path),
-        params,
-        query: query.to_string(),
-        headers_source: LazyHeaders::Converted(headers),
-        headers_cache: std::sync::OnceLock::new(),
-        client_ip_addr: client_ip,
-        body_bytes: body,
-        body_stream_rx: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        query_cache: std::sync::OnceLock::new(),
-        query_all_cache: std::sync::OnceLock::new(),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Handler result ↔ response (shared by the sync path and the async engine)
-// ---------------------------------------------------------------------------
-
-/// `isojson.dumps` (orjson-compatible, and safe in own-GIL sub-interpreters), falling back
-/// to `json.dumps`; one per interpreter. Not orjson: it keeps its types and strings in
-/// process-global statics, so every sub-interpreter got the first one's objects, and ending
-/// any sub-interpreter freed objects another one still used.
-static JSON_DUMPS: pyo3::sync::PyOnceLock<Py<PyAny>> = pyo3::sync::PyOnceLock::new();
-
-fn json_dumps_func(py: Python<'_>) -> Result<&Py<PyAny>, String> {
-    JSON_DUMPS
-        .get_or_try_init(py, || {
-            py.import("isojson")
-                .or_else(|_| py.import("json"))
-                .and_then(|m| m.getattr("dumps"))
-                .map(|f| f.unbind())
+    module: &Bound<'_, PyModule>,
+) -> Result<(), ExecError> {
+    let src_c = CString::new(src).map_err(ExecError::Nul)?;
+    let file_c = CString::new(filename).map_err(ExecError::Nul)?;
+    let dict = module.dict();
+    // SAFETY: attached (`py`); the strings are NUL-terminated; `dict` is a live dict.
+    // `Py_CompileString` and `PyEval_EvalCode` return a new reference or NULL with an
+    // exception set.
+    let ran = unsafe {
+        Bound::from_owned_ptr_or_err(
+            py,
+            ffi::Py_CompileString(src_c.as_ptr(), file_c.as_ptr(), ffi::Py_file_input),
+        )
+        .and_then(|code| {
+            Bound::from_owned_ptr_or_err(
+                py,
+                ffi::PyEval_EvalCode(code.as_ptr(), dict.as_ptr(), dict.as_ptr()),
+            )
         })
-        .map_err(|e| format!("no JSON serializer: {e}"))
-}
-
-/// Serialize a Python dict/list to a JSON string (isojson returns bytes, json a str).
-unsafe fn json_dumps(py: Python<'_>, obj: PyObjRef) -> Result<String, String> {
-    let dumps = json_dumps_func(py)?.as_ptr();
-    let args = PyObjRef::from_owned(ffi::PyTuple_New(1)).ok_or("failed to create tuple")?;
-    ffi::PyTuple_SetItem(args.as_ptr(), 0, obj.into_raw());
-
-    let result = PyObjRef::from_owned(ffi::PyObject_Call(
-        dumps,
-        args.as_ptr(),
-        std::ptr::null_mut(),
-    ))
-    .ok_or_else(|| {
-        log_and_clear_py_exception("json.dumps");
-        "json.dumps failed".to_string()
-    })?;
-
-    if ffi::PyBytes_Check(result.as_ptr()) != 0 {
-        let ptr = ffi::PyBytes_AsString(result.as_ptr());
-        let size = ffi::PyBytes_Size(result.as_ptr());
-        // PyBytes_Size returns -1 on error (Py_ssize_t). Cast to
-        // usize without checking would yield usize::MAX and feed
-        // an enormous slice to from_raw_parts → UB (arc interp-2).
-        if ptr.is_null() || size < 0 {
-            if !ffi::PyErr_Occurred().is_null() {
-                ffi::PyErr_Clear();
-            }
-            return Err("failed to extract bytes".to_string());
-        }
-        let bytes = std::slice::from_raw_parts(ptr as *const u8, size as usize);
-        String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())
-    } else {
-        pyobj_to_string(result.as_ptr())
-    }
-}
-
-/// A callable's `__name__`, for error messages.
-unsafe fn callable_name(obj: *mut ffi::PyObject) -> String {
-    let name = PyObjRef::from_owned(ffi::PyObject_GetAttrString(obj, c"__name__".as_ptr()));
-    match name.and_then(|n| pyobj_to_string(n.as_ptr()).ok()) {
-        Some(n) => n,
-        None => {
-            ffi::PyErr_Clear();
-            "<unnamed>".to_string()
-        }
-    }
-}
-
-/// Copies a `bytes` object's contents.
-unsafe fn bytes_contents(obj: *mut ffi::PyObject) -> Vec<u8> {
-    let size = ffi::PyBytes_Size(obj);
-    let ptr = ffi::PyBytes_AsString(obj);
-    if !ptr.is_null() && size > 0 {
-        std::slice::from_raw_parts(ptr as *const u8, size as usize).to_vec()
-    } else {
-        ffi::PyErr_Clear();
-        Vec::new()
-    }
-}
-
-/// Map a handler's return value to a response. The same mapping serves the sync worker
-/// path and the async engine (`_worker_to_response` / `_worker_send`, M4 review N1b):
-///
-/// - a `Response` (or anything with `status_code` + `body`) → its fields;
-/// - `dict` → JSON;
-/// - `str` → its text (the HTTP layer labels a `{`/`[`-prefixed body JSON);
-/// - `bytes` → the bytes, `application/octet-stream`;
-/// - `None` → an empty 200;
-/// - a `Stream` → an error: streaming responses need `gil=True, stream=True` (FR-16);
-/// - anything else → `str(value)`.
-///
-/// # Safety
-/// Must be called with the GIL of the interpreter `result_obj` belongs to.
-pub(crate) unsafe fn parse_result(
-    py: Python<'_>,
-    result_obj: PyObjRef,
-) -> Result<SubInterpResponse, String> {
-    let ptr = result_obj.as_ptr();
-
-    // Check if it's a Response or any response-like object
-    // (duck typing: has status_code + body attributes).
-    //
-    // PyObject_IsInstance returns 1 (true), 0 (false), or -1 (error
-    // with exception set). Treating -1 as false without clearing
-    // the exception is a SystemError latent bomb — the next C-API
-    // call short-circuits on the pending exception.
-    let resp_cls = py.get_type::<crate::types::PyronovaResponse>();
-    let is_response = match ffi::PyObject_IsInstance(ptr, resp_cls.as_ptr()) {
-        1 => true,
-        -1 => {
-            ffi::PyErr_Clear();
-            // Fall through to duck-type check.
-            let has_status = ffi::PyObject_HasAttrString(ptr, c"status_code".as_ptr()) == 1;
-            let has_body = ffi::PyObject_HasAttrString(ptr, c"body".as_ptr()) == 1;
-            has_status && has_body
-        }
-        _ => {
-            // 0 (not an instance) — try duck-typing.
-            let has_status = ffi::PyObject_HasAttrString(ptr, c"status_code".as_ptr()) == 1;
-            let has_body = ffi::PyObject_HasAttrString(ptr, c"body".as_ptr()) == 1;
-            has_status && has_body
-        }
     };
-    if is_response {
-        return parse_response(py, result_obj);
-    }
-
-    // A worker can't stream a response: the body would be `str(stream)`. Refuse loudly.
-    let stream_cls = py.get_type::<crate::python::stream::PyronovaStream>();
-    if ffi::PyObject_IsInstance(ptr, stream_cls.as_ptr()) == 1 {
-        let msg = "a sub-interpreter handler returned a Stream; streaming responses need \
-                   gil=True, stream=True on the route";
-        tracing::error!(target: "pyronova::handler", "{msg}");
-        return Err(msg.to_string());
-    }
-    ffi::PyErr_Clear();
-
-    // dict → JSON
-    if ffi::PyDict_Check(ptr) != 0 {
-        let json_str = json_dumps(py, result_obj)?;
-        return Ok(SubInterpResponse {
-            body: json_str.into_bytes(),
-            status: 200,
-            content_type: None,
-            headers: Vec::new(),
-            is_json: true,
-        });
-    }
-
-    // string
-    if ffi::PyUnicode_Check(ptr) != 0 {
-        let s = pyobj_to_string(ptr)?;
-        return Ok(SubInterpResponse {
-            body: s.into_bytes(),
-            status: 200,
-            content_type: None,
-            headers: Vec::new(),
-            is_json: false,
-        });
-    }
-
-    // bytes → raw body
-    if ffi::PyBytes_Check(ptr) != 0 {
-        return Ok(SubInterpResponse {
-            body: bytes_contents(ptr),
-            status: 200,
-            content_type: Some("application/octet-stream".to_string()),
-            headers: Vec::new(),
-            is_json: false,
-        });
-    }
-
-    // None → empty 200
-    if ptr == ffi::Py_None() {
-        return Ok(SubInterpResponse {
-            body: Vec::new(),
-            status: 200,
-            content_type: None,
-            headers: Vec::new(),
-            is_json: false,
-        });
-    }
-
-    // fallback: str(result)
-    let str_obj = PyObjRef::from_owned(ffi::PyObject_Str(ptr)).ok_or_else(|| {
-        ffi::PyErr_Clear();
-        "str() failed".to_string()
-    })?;
-    let s = pyobj_to_string(str_obj.as_ptr())?;
-    Ok(SubInterpResponse {
-        body: s.into_bytes(),
-        status: 200,
-        content_type: None,
-        headers: Vec::new(),
-        is_json: false,
+    ran.map(drop).map_err(|e| ExecError::Raised {
+        raised: StartException::capture(py, &e),
+        failure: script_failure(py, &e, filename, src),
     })
 }
 
-/// Build a `Response` Python object from a SubInterpResponse.
+/// Whether `err` was raised by a relative import in the module compiled from `src` as
+/// `filename`: the innermost traceback frame in that file is on a `from .x import y`
+/// statement.
+fn script_failure(py: Python<'_>, err: &PyErr, filename: &str, src: &str) -> ScriptFailure {
+    if !err.is_instance_of::<PyImportError>(py) {
+        return ScriptFailure::Other;
+    }
+    match failing_line(py, err, filename).and_then(|line| relative_import_at(py, src, line)) {
+        Ok(true) => ScriptFailure::RelativeImport,
+        Ok(false) => ScriptFailure::Other,
+        Err(e) => {
+            tracing::warn!(
+                target: "pyronova::server",
+                error = %e,
+                "could not tell whether the import that failed in {filename} was relative"
+            );
+            ScriptFailure::Other
+        }
+    }
+}
+
+/// The line of the innermost frame of `err`'s traceback that is in `filename`, if any.
+fn failing_line(py: Python<'_>, err: &PyErr, filename: &str) -> PyResult<Option<usize>> {
+    let mut line = None;
+    let mut tb = err.traceback(py);
+    while let Some(frame) = tb {
+        let code_file: String = frame
+            .getattr("tb_frame")?
+            .getattr("f_code")?
+            .getattr("co_filename")?
+            .extract()?;
+        if code_file == filename {
+            line = Some(frame.getattr("tb_lineno")?.extract()?);
+        }
+        tb = frame.getattr("tb_next")?.cast_into::<PyTraceback>().ok();
+    }
+    Ok(line)
+}
+
+/// Whether `line` of `src` is inside a relative `from` import statement.
+fn relative_import_at(py: Python<'_>, src: &str, line: Option<usize>) -> PyResult<bool> {
+    let Some(line) = line else {
+        return Ok(false);
+    };
+    let ast = py.import("ast")?;
+    let import_from = ast.getattr("ImportFrom")?;
+    let tree = ast.call_method1("parse", (src,))?;
+    for node in ast.call_method1("walk", (tree,))?.try_iter()? {
+        let node = node?;
+        if !node.is_instance(&import_from)? || node.getattr("level")?.extract::<u32>()? == 0 {
+            continue;
+        }
+        let first: usize = node.getattr("lineno")?.extract()?;
+        let last: usize = node.getattr("end_lineno")?.extract()?;
+        if (first..=last).contains(&line) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+// ---------------------------------------------------------------------------
+// Thread states
+// ---------------------------------------------------------------------------
+
+/// Runs `f` with a token for the thread state current on this thread, which PyO3 does not
+/// know is attached: a worker's init on the main OS thread, whose gilstate thread state is
+/// main's (`Python::attach` there would switch to it), and a worker's end. A `Py<T>`
+/// dropped in `f` would be deferred, not released: `f` releases with `drop_ref`.
 ///
 /// # Safety
-/// Must be called with the GIL of the target interpreter.
-pub(crate) unsafe fn build_response(
-    py: Python<'_>,
-    resp: &SubInterpResponse,
-) -> Result<PyObjRef, String> {
-    let resp_cls = py.get_type::<crate::types::PyronovaResponse>();
-
-    // Convert body to Python object — use bytes for binary, str for text
-    let py_body = if resp.is_json || std::str::from_utf8(&resp.body).is_ok() {
-        let body_str = unsafe { std::str::from_utf8_unchecked(&resp.body) };
-        py_str(body_str).ok_or("failed to create body str")?
-    } else {
-        // Binary data: use PyBytes to avoid UTF-8 corruption
-        PyObjRef::from_owned(ffi::PyBytes_FromStringAndSize(
-            resp.body.as_ptr() as *const _,
-            resp.body.len() as isize,
-        ))
-        .ok_or("failed to create body bytes")?
-    };
-    let py_status = PyObjRef::from_owned(ffi::PyLong_FromLong(resp.status as i64))
-        .ok_or("failed to create status")?;
-    let py_ct = match &resp.content_type {
-        Some(ct) => py_str(ct).ok_or("failed to create content_type")?,
-        None => PyObjRef::from_borrowed(ffi::Py_None()).unwrap(),
-    };
-    let py_headers = py_str_dict_from_vec(&resp.headers).ok_or("failed to create headers dict")?;
-
-    // Response(body, status_code, content_type, headers)
-    let args = PyObjRef::from_owned(ffi::PyTuple_New(0)).ok_or("failed to create args")?;
-    let kwargs = PyObjRef::from_owned(ffi::PyDict_New()).ok_or("failed to create kwargs")?;
-
-    ffi::PyDict_SetItemString(kwargs.as_ptr(), c"body".as_ptr(), py_body.as_ptr());
-    ffi::PyDict_SetItemString(kwargs.as_ptr(), c"status_code".as_ptr(), py_status.as_ptr());
-    ffi::PyDict_SetItemString(kwargs.as_ptr(), c"content_type".as_ptr(), py_ct.as_ptr());
-    ffi::PyDict_SetItemString(kwargs.as_ptr(), c"headers".as_ptr(), py_headers.as_ptr());
-
-    PyObjRef::from_owned(ffi::PyObject_Call(
-        resp_cls.as_ptr(),
-        args.as_ptr(),
-        kwargs.as_ptr(),
-    ))
-    .ok_or_else(|| {
-        log_and_clear_py_exception("_Response construction");
-        "failed to create _Response".to_string()
-    })
+/// A thread state is current on this thread.
+unsafe fn with_current_tstate<T>(f: impl for<'py> FnOnce(Python<'py>) -> T) -> T {
+    f(Python::assume_attached())
 }
 
-/// Parse a `Response` (or duck-typed response) Python object.
-unsafe fn parse_response(py: Python<'_>, obj: PyObjRef) -> Result<SubInterpResponse, String> {
-    let ptr = obj.as_ptr();
+/// Holds a sub-interpreter's GIL; releasing it on drop, so a panic mid-handler can't leave
+/// the GIL locked (the next request would deadlock). The saved thread state is written
+/// back to `tstate_cell` on drop, so the caller has it even after an unwind.
+struct SubInterpGilGuard<'a> {
+    tstate_cell: &'a Cell<*mut ffi::PyThreadState>,
+}
 
-    // status_code
-    let status = {
-        let attr = PyObjRef::from_owned(ffi::PyObject_GetAttrString(ptr, c"status_code".as_ptr()));
-        match attr {
-            Some(a) => {
-                let code = ffi::PyLong_AsLong(a.as_ptr());
-                if code == -1 && !ffi::PyErr_Occurred().is_null() {
-                    ffi::PyErr_Clear();
-                    200
-                } else {
-                    code as u16
-                }
-            }
-            None => {
-                ffi::PyErr_Clear();
-                200
-            }
-        }
-    };
+impl<'a> SubInterpGilGuard<'a> {
+    /// Acquires the sub-interpreter's GIL.
+    ///
+    /// # Safety
+    /// `tstate` is a saved thread state usable on this thread, and no thread state is
+    /// current here.
+    unsafe fn acquire(
+        tstate: *mut ffi::PyThreadState,
+        tstate_cell: &'a Cell<*mut ffi::PyThreadState>,
+    ) -> Self {
+        ffi::PyEval_RestoreThread(tstate);
+        Self { tstate_cell }
+    }
+}
 
-    // content_type
-    let content_type = {
-        let attr = PyObjRef::from_owned(ffi::PyObject_GetAttrString(ptr, c"content_type".as_ptr()));
-        match attr {
-            Some(a) if a.as_ptr() != ffi::Py_None() => pyobj_to_string(a.as_ptr()).ok(),
-            _ => {
-                ffi::PyErr_Clear();
-                None
-            }
+impl Drop for SubInterpGilGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the GIL is held while this guard exists.
+        unsafe {
+            self.tstate_cell.set(ffi::PyEval_SaveThread());
         }
-    };
+    }
+}
 
-    // headers
-    //
-    // CRITICAL: PyDict_Next forbids dict mutation during iteration.
-    // PyObject_Str may invoke user __str__ which could mutate the
-    // dict → undefined behaviour / segfault. We collect borrowed
-    // key/value refs first, INCREF them, then release the iteration
-    // scope before calling any method that may re-enter Python.
-    let mut resp_headers: Vec<(String, String)> = Vec::new();
-    {
-        let attr = PyObjRef::from_owned(ffi::PyObject_GetAttrString(ptr, c"headers".as_ptr()));
-        if let Some(a) = &attr {
-            if ffi::PyDict_Check(a.as_ptr()) != 0 {
-                // Phase 1: snapshot (no user code runs).
-                let mut snapshot: Vec<(PyObjRef, PyObjRef)> = Vec::new();
-                let mut pos: isize = 0;
-                let mut key: *mut ffi::PyObject = std::ptr::null_mut();
-                let mut val: *mut ffi::PyObject = std::ptr::null_mut();
-                while ffi::PyDict_Next(a.as_ptr(), &mut pos, &mut key, &mut val) != 0 {
-                    // PyDict_Next returns borrowed refs — INCREF to own them.
-                    if let (Some(k), Some(v)) =
-                        (PyObjRef::from_borrowed(key), PyObjRef::from_borrowed(val))
-                    {
-                        snapshot.push((k, v));
-                    }
-                }
-                // Phase 2: convert — safe to invoke __str__ now.
-                for (k_obj, v_obj) in snapshot {
-                    let str_key = PyObjRef::from_owned(ffi::PyObject_Str(k_obj.as_ptr()));
-                    if let Some(sk) = str_key {
-                        if let Ok(k) = pyobj_to_string(sk.as_ptr()) {
-                            // Check if value is a Python list — e.g. multiple Set-Cookie values
-                            if ffi::PyList_Check(v_obj.as_ptr()) != 0 {
-                                // Phase 1: snapshot the list items (no user code
-                                // runs). PyList_GetItem returns borrowed refs, and
-                                // PyObject_Str below may invoke user __str__ which
-                                // could mutate the list → invalidating the borrow.
-                                // INCREF each item to own it before converting.
-                                let n = ffi::PyList_Size(v_obj.as_ptr());
-                                let mut items: Vec<PyObjRef> = Vec::new();
-                                for i in 0..n {
-                                    let item = ffi::PyList_GetItem(v_obj.as_ptr(), i);
-                                    if item.is_null() {
-                                        ffi::PyErr_Clear();
-                                        continue;
-                                    }
-                                    if let Some(owned) = PyObjRef::from_borrowed(item) {
-                                        items.push(owned);
-                                    }
-                                }
-                                // Phase 2: convert — safe to invoke __str__ now.
-                                for item in items {
-                                    if let Some(item_str) =
-                                        PyObjRef::from_owned(ffi::PyObject_Str(item.as_ptr()))
-                                    {
-                                        if let Ok(v) = pyobj_to_string(item_str.as_ptr()) {
-                                            resp_headers.push((k.clone(), v));
-                                        } else {
-                                            ffi::PyErr_Clear();
-                                        }
-                                    } else {
-                                        ffi::PyErr_Clear();
-                                    }
-                                }
-                            } else {
-                                let str_val =
-                                    PyObjRef::from_owned(ffi::PyObject_Str(v_obj.as_ptr()));
-                                if let Some(sv) = str_val {
-                                    if let Ok(v) = pyobj_to_string(sv.as_ptr()) {
-                                        resp_headers.push((k, v));
-                                    } else {
-                                        ffi::PyErr_Clear();
-                                    }
-                                } else {
-                                    ffi::PyErr_Clear();
-                                }
-                            }
-                        }
-                    } else {
-                        ffi::PyErr_Clear();
-                    }
-                }
-            }
-        }
-        ffi::PyErr_Clear();
+/// Replaces the worker's thread state (created on the building thread) with a fresh one
+/// bound to the calling thread, and returns it saved.
+///
+/// A thread state created on one OS thread and attached/detached on another accumulates
+/// per-thread bookkeeping: a pure-C reproducer leaks ~1 KB per attach cycle (997 B/iter
+/// shared vs 0 B/iter with a `PyThreadState_New` on the serving thread). See
+/// docs/memory-leak-investigation-2026-04-19.md.
+///
+/// # Safety
+/// `creator_tstate` is the worker's saved thread state, not yet bound to another thread,
+/// and no thread state is current on this thread.
+unsafe fn rebind_tstate_to_current_thread(
+    creator_tstate: *mut ffi::PyThreadState,
+) -> *mut ffi::PyThreadState {
+    ffi::PyEval_RestoreThread(creator_tstate);
+    let interp = ffi::PyInterpreterState_Get();
+    let fresh = ffi::PyThreadState_New(interp);
+    if fresh.is_null() {
+        // Keep serving on the creator tstate: the per-request leak above comes back on
+        // this worker, so say so loudly, with what CPython reported. The error is taken
+        // off the interpreter here, or the first request would start with it pending.
+        let reported = with_current_tstate(PyErr::take);
+        tracing::error!(
+            target: "pyronova::server",
+            error = ?reported,
+            "PyThreadState_New returned NULL while binding a worker to its thread (the \
+             interpreter is shutting down, or out of memory); the worker keeps the thread \
+             state it was created with, which leaks ~1 KB per request until restart"
+        );
+        return ffi::PyEval_SaveThread();
+    }
+    let prev = ffi::PyThreadState_Swap(fresh);
+    debug_assert_eq!(prev, creator_tstate);
+    ffi::PyThreadState_Clear(creator_tstate);
+    ffi::PyThreadState_Delete(creator_tstate);
+    ffi::PyEval_SaveThread()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refused_interpreter_reports_its_pystatus() {
+        let status = ffi::PyStatus {
+            _type: ffi::_PyStatus_TYPE::_PyStatus_TYPE_ERROR,
+            func: c"init_interp_create_gil".as_ptr(),
+            err_msg: c"failed to create a new GIL".as_ptr(),
+            exitcode: 0,
+        };
+        // SAFETY: both strings are NUL-terminated literals.
+        let err = unsafe { NewInterpreterError::from_status(&status) };
+        assert_eq!(
+            err.to_string(),
+            "Py_NewInterpreterFromConfig failed in init_interp_create_gil: failed to create \
+             a new GIL"
+        );
     }
 
-    // body (returns Vec<u8>)
-    let (body, is_json): (Vec<u8>, bool) = {
-        let attr = PyObjRef::from_owned(ffi::PyObject_GetAttrString(ptr, c"body".as_ptr()));
-        match attr {
-            Some(a) => {
-                if ffi::PyDict_Check(a.as_ptr()) != 0 {
-                    match json_dumps(py, a) {
-                        Ok(s) => (s.into_bytes(), true),
-                        Err(e) => {
-                            tracing::error!(
-                                target: "pyronova::server",
-                                error = %e,
-                                "JSON serialization failed for response body dict"
-                            );
-                            let msg = format!(r#"{{"error":"json serialization failed: {}"}}"#, e);
-                            return Ok(SubInterpResponse {
-                                body: msg.into_bytes(),
-                                status: 500,
-                                content_type: Some("application/json".to_string()),
-                                headers: resp_headers,
-                                is_json: true,
-                            });
-                        }
-                    }
-                } else if ffi::PyBytes_Check(a.as_ptr()) != 0 {
-                    // Raw bytes — pass through without UTF-8 conversion
-                    (bytes_contents(a.as_ptr()), false)
-                } else if ffi::PyUnicode_Check(a.as_ptr()) != 0 {
-                    (
-                        pyobj_to_string(a.as_ptr()).unwrap_or_default().into_bytes(),
-                        false,
-                    )
-                } else {
-                    let str_obj = PyObjRef::from_owned(ffi::PyObject_Str(a.as_ptr()));
-                    match str_obj {
-                        Some(s) => (
-                            pyobj_to_string(s.as_ptr()).unwrap_or_default().into_bytes(),
-                            false,
-                        ),
-                        None => {
-                            ffi::PyErr_Clear();
-                            (Vec::new(), false)
-                        }
-                    }
-                }
-            }
-            None => {
-                ffi::PyErr_Clear();
-                (Vec::new(), false)
-            }
-        }
-    };
+    #[test]
+    fn a_status_without_text_says_so() {
+        let status = ffi::PyStatus {
+            _type: ffi::_PyStatus_TYPE::_PyStatus_TYPE_OK,
+            func: std::ptr::null(),
+            err_msg: std::ptr::null(),
+            exitcode: 0,
+        };
+        // SAFETY: NULL pointers are allowed.
+        let err = unsafe { NewInterpreterError::from_status(&status) };
+        assert_eq!(
+            err.to_string(),
+            "Py_NewInterpreterFromConfig failed: it returned no error message and no thread \
+             state"
+        );
+    }
 
-    Ok(SubInterpResponse {
-        body,
-        status,
-        content_type,
-        headers: resp_headers,
-        is_json,
-    })
+    #[test]
+    fn the_relative_import_hint_is_only_for_a_relative_import() {
+        assert!(ScriptFailure::RelativeImport
+            .to_string()
+            .contains("outside any package, so a relative import"));
+        assert_eq!(ScriptFailure::Other.to_string(), "");
+    }
+
+    #[test]
+    fn the_async_task_budget_ends_before_the_callers() {
+        assert!(ASYNC_TASK_BUDGET < REQUEST_BUDGET);
+        assert_eq!(ASYNC_TASK_BUDGET + ASYNC_TASK_MARGIN, REQUEST_BUDGET);
+    }
 }

@@ -114,6 +114,11 @@ app.static("/static", "/data/static")
 # (METHOD, path), fallback to the regular pipeline on miss.
 app.add_fast_response("GET", "/pipeline", b"ok", content_type="text/plain")
 
+# unary-grpc / unary-grpc-tls profiles: the engine's built-in
+# benchmark.BenchmarkService/GetSum, answered in Rust. Opt-in; without this
+# call the GetSum path is routed like any other request (404 here).
+app.enable_grpc_benchmark()
+
 
 def _sum_query_params(req) -> int:
     total = 0

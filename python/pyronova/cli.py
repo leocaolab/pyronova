@@ -32,10 +32,8 @@ def _load_app(target: str) -> "Pyronova":
     """Resolve ``module[:attr]`` → Pyronova instance. Importing the module
     runs its top-level code, which registers routes on the app."""
     if ":" in target:
-        # A module:attr spec has exactly one colon. More than one (a:b:c)
-        # or a leading colon (:app) is a malformed target — fail with a
-        # clear message rather than a confusing ImportError downstream
-        # (arc findings cli-18, cli-21). Module names never contain colons.
+        # Module names never contain a colon: `a:b:c` or `:app` is a malformed target,
+        # named here rather than as a confusing ImportError later.
         if target.count(":") > 1:
             sys.exit(
                 f"pyronova: invalid target {target!r}: expected module:attr "
@@ -73,7 +71,7 @@ def _load_app(target: str) -> "Pyronova":
     # `__main__` is this file, so point them at the app's module instead.
     module_file = getattr(module, "__file__", None)
     if module_file:
-        app._engine.set_script_path(os.path.abspath(module_file))
+        app._set_app_file(os.path.abspath(module_file))
     return app
 
 
@@ -99,7 +97,6 @@ def _cmd_run(args: argparse.Namespace) -> None:
 def _cmd_dev(args: argparse.Namespace) -> None:
     os.environ.setdefault("PYRONOVA_LOG", "1")
     app = _load_app(args.target)
-    # Dev defaults: bind all interfaces so LAN clients can probe.
     app.run(
         host=args.host,
         port=args.port,
@@ -112,38 +109,16 @@ def _cmd_routes(args: argparse.Namespace) -> None:
     app = _load_app(args.target)
     rows: list[tuple[str, str, str, str]] = []
     for r in app.routes:
-        flags = []
-        if r.get("gil"):
-            flags.append("gil")
-        if r.get("stream"):
-            flags.append("stream")
-        if r.get("async"):
-            flags.append("async")
-        if r.get("model"):
-            flags.append(f"model={r['model']}")
-        rows.append((
-            r.get("method", "?"),
-            r.get("path", "?"),
-            r.get("handler", "?"),
-            ",".join(flags),
-        ))
+        flags = [name for name, on in (("gil", r.gil), ("stream", r.stream), ("async", r.is_async)) if on]
+        if r.model is not None:
+            flags.append(f"model={r.model}")
+        rows.append((r.method, r.path, r.handler, ",".join(flags)))
     for r in app.fast_routes:
-        rows.append((
-            r.get("method", "?"),
-            r.get("path", "?"),
-            f"<fast:{r.get('bytes', '?')}B>",
-            f"status={r.get('status_code', '?')}",
-        ))
+        rows.append((r.method, r.path, f"<fast:{r.body_bytes}B>", f"status={r.status_code}"))
 
     if not rows:
         print("(no routes registered)")
         return
-
-    # Coerce every cell to str up front: a route dict may carry non-string
-    # values (e.g. an int method/handler from a misbehaving registration),
-    # and both len() and the {:<w} format spec raise on non-str — turning a
-    # diagnostic command into a crash (arc finding cli-20).
-    rows = [tuple(str(c) for c in row) for row in rows]
 
     widths = [max(len(r[i]) for r in rows) for i in range(4)]
     header = ("METHOD", "PATH", "HANDLER", "FLAGS")
@@ -174,9 +149,6 @@ def main(argv: list[str] | None = None) -> None:
     try:
         from pyronova import __version__ as _v
     except (ImportError, AttributeError):
-        # Only swallow the genuinely-expected lookup failures (package not
-        # installed / __version__ absent). A broad `except Exception` here
-        # would mask real bugs behind a silent "dev" fallback (arc cli-19).
         _v = "dev"
     parser.add_argument("--version", action="version", version=f"pyronova {_v}")
     sub = parser.add_subparsers(dest="cmd", required=True)

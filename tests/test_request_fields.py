@@ -9,92 +9,109 @@ from pyronova import Pyronova, Response
 from pyronova.testing import TestClient
 
 
+# Module level: TestClient serves it through sub-interpreter workers, which rebuild
+# it by executing this module.
+app = Pyronova()
+
+
+@app.get("/")
+def index(req):
+    return "ok"
+
+
+@app.get("/fields")
+def all_fields(req):
+    return {
+        "method": req.method,
+        "path": req.path,
+        "query": req.query,
+        "client_ip": req.client_ip,
+        "has_headers": len(req.headers) > 0,
+        "params": req.params,
+    }
+
+
+@app.post("/fields")
+def post_fields(req):
+    return {
+        "method": req.method,
+        "path": req.path,
+        "body_len": len(req.body),
+        "text": req.text(),
+        "client_ip": req.client_ip,
+    }
+
+
+@app.get("/user/{name}")
+def user(req):
+    return {"name": req.params["name"]}
+
+
+@app.get("/a/{x}/b/{y}/c/{z}")
+def triple_param(req):
+    return {
+        "x": req.params["x"],
+        "y": req.params["y"],
+        "z": req.params["z"],
+    }
+
+
+@app.get("/query-multi")
+def query_multi(req):
+    return {"raw": req.query, "parsed": req.query_params}
+
+
+@app.put("/put-body")
+def put_body(req):
+    return {"method": req.method, "data": req.json()}
+
+
+@app.patch("/patch-body")
+def patch_body(req):
+    return {"method": req.method, "data": req.json()}
+
+
+@app.delete("/del/{id}")
+def del_item(req):
+    return {"method": req.method, "id": req.params["id"]}
+
+
+@app.get("/empty-query")
+def empty_query(req):
+    return {"query": req.query, "params_count": len(req.query_params)}
+
+
+@app.get("/headers-check")
+def headers_check(req):
+    return {
+        "content_type": req.headers.get("content-type", "none"),
+        "custom": req.headers.get("x-custom", "none"),
+        "accept": req.headers.get("accept", "none"),
+    }
+
+
+@app.post("/headers-check")
+def headers_check_post(req):
+    return {
+        "content_type": req.headers.get("content-type", "none"),
+        "custom": req.headers.get("x-custom", "none"),
+        "accept": req.headers.get("accept", "none"),
+    }
+
+
+@app.post("/binary-body")
+def binary_body(req):
+    return {"body_len": len(req.body), "is_bytes": isinstance(req.body, (bytes, memoryview))}
+
+
+@app.get("/unicode-param/{name}")
+def unicode_param(req):
+    return {"name": req.params["name"]}
+
+
 @pytest.fixture(scope="module")
 def client():
-    app = Pyronova()
-
-    @app.get("/")
-    def index(req):
-        return "ok"
-
-    @app.get("/fields")
-    def all_fields(req):
-        return {
-            "method": req.method,
-            "path": req.path,
-            "query": req.query,
-            "client_ip": req.client_ip,
-            "has_headers": len(req.headers) > 0,
-            "params": req.params,
-        }
-
-    @app.post("/fields")
-    def post_fields(req):
-        return {
-            "method": req.method,
-            "path": req.path,
-            "body_len": len(req.body),
-            "text": req.text(),
-            "client_ip": req.client_ip,
-        }
-
-    @app.get("/user/{name}")
-    def user(req):
-        return {"name": req.params["name"]}
-
-    @app.get("/a/{x}/b/{y}/c/{z}")
-    def triple_param(req):
-        return {
-            "x": req.params["x"],
-            "y": req.params["y"],
-            "z": req.params["z"],
-        }
-
-    @app.get("/query-multi")
-    def query_multi(req):
-        return {"raw": req.query, "parsed": req.query_params}
-
-    @app.put("/put-body")
-    def put_body(req):
-        return {"method": req.method, "data": req.json()}
-
-    @app.patch("/patch-body")
-    def patch_body(req):
-        return {"method": req.method, "data": req.json()}
-
-    @app.delete("/del/{id}")
-    def del_item(req):
-        return {"method": req.method, "id": req.params["id"]}
-
-    @app.get("/empty-query")
-    def empty_query(req):
-        return {"query": req.query, "params_count": len(req.query_params)}
-
-    @app.get("/headers-check")
-    def headers_check(req):
-        return {
-            "content_type": req.headers.get("content-type", "none"),
-            "custom": req.headers.get("x-custom", "none"),
-            "accept": req.headers.get("accept", "none"),
-        }
-
-    @app.post("/headers-check")
-    def headers_check_post(req):
-        return {
-            "content_type": req.headers.get("content-type", "none"),
-            "custom": req.headers.get("x-custom", "none"),
-            "accept": req.headers.get("accept", "none"),
-        }
-
-    @app.post("/binary-body")
-    def binary_body(req):
-        return {"body_len": len(req.body), "is_bytes": isinstance(req.body, (bytes, memoryview))}
-
-    @app.get("/unicode-param/{name}")
-    def unicode_param(req):
-        return {"name": req.params["name"]}
-
-    c = TestClient(app, port=19887)
+    c = TestClient(app)
     yield c
     c.close()
 

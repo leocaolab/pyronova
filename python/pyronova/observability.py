@@ -5,11 +5,12 @@ Two opt-in toggles on ``Pyronova``:
     app.enable_request_id()   # guarantees X-Request-ID on every response
     app.enable_metrics()      # GET /metrics → Prometheus text format
 
-Both ride on ``before_request`` / ``after_request`` hooks and keep state
-in ``app.state`` (the shared DashMap), so counters aggregate correctly
-across sub-interpreter workers.
+Both ride on ``before_request`` / ``after_request`` hooks. The metrics
+counters live in ``app.state``, the one map every interpreter shares: each
+sub-interpreter worker has its own Python globals, so a module-level dict
+would count per worker.
 
-Metrics exposed (v1, RED-style without histograms):
+Metrics exposed (RED-style, no histograms):
 
 - ``pyronova_http_requests_total`` — global request counter
 - ``pyronova_http_requests_by_class_total{class="2xx|3xx|4xx|5xx"}``
@@ -17,21 +18,14 @@ Metrics exposed (v1, RED-style without histograms):
 - ``pyronova_http_request_duration_seconds_sum``
 - ``pyronova_http_request_duration_seconds_count``
 
-(Latency is tracked as a running sum + count; compute avg via
-``sum / count`` in the dashboard. Per-bucket histograms are a v1.1
-upgrade.)
-
-Why ``app.state`` and not a Python dict: in sub-interpreter mode, each
-worker has its own Python globals, so a module-level ``defaultdict``
-would silently fragment counts per worker. ``app.state.incr`` is one
-atomic DashMap op shared by every interpreter.
+Latency is a running sum + count; the average is ``sum / count`` in the
+dashboard.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-import uuid
 from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
@@ -52,18 +46,15 @@ _metrics_start_ns: ContextVar[int | None] = ContextVar("pyronova_obs_metrics_sta
 
 
 def install_request_id(app: "Pyronova", header: str) -> None:
-    from pyronova.context import ctx, _reset_for_new_request
+    from pyronova.context import ctx
 
     header_lower = header.lower()
 
     def _before(req):
-        # Fresh context per request — prevents leftover keys from a
-        # recycled worker thread from leaking into the next caller.
-        _reset_for_new_request()
-        # Stash the incoming id (or a freshly-minted one) for this request so
-        # the after-hook can echo it back without mutating the frozen req.
-        headers = req.headers
-        rid = headers.get(header_lower) or headers.get(header) or uuid.uuid4().hex
+        # The engine wrote the request's id once, as `req.request_id` (the client's `header`
+        # value when it sent a usable one); a 5xx reports the same id. Stash it for the
+        # after-hook, which echoes it without mutating the frozen req.
+        rid = req.request_id
         _request_id.set(rid)
         ctx.set_request_id(rid)
         return None
@@ -72,12 +63,8 @@ def install_request_id(app: "Pyronova", header: str) -> None:
         rid = _request_id.get()
         if rid is None:
             return resp
-        # HTTP header names are case-insensitive, but a Python dict is not.
-        # If resp.headers already carries any case-variant of this header
-        # (e.g. "X-Request-ID" vs our "x-request-id"), a naive {**, lower:
-        # rid} merge would emit BOTH as separate response headers. Drop any
-        # existing case-variant first, then set the canonical lower-case key
-        # (arc finding observability-45).
+        # Header names are case-insensitive but dict keys are not: drop any case variant
+        # already set, or the response would carry the header twice.
         merged = {k: v for k, v in resp.headers.items() if k.lower() != header_lower}
         merged[header_lower] = rid
         return Response(
@@ -104,10 +91,7 @@ def install_metrics(app: "Pyronova", path: str) -> None:
         if req.path == path:
             return resp
 
-        # Observability MUST NOT break the request. Wrap every counter
-        # touch so a transient state.incr failure (DashMap contention,
-        # value-type drift, etc.) logs and continues instead of raising
-        # into the response path (arc finding observability-2).
+        # Counting must not break the request: a failure is logged, the response kept.
         try:
             status = resp.status_code
             state.incr("_m:req:total", 1)
@@ -117,15 +101,11 @@ def install_metrics(app: "Pyronova", path: str) -> None:
                 state.incr(f"_m:req:method:{method}", 1)
 
             start = _metrics_start_ns.get()
-            _metrics_start_ns.set(None)
             if start is not None:
                 elapsed_us = max(0, (time.monotonic_ns() - start) // 1000)
                 state.incr("_m:lat:sum_us", int(elapsed_us))
                 state.incr("_m:lat:count", 1)
         except Exception:
-            # Log via stdlib (routed to Rust tracing in sub-interps);
-            # do NOT propagate.
-            import logging
             logging.getLogger("pyronova.observability").exception(
                 "metrics _after hook failed; request unaffected"
             )
@@ -146,18 +126,21 @@ def install_metrics(app: "Pyronova", path: str) -> None:
     app.get(path, gil=True)(_metrics_handler)
 
 
-_log = logging.getLogger("pyronova.observability")
+class CorruptMetric(ValueError):
+    """A metrics counter in ``app.state`` holds something that is not an integer."""
 
 
 def _read_int(state, key: str) -> int:
+    """The counter ``key``; one never incremented is 0. A value that is not an integer is
+    ``CorruptMetric`` (the scrape fails, with the key and value in the log): reporting it
+    as 0 would hand the monitoring a made-up number."""
     v = state.get(key)
     if v is None:
         return 0
     try:
         return int(v)
     except (ValueError, TypeError):
-        _log.warning("metrics key %r has non-integer value %r", key, v)
-        return 0
+        raise CorruptMetric(f"metrics counter {key!r} holds {v!r}, not an integer") from None
 
 
 def _render_prometheus(state) -> str:
@@ -189,5 +172,5 @@ def _render_prometheus(state) -> str:
     parts.append("# TYPE pyronova_http_request_duration_seconds_count counter")
     parts.append(f"pyronova_http_request_duration_seconds_count {count}")
 
-    parts.append("")  # trailing newline — Prometheus is tolerant but nicer
+    parts.append("")  # the text format ends the last line with a newline too
     return "\n".join(parts)

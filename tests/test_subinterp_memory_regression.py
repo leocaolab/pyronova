@@ -9,7 +9,7 @@ Yesterday's fixes (v1.4.5 security + correctness):
   - etc. — see CHANGELOG v1.4.5
 
 Today's fixes (hot-path leak):
-  - PyObjRef::Drop uses PyThreadState_GetUnchecked (sub-interp aware)
+  - a reference is released with its own interpreter's thread state current
   - call_handler uses PyObject_Vectorcall (was PyObject_Call)
   - build_request uses PyObject_Vectorcall (was PyObject_Call)
   - build_request does manual Py_DECREF on each arg to compensate the
@@ -47,8 +47,11 @@ from pathlib import Path
 
 import pytest
 
+from tests._helpers import bound_port, read_file
+
 HOST = "127.0.0.1"
-PORT = 19777
+# The server binds port 0; the `server` fixture sets this to the port it bound.
+_server_port: int | None = None
 
 
 SERVER_SCRIPT = '''
@@ -174,23 +177,31 @@ if __name__ == "__main__":
 @pytest.fixture(scope="module")
 def server():
     """One long-lived hybrid-mode server shared across this module's tests."""
+    global _server_port
     script_path = f"/tmp/pyronova_regression_{os.getpid()}.py"
     Path(script_path).write_text(
-        SERVER_SCRIPT.replace("{HOST}", HOST).replace("{PORT}", str(PORT))
+        SERVER_SCRIPT.replace("{HOST}", HOST).replace("{PORT}", "0")
     )
     env = dict(os.environ)
-    proc = subprocess.Popen(
-        [sys.executable, script_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        preexec_fn=os.setsid,
-        env=env,
-    )
+    log_path = script_path + ".log"
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(
+            [sys.executable, script_path],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=env,
+        )
+    try:
+        _server_port = bound_port(read_file(log_path), proc, timeout=10)
+    except RuntimeError as e:
+        proc.kill()
+        pytest.fail(f"Pyronova server did not start within 10s:\n{e}")
     # Wait for readiness
     deadline = time.time() + 10
     while time.time() < deadline:
         try:
-            urllib.request.urlopen(f"http://{HOST}:{PORT}/", timeout=0.5)
+            urllib.request.urlopen(f"http://{HOST}:{_server_port}/", timeout=0.5)
             break
         except Exception:
             time.sleep(0.1)
@@ -208,14 +219,15 @@ def server():
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except Exception:
             pass
-    try:
-        os.unlink(script_path)
-    except Exception:
-        pass
+    for path in (script_path, log_path):
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
 
 
 def _get(path: str) -> dict:
-    url = f"http://{HOST}:{PORT}{path}"
+    url = f"http://{HOST}:{_server_port}{path}"
     with urllib.request.urlopen(url, timeout=5) as r:
         data = r.read()
     try:
@@ -226,7 +238,7 @@ def _get(path: str) -> dict:
 
 def _hammer(n: int, path: str = "/") -> None:
     """Fire N requests serially to generate load on sub-interpreter heaps."""
-    url = f"http://{HOST}:{PORT}{path}"
+    url = f"http://{HOST}:{_server_port}{path}"
     for _ in range(n):
         urllib.request.urlopen(url, timeout=2).read()
 
@@ -239,7 +251,7 @@ def _hammer_concurrent(duration_sec: float, workers: int = 16, path: str = "/") 
     attach/detach pattern that exposes the leak (serial load doesn't).
     """
     import threading
-    url = f"http://{HOST}:{PORT}{path}"
+    url = f"http://{HOST}:{_server_port}{path}"
     stop_at = time.monotonic() + duration_sec
     counts = [0] * workers
 
@@ -287,7 +299,7 @@ def test_router_case_insensitive_for_lowercase_method(server):
     # sends canonical upper-case 'GET', so exercise via raw socket.
     import socket
 
-    s = socket.create_connection((HOST, PORT), timeout=5)
+    s = socket.create_connection((HOST, _server_port), timeout=5)
     s.sendall(
         b"get /lowercase_route_match HTTP/1.1\r\n"
         b"Host: 127.0.0.1\r\n"
@@ -479,9 +491,9 @@ def test_sustained_concurrent_load_no_leak(server):
       - Normal allocator noise and legit working-set fill stays under.
 
     If this test fails:
-      - First check `rebind_tstate_to_current_thread` is still called
-        at the top of both worker_thread_loop and worker_thread_loop_async
-        in src/python/interp.rs.
+      - First check `rebind_tstate_to_current_thread` is still called by
+        `SubInterpreterWorker::bind_to_this_thread` (src/python/worker.rs)
+        before a worker thread serves.
       - Then run /tmp/pep684_repro/repro_threadstate_new.c to confirm
         the pure-C reproducer still shows 0 B/iter on the FRESH variant.
     """
@@ -516,6 +528,6 @@ def test_sustained_concurrent_load_no_leak(server):
         f"({completed} requests, ~{completed // 12} rps). "
         f"Expected < 15 MB. This almost certainly means the "
         f"rebind_tstate_to_current_thread fix has regressed — see "
-        f"src/python/interp.rs::rebind_tstate_to_current_thread and the test "
+        f"src/python/worker.rs::rebind_tstate_to_current_thread and the test "
         f"docstring for diagnosis steps."
     )

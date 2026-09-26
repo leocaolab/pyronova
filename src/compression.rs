@@ -1,20 +1,21 @@
 //! HTTP response compression — Content-Encoding negotiation.
 //!
-//! Disabled by default. Opt-in via `app.enable_compression()` which flips a
-//! global `AtomicBool`. When disabled the hot path is a single relaxed load
-//! + branch-not-taken; zero cost over the uncompressed baseline.
+//! Disabled by default. Each app opts in with `app.enable_compression()`, which hands the
+//! engine a validated [`Settings`]; a run serves it from its `SiteConfig`. When disabled
+//! the hot path is one `Option` check.
 //!
-//! Negotiates with the client's `Accept-Encoding` (parsing q-values and
-//! `identity;q=0`), applies an allowlist to content-types (skips images,
-//! octet-stream, already-compressed types), and honors handler-supplied
-//! `Content-Encoding` (a handler returning pre-compressed bytes is never
-//! double-compressed).
+//! Negotiates with the client's `Accept-Encoding` (q-values, `*`), applies an allowlist
+//! to content-types (skips images, octet-stream, already-compressed types), and honors
+//! handler-supplied `Content-Encoding` (a handler returning pre-compressed bytes is never
+//! double-compressed). A large body, or one for a slow codec setting, is compressed on
+//! the blocking pool so it never stalls a tokio worker.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytes::Bytes;
+use hyper::header::{HeaderMap, HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH, VARY};
 use parking_lot::Mutex;
+use pyo3::prelude::*;
 
 use crate::types::ResponseData;
 
@@ -22,9 +23,11 @@ use crate::types::ResponseData;
 // Per-request compression output buffer pool
 // ---------------------------------------------------------------------------
 
-// Same bounded-pool pattern as the JSON serializer's BUFFER_POOL.
-// Buffers up to 4 MiB are recycled; larger ones are dropped to bound
-// memory. 32 slots comfortably covers a 16-worker deployment.
+/// A recycled buffer larger than this is dropped instead, so the pool's memory is bounded.
+const POOL_MAX_BUF_BYTES: usize = 4 << 20;
+/// Buffers kept for reuse; enough for every thread of a 16-worker server.
+const POOL_SLOTS: usize = 32;
+
 static COMPRESS_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
 struct PooledCompressBuf(Vec<u8>);
@@ -38,113 +41,242 @@ impl AsRef<[u8]> for PooledCompressBuf {
 impl Drop for PooledCompressBuf {
     fn drop(&mut self) {
         let mut v = std::mem::take(&mut self.0);
-        if v.capacity() <= 4 << 20 {
+        if v.capacity() <= POOL_MAX_BUF_BYTES {
             v.clear();
             let mut pool = COMPRESS_POOL.lock();
-            if pool.len() < 32 {
+            if pool.len() < POOL_SLOTS {
                 pool.push(v);
             }
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// Settings, validated once at the Python edge
+// ---------------------------------------------------------------------------
+
 /// Default minimum body size to compress. Small payloads cost more CPU to
 /// compress + send headers than the saved bytes.
-pub(crate) const DEFAULT_MIN_SIZE: usize = 512;
+const DEFAULT_MIN_SIZE: u32 = 512;
+const DEFAULT_GZIP_LEVEL: i64 = 6;
+const DEFAULT_BROTLI_QUALITY: i64 = 4;
 
-static ENABLED: AtomicBool = AtomicBool::new(false);
-static MIN_SIZE: AtomicUsize = AtomicUsize::new(DEFAULT_MIN_SIZE);
-/// Bit 0 = gzip allowed, bit 1 = brotli allowed.
-static ALGO_MASK: AtomicUsize = AtomicUsize::new(0b11);
-static GZIP_LEVEL: AtomicUsize = AtomicUsize::new(6);
-static BROTLI_QUALITY: AtomicUsize = AtomicUsize::new(4);
-
-const ALGO_GZIP: usize = 0b01;
-const ALGO_BR: usize = 0b10;
-
-/// A compression configuration as stored: the algorithms as a mask, levels clamped.
+/// The algorithms the server may use; never none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Settings {
-    enabled: bool,
-    min_size: usize,
-    algo_mask: usize,
-    gzip_level: usize,
-    brotli_quality: usize,
+enum Algos {
+    Gzip,
+    Brotli,
+    Both,
 }
 
-impl Settings {
-    pub(crate) fn new(
-        enabled: bool,
-        min_size: usize,
-        gzip: bool,
-        brotli: bool,
-        gzip_level: u32,
-        brotli_quality: u32,
-    ) -> Self {
-        Settings {
-            enabled,
-            min_size,
-            algo_mask: (if gzip { ALGO_GZIP } else { 0 }) | (if brotli { ALGO_BR } else { 0 }),
-            gzip_level: gzip_level.clamp(1, 9) as usize,
-            brotli_quality: brotli_quality.clamp(0, 11) as usize,
+impl Algos {
+    fn of(gzip: bool, brotli: bool) -> Result<Self, SettingsError> {
+        match (gzip, brotli) {
+            (true, true) => Ok(Self::Both),
+            (true, false) => Ok(Self::Gzip),
+            (false, true) => Ok(Self::Brotli),
+            (false, false) => Err(SettingsError::NoAlgorithm),
+        }
+    }
+
+    fn gzip(self) -> bool {
+        matches!(self, Self::Gzip | Self::Both)
+    }
+
+    fn brotli(self) -> bool {
+        matches!(self, Self::Brotli | Self::Both)
+    }
+}
+
+/// A gzip compression level, 1..=9.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GzipLevel(u8);
+
+impl GzipLevel {
+    fn new(level: i64) -> Result<Self, SettingsError> {
+        match u8::try_from(level) {
+            Ok(level @ 1..=9) => Ok(Self(level)),
+            _ => Err(SettingsError::GzipLevel(level)),
         }
     }
 }
 
-/// Sets the process-wide compression configuration.
-pub(crate) fn configure(
-    enabled: bool,
-    min_size: usize,
-    gzip: bool,
-    brotli: bool,
-    gzip_level: u32,
-    brotli_quality: u32,
-) {
-    let s = Settings::new(enabled, min_size, gzip, brotli, gzip_level, brotli_quality);
-    ALGO_MASK.store(s.algo_mask, Ordering::Relaxed);
-    MIN_SIZE.store(s.min_size, Ordering::Relaxed);
-    GZIP_LEVEL.store(s.gzip_level, Ordering::Relaxed);
-    BROTLI_QUALITY.store(s.brotli_quality, Ordering::Relaxed);
-    ENABLED.store(s.enabled, Ordering::Release);
-}
+/// A brotli quality, 0..=11.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BrotliQuality(u8);
 
-/// The process-wide compression configuration.
-pub(crate) fn current() -> Settings {
-    Settings {
-        enabled: ENABLED.load(Ordering::Acquire),
-        min_size: MIN_SIZE.load(Ordering::Relaxed),
-        algo_mask: ALGO_MASK.load(Ordering::Relaxed),
-        gzip_level: GZIP_LEVEL.load(Ordering::Relaxed),
-        brotli_quality: BROTLI_QUALITY.load(Ordering::Relaxed),
+impl BrotliQuality {
+    /// At or above this quality brotli is slow enough (~1 MB/s at 11) that even a small
+    /// body is compressed off the tokio worker.
+    const SLOW: u8 = 10;
+
+    fn new(quality: i64) -> Result<Self, SettingsError> {
+        match u8::try_from(quality) {
+            Ok(quality @ 0..=11) => Ok(Self(quality)),
+            _ => Err(SettingsError::BrotliQuality(quality)),
+        }
     }
 }
 
-#[inline]
-pub(crate) fn is_enabled() -> bool {
-    ENABLED.load(Ordering::Relaxed)
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+enum SettingsError {
+    #[error("min_size must be 0..={max} bytes, got {0}", max = u32::MAX)]
+    MinSize(i64),
+    #[error("gzip_level must be 1..=9, got {0}")]
+    GzipLevel(i64),
+    #[error("brotli_quality must be 0..=11, got {0}")]
+    BrotliQuality(i64),
+    #[error(
+        "gzip=False and brotli=False enables no algorithm; use disable_compression() to turn \
+         compression off"
+    )]
+    NoAlgorithm,
 }
 
+impl From<SettingsError> for PyErr {
+    fn from(e: SettingsError) -> Self {
+        pyo3::exceptions::PyValueError::new_err(e.to_string())
+    }
+}
+
+/// An app's compression settings: `Compression(min_size=512, gzip=True, brotli=True,
+/// gzip_level=6, brotli_quality=4)`. A level out of its codec's range, or neither
+/// algorithm, is a `ValueError` here, never clamped or ignored later.
+#[pyclass(frozen, name = "Compression", module = "pyronova.engine")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Settings {
+    min_size: u32,
+    algos: Algos,
+    gzip_level: GzipLevel,
+    brotli_quality: BrotliQuality,
+}
+
+impl Settings {
+    fn parse(
+        min_size: i64,
+        gzip: bool,
+        brotli: bool,
+        gzip_level: i64,
+        brotli_quality: i64,
+    ) -> Result<Self, SettingsError> {
+        Ok(Self {
+            min_size: u32::try_from(min_size).map_err(|_| SettingsError::MinSize(min_size))?,
+            algos: Algos::of(gzip, brotli)?,
+            gzip_level: GzipLevel::new(gzip_level)?,
+            brotli_quality: BrotliQuality::new(brotli_quality)?,
+        })
+    }
+}
+
+#[pymethods]
+impl Settings {
+    #[new]
+    #[pyo3(signature = (
+        *,
+        min_size = i64::from(DEFAULT_MIN_SIZE),
+        gzip = true,
+        brotli = true,
+        gzip_level = DEFAULT_GZIP_LEVEL,
+        brotli_quality = DEFAULT_BROTLI_QUALITY,
+    ))]
+    fn py_new(
+        min_size: i64,
+        gzip: bool,
+        brotli: bool,
+        gzip_level: i64,
+        brotli_quality: i64,
+    ) -> PyResult<Self> {
+        Ok(Self::parse(
+            min_size,
+            gzip,
+            brotli,
+            gzip_level,
+            brotli_quality,
+        )?)
+    }
+
+    #[getter]
+    fn min_size(&self) -> u32 {
+        self.min_size
+    }
+
+    #[getter]
+    fn gzip(&self) -> bool {
+        self.algos.gzip()
+    }
+
+    #[getter]
+    fn brotli(&self) -> bool {
+        self.algos.brotli()
+    }
+
+    #[getter]
+    fn gzip_level(&self) -> u8 {
+        self.gzip_level.0
+    }
+
+    #[getter]
+    fn brotli_quality(&self) -> u8 {
+        self.brotli_quality.0
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Compression(min_size={}, gzip={}, brotli={}, gzip_level={}, brotli_quality={})",
+            self.min_size,
+            py_bool(self.algos.gzip()),
+            py_bool(self.algos.brotli()),
+            self.gzip_level.0,
+            self.brotli_quality.0
+        )
+    }
+}
+
+fn py_bool(b: bool) -> &'static str {
+    if b {
+        "True"
+    } else {
+        "False"
+    }
+}
+
+/// A codec with the level it runs at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Algo {
-    Gzip,
-    Brotli,
+    Gzip(GzipLevel),
+    Brotli(BrotliQuality),
 }
 
 impl Algo {
     fn header_value(self) -> &'static str {
         match self {
-            Algo::Gzip => "gzip",
-            Algo::Brotli => "br",
+            Algo::Gzip(_) => "gzip",
+            Algo::Brotli(_) => "br",
+        }
+    }
+}
+
+/// The codec [`negotiate`] picked, at this app's level for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Coding {
+    Gzip,
+    Brotli,
+}
+
+impl Coding {
+    fn at(self, settings: &Settings) -> Algo {
+        match self {
+            Coding::Gzip => Algo::Gzip(settings.gzip_level),
+            Coding::Brotli => Algo::Brotli(settings.brotli_quality),
         }
     }
 }
 
 /// Parse `Accept-Encoding` and return the server-preferred algorithm the
 /// client accepts. Server preference: brotli > gzip.
-fn negotiate(accept_encoding: &str, mask: usize) -> Option<Algo> {
-    // Track per-algo max q seen (default 1.0 if listed without q-value).
-    // identity q=0 is respected for completeness but we only return Some
-    // when one of our algorithms is acceptable, so it's informational.
+fn negotiate(accept_encoding: &str, allowed: Algos) -> Option<Coding> {
+    // Per-algo max q seen (1.0 if listed without a q-value); -1 = not listed. `identity` is
+    // not negotiated: with no shared coding the body goes out uncompressed.
     let mut br_q = -1.0f32;
     let mut gz_q = -1.0f32;
     let mut star_q = -1.0f32;
@@ -159,13 +291,10 @@ fn negotiate(accept_encoding: &str, mask: usize) -> Option<Algo> {
                 let mut q = 1.0f32;
                 for param in rest.split(';') {
                     let p = param.trim();
-                    // Case-insensitive "q=" prefix check without heap allocation.
-                    if p.len() >= 2 && p[..2].eq_ignore_ascii_case("q=") {
+                    if let Some(value) = strip_prefix_ignore_ascii_case(p, "q=") {
                         // Malformed q-value → 0.0 (disabled), not 1.0 (max preference).
-                        q = p[2..].trim().parse().unwrap_or(0.0);
-                        // First q= wins; duplicate params (e.g. `br;q=1.0;q=0.0`)
-                        // have undefined semantics, so don't let a later write
-                        // silently flip the preference. Take the first, stop.
+                        q = value.trim().parse().unwrap_or(0.0);
+                        // The first q= wins: a later duplicate must not flip the preference.
                         break;
                     }
                 }
@@ -173,7 +302,6 @@ fn negotiate(accept_encoding: &str, mask: usize) -> Option<Algo> {
             }
             None => (part, 1.0),
         };
-        // eq_ignore_ascii_case avoids a heap allocation on every token.
         if name.eq_ignore_ascii_case("br") {
             br_q = br_q.max(q);
         } else if name.eq_ignore_ascii_case("gzip") || name.eq_ignore_ascii_case("x-gzip") {
@@ -191,13 +319,22 @@ fn negotiate(accept_encoding: &str, mask: usize) -> Option<Algo> {
         gz_q = star_q;
     }
 
-    if mask & ALGO_BR != 0 && br_q > 0.0 {
-        return Some(Algo::Brotli);
+    if allowed.brotli() && br_q > 0.0 {
+        return Some(Coding::Brotli);
     }
-    if mask & ALGO_GZIP != 0 && gz_q > 0.0 {
-        return Some(Algo::Gzip);
+    if allowed.gzip() && gz_q > 0.0 {
+        return Some(Coding::Gzip);
     }
     None
+}
+
+/// `s` without its ASCII `prefix`, matched case-insensitively. Compares bytes, so a
+/// multi-byte character across the prefix length is a mismatch, never a panic.
+fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.as_bytes().get(..prefix.len())?;
+    // The ASCII prefix matched, so `prefix.len()` is a char boundary of `s`.
+    head.eq_ignore_ascii_case(prefix.as_bytes())
+        .then(|| &s[prefix.len()..])
 }
 
 /// Allowlist of content-types that benefit from compression.
@@ -207,8 +344,8 @@ fn is_compressible(content_type: &str) -> bool {
         .next()
         .unwrap_or(content_type)
         .trim();
-    // "text/" prefix — case-insensitive, no allocation.
-    if ct.len() > 5 && ct[..5].eq_ignore_ascii_case("text/") {
+    // "text/" prefix, with a subtype after it.
+    if strip_prefix_ignore_ascii_case(ct, "text/").is_some_and(|subtype| !subtype.is_empty()) {
         return true;
     }
     // application/* and image/svg types. The framework always emits these
@@ -229,253 +366,246 @@ fn is_compressible(content_type: &str) -> bool {
     )
 }
 
-fn gzip_compress(data: &[u8], level: u32, out: &mut Vec<u8>) -> bool {
-    let mut enc = flate2::write::GzEncoder::new(out, flate2::Compression::new(level));
-    if enc.write_all(data).is_err() {
-        return false;
-    }
-    enc.finish().is_ok()
+fn gzip_compress(data: &[u8], level: GzipLevel, out: &mut Vec<u8>) -> std::io::Result<()> {
+    let mut enc = flate2::write::GzEncoder::new(out, flate2::Compression::new(level.0.into()));
+    enc.write_all(data)?;
+    enc.finish()?;
+    Ok(())
 }
 
-fn brotli_compress(data: &[u8], quality: u32, out: &mut Vec<u8>) -> bool {
+fn brotli_compress(data: &[u8], quality: BrotliQuality, out: &mut Vec<u8>) -> std::io::Result<()> {
     let params = brotli::enc::BrotliEncoderParams {
-        quality: quality as i32,
+        quality: quality.0.into(),
         ..Default::default()
     };
     let mut reader = data;
-    brotli::BrotliCompress(&mut reader, out, &params).is_ok()
+    brotli::BrotliCompress(&mut reader, out, &params)?;
+    Ok(())
 }
 
-/// Core compression primitive. Returns Some((compressed_body, encoding))
-/// iff compression should be applied, else None.
-///
-/// Callers are responsible for swapping the body in and setting the
-/// `Content-Encoding` + `Vary: Accept-Encoding` headers via
-/// [`set_compression_headers`].
-fn try_compress(
-    body: &[u8],
-    content_type: &str,
-    accept_encoding: &str,
-) -> Option<(Bytes, &'static str)> {
-    if !is_enabled() {
+/// Mark `headers` as carrying a body compressed with `encoding`: set `Content-Encoding`,
+/// drop a handler-supplied `Content-Length` (it counted the uncompressed body; hyper
+/// recomputes it), and add `Accept-Encoding` to `Vary` unless a `Vary` line names it.
+fn set_compression_headers(headers: &mut HeaderMap, encoding: &'static str) {
+    headers.insert(CONTENT_ENCODING, HeaderValue::from_static(encoding));
+    headers.remove(CONTENT_LENGTH);
+    if headers.get_all(VARY).iter().any(names_accept_encoding) {
+        return;
+    }
+    // Merged into a lone `Vary` line; otherwise a line of its own, which a cache reads
+    // the same way.
+    let mut lines = headers.get_all(VARY).iter();
+    let merged = match (lines.next(), lines.next()) {
+        (Some(only), None) => only.to_str().ok().and_then(|v| {
+            let v = v.trim_end().trim_end_matches(',').trim_end();
+            HeaderValue::from_str(&format!("{v}, Accept-Encoding")).ok()
+        }),
+        _ => None,
+    };
+    if let Some(vary) = merged {
+        headers.insert(VARY, vary);
+    } else {
+        headers.append(VARY, HeaderValue::from_static("Accept-Encoding"));
+    }
+}
+
+fn names_accept_encoding(vary: &HeaderValue) -> bool {
+    vary.to_str().is_ok_and(|v| {
+        v.split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case("accept-encoding"))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Compressing a response
+// ---------------------------------------------------------------------------
+
+/// A body at or above this size is compressed on the blocking pool: gzip-6 and brotli-4
+/// take on the order of 100 µs per 16 KiB, too long to hold a tokio worker.
+const INLINE_MAX_BYTES: usize = 16 * 1024;
+
+/// One body to compress with one codec. Owns a reference to the body, so it can move to
+/// the blocking pool.
+struct Job {
+    body: Bytes,
+    algo: Algo,
+}
+
+impl Job {
+    fn runs_inline(&self) -> bool {
+        let slow = matches!(self.algo, Algo::Brotli(q) if q.0 >= BrotliQuality::SLOW);
+        self.body.len() < INLINE_MAX_BYTES && !slow
+    }
+
+    /// The compressed body, or `None` when compression failed (logged) or did not shrink
+    /// the body.
+    fn run(self) -> Option<Bytes> {
+        let mut buf = COMPRESS_POOL
+            .lock()
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(self.body.len() / 2 + 64));
+        buf.clear();
+
+        let compressed = match self.algo {
+            Algo::Gzip(level) => gzip_compress(&self.body, level, &mut buf),
+            Algo::Brotli(quality) => brotli_compress(&self.body, quality, &mut buf),
+        };
+        let buf = PooledCompressBuf(buf);
+        match compressed {
+            Ok(()) => (buf.0.len() < self.body.len()).then(|| Bytes::from_owner(buf)),
+            Err(e) => {
+                tracing::warn!(
+                    target: "pyronova::server",
+                    error = %e,
+                    encoding = self.algo.header_value(),
+                    "response compression failed; sending the body uncompressed"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// What compressing `data` takes, or `None` when it goes out as is: no settings (off), a
+/// handler-set `Content-Encoding`, a type not worth compressing, a body under
+/// `min_size`, or no coding the client and the app share.
+fn plan(data: &ResponseData, accept_encoding: &str, settings: &Settings) -> Option<Job> {
+    if accept_encoding.is_empty() || data.headers.contains_key("content-encoding") {
         return None;
     }
-    if accept_encoding.is_empty() {
+    if data.body.len() < settings.min_size as usize {
         return None;
     }
-    if body.len() < MIN_SIZE.load(Ordering::Relaxed) {
-        return None;
-    }
+    // A handler's own `content-type` header is the type that goes out.
+    let content_type = data
+        .headers
+        .get("content-type")
+        .or_else(|| data.content_type.to_str().ok())?;
     if !is_compressible(content_type) {
         return None;
     }
-
-    let mask = ALGO_MASK.load(Ordering::Relaxed);
-    let algo = negotiate(accept_encoding, mask)?;
-
-    let mut buf = COMPRESS_POOL
-        .lock()
-        .pop()
-        .unwrap_or_else(|| Vec::with_capacity(body.len() / 2 + 64));
-    buf.clear();
-
-    let ok = match algo {
-        Algo::Gzip => gzip_compress(body, GZIP_LEVEL.load(Ordering::Relaxed) as u32, &mut buf),
-        Algo::Brotli => brotli_compress(
-            body,
-            BROTLI_QUALITY.load(Ordering::Relaxed) as u32,
-            &mut buf,
-        ),
-    };
-
-    // Return buf to pool if compression failed or didn't shrink the body.
-    if !ok || buf.len() >= body.len() {
-        drop(PooledCompressBuf(buf));
-        return None;
-    }
-
-    Some((
-        Bytes::from_owner(PooledCompressBuf(buf)),
-        algo.header_value(),
-    ))
+    let coding = negotiate(accept_encoding, settings.algos)?;
+    Some(Job {
+        body: data.body.clone(),
+        algo: coding.at(settings),
+    })
 }
 
-/// Merge `Accept-Encoding` into an existing `Vary` header (case-insensitive)
-/// and set `Content-Encoding`. Used by the main-thread `ResponseData` path.
-fn set_compression_headers(
-    headers: &mut std::collections::HashMap<String, String>,
-    encoding: &'static str,
-) {
-    headers.insert("content-encoding".to_string(), encoding.to_string());
-    // Remove any handler-supplied Content-Length — it reflected the pre-compression
-    // size and is now wrong. hyper will recompute from the compressed body.
-    headers.retain(|k, _| !k.eq_ignore_ascii_case("content-length"));
-    let existing_vary = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("vary"))
-        .map(|(k, v)| (k.clone(), v.clone()));
-    match existing_vary {
-        Some((k, v)) => {
-            if !v
-                .split(',')
-                .any(|tok| tok.trim().eq_ignore_ascii_case("accept-encoding"))
-            {
-                let v_clean = v.trim_end().trim_end_matches(',').trim_end();
-                headers.insert(k, format!("{v_clean}, Accept-Encoding"));
-            }
-        }
-        None => {
-            headers.insert("vary".to_string(), "Accept-Encoding".to_string());
-        }
-    }
-}
-
-/// Same as [`set_compression_headers`] but for the sub-interpreter path where
-/// headers are stored as `Vec<(String, String)>` to support duplicate keys
-/// (e.g. multiple `Set-Cookie` values).
-fn set_compression_headers_vec(headers: &mut Vec<(String, String)>, encoding: &'static str) {
-    headers.push(("content-encoding".to_string(), encoding.to_string()));
-    // Remove any handler-supplied Content-Length — it reflected the pre-compression
-    // size and is now wrong. hyper will recompute from the compressed body.
-    headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
-    let existing_vary = headers
-        .iter()
-        .position(|(k, _)| k.eq_ignore_ascii_case("vary"));
-    match existing_vary {
-        Some(idx) => {
-            let v = &headers[idx].1;
-            if !v
-                .split(',')
-                .any(|tok| tok.trim().eq_ignore_ascii_case("accept-encoding"))
-            {
-                let v_clean = v.trim_end().trim_end_matches(',').trim_end();
-                let new_val = format!("{v_clean}, Accept-Encoding");
-                headers[idx].1 = new_val;
-            }
-        }
-        None => {
-            headers.push(("vary".to_string(), "Accept-Encoding".to_string()));
-        }
-    }
-}
-
-/// Maybe compress `data` in place. No-op when:
-///   - globally disabled
-///   - `accept_encoding` is empty or doesn't include a supported algorithm
-///   - body is smaller than the configured minimum
-///   - content-type is not in the compressible allowlist
-///   - handler already set a `Content-Encoding` header
-pub(crate) fn maybe_compress(data: &mut ResponseData, accept_encoding: &str) {
-    if data
-        .headers
-        .keys()
-        .any(|k| k.eq_ignore_ascii_case("content-encoding"))
-    {
-        return;
-    }
-    let Some((compressed, encoding)) =
-        try_compress(&data.body, &data.content_type, accept_encoding)
-    else {
-        return;
-    };
+fn apply(data: &mut ResponseData, compressed: Bytes, algo: Algo) {
     data.body = compressed;
-    set_compression_headers(&mut data.headers, encoding);
+    set_compression_headers(data.headers.as_map_mut(), algo.header_value());
 }
 
-/// Variant used by the sub-interpreter fast path.
-///
-/// Takes `body` by value to avoid the `Bytes → Vec` copy that the old
-/// `&mut Vec<u8>` + `compressed.to_vec()` pattern required. Returns
-/// `Bytes` directly: the compressed pool buffer or (if no compression)
-/// the original `Vec<u8>` wrapped in `Bytes::from` (O(1) ownership
-/// transfer, no copy).
-pub(crate) fn maybe_compress_subinterp(
-    body: Vec<u8>,
-    content_type: &str,
-    headers: &mut Vec<(String, String)>,
+/// `data` compressed for a client that sent `accept_encoding`, as `settings` (the app's;
+/// `None` = off) allow. A large body is compressed on the blocking pool.
+pub(crate) async fn compress(
+    mut data: ResponseData,
     accept_encoding: &str,
-) -> Bytes {
-    if headers
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
-    {
-        return Bytes::from(body);
-    }
-    let Some((compressed, encoding)) = try_compress(&body, content_type, accept_encoding) else {
-        return Bytes::from(body);
+    settings: Option<&Settings>,
+) -> ResponseData {
+    let Some(job) = settings.and_then(|s| plan(&data, accept_encoding, s)) else {
+        return data;
     };
-    set_compression_headers_vec(headers, encoding);
-    compressed
+    let algo = job.algo;
+    let compressed = if job.runs_inline() {
+        job.run()
+    } else {
+        off_the_worker(job).await
+    };
+    if let Some(compressed) = compressed {
+        apply(&mut data, compressed, algo);
+    }
+    data
+}
+
+async fn off_the_worker(job: Job) -> Option<Bytes> {
+    let encoding = job.algo.header_value();
+    match tokio::task::spawn_blocking(move || job.run()).await {
+        Ok(compressed) => compressed,
+        Err(e) => {
+            tracing::warn!(
+                target: "pyronova::server",
+                error = %e,
+                encoding,
+                "response compression task did not finish; sending the body uncompressed"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
+    use crate::types::ResponseHeaders;
 
-    // Tests share global config state — serialize them to prevent races.
-    static CONFIG_LOCK: Mutex<()> = Mutex::new(());
+    fn settings(min_size: i64, gzip: bool, brotli: bool) -> Settings {
+        Settings::parse(min_size, gzip, brotli, 6, 4).unwrap()
+    }
 
-    fn reset() {
-        configure(false, DEFAULT_MIN_SIZE, true, true, 6, 4);
+    fn json(body: impl Into<Bytes>) -> ResponseData {
+        ResponseData {
+            body: body.into(),
+            content_type: HeaderValue::from_static("application/json"),
+            status: hyper::StatusCode::OK,
+            headers: ResponseHeaders::new(),
+        }
+    }
+
+    /// `compress` on a current-thread runtime, as a TPC thread runs it.
+    fn compressed(data: ResponseData, accept: &str, settings: Option<&Settings>) -> ResponseData {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(compress(data, accept, settings))
     }
 
     #[test]
     fn negotiate_picks_brotli_over_gzip() {
-        let algo = negotiate("gzip, deflate, br", ALGO_GZIP | ALGO_BR);
-        assert_eq!(algo, Some(Algo::Brotli));
+        assert_eq!(
+            negotiate("gzip, deflate, br", Algos::Both),
+            Some(Coding::Brotli)
+        );
     }
 
     #[test]
     fn negotiate_gzip_only_when_brotli_disabled() {
-        let algo = negotiate("gzip, br", ALGO_GZIP);
-        assert_eq!(algo, Some(Algo::Gzip));
+        assert_eq!(negotiate("gzip, br", Algos::Gzip), Some(Coding::Gzip));
     }
 
     #[test]
     fn negotiate_respects_q_zero() {
-        let algo = negotiate("br;q=0, gzip", ALGO_GZIP | ALGO_BR);
-        assert_eq!(algo, Some(Algo::Gzip));
+        assert_eq!(negotiate("br;q=0, gzip", Algos::Both), Some(Coding::Gzip));
     }
 
     #[test]
     fn negotiate_wildcard() {
-        let algo = negotiate("*", ALGO_GZIP | ALGO_BR);
-        assert_eq!(algo, Some(Algo::Brotli));
+        assert_eq!(negotiate("*", Algos::Both), Some(Coding::Brotli));
     }
 
     #[test]
     fn negotiate_wildcard_q_zero_excludes() {
-        // "*;q=0, gzip" — explicitly listed gzip wins, brotli excluded by wildcard
-        let algo = negotiate("*;q=0, gzip", ALGO_GZIP | ALGO_BR);
-        assert_eq!(algo, Some(Algo::Gzip));
+        assert_eq!(negotiate("*;q=0, gzip", Algos::Both), Some(Coding::Gzip));
     }
 
     #[test]
     fn negotiate_none_when_unsupported() {
-        assert_eq!(negotiate("deflate, compress", ALGO_GZIP | ALGO_BR), None);
+        assert_eq!(negotiate("deflate, compress", Algos::Both), None);
     }
 
     #[test]
     fn negotiate_uppercase_q_param() {
-        // Q= should be treated the same as q= (case-insensitive param name).
-        let algo = negotiate("br;Q=0, gzip", ALGO_GZIP | ALGO_BR);
-        assert_eq!(algo, Some(Algo::Gzip));
+        assert_eq!(negotiate("br;Q=0, gzip", Algos::Both), Some(Coding::Gzip));
     }
 
     #[test]
     fn negotiate_uppercase_algo_names() {
-        // BR / GZIP in caps — real clients don't do this but we should be robust.
-        let algo = negotiate("BR, GZIP", ALGO_GZIP | ALGO_BR);
-        assert_eq!(algo, Some(Algo::Brotli));
+        assert_eq!(negotiate("BR, GZIP", Algos::Both), Some(Coding::Brotli));
     }
 
     #[test]
     fn negotiate_malformed_q_disables() {
-        // Malformed q-value should disable the algorithm (0.0), not enable it (1.0).
-        let algo = negotiate("br;q=bad, gzip", ALGO_GZIP | ALGO_BR);
-        assert_eq!(algo, Some(Algo::Gzip));
+        assert_eq!(negotiate("br;q=bad, gzip", Algos::Both), Some(Coding::Gzip));
     }
 
     #[test]
@@ -503,125 +633,161 @@ mod tests {
     }
 
     #[test]
-    fn disabled_by_default_is_noop() {
-        let _g = CONFIG_LOCK.lock().unwrap();
-        reset();
-        let mut data = ResponseData {
-            body: Bytes::from(vec![b'x'; 2048]),
-            content_type: "application/json".to_string(),
-            status: 200,
-            headers: HashMap::new(),
-        };
-        let before = data.body.clone();
-        maybe_compress(&mut data, "gzip, br");
-        assert_eq!(data.body, before);
+    fn no_settings_is_noop() {
+        let data = compressed(json(vec![b'x'; 2048]), "gzip, br", None);
+        assert_eq!(data.body.len(), 2048);
         assert!(!data.headers.contains_key("content-encoding"));
     }
 
     #[test]
     fn enabled_compresses_json() {
-        let _g = CONFIG_LOCK.lock().unwrap();
-        configure(true, 100, true, true, 6, 4);
-        let payload = serde_json::to_vec(&serde_json::json!({
-            "items": vec!["hello world"; 100]
-        }))
-        .unwrap();
-        let mut data = ResponseData {
-            body: Bytes::from(payload.clone()),
-            content_type: "application/json".to_string(),
-            status: 200,
-            headers: HashMap::new(),
-        };
-        maybe_compress(&mut data, "br, gzip");
+        let payload = vec![b'x'; 4096];
+        let data = compressed(
+            json(payload.clone()),
+            "br, gzip",
+            Some(&settings(100, true, true)),
+        );
         assert!(data.body.len() < payload.len());
         assert_eq!(data.headers.get("content-encoding").unwrap(), "br");
         assert_eq!(
             data.headers.get("vary").unwrap().to_ascii_lowercase(),
             "accept-encoding"
         );
-        reset();
+    }
+
+    #[test]
+    fn large_body_compresses_off_the_worker() {
+        let payload = vec![b'y'; INLINE_MAX_BYTES * 4];
+        let job = plan(&json(payload.clone()), "gzip", &settings(100, true, false)).unwrap();
+        assert!(!job.runs_inline());
+        let data = compressed(
+            json(payload.clone()),
+            "gzip",
+            Some(&settings(100, true, false)),
+        );
+        assert!(data.body.len() < payload.len());
+        assert_eq!(data.headers.get("content-encoding").unwrap(), "gzip");
+    }
+
+    #[test]
+    fn slow_brotli_quality_never_runs_inline() {
+        let slow = Settings::parse(0, false, true, 6, 11).unwrap();
+        let job = plan(&json(vec![b'z'; 1024]), "br", &slow).unwrap();
+        assert!(!job.runs_inline());
+        let fast = plan(&json(vec![b'z'; 1024]), "br", &settings(0, false, true)).unwrap();
+        assert!(fast.runs_inline());
     }
 
     #[test]
     fn small_body_skipped() {
-        let _g = CONFIG_LOCK.lock().unwrap();
-        configure(true, 512, true, true, 6, 4);
-        let mut data = ResponseData {
-            body: Bytes::from("small"),
-            content_type: "application/json".to_string(),
-            status: 200,
-            headers: HashMap::new(),
-        };
-        maybe_compress(&mut data, "gzip, br");
-        assert!(!data.headers.contains_key("content-encoding"));
-        reset();
+        let data = json("small");
+        assert!(plan(&data, "gzip, br", &settings(512, true, true)).is_none());
     }
 
     #[test]
     fn binary_content_type_skipped() {
-        let _g = CONFIG_LOCK.lock().unwrap();
-        configure(true, 100, true, true, 6, 4);
-        let mut data = ResponseData {
-            body: Bytes::from(vec![0u8; 2048]),
-            content_type: "image/png".to_string(),
-            status: 200,
-            headers: HashMap::new(),
-        };
-        maybe_compress(&mut data, "gzip, br");
-        assert!(!data.headers.contains_key("content-encoding"));
-        reset();
+        let mut data = json(vec![0u8; 2048]);
+        data.content_type = HeaderValue::from_static("image/png");
+        assert!(plan(&data, "gzip, br", &settings(100, true, true)).is_none());
     }
 
     #[test]
     fn handler_content_encoding_preserved() {
-        let _g = CONFIG_LOCK.lock().unwrap();
-        configure(true, 100, true, true, 6, 4);
-        let mut headers = HashMap::new();
-        headers.insert("Content-Encoding".to_string(), "identity".to_string());
-        let mut data = ResponseData {
-            body: Bytes::from(vec![b'x'; 2048]),
-            content_type: "application/json".to_string(),
-            status: 200,
-            headers,
-        };
-        maybe_compress(&mut data, "gzip, br");
-        // No override; existing header stays.
+        let mut data = json(vec![b'x'; 2048]);
+        data.headers
+            .as_map_mut()
+            .insert(CONTENT_ENCODING, HeaderValue::from_static("identity"));
+        let data = compressed(data, "gzip, br", Some(&settings(100, true, true)));
         assert_eq!(data.headers.get("Content-Encoding").unwrap(), "identity");
-        reset();
     }
 
     #[test]
     fn vary_merges_with_existing() {
-        let _g = CONFIG_LOCK.lock().unwrap();
-        configure(true, 100, true, true, 6, 4);
-        let mut headers = HashMap::new();
-        headers.insert("Vary".to_string(), "Origin".to_string());
-        let payload = vec![b'a'; 4096];
-        let mut data = ResponseData {
-            body: Bytes::from(payload),
-            content_type: "application/json".to_string(),
-            status: 200,
-            headers,
-        };
-        maybe_compress(&mut data, "gzip");
-        let vary = data.headers.get("Vary").unwrap();
-        assert!(vary.to_ascii_lowercase().contains("origin"));
-        assert!(vary.to_ascii_lowercase().contains("accept-encoding"));
-        reset();
+        let mut data = json(vec![b'a'; 4096]);
+        data.headers
+            .as_map_mut()
+            .insert(VARY, HeaderValue::from_static("Origin"));
+        let data = compressed(data, "gzip", Some(&settings(100, true, true)));
+        let vary = data.headers.get("Vary").unwrap().to_ascii_lowercase();
+        assert!(vary.contains("origin"));
+        assert!(vary.contains("accept-encoding"));
     }
 
     #[test]
     fn empty_accept_encoding_noop() {
-        let _g = CONFIG_LOCK.lock().unwrap();
-        configure(true, 100, true, true, 6, 4);
-        let mut data = ResponseData {
-            body: Bytes::from(vec![b'x'; 2048]),
-            content_type: "application/json".to_string(),
-            status: 200,
-            headers: HashMap::new(),
-        };
-        maybe_compress(&mut data, "");
-        assert!(!data.headers.contains_key("content-encoding"));
-        reset();
+        assert!(plan(&json(vec![b'x'; 2048]), "", &settings(100, true, true)).is_none());
+    }
+
+    #[test]
+    fn is_compressible_non_ascii_does_not_panic() {
+        // Byte 5 falls inside the 3-byte '€': a `str[..5]` slice panics here.
+        assert!(!is_compressible("tex\u{20ac}/plain"));
+        assert!(!is_compressible("\u{20ac}\u{20ac}/x"));
+        assert!(is_compressible("text/\u{20ac}"));
+        assert!(!is_compressible("text/"));
+    }
+
+    #[test]
+    fn negotiate_non_ascii_param_does_not_panic() {
+        // Byte 2 falls inside the 3-byte '€' of the parameter.
+        assert_eq!(
+            negotiate("br;\u{20ac}, gzip", Algos::Both),
+            Some(Coding::Brotli)
+        );
+        assert_eq!(
+            negotiate("br;q\u{20ac}", Algos::Brotli),
+            Some(Coding::Brotli)
+        );
+    }
+
+    #[test]
+    fn levels_out_of_range_are_errors_not_clamped() {
+        assert_eq!(
+            Settings::parse(100, true, true, 42, 4),
+            Err(SettingsError::GzipLevel(42))
+        );
+        assert_eq!(
+            Settings::parse(100, true, true, 0, 4),
+            Err(SettingsError::GzipLevel(0))
+        );
+        assert_eq!(
+            Settings::parse(100, true, true, 6, 12),
+            Err(SettingsError::BrotliQuality(12))
+        );
+        assert_eq!(
+            Settings::parse(100, true, true, 6, -1),
+            Err(SettingsError::BrotliQuality(-1))
+        );
+        assert_eq!(
+            Settings::parse(-1, true, true, 6, 4),
+            Err(SettingsError::MinSize(-1))
+        );
+    }
+
+    #[test]
+    fn no_algorithm_is_an_error() {
+        assert_eq!(
+            Settings::parse(100, false, false, 6, 4),
+            Err(SettingsError::NoAlgorithm)
+        );
+    }
+
+    #[test]
+    fn range_edges_are_accepted() {
+        let s = Settings::parse(0, true, false, 1, 0).unwrap();
+        assert_eq!((s.gzip_level.0, s.brotli_quality.0), (1, 0));
+        let s = Settings::parse(0, false, true, 9, 11).unwrap();
+        assert_eq!((s.gzip_level.0, s.brotli_quality.0), (9, 11));
+    }
+
+    #[test]
+    fn compress_helpers_report_success_as_a_result() {
+        let data = vec![b'a'; 4096];
+        let mut gz = Vec::new();
+        gzip_compress(&data, GzipLevel(6), &mut gz).unwrap();
+        assert!(!gz.is_empty() && gz.len() < data.len());
+        let mut br = Vec::new();
+        brotli_compress(&data, BrotliQuality(4), &mut br).unwrap();
+        assert!(!br.is_empty() && br.len() < data.len());
     }
 }

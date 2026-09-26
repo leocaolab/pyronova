@@ -24,6 +24,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._helpers import listening_ports
+
 _supported = pytest.mark.skipif(
     sys.platform not in ("linux", "darwin"),
     reason="isolate() clones via cp -c / cp --reflink (Linux/macOS)",
@@ -80,9 +82,10 @@ def test_single_phase_check_unreadable_counts_as_single(tmp_path):
     assert is_single(str(tmp_path / "missing.so")) is True
 
 
-def _start(script_text, tmp_path, name, port, workers, env_extra=None):
+def _start(script_text, tmp_path, name, workers, env_extra=None):
+    """Launches the script on port 0; `_base` reads the port it bound from the log."""
     script = tmp_path / f"{name}.py"
-    script.write_text(script_text.replace("{port}", str(port)))
+    script.write_text(script_text.replace("{port}", "0"))
     log = tmp_path / f"{name}.log"
     env = dict(os.environ, PYRONOVA_WORKERS=str(workers),
                PYRONOVA_ISOLATE_DIR=str(tmp_path / "copies"), **(env_extra or {}))
@@ -91,19 +94,28 @@ def _start(script_text, tmp_path, name, port, workers, env_extra=None):
     return proc, log
 
 
-def _get(url, proc, log, tries=400):
+def _base(log) -> str | None:
+    """The server's base URL once its startup line names the bound port."""
+    ports = listening_ports(log.read_text(errors="replace"))
+    return f"http://127.0.0.1:{ports[0]}" if ports else None
+
+
+def _get(path, proc, log, tries=400):
     for _ in range(tries):
         if proc.poll() is not None:
             pytest.fail(f"server exited early (rc={proc.returncode}):\n"
                         f"{log.read_text(errors='replace')[-3000:]}")
-        try:
-            r = urllib.request.urlopen(url, timeout=10)
-            if r.status == 200:
-                return json.loads(r.read())
-        except urllib.error.HTTPError as e:
-            pytest.fail(f"{url} -> HTTP {e.code}:\n{log.read_text(errors='replace')[-3000:]}")
-        except Exception:
-            pass
+        base = _base(log)
+        if base is not None:
+            url = base + path
+            try:
+                r = urllib.request.urlopen(url, timeout=10)
+                if r.status == 200:
+                    return json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                pytest.fail(f"{url} -> HTTP {e.code}:\n{log.read_text(errors='replace')[-3000:]}")
+            except Exception:
+                pass
         time.sleep(0.5)
     pytest.fail(f"server never became ready:\n{log.read_text(errors='replace')[-3000:]}")
 
@@ -146,10 +158,9 @@ def test_shared_single_phase_ext_is_cloned_not_loaded_shared(tmp_path):
     refused before its init runs, scipy is cloned, and `_fblas` is built in
     the worker. Finalization (no hard exit) must be clean too."""
     pytest.importorskip("scipy")
-    port = 8995
-    proc, log = _start(_SCIPY_LAZY, tmp_path, "scipy_lazy", port, workers=2)
+    proc, log = _start(_SCIPY_LAZY, tmp_path, "scipy_lazy", workers=2)
     try:
-        r = _get(f"http://127.0.0.1:{port}/sp", proc, log)
+        r = _get("/sp", proc, log)
         assert r["fun"] < 1e-6
         assert r["fblas_isolated"], "scipy.linalg._fblas was loaded from the shared file"
     finally:
@@ -188,11 +199,10 @@ def test_undeclared_ext_without_own_guard_is_isolated_in_every_worker(tmp_path):
     covers the def's refcount), and SIGINT must finalize cleanly."""
     pytest.importorskip("orjson")
     import concurrent.futures
-    port = 8996
-    proc, log = _start(_ORJSON_TOP, tmp_path, "orjson_top", port, workers=4)
+    proc, log = _start(_ORJSON_TOP, tmp_path, "orjson_top", workers=4)
     try:
-        url = f"http://127.0.0.1:{port}/oj"
-        _get(url, proc, log)
+        _get("/oj", proc, log)
+        url = _base(log) + "/oj"
         with concurrent.futures.ThreadPoolExecutor(16) as ex:
             rs = list(ex.map(lambda _: json.loads(urllib.request.urlopen(url, timeout=10).read()),
                              range(64)))
@@ -236,11 +246,10 @@ def test_graceful_sigint_finalizes_isolated_workers(tmp_path):
     single-phase modules + orjson)."""
     pytest.importorskip("scipy")
     pytest.importorskip("orjson")
-    port = 8997
-    proc, log = _start(_FINALIZE, tmp_path, "finalize", port, workers=4)
+    proc, log = _start(_FINALIZE, tmp_path, "finalize", workers=4)
     try:
         for _ in range(8):
-            _get(f"http://127.0.0.1:{port}/x", proc, log)
+            _get("/x", proc, log)
     finally:
         rc = _sigint(proc)
     text = log.read_text(errors="replace")

@@ -2,7 +2,7 @@
 
 A worker runs the same program as the main interpreter: the user's script
 imports the real `pyronova` package and its engine. This bootstrap only
-prepares the interpreter for it (Layer 2, FR-10):
+prepares the interpreter for it:
 
 - routes Python `logging` through Rust `tracing` (`pyronova.engine.emit_python_log`),
   tagged with this worker's id;
@@ -10,8 +10,9 @@ prepares the interpreter for it (Layer 2, FR-10):
 - installs per-worker C-extension isolation (private library copies for
   extensions that can't be shared between interpreters).
 
-It runs as the module `__pyronova_bootstrap__`, in its own namespace. Rust sets
-`WORKER_ID` and `POOL_ID` in it before it runs.
+It runs as the module `__pyronova_bootstrap__`, in its own namespace. Rust sets in it
+before it runs: `WORKER_ID` (this worker's index) and `ISOLATE_LIBS` (the libraries
+`app.isolate(...)` declared, a tuple of names).
 """
 
 # -- Python logging bridge to Rust tracing -----------------------------------
@@ -20,99 +21,28 @@ import logging as _logging
 import os as _os
 import sys, os
 
-# Set once `pyronova.engine` is imported, at the end of this file (after the
-# isolation machinery is installed, so the package's own imports go through it).
-_emit_python_log = None
-
-
-class _PyronovaRustHandler(_logging.Handler):
-    """Routes Python logging records through Rust tracing, tagged with this
-    worker's id. Records logged before the engine is imported (during this
-    bootstrap) go to stderr."""
-
-    def __init__(self, worker_id):
-        super().__init__()
-        self._worker_id = worker_id
-
-    def emit(self, record):
-        try:
-            msg = record.getMessage()
-            # Preserve exception tracebacks (logger.exception / exc_info=True).
-            # Use a local variable rather than mutating record.exc_text so the
-            # same LogRecord can safely be routed to multiple handlers.
-            if record.exc_info:
-                exc_text = record.exc_text or self.formatException(record.exc_info)
-                msg = f"{msg}\n{exc_text}"
-            if _emit_python_log is None:
-                sys.stderr.write(f"{record.levelname} {record.name}: {msg}\n")
-                return
-            _emit_python_log(
-                record.levelname,
-                record.name,
-                msg,
-                record.pathname or "",
-                record.lineno or 0,
-                self._worker_id,
-            )
-        except Exception:
-            # Never crash business logic due to logging. `handleError` is
-            # Python's own "I tried to log and it blew up" hook — it
-            # respects `logging.raiseExceptions` (False in production) and
-            # writes a diagnostic to sys.stderr with the failing record,
-            # which `pass` silently discarded. Upstream handlers on every
-            # stdlib logging class use this exact pattern.
-            self.handleError(record)
+# `RustLogHandler` and `root_level` come from `pyronova/_log_bridge.py`, which the
+# engine runs in this namespace just before this file. The handler writes to stderr
+# until it is connected to the engine, at the end of this file (after the isolation
+# machinery is installed, so the package's own imports go through it).
 
 _root = _logging.getLogger()
 _root.handlers.clear()
-_root.addHandler(_PyronovaRustHandler(WORKER_ID))
-# Sync Python's level gate with Rust's EnvFilter — rejects calls below
-# threshold *before* getMessage() formatting or FFI crossing occurs.
-# e.g. level=ERROR → logger.debug() returns immediately, no FFI overhead.
-_PYRONOVA_LEVEL_MAP = {
-    "TRACE": _logging.DEBUG, "DEBUG": _logging.DEBUG,
-    "INFO": _logging.INFO, "WARN": _logging.WARNING, "WARNING": _logging.WARNING,
-    "ERROR": _logging.ERROR, "CRITICAL": _logging.CRITICAL,
-    "OFF": _logging.CRITICAL + 10,
-}
-_log_level_str = _os.environ.get("PYRONOVA_LOG_LEVEL", "DEBUG").upper()
-if _log_level_str not in _PYRONOVA_LEVEL_MAP:
-    print(
-        f"pyronova: unrecognized PYRONOVA_LOG_LEVEL={_log_level_str!r}, defaulting to DEBUG",
-        file=sys.stderr,
-    )
-_root.setLevel(_PYRONOVA_LEVEL_MAP.get(_log_level_str, _logging.DEBUG))
+_log_handler = RustLogHandler(WORKER_ID)
+_root.addHandler(_log_handler)
+# The root level is synced with Rust's filter at the end of this file, once the
+# engine is imported.
 
-# -- Smart GC: hand Python GC scheduling off to the Rust engine --------------
+# -- GC: cycle collection on the engine's schedule ----------------------------
 #
-# CPython's default GC triggers on a per-generation allocation threshold
-# (gc.get_threshold() = (700, 10, 10) by default). At 400k+ rps that
-# threshold is tripped HUNDREDS of times per second, each hit blocking
-# the current thread for generation-0 scan + possibly escalating to gen-1
-# or gen-2. On the request hot path this translates into P99 tail
-# latency spikes of 10-50ms even on an otherwise well-behaved workload.
-#
-# Fix: turn off CPython's automatic trigger entirely. The Rust engine
-# holds a cached `gc.collect` function pointer per sub-interp and fires
-# it at a configurable request-count interval (default 5000, control
-# via `PYRONOVA_GC_THRESHOLD=N` — set 0 to disable scheduled collection
-# entirely on workloads that never accrete cycles).
-#
-# Ref counting still runs on every DECREF to zero, so non-cyclic garbage
-# is collected instantly. Only cycle-collection waits for the timer.
-# For the standard Pyronova request path (where Request + Response are
-# ref-counted to zero by tp_dealloc at the end of each handler), there
-# are effectively no cycles to collect — gc.collect() becomes a
-# zero-cost safety valve.
+# CPython's allocation-threshold trigger fires hundreds of times a second at high
+# request rates, each a pause on the request path (p99 spikes). The engine runs
+# `gc.collect()` on its own schedule instead (`GcMode` in src/config.rs,
+# `PYRONOVA_GC_MODE`); reference counting still frees non-cyclic garbage at once.
 try:
     import gc as _gc
     _gc.disable()
 except Exception:
-    # NEVER silently swallow. If gc.disable() fails, automatic GC stays
-    # on — at 400k RPS that means hundreds of generation-0 collections
-    # per second, each adding 10-50ms to P99 tail latency. Without this
-    # log the regression is invisible until production monitoring catches
-    # the tail spike. Emit at ERROR so it shows up in default log filters.
     _logging.getLogger("pyronova.bootstrap").error(
         "gc.disable() failed — CPython auto-GC remains active; "
         "expect P99 tail spikes at high RPS",
@@ -127,8 +57,9 @@ except Exception:
 # sub-interpreters ("does not support loading in subinterpreters").
 #
 # Two ways in, one machinery:
-#   • PROACTIVE — `app.isolate("numpy")` records the lib in PYRONOVA_ISOLATE_LIBS;
-#     `_pyronova_isolate_libs()` clones it at worker init, before the user script.
+#   • PROACTIVE — `app.isolate("numpy")` records the lib on the app; the worker gets the
+#     list as `ISOLATE_LIBS` and `_pyronova_isolate_libs()` clones it at worker init,
+#     before the user script.
 #   • REACTIVE  — `_iso_import` (installed as builtins.__import__ below) catches the
 #     "does not support loading in subinterpreters" / PyO3 #576 ImportError, reads
 #     the offending binary module straight out of the error, isolates it, and
@@ -177,14 +108,10 @@ def _iso_resolve_src(lib):
     """On-disk source dir (package) or file (single-file ext) for `lib` in the
     ORIGINAL install, or None.
 
-    Searches sys.path without the isolate root. Once one lib is isolated, this
-    worker's clone dir is on sys.path, and it can already hold a clone of the
-    NEXT lib (clone dirs are reused across runs). Resolving to that clone made
-    `_iso_clone_lib` compare the clone against itself, find the signature
-    stale, rmtree it and copy from the path it had just deleted; the retry then
-    loaded the shared site-packages file (sklearn after scipy: "Interpreter
-    change detected - this module can only be loaded into one interpreter per
-    process").
+    Searches sys.path without the isolate root: once one lib is isolated, this
+    worker's clone dir is on sys.path and may already hold a clone of the NEXT lib
+    (clone dirs are reused across runs). Resolving to that clone would compare the
+    clone against itself, delete it and copy from the deleted path.
 
     Uses PathFinder (searches the given path directly, ignoring sys.modules)
     rather than importlib.util.find_spec: a single-phase extension re-init can
@@ -192,7 +119,7 @@ def _iso_resolve_src(lib):
     internal _pydantic_core.so), and find_spec() raises ValueError on such an
     entry."""
     import sys, importlib.util, importlib.machinery
-    root = _os.path.realpath(_os.environ.get("PYRONOVA_ISOLATE_DIR", "/tmp/pyronova-isolate"))
+    root = _os.path.realpath(_iso_root())
     path = [p for p in sys.path
             if not (_os.path.realpath(p or ".") + _os.sep).startswith(root + _os.sep)]
     try:
@@ -216,6 +143,40 @@ def _iso_resolve_src(lib):
     return None
 
 
+class _IsoError(RuntimeError):
+    """Per-worker isolation could not prepare a library's private copy."""
+
+
+def _iso_root():
+    """Where the per-worker clones live: `PYRONOVA_ISOLATE_DIR`, else a directory
+    of this user's own in the temp dir."""
+    import tempfile
+    return _os.environ.get("PYRONOVA_ISOLATE_DIR") or _os.path.join(
+        tempfile.gettempdir(), "pyronova-isolate-%d" % _os.getuid()
+    )
+
+
+def _iso_claim_root(root):
+    """Create `root` private to this user, or check an existing one is. Workers
+    load `.so` files from under it, so a root another user can write to lets
+    them plant code that runs in this server."""
+    import stat
+    _os.makedirs(root, mode=0o700, exist_ok=True)
+    st = _os.lstat(root)
+    if not stat.S_ISDIR(st.st_mode):
+        raise _IsoError(f"isolate dir {root} is not a directory (a symlink?); refusing to load clones from it")
+    if st.st_uid != _os.getuid():
+        raise _IsoError(
+            f"isolate dir {root} is owned by uid {st.st_uid}, not this user ({_os.getuid()}); "
+            "refusing to load clones from it. Set PYRONOVA_ISOLATE_DIR to a directory you own."
+        )
+    if st.st_mode & 0o022:
+        raise _IsoError(
+            f"isolate dir {root} is writable by other users (mode {stat.S_IMODE(st.st_mode):o}); "
+            "refusing to load clones from it. chmod go-w it or set PYRONOVA_ISOLATE_DIR."
+        )
+
+
 def _iso_worker_dir(seed_libs):
     """Claim (once) this worker's private clone dir and add it to sys.path.
 
@@ -233,7 +194,8 @@ def _iso_worker_dir(seed_libs):
     if _ISO["worker_dir"] is not None:
         return _ISO["worker_dir"]
     import os, sys, fcntl, hashlib
-    root = os.environ.get("PYRONOVA_ISOLATE_DIR", "/tmp/pyronova-isolate")
+    root = _iso_root()
+    _iso_claim_root(root)
     if seed_libs:
         sig = hashlib.sha1()
         for lib in seed_libs:
@@ -266,68 +228,124 @@ def _iso_worker_dir(seed_libs):
     worker_dir = os.path.join(base, "w%d" % idx)
     os.makedirs(worker_dir, exist_ok=True)
     _ISO["worker_dir"] = worker_dir
-    # NOTE: do NOT put worker_dir on sys.path here. The clone SOURCE must always
-    # resolve to the ORIGINAL install (site-packages), never to a prior clone —
-    # if worker_dir were on the path before cloning, on a warm restart
-    # `_iso_resolve_src` would find the existing clone and treat it as the source,
-    # and the freshness check would rmtree-then-cp it onto itself, destroying it.
-    # Path insertion happens in `_iso_ensure_on_path`, AFTER cloning.
     return worker_dir
 
 
 def _iso_ensure_on_path(worker_dir):
     """Put this worker's clone dir at the front of sys.path (once), so imports of
-    isolated libs resolve to the private copy. Called AFTER cloning — see the
-    ordering note in `_iso_worker_dir`."""
+    isolated libs resolve to the private copy."""
     import sys
     if not _ISO["path_inserted"]:
         sys.path.insert(0, worker_dir)
         _ISO["path_inserted"] = True
 
 
+def _iso_remove(path):
+    """Remove a clone, a partial copy or a lost race's copy as what it is: `rmtree` for a
+    real directory, `os.remove` for a file (a single-file extension) or a symlink (never
+    followed into what it points at)."""
+    import os, shutil
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    else:
+        os.remove(path)
+
+
+def _iso_clone_files(clone):
+    """The files of a clone as {relative path: size} ("" for a single-file clone).
+    `__pycache__` is left out: Python writes there at runtime, and losing it costs a
+    recompile, not an import."""
+    import os
+    if not os.path.isdir(clone) or os.path.islink(clone):
+        return {"": os.lstat(clone).st_size}
+    files = {}
+    for root, dirs, names in os.walk(clone):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        for name in names:
+            path = os.path.join(root, name)
+            files[os.path.relpath(path, clone)] = os.lstat(path).st_size
+    return files
+
+
+def _iso_clone_stale(clone, manifest_path, source_sig):
+    """Why the existing `clone` can't be reused, as `(damaged, reason)`, or None if it
+    can. Its manifest must name the current source, and every file the clone was made
+    with must still be there at its size (`damaged`): the clone root sits in the temp
+    dir, whose cleaner deletes files it takes for unused (a `.py` loaded from its
+    `.pyc` is only stat'ed, never read)."""
+    import os, json
+    try:
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+    except FileNotFoundError:
+        return False, "it has no manifest"
+    except ValueError:
+        return False, "its manifest is not the current format"
+    if manifest.get("source") != source_sig:
+        return False, "the library changed"
+    for rel, size in manifest.get("files", {}).items():
+        path = os.path.join(clone, rel) if rel else clone
+        try:
+            now = os.lstat(path).st_size
+        except FileNotFoundError:
+            return True, f"{path} is missing"
+        if now != size:
+            return True, f"{path} is {now} bytes, cloned as {size}"
+    return None
+
+
 def _iso_clone_lib(lib, worker_dir, pkg2dist):
     """Clone `lib` (and its vendored `.libs`) into `worker_dir`. Returns the
     cloned destination path (dir or file), or None if the lib can't be resolved.
 
-    Freshness: a per-lib `<basename>.sig` manifest records the source signature.
-    An existing clone is reused only if the manifest still matches — a lib upgrade
-    (mtime/size change) forces a re-clone. This covers reactively-added libs the
-    bucket signature can't see, and makes declared-lib upgrades safe regardless of
-    the bucket keying."""
-    import os, subprocess, shutil, platform
+    Freshness: each clone has a `<basename>.sig` manifest with its source's signature
+    and the clone's files. An existing clone is reused only if the source is unchanged
+    (a lib upgrade forces a re-clone) and the clone is still whole (a file deleted from
+    it forces a re-clone, with a warning naming the file). This covers reactively-added
+    libs the bucket signature can't see, and makes declared-lib upgrades safe regardless
+    of the bucket keying."""
+    import os, subprocess, platform, json
     src = _iso_resolve_src(lib)
     if src is None:
         return None
-    st = os.stat(src)
-    cur_sig = "%d\0%d" % (st.st_mtime_ns, st.st_size)
     clone = ["cp", "-c", "-R"] if platform.system() == "Darwin" else ["cp", "--reflink=auto", "-R"]
 
-    def _clone(s, d, sig_path=None):
-        if os.path.exists(d):
-            if sig_path is None:
-                return  # vendored .libs: no manifest, reuse as-is
-            try:
-                with open(sig_path) as f:
-                    if f.read() == cur_sig:
-                        return  # up-to-date clone, inodes already verified
-            except OSError:
-                pass
-            shutil.rmtree(d, ignore_errors=True)  # stale (lib upgraded) — re-clone
+    def _clone(s, d, manifest_path):
+        st = os.stat(s)
+        source_sig = "%d\0%d" % (st.st_mtime_ns, st.st_size)
+        if os.path.lexists(d):
+            stale = _iso_clone_stale(d, manifest_path, source_sig)
+            if stale is None:
+                return  # up-to-date clone, inodes already verified
+            damaged, why = stale
+            if damaged:
+                _logging.getLogger("pyronova.isolate").warning(
+                    "auto-isolate: the clone of %r at %s is damaged (%s); cloning it again",
+                    lib, d, why,
+                )
+            _iso_remove(d)
         # Clone into a temp dir and atomically rename it into place, so a
         # first-ever concurrent boot never observes a half-written copy.
         tmp = "%s.tmp-%d" % (d, os.getpid())
-        subprocess.run(clone + [s, tmp], check=False,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        done = subprocess.run(clone + [s, tmp], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE, text=True)
+        if done.returncode != 0:
+            if os.path.lexists(tmp):
+                _iso_remove(tmp)  # cp may leave a partial copy
+            raise _IsoError(
+                f"cloning {s} into {tmp} failed ({' '.join(clone)} exited "
+                f"{done.returncode}): {done.stderr.strip()}"
+            )
         try:
             os.replace(tmp, d)
         except OSError:
-            shutil.rmtree(tmp, ignore_errors=True)  # lost the race — use theirs
-        if sig_path is not None:
-            try:
-                with open(sig_path, "w") as f:
-                    f.write(cur_sig)
-            except OSError:
-                pass
+            if not os.path.lexists(d):
+                raise
+            _iso_remove(tmp)  # lost the race to another boot — use theirs
+        manifest_tmp = "%s.tmp-%d" % (manifest_path, os.getpid())
+        with open(manifest_tmp, "w") as f:
+            json.dump({"source": source_sig, "files": _iso_clone_files(d)}, f)
+        os.replace(manifest_tmp, manifest_path)
 
     base_name = os.path.basename(src)
     dst = os.path.join(worker_dir, base_name)
@@ -345,11 +363,12 @@ def _iso_clone_lib(lib, worker_dir, pkg2dist):
     for ln in libs_names:
         vendored = os.path.join(parent, ln + ".libs")
         if os.path.isdir(vendored):
-            _clone(vendored, os.path.join(worker_dir, os.path.basename(vendored)))
+            vendored_dst = os.path.join(worker_dir, os.path.basename(vendored))
+            _clone(vendored, vendored_dst, vendored_dst + ".sig")
     return dst
 
 
-# pyronova itself is never cloned, evicted or re-executed (Layer 2, FR-11): its engine
+# pyronova itself is never cloned, evicted or re-executed: its engine
 # keeps process-wide state (the main-interpreter handle, the async worker registry, the
 # logger, the Postgres pool) that must exist once, and re-executing the package in a
 # worker would duplicate `pyronova.context.ctx` and its ContextVars.
@@ -379,11 +398,18 @@ def _iso_evict(lib):
 
 
 def _iso_pkg2dist():
+    """Import name -> distribution names, for finding a package's vendored `<dist>.libs`.
+    Reading it fails only on broken install metadata; a clone made without it could miss
+    the libraries the package loads, so that is an error, with its cause."""
     import importlib.metadata as _md
     try:
         return _md.packages_distributions()
-    except Exception:
-        return {}
+    except Exception as exc:
+        raise _IsoError(
+            "reading the installed distributions (importlib.metadata."
+            f"packages_distributions) failed: {exc!r}; a per-worker copy could miss the "
+            "shared libraries its package vendors, so none is made"
+        ) from exc
 
 
 def _iso_report(lib, dst):
@@ -452,12 +478,9 @@ def _pyronova_isolate_libs():
     Proactive just does the cloning up front so the first request pays no `cp`.
     (No persistent override: that would mask the collision signal an UNDECLARED
     single-phase lib needs to trigger its own reactive clone.)"""
-    import os
-    libs = [x.strip() for x in os.environ.get("PYRONOVA_ISOLATE_LIBS", "").split(",") if x.strip()]
+    libs = list(ISOLATE_LIBS)
     if not libs:
         return
-    if "pyronova" in libs:
-        raise RuntimeError(_ISO_PYRONOVA_REFUSED)
     # Sub-interpreter probe: the override raises on the main interp, where no
     # per-worker copy is needed. Probe and restore — real loads flip it later.
     prev, ok = _iso_transient_override()
@@ -471,8 +494,6 @@ def _pyronova_isolate_libs():
     pkg2dist = _iso_pkg2dist()
     cloned_any = False
     for lib in resolvable:
-        # Clone while worker_dir is NOT yet on sys.path, so each source resolves
-        # to the original install, not a sibling clone (warm-restart safety).
         if _iso_clone_lib(lib, worker_dir, pkg2dist) is not None:
             _ISO["isolated"].add(lib)
             cloned_any = True
@@ -495,10 +516,14 @@ def _pyronova_isolate_libs():
 # clone: a different file, so a different key. Declared libs (pre-staged clones
 # already on sys.path) load isolated on the first try.
 
+import _thread
 import builtins as _builtins
 import importlib.machinery as _machinery
 _iso_real_import = _builtins.__import__
-_iso_in_hook = False  # re-entrancy guard: only the OUTERMOST import self-heals
+# Per thread: whether an import on this thread is already inside `_iso_import`. Only the
+# OUTERMOST import of a thread self-heals; threads importing concurrently each have their
+# own outermost import.
+_iso_hook = _thread._local()
 
 
 def _iso_is_private_clone(path):
@@ -741,7 +766,7 @@ class _IsolatingExtensionFinder:
     def find_spec(self, fullname, path, target=None):
         if _iso_is_pyronova(fullname):
             # The engine declares per-interpreter support and loads through CPython's
-            # own check; the loaders here never touch it (FR-11).
+            # own check; the loaders here never touch it.
             return None
         if path is None:
             spec = _machinery.BuiltinImporter.find_spec(fullname)
@@ -813,13 +838,12 @@ def _iso_offending_module(exc):
 
 
 def _iso_import(name, globals=None, locals=None, fromlist=(), level=0):
-    global _iso_in_hook
-    if _iso_in_hook:
+    if getattr(_iso_hook, "active", False):
         # Nested import (e.g. numpy/__init__ importing its own .so): let it raise
         # so the failure propagates to the outermost call, which owns the
         # isolate-and-restart of the whole top-level statement.
         return _iso_real_import(name, globals, locals, fromlist, level)
-    _iso_in_hook = True
+    _iso_hook.active = True
     try:
         outer = (name or "").split(".")[0] if level == 0 else ""
         cloned = set()
@@ -833,18 +857,18 @@ def _iso_import(name, globals=None, locals=None, fromlist=(), level=0):
                 top = (bad or outer).split(".")[0]
                 # One clone per package per statement: a package that still
                 # fails from its clone surfaces its real error, never loops.
-                # pyronova is never isolated (FR-11): its error surfaces as is.
+                # pyronova is never isolated: its error surfaces as is.
                 if not top or top == "pyronova" or top in cloned or not _iso_isolate(top):
                     raise
                 cloned.add(top)
                 # Drop the statement's partial import too, so the retry
                 # re-resolves it with the clone dir on sys.path. Never pyronova:
                 # the failed submodule is already out of sys.modules, and the
-                # package must stay the one this worker already executed (FR-11).
+                # package must stay the one this worker already executed.
                 if outer and outer != "pyronova":
                     _iso_evict(outer)
     finally:
-        _iso_in_hook = False
+        _iso_hook.active = False
 
 
 _pyronova_isolate_libs()
@@ -861,3 +885,8 @@ _builtins.__import__ = _iso_import
 # Imported last, with the isolation machinery above in place: importing the
 # engine imports the `pyronova` package, and its own imports go through it.
 from pyronova.engine import emit_python_log as _emit_python_log  # noqa: E402
+from pyronova.engine import _python_log_level  # noqa: E402
+
+_log_handler.connect(_emit_python_log)
+# Python's level gate is the level the main interpreter's `init_logger` applied.
+_root.setLevel(root_level(_python_log_level()))

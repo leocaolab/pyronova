@@ -34,13 +34,17 @@ cd pyronova
 python3.14 -m venv .venv
 source .venv/bin/activate
 pip install maturin
-maturin develop --release        # 1-3 min on first build
+maturin develop --release --features bench   # 1-3 min on first build
 ```
+
+The `bench` cargo feature compiles in `bench_inmem` / `bench_loopback`, which the
+`bench_inmem*.py` / `bench_loopback*.py` scripts below call; the default build has
+neither. External-client runs (wrk, section 3) work with either build.
 
 Verify:
 
 ```bash
-.venv/bin/python -c "from pyronova import Pyronova; print('ok')"
+.venv/bin/python -c "from pyronova.engine import PyronovaApp; assert hasattr(PyronovaApp, 'bench_inmem'); print('ok')"
 ```
 
 ## 2. Benchmark ladder (run in this order)

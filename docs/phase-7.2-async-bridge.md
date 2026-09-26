@@ -1,6 +1,6 @@
 # Phase 7.2: Native Async Bridge — 设计文档
 
-> **已被部分取代（2026-09，Layer 2，`docs/design/real-engine-in-workers.md`）：** 下文的 `pyronova_recv` / `pyronova_send` C-FFI 函数（用 `PyCFunction_NewEx` 注入 worker 的 globals）已删除。worker 现在导入真正的 `pyronova.engine`，async 引擎通过 `pyronova.engine._worker_recv` / `_worker_send`（`src/python/worker_api.rs`）与 Rust 通信，等待通道时同样释放 GIL。fetcher 线程 + `run_coroutine_threadsafe` 的结构保留。
+> **已被部分取代（2026-09，Layer 2，`docs/design/real-engine-in-workers.md`）：** 下文的 `pyronova_recv` / `pyronova_send` C-FFI 函数（用 `PyCFunction_NewEx` 注入 worker 的 globals）已删除，全局的 `WORKER_STATES` 注册表也已由每个 worker 池自己的 inbox 取代。worker 现在导入真正的 `pyronova.engine`，async 引擎通过 `pyronova.engine._worker_recv` / `_worker_send`（`src/python/worker_api.rs`）与 Rust 通信，等待通道时同样释放 GIL。fetcher 线程 + `run_coroutine_threadsafe` 的结构保留。
 
 
 > 目标：Sub-interpreter I/O 并发从 8k → 70k+ req/s（追平/超越 Robyn 的 86k）

@@ -124,10 +124,9 @@ app = Pyronova()
 app.enable_logging()  # 开启结构化日志
 ```
 
-输出格式：
+每个请求由 Rust 写一行 `pyronova::access`（所有模式一致，默认 JSON 格式）：
 ```
-GIL 模式:      2026-03-24 17:30:01 [INFO ] GET /api/trade → 200 (2.3ms)
-Sub-interp:    [INFO ] GET /api/trade → 200
+{"level":"INFO","fields":{"message":"Request handled","method":"GET","path":"/api/trade","status":200,"latency_us":2300,"mode":"gil"},"target":"pyronova::access"}
 ```
 
 ### 用户自定义日志
@@ -148,9 +147,11 @@ def trade(req):
 ### 日志级别
 
 ```python
-app.enable_logging(level="info")    # INFO/WARN/ERROR (默认)
+app.enable_logging()                # 保留已配置级别；ERROR/OFF 提升到 INFO
+app.enable_logging(level="info")    # INFO/WARN/ERROR
 app.enable_logging(level="error")   # 只显示错误
 app.enable_logging(level="debug")   # 全部显示
+# 显式 level 优先于 log_config / debug=True
 ```
 
 ## Pydantic 集成
@@ -226,9 +227,17 @@ def echo(ws):
 data = ws.recv_bytes()
 ws.send_bytes(data)
 
-# 混合
-msg_type, data = ws.recv_message()  # ("text", "hello") or ("binary", b"\x00")
+# 混合：文本返回 str，二进制返回 bytes
+msg = ws.recv_message()  # "hello" 或 b"\x00"
 ```
+
+`recv()` 遇到二进制消息（或 `recv_bytes()` 遇到文本消息）会抛 `TypeError`，
+这条消息仍留在队列里，可用 `recv_message()` 读出，不会被静默丢弃。
+
+限制（进程级）：`app.max_websocket_message_size`（默认 1 MiB，双向；超限的
+客户端消息以 1009 关闭连接，超限的 `ws.send` 抛 `ValueError`）、
+`app.max_websocket_connections`（默认 1024，每个连接一个处理线程；满了升级请求返回 503）。
+每个方向的缓冲按字节计，约为一条最大消息的大小；`ws.send` 在缓冲满时抛 `BlockingIOError`。
 
 ## SSE 流式传输
 
@@ -270,8 +279,12 @@ del app.state["key"]
 # 启用 (环境变量)
 # PYRONOVA_METRICS=1 python app.py
 
-from pyronova import get_gil_metrics
-last, peak, probes, total, rss, queue, hold, dropped, total_req = get_gil_metrics()
+from pyronova import get_gil_metrics, reset_peaks
+m = get_gil_metrics()          # Metrics 快照；读取不会清零
+m.gil_wait_peak_us, m.gil_hold_peak_us, m.gil_queue_length
+m.rss_bytes                    # 采样器还没读到时为 None
+m.dropped_requests, m.total_requests
+reset_peaks()                  # 显式开始新的峰值窗口
 ```
 
 ## IDE 支持
@@ -279,6 +292,12 @@ last, peak, probes, total, rss, queue, hold, dropped, total_req = get_gil_metric
 `engine.pyi` 提供完整的类型提示。IDE 中 `req.` 会自动补全：
 - `req.method`, `req.path`, `req.params`, `req.query`, `req.headers`
 - `req.body`, `req.text()`, `req.json()`, `req.query_params`
+
+`req.headers` 是只读、名字大小写不敏感的映射（`Headers`）。同名多行的字段读出来是按 RFC 9110 用 `", "` 合并的一个值，`cookie` 例外，用 `"; "` 合并（RFC 9113 §8.2.3）；`req.headers.get_all(name)` 返回原样的每一行。
+
+## 返回值 → 响应
+
+所有解释器（GIL、子解释器池、TPC、async 引擎）用同一套映射，类型只看返回的值，不看文本内容：`dict` / `list` → JSON，`str` → `text/plain`，`bytes` → `application/octet-stream`，`None` → 空 200，`Response` → 它的状态码和头。`Response(headers=...)` 的值必须是 `str` 或 `str` 列表（每项一行，如多个 `Set-Cookie`），否则抛 `TypeError` / `ValueError` 并指明是哪个头；其中的 `Content-Type` / `Server` 会替换默认值。`after_request` 钩子抛异常时，每条路径都返回 500。
 
 ## 内存效率
 

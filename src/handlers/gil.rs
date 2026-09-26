@@ -1,170 +1,105 @@
-//! GIL-mode request handler.
+//! Main-interpreter dispatch from a Tokio thread.
 //!
-//! Default path when TPC is off — handlers run on the main Python
-//! interpreter via `tokio::task::spawn_blocking`. Supports the full
-//! route feature set (async def, streaming, C-extensions, gil=True
-//! is moot here since everything already runs on the main interp).
-//!
-//! Extracted out of the monolithic `src/handlers.rs`. Shared helpers
-//! (`apply_cors`, `full_body`, `build_fast_response`,
-//! `stream_body_feeder`, `call_handler_with_hooks`,
-//! `build_stream_response`, `HandlerResult`) live in the parent and
-//! are imported via `super::`.
+//! GIL mode (`mode="gil"`, TPC or not) runs every handler this way; the sub-interpreter
+//! pool runs its `gil=True` routes and the fallback this way too ([`run_on_main`]).
 
 use std::sync::Arc;
 
-use bytes::Bytes;
-use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 
-use crate::response::{build_response, payload_too_large_response};
-use crate::router::FrozenRoutes;
+use crate::body::{body_channel, stream_body_feeder, BoxBody};
+use crate::error::HandlerError;
+use crate::request_head::{Body, RequestHead};
+use crate::router::{Call, RequestBody, Target};
+use crate::site::SharedSite;
 use crate::types::PyronovaRequest;
 
-use super::{
-    apply_cors, build_stream_response, call_handler_with_hooks, full_body, max_body_size,
-    preprocess_request, stream_body_feeder, BoxBody, HandlerResult, Prepared, Preprocessed,
+use super::pipeline::{
+    await_reply, await_streamed_reply, collect_body, fail, finish, preprocess, task_lost,
+    AcceptEncoding, Prepared, Preprocessed, RequestLine, Served,
 };
+use super::{build_main_http_response, call_handler_with_hooks};
 
 pub(crate) async fn handle_request(
     req: Request<Incoming>,
-    routes: FrozenRoutes,
+    site: SharedSite,
     client_ip_addr: std::net::IpAddr,
 ) -> Result<Response<BoxBody>, hyper::Error> {
-    // Shared preprocessing: gRPC short-circuit, fast-path, header/body
-    // extraction, route lookup, and the static-file / 404 fallback. Any
-    // short-circuit returns an early response; otherwise we get the
-    // prepared request state and continue with GIL-specific dispatch.
-    let Prepared {
-        method,
-        path,
-        query,
-        raw_headers,
-        accept_encoding,
-        body: body_obj,
-        handler_idx,
-        params,
-        start,
-    } = match preprocess_request(
-        req,
-        &routes,
-        routes.cors_config.as_ref(),
-        &routes.static_dirs,
-        |m, p| routes.lookup(m, p),
-    )
-    .await?
-    {
+    let prepared = match preprocess(req, &site, client_ip_addr).await? {
         Preprocessed::Respond(r) => return Ok(r),
         Preprocessed::Dispatch(p) => p,
     };
+    // In GIL mode every handler runs on main; a worker route's body is buffered.
+    let (target, body) = match prepared.call {
+        Call::Worker(id, _) => (Target::Route(id), RequestBody::Buffered),
+        Call::Main(target, body) => (target, body),
+    };
+    Ok(run_on_main(&site, prepared, target, body, Served::Main).await)
+}
 
-    let is_stream_route =
-        handler_idx != usize::MAX && routes.is_stream.get(handler_idx).copied().unwrap_or(false);
+/// Runs `target`'s handler on the main interpreter from a blocking-pool thread, within the
+/// request budget, and finishes the response.
+pub(crate) async fn run_on_main(
+    site: &SharedSite,
+    prepared: Prepared,
+    target: Target,
+    body: RequestBody,
+    served: Served,
+) -> Response<BoxBody> {
+    let Prepared {
+        head,
+        body: incoming,
+        start,
+        ..
+    } = prepared;
+    // The `Request` takes the head; the log lines and the response keep their own copies.
+    let label = head.label();
+    let accept_encoding = AcceptEncoding::of(&head);
+    let tag = label.tag();
 
-    let (body_bytes, body_stream_rx) = if is_stream_route {
-        // Streaming path: spawn a feeder that pushes body frames into a
-        // channel. The handler takes the receiver out via `req.stream`
-        // on first access.
-        let (tx, rx) = tokio::sync::mpsc::channel::<crate::python::body_stream::ChunkMsg>(
-            crate::python::body_stream::CHANNEL_CAPACITY,
-        );
-        let cap = max_body_size();
-        tokio::spawn(stream_body_feeder(body_obj, tx, cap));
-        (Bytes::new(), Arc::new(std::sync::Mutex::new(Some(rx))))
-    } else {
-        // Buffered path (default): collect the whole body with size + time limits.
-        use http_body_util::Limited;
-        let limited = Limited::new(body_obj, max_body_size());
-        let bytes =
-            match tokio::time::timeout(std::time::Duration::from_secs(30), limited.collect()).await
-            {
-                Ok(Ok(c)) => c.to_bytes(),
-                Ok(Err(e)) => {
-                    // `Limited::collect` fails either because the size cap was
-                    // exceeded or because the underlying body produced an IO /
-                    // protocol error. We respond 413 in both cases (the body is
-                    // unusable regardless), but log the cause so a non-size
-                    // failure isn't silently misreported as "too large".
-                    tracing::warn!(
-                        target: "pyronova::server",
-                        error = %e,
-                        "request body collection failed; responding 413"
-                    );
-                    let mut r = full_body(payload_too_large_response());
-                    apply_cors(&mut r, routes.cors_config.as_ref());
-                    return Ok(r);
-                }
-                Err(_) => {
-                    let mut r = full_body(crate::response::gateway_timeout_response());
-                    apply_cors(&mut r, routes.cors_config.as_ref());
-                    return Ok(r);
-                }
+    let max_body = site.config.limits.max_body_bytes;
+    let resp = match main_request(head, incoming, body, max_body).await {
+        Ok((sky_req, feeder)) => {
+            let site_ref = Arc::clone(site);
+            let task = tokio::task::spawn_blocking(move || {
+                call_handler_with_hooks(&site_ref, target, sky_req)
+            });
+            let reply = match feeder {
+                Some(mut feeder) => await_streamed_reply(&mut feeder, task, task_lost).await,
+                None => await_reply(task, task_lost).await,
             };
-        (bytes, Arc::new(std::sync::Mutex::new(None)))
-    };
-
-    let method_log = Arc::clone(&method);
-    let path_log = Arc::clone(&path);
-    let sky_req = PyronovaRequest {
-        method,
-        path,
-        params,
-        query,
-        headers_source: crate::types::LazyHeaders::Raw(raw_headers),
-        headers_cache: std::sync::OnceLock::new(),
-        client_ip_addr,
-        body_bytes,
-        body_stream_rx,
-        query_cache: std::sync::OnceLock::new(),
-        query_all_cache: std::sync::OnceLock::new(),
-    };
-
-    // spawn_blocking: prevent GIL acquisition from starving Tokio workers
-    let routes_ref = Arc::clone(&routes);
-    let handler_result = tokio::task::spawn_blocking(move || {
-        call_handler_with_hooks(routes_ref, handler_idx, sky_req)
-    })
-    .await
-    .unwrap_or_else(|_| {
-        HandlerResult::PyronovaResponse(Err("handler thread panicked".to_string()))
-    });
-
-    let mut resp = match handler_result {
-        HandlerResult::PyronovaResponse(mut result) => {
-            if let Ok(data) = result.as_mut() {
-                crate::compression::maybe_compress(data, &accept_encoding);
-            }
-            // Don't propagate build_response errors via `?` — that would
-            // skip apply_cors below, breaking CORS-protected APIs when
-            // response construction fails (e.g. invalid header chars
-            // from a handler). Convert to a 500 with CORS still applied,
-            // matching the 404/413/504 paths above.
-            match build_response(result) {
-                Ok(r) => full_body(r),
-                Err(e) => {
-                    let mut r = full_body(crate::response::error_response(&e.to_string()));
-                    apply_cors(&mut r, routes.cors_config.as_ref());
-                    return Ok(r);
+            match reply {
+                Ok(result) => {
+                    let compression = site.config.compression.as_ref();
+                    build_main_http_response(result, &accept_encoding, compression).await
                 }
+                Err(e) => fail(e, &tag),
             }
         }
-        HandlerResult::PyronovaStream(info) => build_stream_response(info),
+        Err(e) => fail(e, &tag),
     };
+    finish(resp, site, &RequestLine::of(&label, start), served)
+}
 
-    apply_cors(&mut resp, routes.cors_config.as_ref());
-    let latency_us = start.elapsed().as_micros() as u64;
-    let status = resp.status().as_u16();
-    if super::should_log_request(&routes, status) {
-        tracing::info!(
-            target: "pyronova::access",
-            method = %method_log,
-            path = %path_log,
-            status,
-            latency_us,
-            mode = "gil",
-            "PyronovaRequest handled"
-        );
-    }
-    Ok(resp)
+/// The `Request` a main-interpreter handler gets: the body collected, or fed through
+/// `req.stream` for a `stream=True` route (with the task feeding it).
+async fn main_request(
+    head: RequestHead,
+    incoming: Incoming,
+    body: RequestBody,
+    max_body: usize,
+) -> Result<(PyronovaRequest, Option<tokio::task::JoinHandle<()>>), HandlerError> {
+    let (body, feeder) = match body {
+        RequestBody::Streamed => {
+            let (tx, rx) = body_channel();
+            let feeder = tokio::spawn(stream_body_feeder(incoming, tx, max_body));
+            (Body::Streamed(rx), Some(feeder))
+        }
+        RequestBody::Buffered => (
+            Body::Buffered(collect_body(incoming, max_body).await?),
+            None,
+        ),
+    };
+    Ok((PyronovaRequest::new(head, body), feeder))
 }

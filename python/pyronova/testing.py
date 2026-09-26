@@ -1,10 +1,11 @@
 """TestClient — exercise a Pyronova app without manually managing a server.
 
-Starts the app in a background thread and talks to it over a real TCP
-socket, so every piece of the stack (Rust accept loop, sub-interp
-dispatch, CORS, compression, hooks) is exercised exactly as it would be
-in production. Pure stdlib for HTTP; WebSocket support requires the
-``websockets`` package.
+Starts the app in a background thread, in the mode ``app.run()`` uses by
+default, and talks to it over a real TCP socket, so every piece of the stack
+(Rust accept loop, sub-interp dispatch, CORS, compression, hooks) is exercised
+as it would be in production. Define the app at module level: sub-interpreter
+workers rebuild it by executing that module. Pure stdlib for HTTP; WebSocket
+support requires the ``websockets`` package.
 
 Basics::
 
@@ -31,10 +32,9 @@ WebSocket::
 
 from __future__ import annotations
 
-import errno as _errno
+import http.client
 import json
 import logging as _logging
-import socket as _socket
 import threading
 import time
 import urllib.parse
@@ -43,9 +43,18 @@ import urllib.error
 from collections import defaultdict
 from dataclasses import dataclass, field
 from http.cookiejar import CookieJar
-from typing import Any, Iterator
+from typing import Any, Iterator, NoReturn
+
+from pyronova.app import Pyronova, WorkersAbandoned, _ServeSettings
 
 _logger = _logging.getLogger("pyronova.testing")
+
+# How long the server may take to accept its first connection; building the
+# sub-interpreter workers (each executes the app's module) dominates it.
+_READY_POLL_S = 0.1
+_READY_POLLS = 300
+# How long close() waits for the server to drain and run its shutdown hooks.
+_STOP_TIMEOUT_S = 60
 
 
 def _collapse_headers(msg) -> "dict[str, str | list[str]]":
@@ -64,13 +73,13 @@ class TestResponse:
     Attributes:
         status_code: HTTP status code.
         body: raw response body bytes.
-        headers: response headers (case-sensitive dict from urllib).
+        headers: response headers keyed by lower-case name; a header sent more than
+            once (e.g. Set-Cookie) is a list of its values, any other a plain string.
+            ``get_header_list()`` always gives a list.
     """
 
     status_code: int
     body: bytes
-    # Multi-valued headers (e.g. Set-Cookie) are stored as lists; all
-    # others remain plain strings. Use get_header_list() for the raw list.
     headers: dict[str, "str | list[str]"] = field(default_factory=dict)
 
     def get_header_list(self, name: str) -> list[str]:
@@ -108,17 +117,28 @@ class TestResponse:
 
 
 class TestClient:
-    """Test client — starts Pyronova in a background thread.
+    """Test client — serves the app in a background thread, the way ``app.run()`` does.
+
+    The server runs in the mode ``app.run()`` picks when given none, so non-``gil=True``
+    routes run in sub-interpreter workers. Workers rebuild the app by executing the
+    module that created it, so define the app at module level (as in production).
+    An app created inside a function can only be served with ``mode="gil"``.
 
     Args:
         app: Pyronova app instance.
         host: bind address (default ``127.0.0.1``).
-        port: bind port. ``None`` picks an unused port — preferred for
-              new tests so parallel runs don't collide on a hard-coded
-              number.
+        port: bind port. ``None`` has the server bind one the kernel picks;
+              the ``port`` attribute is the one it bound — preferred for new
+              tests so parallel runs don't collide on a hard-coded number.
+        mode: serving mode, as for ``app.run()``. ``None`` (default) is
+              ``app.run()``'s default; ``"gil"`` serves every handler on the
+              main interpreter.
         timeout: default per-request timeout in seconds (default 10).
         follow_redirects: whether to follow 3xx redirects (default True,
               matching urllib's historical behavior).
+
+    ``close()`` (or leaving the ``with`` block) stops the server: shutdown hooks
+    run and the port is released.
     """
 
     # Tell pytest this is not a test class (silences the collection
@@ -127,31 +147,15 @@ class TestClient:
 
     def __init__(
         self,
-        app: Any,
+        app: Pyronova,
         host: str = "127.0.0.1",
         port: int | None = None,
         *,
+        mode: str | None = None,
         timeout: float = 10.0,
         follow_redirects: bool = True,
     ):
-        auto_port = port is None
-
-        def _free_port() -> int:
-            # Ask the kernel for an unused port. try/finally so a failing
-            # bind() (permission denied, address in use) can't leak the
-            # socket fd (arc finding testing-47).
-            s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-            try:
-                s.bind((host, 0))
-                return s.getsockname()[1]
-            finally:
-                s.close()
-
-        if port is None:
-            port = _free_port()
         self.host = host
-        self.port = port
-        self.base_url = f"http://{host}:{port}"
         self.timeout = timeout
         self.follow_redirects = follow_redirects
 
@@ -163,133 +167,124 @@ class TestClient:
             _NoRedirectHandler() if not follow_redirects else urllib.request.HTTPRedirectHandler(),
         )
 
+        self._app = app
+        # Port 0: the server binds a port the kernel picks and reports it (no pick-then-
+        # rebind race with other processes).
+        self._settings = _ServeSettings.resolve(
+            host=host, port=0 if port is None else port, mode=mode
+        )
+        # Under a test runner `__main__` is the runner, not the app's script.
+        if app._app_file_path is None and app._defined_in is not None:
+            app._set_app_file(app._defined_in)
+
+        # This client's own server (an engine `Server`), once bound; `close()` stops that
+        # one server, never another server of the same app (e.g. an outer TestClient).
+        # `_closing` records a close() that came before the server existed, so the
+        # server is stopped as soon as it is bound.
+        self._lock = threading.Lock()
+        self._server = None
+        self._closing = False
         self._server_error: Exception | None = None
-
-        def _addr_in_use(exc: Exception) -> bool:
-            # Detect "port already taken" across the ways app.run can surface
-            # it: a plain OSError with errno set, or a PyO3-wrapped error whose
-            # message carries the OS text. Conservative — only these retry.
-            # errno is imported at module level so a hostile import can't
-            # silently disable detection (arc finding testing-25).
-            if isinstance(exc, OSError) and exc.errno in (
-                _errno.EADDRINUSE,
-                _errno.EADDRNOTAVAIL,
-            ):
-                return True
-            msg = str(exc).lower()
-            return "address already in use" in msg or "addrinuse" in msg
-
-        def _run_server():
-            # Picking a free port (bind→getsockname→close) then letting the
-            # server rebind it is inherently racy: between close() and the
-            # server's bind() another process can steal the port (TOCTOU,
-            # arc finding testing-24). app.run binds by host/port only — the
-            # Rust side has no fd-passing path — so the window can't be closed
-            # outright. When we auto-picked the port, repick a fresh one and
-            # retry on "address in use" so parallel test runs don't flake.
-            # A user-supplied port is honored exactly, no retry.
-            #
-            # Each repick calls _free_port() again, which carries the same
-            # TOCTOU window (arc finding testing-27). Under heavy contention
-            # (pytest-xdist, constrained ephemeral range) back-to-back losses
-            # are possible, so we back off between attempts to let the racing
-            # processes settle rather than burning all attempts instantly.
-            attempts = 8 if auto_port else 1
-            last_exc: Exception | None = None
-            for _attempt in range(attempts):
-                try:
-                    app.run(host=self.host, port=self.port, mode="default")
-                    return  # server ran and shut down cleanly
-                except Exception as e:  # noqa: BLE001 — stored & logged below
-                    last_exc = e
-                    if auto_port and _addr_in_use(e) and _attempt < attempts - 1:
-                        # Lost the port between probe and bind — pick another.
-                        # The readiness probe re-reads base_url each pass and
-                        # treats a refused connection as "still starting", so
-                        # updating it here is safe (arc finding testing-26:
-                        # leave a breadcrumb so port churn isn't invisible).
-                        old_port = self.port
-                        # Exponential backoff (10ms, 20ms, 40ms, ... capped at
-                        # ~1.3s) shrinks the odds of racing the same way twice
-                        # when many test processes contend (arc finding
-                        # testing-27).
-                        time.sleep(min(0.01 * (2 ** _attempt), 1.28))
-                        self.port = _free_port()
-                        self.base_url = f"http://{self.host}:{self.port}"
-                        _logger.info(
-                            "TestClient port %d was taken, repicking %d "
-                            "(attempt %d/%d)",
-                            old_port, self.port, _attempt + 1, attempts,
-                        )
-                        continue
-                    break
-            self._server_error = last_exc
-            # Distinguish exhausted port-collision retries from a genuine
-            # server crash so the test author isn't left guessing why they
-            # only see 'connection refused' (arc findings testing-3, -26).
-            if auto_port and last_exc is not None and _addr_in_use(last_exc):
-                _logger.warning(
-                    "TestClient port collision persisted after %d attempts "
-                    "(last port=%d); clients will see connection refused. "
-                    "Likely ephemeral-port exhaustion under heavy parallelism.",
-                    attempts, self.port, exc_info=last_exc,
-                )
-            else:
-                # Pre-fix the exception was stored but never logged.
-                # Tests then saw only generic 'connection refused' with
-                # no clue why (arc finding testing-3).
-                _logger.error(
-                    "TestClient inner server crashed; clients will see "
-                    "connection refused",
-                    exc_info=last_exc,
-                )
-
-        self._thread = threading.Thread(target=_run_server, daemon=True)
+        self._thread = threading.Thread(
+            target=self._serve, name="pyronova-testclient", daemon=True
+        )
         self._thread.start()
+        self._wait_until_ready()
 
-        # Readiness probe. Any HTTP response (2xx-5xx) proves the server
-        # is accepting connections; only ConnectionError / timeout means
-        # it's still starting.
-        for _ in range(50):
-            time.sleep(0.1)
+    @property
+    def port(self) -> int:
+        """The port the server listens on (the one the kernel picked for ``port=None``)."""
+        server = self._server
+        return self._settings.port if server is None else server.port
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    def _serve(self) -> None:
+        try:
+            self._app._serve(
+                self._settings,
+                lambda settings: self._app._start(settings, on_bound=self._bound),
+            )
+        except Exception as e:  # noqa: BLE001 — stored for the readiness probe / close()
+            self._server_error = e
+            _logger.error(
+                "TestClient server on port %d stopped with an error; clients will see "
+                "connection refused", self.port, exc_info=e,
+            )
+
+    def _bound(self, server) -> None:
+        """The engine bound this client's server; it serves next unless close() came first."""
+        with self._lock:
+            self._server = server
+            if self._closing:
+                server.shutdown()
+
+    def _wait_until_ready(self) -> None:
+        # The engine binds every listener before it builds a worker, and the server is
+        # this client's from then on; after that, any HTTP response (2xx-5xx) proves it is
+        # serving, and only ConnectionError / timeout means it is still starting.
+        for _ in range(_READY_POLLS):
+            time.sleep(_READY_POLL_S)
             if not self._thread.is_alive():
-                err = self._server_error
-                raise RuntimeError(
-                    f"TestClient: server thread exited before accepting connections"
-                    + (f": {type(err).__name__}: {err}" if err else "")
-                )
+                self._raise_exited_early()
+            if self._server is None:
+                continue
             try:
-                # Context manager guarantees the response is closed even if
-                # something raises after open() (arc finding testing-48).
                 with self._opener.open(f"{self.base_url}/", timeout=1):
                     pass
                 return
             except urllib.error.HTTPError as e:
-                # An HTTP error still proves the server is up. HTTPError is a
-                # file-like object holding an open socket — close it so the
-                # probe doesn't leak a connection (arc finding testing-49).
+                # An HTTP error still proves the server is up. It holds the open
+                # socket: close it so the probe doesn't leak a connection.
                 e.close()
                 return
-            except urllib.error.URLError:
-                pass
-            except OSError:
+            except (urllib.error.URLError, OSError):
                 pass
 
-        # The thread may have died during the final probe iteration (after the
-        # top-of-loop is_alive check, while open() raised URLError/OSError).
-        # Prefer the informative crash diagnostic over the generic timeout.
+        # The thread may have died during the final probe iteration.
         if not self._thread.is_alive():
-            err = self._server_error
-            raise RuntimeError(
-                f"TestClient: server thread exited before accepting connections"
-                + (f": {type(err).__name__}: {err}" if err else "")
+            self._raise_exited_early()
+        raise RuntimeError(
+            f"TestClient: server failed to start within {_READY_POLLS * _READY_POLL_S:.0f}s"
+        )
+
+    def _raise_exited_early(self) -> NoReturn:
+        """The server thread ended before serving: raise what stopped it, as it is."""
+        err = self._server_error
+        if err is None:
+            raise RuntimeError("TestClient: server thread exited before accepting connections")
+        if self._app._defined_in is None and self._settings.mode.uses_workers:
+            err.add_note(
+                "This app was created inside a function, so sub-interpreter workers "
+                "cannot rebuild it by executing its module. Define it at module level, "
+                "or pass mode='gil' to serve every handler on the main interpreter."
             )
+        raise err
 
-        raise RuntimeError("TestClient: server failed to start within 5s")
+    def close(self) -> None:
+        """Stop this client's server and wait until it has: its shutdown hooks have run and
+        the port is free. Other servers of the same app keep serving. Safe from any
+        thread, also while the server is still starting. Idempotent.
 
-    def close(self):
-        """Server runs as daemon thread — dies when main thread exits."""
-        pass
+        Raises ``WorkersAbandoned`` when worker threads outlived the shutdown grace
+        period: ``app.run()`` would exit the process there; a test process is left
+        running, and will abort when it finalizes."""
+        with self._lock:
+            self._closing = True
+            server = self._server
+        if server is not None:
+            server.shutdown()
+        self._thread.join(_STOP_TIMEOUT_S)
+        if self._thread.is_alive():
+            raise RuntimeError(
+                f"TestClient: server on port {self.port} did not stop within "
+                f"{_STOP_TIMEOUT_S}s"
+            )
+        err, self._server_error = self._server_error, None
+        if isinstance(err, WorkersAbandoned):
+            raise err
 
     def __enter__(self):
         return self
@@ -341,12 +336,11 @@ class TestClient:
                     headers=_collapse_headers(resp.headers),
                 )
         except urllib.error.HTTPError as e:
-            # e.read() can itself raise (timeout / broken pipe while reading
-            # the error body). Degrade to an empty body rather than letting a
-            # different, undocumented exception escape (arc finding testing-50).
+            # Reading the error body can fail (timeout, connection reset): the status
+            # is still the answer, so the body is empty rather than the error escaping.
             try:
                 err_body = e.read()
-            except Exception:
+            except (OSError, http.client.HTTPException):
                 err_body = b""
             finally:
                 e.close()

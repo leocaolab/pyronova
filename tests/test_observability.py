@@ -6,7 +6,6 @@ import re
 
 import pytest
 
-from pyronova import Pyronova
 from pyronova.testing import TestClient
 
 
@@ -16,12 +15,8 @@ from pyronova.testing import TestClient
 
 
 def test_request_id_minted_when_absent():
-    app = Pyronova()
-    app.enable_request_id()
-
-    @app.get("/")
-    def root(req):
-        return "ok"
+    # Its own module: a worker serves one app per module.
+    from tests.apps.obs_request_id import app
 
     with TestClient(app, port=None) as c:
         r = c.get("/")
@@ -33,12 +28,8 @@ def test_request_id_minted_when_absent():
 
 
 def test_request_id_echoed_when_client_supplies():
-    app = Pyronova()
-    app.enable_request_id()
-
-    @app.get("/")
-    def root(req):
-        return "ok"
+    # Its own module: a worker serves one app per module.
+    from tests.apps.obs_request_id_echo import app
 
     with TestClient(app, port=None) as c:
         r = c.get("/", headers={"X-Request-ID": "trace-abc-123"})
@@ -48,13 +39,8 @@ def test_request_id_echoed_when_client_supplies():
 
 
 def test_enable_request_id_idempotent():
-    app = Pyronova()
-    app.enable_request_id()
-    app.enable_request_id()  # no error, no double-hook
-
-    @app.get("/")
-    def root(req):
-        return "ok"
+    # Its own module: a worker serves one app per module.
+    from tests.apps.obs_request_id_twice import app
 
     with TestClient(app, port=None) as c:
         r = c.get("/")
@@ -64,12 +50,8 @@ def test_enable_request_id_idempotent():
 
 
 def test_custom_header_name():
-    app = Pyronova()
-    app.enable_request_id(header="X-Trace-Id")
-
-    @app.get("/")
-    def root(req):
-        return "ok"
+    # Its own module: a worker serves one app per module.
+    from tests.apps.obs_request_id_custom_header import app
 
     with TestClient(app, port=None) as c:
         r = c.get("/", headers={"X-Trace-Id": "custom-42"})
@@ -83,12 +65,8 @@ def test_custom_header_name():
 
 
 def test_metrics_endpoint_content_type():
-    app = Pyronova()
-    app.enable_metrics()
-
-    @app.get("/")
-    def root(req):
-        return "ok"
+    # Its own module: a worker serves one app per module.
+    from tests.apps.obs_metrics import app
 
     with TestClient(app, port=None) as c:
         r = c.get("/metrics")
@@ -97,17 +75,8 @@ def test_metrics_endpoint_content_type():
 
 
 def test_metrics_counts_requests():
-    app = Pyronova()
-    app.enable_metrics()
-
-    @app.get("/")
-    def root(req):
-        return "ok"
-
-    @app.get("/boom")
-    def boom(req):
-        from pyronova import Response
-        return Response(body="broken", status_code=500)
+    # Its own module: a worker serves one app per module.
+    from tests.apps.obs_metrics_counts import app
 
     with TestClient(app, port=None) as c:
         # TestClient sends one GET / during startup to probe readiness;
@@ -131,12 +100,8 @@ def test_metrics_counts_requests():
 
 
 def test_metrics_scrape_is_not_counted():
-    app = Pyronova()
-    app.enable_metrics()
-
-    @app.get("/")
-    def root(req):
-        return "ok"
+    # Its own module: a worker serves one app per module.
+    from tests.apps.obs_metrics_scrape import app
 
     with TestClient(app, port=None) as c:
         # Baseline after startup probe.
@@ -149,14 +114,8 @@ def test_metrics_scrape_is_not_counted():
 
 
 def test_metrics_records_latency():
-    app = Pyronova()
-    app.enable_metrics()
-
-    @app.get("/slow")
-    def slow(req):
-        import time
-        time.sleep(0.01)
-        return "ok"
+    # Its own module: a worker serves one app per module.
+    from tests.apps.obs_metrics_latency import app
 
     with TestClient(app, port=None) as c:
         c.get("/slow")
@@ -169,12 +128,8 @@ def test_metrics_records_latency():
 
 
 def test_metrics_format_has_help_and_type_lines():
-    app = Pyronova()
-    app.enable_metrics()
-
-    @app.get("/")
-    def root(req):
-        return "ok"
+    # Its own module: a worker serves one app per module.
+    from tests.apps.obs_metrics_format import app
 
     with TestClient(app, port=None) as c:
         body = c.get("/metrics").text
@@ -186,13 +141,8 @@ def test_metrics_format_has_help_and_type_lines():
 
 
 def test_enable_metrics_idempotent():
-    app = Pyronova()
-    app.enable_metrics()
-    app.enable_metrics()  # no duplicate route
-
-    @app.get("/")
-    def root(req):
-        return "ok"
+    # Its own module: a worker serves one app per module.
+    from tests.apps.obs_metrics_twice import app
 
     with TestClient(app, port=None) as c:
         base = _counter(c.get("/metrics").text, "pyronova_http_requests_total")
@@ -204,12 +154,8 @@ def test_enable_metrics_idempotent():
 
 
 def test_custom_metrics_path():
-    app = Pyronova()
-    app.enable_metrics(path="/_/prom")
-
-    @app.get("/")
-    def root(req):
-        return "ok"
+    # Its own module: a worker serves one app per module.
+    from tests.apps.obs_metrics_custom_path import app
 
     with TestClient(app, port=None) as c:
         c.get("/")

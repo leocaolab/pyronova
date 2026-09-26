@@ -14,3 +14,5 @@ dist/
 .arc/
 arc.log.jsonl
 python/pyronova/engine.cpython-314-darwin.so.dSYM/
+# Local Claude Code instructions: kept out of the repo.
+/CLAUDE.md

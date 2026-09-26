@@ -16,9 +16,9 @@ from __future__ import annotations
 import json
 import os
 import signal
-import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -26,15 +26,9 @@ from dataclasses import dataclass
 
 import pytest
 
+from tests._helpers import bound_port, read_file
+
 HOST = "127.0.0.1"
-
-
-def _free_port() -> int:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 @dataclass
@@ -66,35 +60,42 @@ class ServerHandle:
             return e.code, e.read().decode(), dict(e.headers)
 
 
-def _boot(script: str, mode: str, port: int) -> subprocess.Popen:
-    """Start a Pyronova server from a script string. Returns the process handle.
+def _boot(script: str, mode: str) -> tuple[subprocess.Popen, int]:
+    """Start a Pyronova server from a script string on a port the kernel picks. Returns
+    the process handle and the bound port (from the server's startup line).
     `mode` controls whether app.run() uses subinterp or GIL mode — the
     script is expected to read $PYRONOVA_MODE and branch.
     """
-    path = f"/tmp/pyronova_test_{os.getpid()}_{port}.py"
-    with open(path, "w") as f:
+    fd, path = tempfile.mkstemp(prefix="pyronova_test_", suffix=".py")
+    with os.fdopen(fd, "w") as f:
         f.write(script)
     env = dict(os.environ)
     env["PYRONOVA_MODE"] = mode
-    env["PYRONOVA_PORT"] = str(port)
+    env["PYRONOVA_PORT"] = "0"
     # Output goes to a file, not a pipe: nobody drains a pipe while tests run, so a chatty
     # server could block on a full one, and `_teardown` scans the whole log, shutdown
     # included (Layer 2, FR-12).
-    log_path = f"/tmp/pyronova_test_{os.getpid()}_{port}.log"
+    log_path = path + ".log"
     with open(log_path, "w") as log:
         proc = subprocess.Popen(
             [sys.executable, path],
             stdout=log, stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid, env=env,
+            start_new_session=True, env=env,
         )
     proc.pyronova_log = log_path  # type: ignore[attr-defined]
+    try:
+        port = bound_port(read_file(log_path), proc)
+    except RuntimeError as e:
+        proc.kill()
+        proc.wait(timeout=5)
+        raise RuntimeError(f"Pyronova server ({mode} mode) failed to start: {e}") from None
     # Poll until responsive
     deadline = time.time() + 10
     last_err = None
     while time.time() < deadline:
         try:
             urllib.request.urlopen(f"http://{HOST}:{port}/__ping", timeout=0.5)
-            return proc
+            return proc, port
         except Exception as e:  # noqa: BLE001 — we only care it starts
             last_err = e
             time.sleep(0.1)
@@ -140,8 +141,7 @@ def feature_server_factory(script: str):
 
     @pytest.fixture(scope="module", params=["gil", "subinterp"])
     def feature_server(request):  # type: ignore[misc]
-        port = _free_port()
-        proc = _boot(script, request.param, port)
+        proc, port = _boot(script, request.param)
         try:
             yield ServerHandle(
                 base_url=f"http://{HOST}:{port}",

@@ -8,42 +8,8 @@ from pyronova.testing import TestClient
 @pytest.fixture(scope="module")
 def app_with_hooks():
     """Create an app with startup hooks that set state."""
-    app = Pyronova()
-    # Track hook execution via a mutable container
-    hook_log = {"startup_called": False, "startup_order": []}
-
-    @app.on_startup
-    def init_cache():
-        hook_log["startup_called"] = True
-        hook_log["startup_order"].append("init_cache")
-        app.state["cache_ready"] = "true"
-
-    @app.on_startup
-    def init_counter():
-        hook_log["startup_order"].append("init_counter")
-        app.state["counter"] = "0"
-
-    @app.get("/")
-    def index(req):
-        return {"ok": True}
-
-    @app.get("/cache-status")
-    def cache_status(req):
-        try:
-            return {"ready": app.state["cache_ready"]}
-        except KeyError:
-            return {"ready": "false"}
-
-    @app.get("/counter")
-    def get_counter(req):
-        try:
-            return {"counter": app.state["counter"]}
-        except KeyError:
-            return {"counter": "-1"}
-
-    @app.get("/hook-log")
-    def get_hook_log(req):
-        return hook_log
+    # Module level (workers rebuild the app by executing its module).
+    from tests.apps.lifecycle_hooks import app, hook_log
 
     return app, hook_log
 
@@ -51,7 +17,7 @@ def app_with_hooks():
 @pytest.fixture(scope="module")
 def client(app_with_hooks):
     app, _ = app_with_hooks
-    c = TestClient(app, port=19882)
+    c = TestClient(app)
     yield c
     c.close()
 
