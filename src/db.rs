@@ -773,16 +773,18 @@ where
             Ok(done) => done,
             Err(join_error) => Err(DbError::from(TaskError::from(join_error))),
         };
-        // Err only when the runtime is shutting down; `delivery` was moved into the
-        // closure, and its Drop completes the future either way.
-        tokio::task::spawn_blocking(move || {
+        // `delivery` was moved into the closure: its Drop completes the future even when
+        // the closure panics or never runs (runtime shutdown).
+        let delivered = tokio::task::spawn_blocking(move || {
             delivery.complete(move |py| match result {
                 Ok(value) => convert(py, value),
                 Err(e) => Err(e.into_pyerr(py)),
             });
         })
-        .await
-        .ok();
+        .await;
+        if let Err(e) = delivered {
+            tracing::error!(target: "pyronova::server", error = %e, "delivering a query result failed");
+        }
     });
     py_fut.call_method1("add_done_callback", (AbortOnCancel(abort),))?;
     Ok(py_fut)
