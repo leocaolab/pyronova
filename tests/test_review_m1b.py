@@ -192,11 +192,13 @@ def test_idle_gc_runs_on_keep_alive_connection(server):
 
     for _ in range(3):
         assert _get(conn, "/work")[0] == 200
-    # Each count probe is a request too; a quiet tick after it collects.
-    first = settle(lambda: _gc_count(conn), lambda n: n >= 1)
+    # Each count probe is a request too; a quiet tick after it collects. Probing every
+    # tick (50 ms) would keep the thread from ever going a full tick without a request,
+    # so the probes are four ticks apart.
+    first = settle(lambda: _gc_count(conn), lambda n: n >= 1, interval=0.2)
 
     assert _get(conn, "/work")[0] == 200
-    second = settle(lambda: _gc_count(conn), lambda n: n > first)
+    second = settle(lambda: _gc_count(conn), lambda n: n > first, interval=0.2)
     conn.close()
 
     assert first >= 1
