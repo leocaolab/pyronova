@@ -34,7 +34,7 @@ def _run(script: str, env: dict[str, str] | None = None, timeout: float = REFUSE
     # A file, not `-c`: sub-interpreter workers rebuild the app by executing it.
     path = os.path.join(tempfile.mkdtemp(prefix="pyronova-m5-"), "app.py")
     with open(path, "w") as f:
-        f.write(textwrap.dedent(script).replace("__PORT__", str(_unused_port())))
+        f.write(textwrap.dedent(script))
     try:
         return subprocess.run(
             [sys.executable, path],
@@ -173,9 +173,12 @@ def test_the_worker_log_level_comes_from_the_engine_not_the_environment():
 
         def probe():
             import time
+            while not app._servers:  # bound on port 0: read the port it got
+                time.sleep(0.05)
+            port = next(iter(app._servers)).port
             for _ in range(200):
                 try:
-                    urllib.request.urlopen(f"http://127.0.0.1:__PORT__/log", timeout=2).read()
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/log", timeout=2).read()
                     break
                 except Exception:
                     time.sleep(0.1)
@@ -184,7 +187,7 @@ def test_the_worker_log_level_comes_from_the_engine_not_the_environment():
 
         if __name__ == "__main__":
             threading.Thread(target=probe, daemon=True).start()
-            app.run(host="127.0.0.1", port=__PORT__, workers=1)
+            app.run(host="127.0.0.1", port=0, workers=1)
         """,
         timeout=60,
     )
@@ -308,26 +311,34 @@ def _get(url: str, ctx=None, attempts: int = 1) -> bytes:
 def test_an_extra_tls_port_is_served_on_every_run_path(cert_key, tmp_path, label, mode, env):
     import ssl
 
+    from tests._helpers import bound_port, read_file
+
     script = tmp_path / "tls_app.py"
     script.write_text(textwrap.dedent(_TLS_APP))
-    plain, tls = _unused_port(), _unused_port()
-    proc = subprocess.Popen(
-        [sys.executable, str(script), str(plain), str(tls), mode, *cert_key],
-        env={**os.environ, **env}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-    )
+    # The plain port is 0, read back from the startup line; `extra_tls_ports` refuses 0
+    # (`_check_port`), so the TLS port is one the kernel just handed out.
+    tls = _unused_port()
+    log_path = tmp_path / "server.log"
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(
+            [sys.executable, str(script), "0", str(tls), mode, *cert_key],
+            env={**os.environ, **env}, stdout=log, stderr=subprocess.STDOUT, text=True,
+        )
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     try:
+        plain = bound_port(read_file(str(log_path)), proc)
         assert _get(f"http://127.0.0.1:{plain}/", attempts=150) == b"hello"
         assert _get(f"https://127.0.0.1:{tls}/", ctx=ctx, attempts=5) == b"hello"
     finally:
         proc.terminate()
         try:
-            out, _ = proc.communicate(timeout=30)
+            proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
             proc.kill()
-            out, _ = proc.communicate()
+            proc.wait()
+    out = log_path.read_text(errors="replace")
     assert f"https://127.0.0.1:{tls}" in out, out
 
 
@@ -429,9 +440,12 @@ def test_a_programmatic_stop_on_the_main_thread_restores_sigint():
             return "ok"
 
         def stop_when_up():
+            while not app._servers:  # bound on port 0: read the port it got
+                time.sleep(0.05)
+            port = next(iter(app._servers)).port
             for _ in range(200):
                 try:
-                    urllib.request.urlopen("http://127.0.0.1:__PORT__/", timeout=1).read()
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=1).read()
                     break
                 except Exception:
                     time.sleep(0.05)
@@ -440,7 +454,7 @@ def test_a_programmatic_stop_on_the_main_thread_restores_sigint():
         if __name__ == "__main__":
             before = signal.getsignal(signal.SIGINT)
             threading.Thread(target=stop_when_up, daemon=True).start()
-            app.run(host="127.0.0.1", port=__PORT__, mode="gil")
+            app.run(host="127.0.0.1", port=0, mode="gil")
             print("RESTORED", signal.getsignal(signal.SIGINT) is before, flush=True)
         """,
         timeout=60,

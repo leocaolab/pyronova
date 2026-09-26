@@ -27,11 +27,11 @@ if __name__ == "__main__":
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="SIGINT shutdown is POSIX")
-@pytest.mark.parametrize(("tpc", "port"), [("1", 8990), ("0", 8991)], ids=["tpc", "pool"])
-def test_no_reference_dropped_without_a_thread_state(tmp_path, tpc, port):
-    proc, log = _start(_APP, tmp_path, f"refs_{tpc}", port, workers=4, env_extra={"PYRONOVA_TPC": tpc})
+@pytest.mark.parametrize("tpc", ["1", "0"], ids=["tpc", "pool"])
+def test_no_reference_dropped_without_a_thread_state(tmp_path, tpc):
+    proc, log = _start(_APP, tmp_path, f"refs_{tpc}", workers=4, env_extra={"PYRONOVA_TPC": tpc})
     try:
-        assert _get(f"http://127.0.0.1:{port}/t", proc, log) == {"ok": 1}
+        assert _get("/t", proc, log) == {"ok": 1}
     finally:
         rc = _sigint(proc)
     text = log.read_text(errors="replace")

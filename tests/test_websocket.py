@@ -6,8 +6,11 @@ import subprocess
 import sys
 import os
 import signal
+import tempfile
 import time
 import pytest
+
+from tests._helpers import bound_port, read_file
 
 PYTHON = sys.executable
 
@@ -40,34 +43,37 @@ def health(req):
     return {"ok": True}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=19880, mode="default")
+    app.run(host="127.0.0.1", port=0, mode="default")
 '''
 
 
 @pytest.fixture(scope="module")
 def ws_server():
-    """Start a WebSocket-capable server as a subprocess."""
+    """Start a WebSocket-capable server as a subprocess; yields the port it bound."""
     script = "/tmp/pyronova_ws_test_server.py"
     with open(script, "w") as f:
         f.write(WS_SERVER)
 
-    proc = subprocess.Popen(
-        [PYTHON, script],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        preexec_fn=os.setsid,
-    )
+    log_path = tempfile.mkstemp(prefix="pyronova_ws_test_", suffix=".log")[1]
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(
+            [PYTHON, script],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            preexec_fn=os.setsid,
+        )
+    port = bound_port(read_file(log_path), proc)
     # Wait for server
     import urllib.request
     for _ in range(50):
         time.sleep(0.1)
         try:
-            urllib.request.urlopen("http://127.0.0.1:19880/health", timeout=1)
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1)
             break
         except Exception:
             pass
 
-    yield proc
+    yield port
 
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
@@ -82,7 +88,7 @@ def ws_server():
 @pytest.mark.asyncio
 async def test_websocket_echo(ws_server):
     import websockets
-    async with websockets.connect("ws://127.0.0.1:19880/echo") as ws:
+    async with websockets.connect(f"ws://127.0.0.1:{ws_server}/echo") as ws:
         await ws.send("hello")
         resp = await asyncio.wait_for(ws.recv(), timeout=5)
         assert resp == "echo: hello"
@@ -95,7 +101,7 @@ async def test_websocket_echo(ws_server):
 @pytest.mark.asyncio
 async def test_websocket_json(ws_server):
     import websockets
-    async with websockets.connect("ws://127.0.0.1:19880/json") as ws:
+    async with websockets.connect(f"ws://127.0.0.1:{ws_server}/json") as ws:
         await ws.send(json.dumps({"key": "value"}))
         resp = await asyncio.wait_for(ws.recv(), timeout=5)
         data = json.loads(resp)
@@ -106,7 +112,7 @@ async def test_websocket_json(ws_server):
 @pytest.mark.asyncio
 async def test_websocket_multiple_messages(ws_server):
     import websockets
-    async with websockets.connect("ws://127.0.0.1:19880/echo") as ws:
+    async with websockets.connect(f"ws://127.0.0.1:{ws_server}/echo") as ws:
         for i in range(10):
             await ws.send(f"msg-{i}")
             resp = await asyncio.wait_for(ws.recv(), timeout=5)

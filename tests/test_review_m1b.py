@@ -13,7 +13,6 @@ from __future__ import annotations
 import http.client
 import os
 import signal
-import socket
 import subprocess
 import sys
 import textwrap
@@ -23,21 +22,17 @@ import urllib.request
 
 import pytest
 
+from tests._helpers import listening_ports
+
 HOST = "127.0.0.1"
 STARTUP_TIMEOUT_S = 30
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((HOST, 0))
-        return s.getsockname()[1]
-
-
 class Server:
     def __init__(self, tmp_path, script: str, env: dict[str, str], ready_path: str = "/"):
-        self.port = _free_port()
+        self.port: int | None = None
         self.script = tmp_path / "app.py"
-        self.script.write_text(textwrap.dedent(script).replace("__PORT__", str(self.port)))
+        self.script.write_text(textwrap.dedent(script).replace("__PORT__", "0"))
         self.log = tmp_path / "server.log"
         full_env = dict(os.environ)
         full_env.update(env)
@@ -57,6 +52,12 @@ class Server:
         while time.time() < deadline:
             if self.proc.poll() is not None:
                 raise RuntimeError(f"server exited early:\n{self.output()}")
+            if self.port is None:
+                ports = listening_ports(self.output())
+                if not ports:
+                    time.sleep(0.1)
+                    continue
+                self.port = ports[0]
             try:
                 urllib.request.urlopen(f"http://{HOST}:{self.port}{self.ready_path}", timeout=1)
                 return

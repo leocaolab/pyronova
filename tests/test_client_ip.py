@@ -50,7 +50,7 @@ def ip_echo(req):
 
 @pytest.fixture(scope="module")
 def client():
-    c = TestClient(app, port=19881)
+    c = TestClient(app)
     yield c
     c.close()
 

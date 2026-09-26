@@ -16,6 +16,8 @@ import os
 import signal
 import time
 
+from tests._helpers import bound_port, read_file
+
 PYTHON = sys.executable
 
 
@@ -25,18 +27,23 @@ def run_server_and_check(script: str, label: str, expected_strings: list[str]):
     with open(script_path, "w") as f:
         f.write(script)
 
-    proc = subprocess.Popen(
-        [PYTHON, script_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        preexec_fn=os.setsid,
-    )
+    # One file for stdout + stderr: tracing writes to stderr, println (and the
+    # "Listening on" line with the bound port) to stdout.
+    log_path = script_path + ".log"
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(
+            [PYTHON, script_path],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            preexec_fn=os.setsid,
+        )
     time.sleep(3)
 
     try:
         import urllib.request
+        port = bound_port(read_file(log_path), proc)
         for _ in range(2):
-            urllib.request.urlopen("http://127.0.0.1:9876/", timeout=2)
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=2)
     except Exception:
         pass
 
@@ -44,9 +51,8 @@ def run_server_and_check(script: str, label: str, expected_strings: list[str]):
     alive = proc.poll() is None
     if alive:
         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    stdout, stderr = proc.communicate(timeout=5)
-    # Merge stdout + stderr — tracing writes to stderr, println to stdout
-    output = stdout.decode() + stderr.decode()
+    proc.wait(timeout=5)
+    output = read_file(log_path)()
 
     passed = 0
     for s in expected_strings:
@@ -70,7 +76,7 @@ app.enable_logging()
 @app.get("/", gil=True)
 def index(req): return "ok"
 
-app.run(host="127.0.0.1", port=9876)
+app.run(host="127.0.0.1", port=0)
 '''
     assert run_server_and_check(script, "gil_logging", [
         "pyronova::access",
@@ -91,7 +97,7 @@ app.enable_logging()
 @app.get("/")
 def index(req): return "ok"
 
-app.run(host="127.0.0.1", port=9876, mode="subinterp")
+app.run(host="127.0.0.1", port=0, mode="subinterp")
 '''
     assert run_server_and_check(script, "subinterp_logging", [
         "pyronova::access",
@@ -110,7 +116,7 @@ def index(req):
     print("USER_PRINT_MARKER", flush=True)
     return "ok"
 
-app.run(host="127.0.0.1", port=9876, mode="subinterp")
+app.run(host="127.0.0.1", port=0, mode="subinterp")
 '''
     assert run_server_and_check(script, "user_print", [
         "USER_PRINT_MARKER",
@@ -131,7 +137,7 @@ def index(req):
     logger.info("LOGGER_MARKER_12345")
     return "ok"
 
-app.run(host="127.0.0.1", port=9876, mode="subinterp")
+app.run(host="127.0.0.1", port=0, mode="subinterp")
 '''
     assert run_server_and_check(script, "user_logging", [
         "LOGGER_MARKER_12345",
@@ -147,7 +153,7 @@ app = Pyronova(debug=True)
 @app.get("/")
 def index(req): return "ok"
 
-app.run(host="127.0.0.1", port=9876)
+app.run(host="127.0.0.1", port=0)
 '''
     assert run_server_and_check(script, "debug_mode", [
         "pyronova::server",
@@ -165,7 +171,7 @@ app = Pyronova(debug=True)
 @app.get("/")
 def index(req): return "ok"
 
-app.run(host="127.0.0.1", port=9876)
+app.run(host="127.0.0.1", port=0)
 '''
     assert run_server_and_check(script, "debug_access_log", [
         "pyronova::access",
@@ -188,7 +194,7 @@ def index(req):
     logger.info("BRIDGE_TEST_MARKER")
     return "ok"
 
-app.run(host="127.0.0.1", port=9876)
+app.run(host="127.0.0.1", port=0)
 '''
     assert run_server_and_check(script, "python_bridge_main", [
         "BRIDGE_TEST_MARKER",
@@ -205,7 +211,7 @@ app = Pyronova(debug=True, log_config={"format": "json"})
 @app.get("/")
 def index(req): return "ok"
 
-app.run(host="127.0.0.1", port=9876)
+app.run(host="127.0.0.1", port=0)
 '''
     assert run_server_and_check(script, "json_format", [
         '"target":"pyronova::server"',

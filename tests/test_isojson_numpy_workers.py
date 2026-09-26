@@ -26,7 +26,7 @@ import numpy as np
 import orjson
 import pytest
 
-from tests.test_isolate_shared_ext import _get, _sigint, _start
+from tests.test_isolate_shared_ext import _base, _get, _sigint, _start
 
 pytestmark = [
     pytest.mark.skipif(
@@ -105,20 +105,19 @@ def _reference(seed):
     ids=["tpc-default", "pool-PYRONOVA_TPC=0"],
 )
 @pytest.mark.parametrize(
-    ("script", "port", "bucket"),
-    [(DECLARED, 8998, "*"), (REACTIVE, 8999, "auto")],
+    ("script", "bucket"),
+    [(DECLARED, "*"), (REACTIVE, "auto")],
     ids=["declared", "reactive"],
 )
-def test_each_worker_serializes_its_own_numpy(tmp_path, script, port, bucket, dispatch):
+def test_each_worker_serializes_its_own_numpy(tmp_path, script, bucket, dispatch):
     assert orjson.__version__ == "3.12.0", orjson.__version__
     # isojson with native numpy (0.2); 0.1 raises "does not support OPT_SERIALIZE_NUMPY"
     assert isojson.dumps(np.float64(1.5), option=isojson.OPT_SERIALIZE_NUMPY) == b"1.5"
     env = {"PYRONOVA_TPC": "0"} if dispatch == "pool" else None
-    port += 10 if dispatch == "pool" else 0
-    proc, log = _start(script, tmp_path, f"isojson_np_{dispatch}", port, workers=4, env_extra=env)
-    base = f"http://127.0.0.1:{port}/s/"
+    proc, log = _start(script, tmp_path, f"isojson_np_{dispatch}", workers=4, env_extra=env)
     try:
-        _get(base + "0", proc, log)
+        _get("/s/0", proc, log)
+        base = _base(log) + "/s/"
 
         def hit(seed):
             return seed, json.loads(urllib.request.urlopen(base + str(seed), timeout=30).read())

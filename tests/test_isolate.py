@@ -17,13 +17,17 @@ import urllib.request
 
 import pytest
 
+from tests._helpers import bound_port, listening_ports, read_file
+
 _supported = pytest.mark.skipif(
     sys.platform not in ("linux", "darwin"),
     reason="isolate() clones via cp -c / cp --reflink (Linux/macOS)",
 )
 
-_PORT = 8973
-_SERVER = f'''
+# Workers clone numpy and import it before the server listens.
+_READY_TIMEOUT_S = 80
+
+_SERVER = '''
 from pyronova import Pyronova
 app = Pyronova()
 app.isolate("numpy")
@@ -37,12 +41,12 @@ def np_op(req):
     import _interpreters
     import time
     time.sleep(0.02)  # hold the worker briefly so concurrency spreads across workers
-    return {{"numpy": np.__version__,
+    return {"numpy": np.__version__,
              "interp": _interpreters.get_current()[0],
-             "isolated": np.__file__.startswith(_ISO_DIR)}}
+             "isolated": np.__file__.startswith(_ISO_DIR)}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port={_PORT}, mode="subinterp")
+    app.run(host="127.0.0.1", port=0, mode="subinterp")
 '''
 
 
@@ -57,12 +61,16 @@ def isolate_server(tmp_path):
         PYRONOVA_WORKERS="4",
         PYRONOVA_ISOLATE_DIR=str(copies),
     )
-    proc = subprocess.Popen(
-        [sys.executable, str(script)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
-    )
-    url = f"http://127.0.0.1:{_PORT}/np"
+    log = tmp_path / "iso_server.log"
+    with open(log, "wb") as out:
+        proc = subprocess.Popen(
+            [sys.executable, str(script)],
+            stdout=out, stderr=subprocess.STDOUT, env=env,
+        )
     try:
+        # Workers clone numpy before the server listens → allow time.
+        port = bound_port(read_file(str(log)), proc, timeout=_READY_TIMEOUT_S)
+        url = f"http://127.0.0.1:{port}/np"
         ready = False
         for _ in range(160):  # workers must clone numpy + import it → allow time
             try:
@@ -114,8 +122,7 @@ def test_isolate_numpy_across_workers(isolate_server):
 # "does not support loading in subinterpreters", the hook reads the offending
 # module out of the error, clones numpy, and retries — with zero app.isolate().
 
-_PORT_AUTO = 8974
-_SERVER_AUTO = f'''
+_SERVER_AUTO = '''
 from pyronova import Pyronova
 app = Pyronova()
 # NOTE: no app.isolate(...) — isolation must happen reactively.
@@ -134,12 +141,12 @@ def np_op(req):
     import _interpreters
     import time
     time.sleep(0.02)
-    return {{"numpy": np.__version__,
+    return {"numpy": np.__version__,
              "interp": _interpreters.get_current()[0],
-             "isolated": np.__file__.startswith(_ISO_DIR)}}
+             "isolated": np.__file__.startswith(_ISO_DIR)}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port={_PORT_AUTO}, mode="subinterp")
+    app.run(host="127.0.0.1", port=0, mode="subinterp")
 '''
 
 
@@ -154,12 +161,16 @@ def auto_isolate_server(tmp_path):
         PYRONOVA_WORKERS="4",
         PYRONOVA_ISOLATE_DIR=str(copies),
     )
-    proc = subprocess.Popen(
-        [sys.executable, str(script)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
-    )
-    url = f"http://127.0.0.1:{_PORT_AUTO}/np"
+    log = tmp_path / "auto_iso_server.log"
+    with open(log, "wb") as out:
+        proc = subprocess.Popen(
+            [sys.executable, str(script)],
+            stdout=out, stderr=subprocess.STDOUT, env=env,
+        )
     try:
+        # Workers clone numpy before the server listens → allow time.
+        port = bound_port(read_file(str(log)), proc, timeout=_READY_TIMEOUT_S)
+        url = f"http://127.0.0.1:{port}/np"
         ready = False
         for _ in range(160):  # workers must clone numpy + import it → allow time
             try:
@@ -212,11 +223,11 @@ def test_auto_isolate_numpy_without_declaration(auto_isolate_server):
 # ---------------------------------------------------------------------------
 
 
-def _start_server(script_text, tmp_path, name, port, workers=4, isolate_dir=None, env_extra=None):
-    """Write a server script, launch it as a subprocess (logs to a file), return
-    (proc, log_path). Caller waits for readiness via `_wait_ready`."""
+def _start_server(script_text, tmp_path, name, workers=4, isolate_dir=None, env_extra=None):
+    """Write a server script (it binds port 0), launch it as a subprocess (logs to a
+    file), return (proc, log_path). Caller waits for readiness via `_wait_ready`."""
     script = tmp_path / f"{name}.py"
-    script.write_text(script_text.format(port=port))
+    script.write_text(script_text.format(port=0))
     log = tmp_path / f"{name}.log"
     env = dict(os.environ, PYRONOVA_WORKERS=str(workers))
     if isolate_dir is not None:
@@ -230,19 +241,25 @@ def _start_server(script_text, tmp_path, name, port, workers=4, isolate_dir=None
     return proc, log
 
 
-def _wait_ready(url, proc, log, tries=200):
+def _wait_ready(path, proc, log, tries=200):
+    """GETs `path` on the server once it listens; its JSON body once it answers 200."""
+    port = None
     for _ in range(tries):
         if proc.poll() is not None:  # died during startup — surface the real error
             pytest.fail(
                 f"server exited early (rc={proc.returncode}):\n"
                 f"{log.read_text(errors='replace')[-2500:]}"
             )
-        try:
-            r = urllib.request.urlopen(url, timeout=2)
-            if r.status == 200:
-                return json.loads(r.read())
-        except Exception:
-            pass
+        if port is None:
+            ports = listening_ports(log.read_text(errors="replace"))
+            port = ports[0] if ports else None
+        if port is not None:
+            try:
+                r = urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=2)
+                if r.status == 200:
+                    return json.loads(r.read())
+            except Exception:
+                pass
         time.sleep(0.5)
     pytest.fail(f"server never became ready:\n{log.read_text(errors='replace')[-2500:]}")
 
@@ -278,13 +295,11 @@ def test_auto_isolate_survives_warm_restart(tmp_path):
     module more than once". Both runs must serve isolated numpy."""
     pytest.importorskip("numpy")
     copies = tmp_path / "copies"
-    port = 8991
-    url = f"http://127.0.0.1:{port}/np"
     for run in range(2):  # run 0 = cold (creates clones); run 1 = warm (reuses)
-        proc, log = _start_server(_SERVER_WARM, tmp_path, f"warm{run}", port,
+        proc, log = _start_server(_SERVER_WARM, tmp_path, f"warm{run}",
                                   workers=4, isolate_dir=copies)
         try:
-            r = _wait_ready(url, proc, log)
+            r = _wait_ready("/np", proc, log)
             assert r["isolated"], f"run {run} ({'cold' if run == 0 else 'warm'}): numpy not isolated"
         finally:
             _stop(proc)
@@ -319,12 +334,11 @@ def test_graceful_sigint_no_abort_and_hooks_run(tmp_path):
     Assert: clean exit (rc==0, not SIGABRT) AND hook ran."""
     pytest.importorskip("numpy")
     mark = tmp_path / "shutdown.mark"
-    port = 8992
-    proc, log = _start_server(_SERVER_SHUTDOWN, tmp_path, "shutdown", port,
+    proc, log = _start_server(_SERVER_SHUTDOWN, tmp_path, "shutdown",
                               workers=4, isolate_dir=tmp_path / "copies",
                               env_extra={"SHUTDOWN_MARK": str(mark)})
     try:
-        _wait_ready(f"http://127.0.0.1:{port}/np", proc, log)
+        _wait_ready("/np", proc, log)
         proc.send_signal(signal.SIGINT)
         rc = proc.wait(timeout=25)
     finally:
@@ -358,11 +372,10 @@ def test_builtin_single_phase_ext_loads_in_workers(tmp_path):
     copied; it must load SHARED under the transient override. Without that
     fallback, worker init died with "module faulthandler does not support
     loading in subinterpreters" (caught by the grill soak on Linux)."""
-    port = 8993
-    proc, log = _start_server(_SERVER_BUILTIN, tmp_path, "builtin", port,
+    proc, log = _start_server(_SERVER_BUILTIN, tmp_path, "builtin",
                               workers=4, isolate_dir=tmp_path / "copies")
     try:
-        r = _wait_ready(f"http://127.0.0.1:{port}/fh", proc, log)
+        r = _wait_ready("/fh", proc, log)
         assert r["loaded"], "faulthandler did not load in the sub-interpreter workers"
     finally:
         _stop(proc)
@@ -393,12 +406,11 @@ def test_isolated_pyo3_multiphase_ext_loads_in_workers(tmp_path):
     memory and the worker aborted on import ("pointer being freed was not
     allocated"; measured with polars' runtime)."""
     pytest.importorskip("pydantic_core")
-    port = 8994
     copies = tmp_path / "copies"
-    proc, log = _start_server(_SERVER_PYO3_MULTIPHASE, tmp_path, "pyo3mp", port,
+    proc, log = _start_server(_SERVER_PYO3_MULTIPHASE, tmp_path, "pyo3mp",
                               workers=2, isolate_dir=copies)
     try:
-        r = _wait_ready(f"http://127.0.0.1:{port}/pc", proc, log)
+        r = _wait_ready("/pc", proc, log)
         assert r == {"isolated": True, "ok": True}, r
     finally:
         _stop(proc)

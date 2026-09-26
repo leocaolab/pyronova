@@ -31,6 +31,7 @@ from typing import Literal, Optional
 import pytest
 
 import pyronova.engine
+from tests._helpers import bound_port, listening_ports
 
 PYTHON = sys.executable
 HOST = "127.0.0.1"
@@ -49,12 +50,6 @@ GENERIC_500 = "Internal Server Error"
 # ---------------------------------------------------------------------------
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((HOST, 0))
-        return s.getsockname()[1]
-
-
 class Reply:
     def __init__(self, status: int, body: bytes, headers: list[tuple[str, str]]):
         self.status = status
@@ -67,7 +62,8 @@ class Reply:
 
 class Server:
     """`script` served on `path`. The script's `app.run` reads mode, port and workers from
-    `RA_MODE` / `RA_PORT` / `RA_WORKERS` (see `RUN`)."""
+    `RA_MODE` / `RA_PORT` / `RA_WORKERS` (see `RUN`); the port is 0, and `port` is the one
+    the server bound, from its startup line."""
 
     def __init__(
         self,
@@ -78,14 +74,14 @@ class Server:
         wait: bool = True,
     ):
         self.path = path
-        self.port = _free_port()
+        self._port: int | None = None
         fd, self.script_path = tempfile.mkstemp(prefix="pyronova_ra_", suffix=".py")
         with os.fdopen(fd, "w") as f:
             f.write(textwrap.dedent(script))
         self.log_path = self.script_path + ".log"
         full_env = dict(os.environ)
         full_env["RA_MODE"] = PATHS[path]["mode"]
-        full_env["RA_PORT"] = str(self.port)
+        full_env["RA_PORT"] = "0"
         full_env["RA_WORKERS"] = str(workers)
         full_env.pop("PYRONOVA_TPC", None)
         full_env.pop("PYRONOVA_LOG", None)
@@ -104,14 +100,24 @@ class Server:
             return
         deadline = time.time() + 30
         while time.time() < deadline:
-            try:
-                with socket.create_connection((HOST, self.port), timeout=0.5):
-                    return
-            except OSError:
-                if self.proc.poll() is not None:
-                    break
-                time.sleep(0.1)
+            ports = listening_ports(self.log())
+            if ports:
+                try:
+                    with socket.create_connection((HOST, ports[0]), timeout=0.5):
+                        self._port = ports[0]
+                        return
+                except OSError:
+                    pass
+            if self.proc.poll() is not None:
+                break
+            time.sleep(0.1)
         raise RuntimeError(f"server ({path}) did not start:\n{self.stop()}")
+
+    @property
+    def port(self) -> int:
+        if self._port is None:
+            self._port = bound_port(self.log, self.proc)
+        return self._port
 
     def request(
         self,
@@ -482,7 +488,7 @@ def test_relative_import_failing_in_a_worker_says_why(tmp_path):
             app.run(host="127.0.0.1", port=int(os.environ["RA_PORT"]), mode="subinterp",
                     workers=1)
     """))
-    env = dict(os.environ, RA_PORT=str(_free_port()), PYRONOVA_TPC="0")
+    env = dict(os.environ, RA_PORT="0", PYRONOVA_TPC="0")
     proc = subprocess.run(
         [PYTHON, "-m", "ra_pkg.app"], cwd=tmp_path, env=env,
         capture_output=True, text=True, timeout=60,

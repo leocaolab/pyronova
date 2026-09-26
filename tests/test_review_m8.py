@@ -63,12 +63,6 @@ def _two_workers(monkeypatch):
     monkeypatch.setenv("PYRONOVA_WORKERS", "2")
 
 
-def _unused_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((HOST, 0))
-        return s.getsockname()[1]
-
-
 def _os_thread_count() -> int:
     if sys.platform.startswith("linux"):
         return len(os.listdir("/proc/self/task"))
@@ -198,5 +192,5 @@ def test_many_clients_leak_no_threads_or_servers():
 def test_mcp_route_is_registered_once():
     _serve_once()
     _serve_once()
-    mcp = [r for r in app.routes if r["path"] == "/mcp"]
+    mcp = [r for r in app.routes if r.path == "/mcp"]
     assert len(mcp) == 1, mcp

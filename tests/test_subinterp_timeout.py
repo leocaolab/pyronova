@@ -17,33 +17,39 @@ import urllib.error
 
 import pytest
 
+from tests._helpers import bound_port, read_file
 
-def start_server(script_path, port):
+
+def start_server(script_path):
+    """Starts the script (it binds port 0); returns the process and the bound port."""
     # This test validates the old pool's 30s zombie-handler watchdog —
     # TPC's inline execution model has no way to interrupt a running
     # Python handler from another thread. Explicitly opt out of TPC
     # via env so we exercise the pool path.
     env = dict(os.environ)
     env["PYRONOVA_TPC"] = "0"
-    proc = subprocess.Popen(
-        [sys.executable, script_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        preexec_fn=os.setsid,
-        env=env,
-    )
+    log_path = script_path + ".log"
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(
+            [sys.executable, script_path],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            preexec_fn=os.setsid,
+            env=env,
+        )
+    port = bound_port(read_file(log_path), proc)
     for _ in range(50):
         time.sleep(0.1)
         try:
             urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=1)
-            return proc
+            return proc, port
         except Exception:
             if proc.poll() is not None:
-                out = proc.stdout.read().decode(errors="replace")
+                out = read_file(log_path)()
                 raise RuntimeError(f"Server exited early:\n{out}")
-    # Stop it before reading: read() waits for EOF, which a live server never sends.
     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    out = proc.communicate(timeout=10)[0].decode(errors="replace")
+    proc.wait(timeout=10)
+    out = read_file(log_path)()
     raise RuntimeError(f"Server failed to start:\n{out}")
 
 
@@ -78,7 +84,7 @@ def slow(req):
     return {"should": "never reach"}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=19894, mode="subinterp", workers=2)
+    app.run(host="127.0.0.1", port=0, mode="subinterp", workers=2)
 '''
 
 
@@ -87,16 +93,16 @@ def server():
     script = "/tmp/pyronova_test_sync_timeout.py"
     with open(script, "w") as f:
         f.write(SLOW_SYNC_SCRIPT)
-    proc = start_server(script, 19894)
-    yield proc
-    stop_server(proc, 19894)
+    proc, port = start_server(script)
+    yield port
+    stop_server(proc, port)
 
 
 def test_sync_timeout_returns_504(server):
     """Sync handler exceeding 30s Rust timeout returns 504."""
     try:
         resp = urllib.request.urlopen(
-            "http://127.0.0.1:19894/slow", timeout=35
+            f"http://127.0.0.1:{server}/slow", timeout=35
         )
         status = resp.status
         body = resp.read()
@@ -110,7 +116,7 @@ def test_server_healthy_after_timeout(server):
     """After a 504 timeout, subsequent fast requests succeed."""
     try:
         resp = urllib.request.urlopen(
-            "http://127.0.0.1:19894/", timeout=5
+            f"http://127.0.0.1:{server}/", timeout=5
         )
         status = resp.status
         body = json.loads(resp.read())

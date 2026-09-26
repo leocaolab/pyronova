@@ -52,7 +52,7 @@ def custom_headers(req):
 
 @pytest.fixture(scope="module")
 def client():
-    c = TestClient(app, port=19877)
+    c = TestClient(app)
     yield c
     c.close()
 
@@ -116,7 +116,7 @@ def cors_client():
     # Its own module (a worker serves one app per module).
     from tests.apps.testclient_cors import app as cors_app
 
-    c = TestClient(cors_app, port=19890)
+    c = TestClient(cors_app)
     yield c
     c.close()
 

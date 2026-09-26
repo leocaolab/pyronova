@@ -34,6 +34,8 @@ import time
 
 import pytest
 
+from tests._helpers import listening_ports, read_file
+
 from pyronova import SharedState
 from pyronova.engine import Request
 
@@ -56,12 +58,6 @@ TRACEBACK = "Traceback (most recent call last)"
 # ---------------------------------------------------------------------------
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((HOST, 0))
-        return s.getsockname()[1]
-
-
 class Reply:
     def __init__(self, status: int, body: bytes, headers: list[tuple[str, str]]):
         self.status = status
@@ -75,14 +71,14 @@ class Reply:
 class Server:
     def __init__(self, script: str, path: str, workers: int = 2, wait: bool = True):
         self.path = path
-        self.port = _free_port()
+        self.port = 0  # the bound one once the server listens
         fd, self.script_path = tempfile.mkstemp(prefix="pyronova_m4_", suffix=".py")
         with os.fdopen(fd, "w") as f:
             f.write(textwrap.dedent(script))
         self.log_path = self.script_path + ".log"
         env = dict(os.environ)
         env["M4_MODE"] = PATHS[path]["mode"]
-        env["M4_PORT"] = str(self.port)
+        env["M4_PORT"] = "0"
         env["M4_WORKERS"] = str(workers)
         env.pop("PYRONOVA_TPC", None)
         env.pop("PYRONOVA_LOG", None)
@@ -100,13 +96,17 @@ class Server:
             return
         deadline = time.time() + 20
         while time.time() < deadline:
-            try:
-                with socket.create_connection((HOST, self.port), timeout=0.5):
-                    return
-            except OSError:
-                if self.proc.poll() is not None:
-                    break
-                time.sleep(0.1)
+            ports = listening_ports(read_file(self.log_path)())
+            if ports:
+                try:
+                    with socket.create_connection((HOST, ports[0]), timeout=0.5):
+                        self.port = ports[0]
+                        return
+                except OSError:
+                    pass
+            if self.proc.poll() is not None:
+                break
+            time.sleep(0.1)
         raise RuntimeError(f"server ({path}) did not start:\n{self.stop()}")
 
     def request(

@@ -34,7 +34,7 @@ def fail(data):
 
 @pytest.fixture(scope="module")
 def client():
-    c = TestClient(app, port=19878)
+    c = TestClient(app)
     yield c
     c.close()
 

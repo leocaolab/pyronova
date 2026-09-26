@@ -22,7 +22,8 @@ import time
 import httpx
 import pytest
 
-from conftest import _free_port, fork_panic_lines
+from conftest import fork_panic_lines
+from tests._helpers import bound_port, read_file
 
 PG_DSN = os.environ.get("PYRONOVA_TEST_PG_DSN")
 
@@ -81,16 +82,16 @@ def _hammer(base: str) -> collections.Counter:
 
 @pytest.mark.parametrize("tpc", ["1", "0"], ids=["tpc", "pool"])
 def test_async_db_on_main_while_workers_execute_engine(tmp_path, tpc):
-    port = _free_port()
-    base = f"http://127.0.0.1:{port}"
     log_path = str(tmp_path / "server.log")
-    env = dict(os.environ, L2_PORT=str(port), RUST_BACKTRACE="0", PYRONOVA_TPC=tpc)
+    env = dict(os.environ, L2_PORT="0", RUST_BACKTRACE="0", PYRONOVA_TPC=tpc)
     with open(log_path, "w") as log:
         proc = subprocess.Popen(
             [sys.executable, os.path.join(HERE, "_l2_async_db_app.py")],
             env=env, stdout=log, stderr=subprocess.STDOUT,
         )
     try:
+        port = bound_port(read_file(log_path), proc)
+        base = f"http://127.0.0.1:{port}"
         _wait_up(base, proc, log_path)
         assert httpx.get(base + "/w", timeout=5).json() == {"real_engine": True}
         statuses = _hammer(base)

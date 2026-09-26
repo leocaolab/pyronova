@@ -17,7 +17,7 @@ def app_with_hooks():
 @pytest.fixture(scope="module")
 def client(app_with_hooks):
     app, _ = app_with_hooks
-    c = TestClient(app, port=19882)
+    c = TestClient(app)
     yield c
     c.close()
 

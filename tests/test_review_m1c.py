@@ -259,6 +259,9 @@ def test_second_thread_waits_instead_of_stopping_early(pool):
     time.sleep(0.1)  # the waiter is now blocked on the first batch
     second = next(cursor)
     waiter.join(timeout=10)
+    assert not waiter.is_alive(), "the waiter never got its row"
+    # A waiter that got StopIteration appends nothing, and the rows all reach this thread.
+    assert len(first) == 1, first
     rest = list(cursor)
     got = sorted(r["i"] for r in first + [second] + rest)
     assert got == [1, 2, 3]
@@ -310,20 +313,21 @@ if __name__ == "__main__":
 def test_stdlib_types_and_typed_errors_in_a_worker(tmp_path):
     import json
     import signal
-    import socket
     import urllib.request
 
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
+    from tests._helpers import bound_port, read_file
+
     script = tmp_path / "m1c_worker_app.py"
     script.write_text(_WORKER_APP)
-    proc = subprocess.Popen(
-        [sys.executable, str(script)],
-        env={**os.environ, "PYRONOVA_PORT": str(port)},
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
-    )
+    log_path = tmp_path / "server.log"
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(
+            [sys.executable, str(script)],
+            env={**os.environ, "PYRONOVA_PORT": "0"},
+            stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+        )
     try:
+        port = bound_port(read_file(str(log_path)), proc, timeout=15)
         deadline = time.time() + 15
         while True:
             try:
@@ -332,7 +336,7 @@ def test_stdlib_types_and_typed_errors_in_a_worker(tmp_path):
             except OSError:
                 if time.time() > deadline or proc.poll() is not None:
                     proc.kill()
-                    raise AssertionError(proc.communicate()[0].decode(errors="replace")[-4000:])
+                    raise AssertionError(log_path.read_text(errors="replace")[-4000:])
                 time.sleep(0.1)
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/kinds", timeout=10) as r:
             got = json.loads(r.read())

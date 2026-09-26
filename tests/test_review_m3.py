@@ -28,6 +28,8 @@ import time
 
 import pytest
 
+from tests._helpers import listening_ports, read_file
+
 from pyronova import Response
 
 PYTHON = sys.executable
@@ -45,12 +47,6 @@ SUBINTERP_PATHS = ["tpc", "pool"]
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((HOST, 0))
-        return s.getsockname()[1]
 
 
 class Reply:
@@ -73,14 +69,14 @@ class Reply:
 class Server:
     def __init__(self, script: str, path: str, workers: int = 2):
         self.path = path
-        self.port = _free_port()
+        self.port = 0  # the bound one once the server listens
         fd, self.script_path = tempfile.mkstemp(prefix="pyronova_m3_", suffix=".py")
         with os.fdopen(fd, "w") as f:
             f.write(textwrap.dedent(script))
         self.log_path = self.script_path + ".log"
         env = dict(os.environ)
         env["M3_MODE"] = PATHS[path]["mode"]
-        env["M3_PORT"] = str(self.port)
+        env["M3_PORT"] = "0"
         env["M3_WORKERS"] = str(workers)
         env.pop("PYRONOVA_TPC", None)
         if PATHS[path]["tpc"] is not None:
@@ -95,13 +91,17 @@ class Server:
             )
         deadline = time.time() + 20
         while time.time() < deadline:
-            try:
-                with socket.create_connection((HOST, self.port), timeout=0.5):
-                    return
-            except OSError:
-                if self.proc.poll() is not None:
-                    break
-                time.sleep(0.1)
+            ports = listening_ports(read_file(self.log_path)())
+            if ports:
+                try:
+                    with socket.create_connection((HOST, ports[0]), timeout=0.5):
+                        self.port = ports[0]
+                        return
+                except OSError:
+                    pass
+            if self.proc.poll() is not None:
+                break
+            time.sleep(0.1)
         raise RuntimeError(f"server ({path}) did not start:\n{self.stop()}")
 
     def request(

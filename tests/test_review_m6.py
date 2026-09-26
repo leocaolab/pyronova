@@ -35,6 +35,8 @@ import urllib.request
 
 import pytest
 
+from tests._helpers import listening_ports, read_file
+
 from pyronova.engine import PyronovaApp
 
 PYTHON = sys.executable
@@ -54,12 +56,6 @@ GET_SUM = "/benchmark.BenchmarkService/GetSum"
 # ---------------------------------------------------------------------------
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((HOST, 0))
-        return s.getsockname()[1]
-
-
 def _write_script(script: str) -> str:
     fd, path = tempfile.mkstemp(prefix="pyronova_m6_", suffix=".py")
     with os.fdopen(fd, "w") as f:
@@ -72,12 +68,12 @@ class Server:
     reads `mode` and `port` from `M6_MODE` / `M6_PORT`."""
 
     def __init__(self, script: str, path: str, workers: int = 2):
-        self.port = _free_port()
+        self.port = 0  # the bound one once the server listens
         self.script_path = _write_script(script)
         self.log_path = self.script_path + ".log"
         env = dict(os.environ)
         env["M6_MODE"] = PATHS[path]["mode"]
-        env["M6_PORT"] = str(self.port)
+        env["M6_PORT"] = "0"
         env["M6_WORKERS"] = str(workers)
         env.pop("PYRONOVA_TPC", None)
         if PATHS[path]["tpc"] is not None:
@@ -92,13 +88,17 @@ class Server:
             )
         deadline = time.time() + 20
         while time.time() < deadline:
-            try:
-                with socket.create_connection((HOST, self.port), timeout=0.5):
-                    return
-            except OSError:
-                if self.proc.poll() is not None:
-                    break
-                time.sleep(0.1)
+            ports = listening_ports(read_file(self.log_path)())
+            if ports:
+                try:
+                    with socket.create_connection((HOST, ports[0]), timeout=0.5):
+                        self.port = ports[0]
+                        return
+                except OSError:
+                    pass
+            if self.proc.poll() is not None:
+                break
+            time.sleep(0.1)
         raise RuntimeError(f"server ({path}) did not start:\n{self.stop()}")
 
     def post(self, path: str, body: bytes, content_type: str) -> tuple[int, bytes, dict]:
@@ -305,7 +305,7 @@ def test_tpc_worker_build_failure_ends_the_built_workers(tmp_path):
     counter = tmp_path / "counter"
     script = FAILING_WORKER + f"""
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port={_free_port()}, mode="subinterp", workers=2)
+    app.run(host="127.0.0.1", port=0, mode="subinterp", workers=2)
 """
     r = _run_script(script, {"M6_COUNTER": str(counter), "M6_FAIL_AT": "3"})
     out = r.stdout + r.stderr

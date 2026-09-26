@@ -30,6 +30,8 @@ import urllib.request
 
 import pytest
 
+from tests._helpers import listening_ports, read_file
+
 PYTHON = sys.executable
 HOST = "127.0.0.1"
 
@@ -49,25 +51,19 @@ PATHS = {
 # ---------------------------------------------------------------------------
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((HOST, 0))
-        return s.getsockname()[1]
-
-
 class Server:
     """A Pyronova server running `script` on one serving path. `app.run` in the script
     reads `mode` and `port` from `M2_MODE` / `M2_PORT`."""
 
     def __init__(self, script: str, path: str, workers: int = 2):
-        self.port = _free_port()
+        self.port = 0  # the bound one once the server listens
         fd, self.script_path = tempfile.mkstemp(prefix="pyronova_m2_", suffix=".py")
         with os.fdopen(fd, "w") as f:
             f.write(textwrap.dedent(script))
         self.log_path = self.script_path + ".log"
         env = dict(os.environ)
         env["M2_MODE"] = PATHS[path]["mode"]
-        env["M2_PORT"] = str(self.port)
+        env["M2_PORT"] = "0"
         env["M2_WORKERS"] = str(workers)
         env.pop("PYRONOVA_TPC", None)
         if PATHS[path]["tpc"] is not None:
@@ -82,13 +78,17 @@ class Server:
             )
         deadline = time.time() + 20
         while time.time() < deadline:
-            try:
-                with socket.create_connection((HOST, self.port), timeout=0.5):
-                    return
-            except OSError:
-                if self.proc.poll() is not None:
-                    break
-                time.sleep(0.1)
+            ports = listening_ports(read_file(self.log_path)())
+            if ports:
+                try:
+                    with socket.create_connection((HOST, ports[0]), timeout=0.5):
+                        self.port = ports[0]
+                        return
+                except OSError:
+                    pass
+            if self.proc.poll() is not None:
+                break
+            time.sleep(0.1)
         raise RuntimeError(f"server ({path}) did not start:\n{self.stop()}")
 
     @property

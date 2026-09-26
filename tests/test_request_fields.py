@@ -111,7 +111,7 @@ def unicode_param(req):
 
 @pytest.fixture(scope="module")
 def client():
-    c = TestClient(app, port=19887)
+    c = TestClient(app)
     yield c
     c.close()
 

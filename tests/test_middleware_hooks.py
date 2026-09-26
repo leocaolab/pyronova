@@ -66,7 +66,7 @@ def headers_echo(req):
 
 @pytest.fixture(scope="module")
 def client():
-    c = TestClient(app, port=19883)
+    c = TestClient(app)
     yield c
     c.close()
 
@@ -137,7 +137,7 @@ def test_before_hook_short_circuit():
     # Its own module: a worker serves one app per module.
     from tests.apps.middleware_short_circuit import app
 
-    c = TestClient(app, port=19884)
+    c = TestClient(app)
     try:
         # Without token — should get 401
         resp = c.get("/protected")
@@ -157,7 +157,7 @@ def test_multiple_after_hooks():
     # Its own module: a worker serves one app per module.
     from tests.apps.middleware_two_after_hooks import app
 
-    c = TestClient(app, port=19885)
+    c = TestClient(app)
     try:
         resp = c.get("/")
         assert resp.status_code == 200

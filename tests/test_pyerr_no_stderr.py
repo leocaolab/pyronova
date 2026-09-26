@@ -46,21 +46,28 @@ def test_raising_handler_does_not_spam_stderr():
 
         def main():
             t = threading.Thread(
-                target=lambda: app.run(host="127.0.0.1", port=19894, mode="subinterp"),
+                target=lambda: app.run(host="127.0.0.1", port=0, mode="subinterp"),
                 daemon=True,
             )
             t.start()
+            # Bound on port 0: read the port it got.
+            for _ in range(60):
+                if app._servers:
+                    break
+                time.sleep(0.1)
+            servers = list(app._servers)
+            base = f"http://127.0.0.1:{servers[0].port}" if servers else "http://127.0.0.1:0"
             for _ in range(60):
                 time.sleep(0.1)
                 try:
-                    urllib.request.urlopen("http://127.0.0.1:19894/", timeout=1)
+                    urllib.request.urlopen(base + "/", timeout=1)
                     break
                 except Exception:
                     continue
             # Trigger the raising handler a few times.
             for _ in range(5):
                 try:
-                    urllib.request.urlopen("http://127.0.0.1:19894/boom", timeout=2).read()
+                    urllib.request.urlopen(base + "/boom", timeout=2).read()
                 except Exception:
                     pass
 

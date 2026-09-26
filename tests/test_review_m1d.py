@@ -17,11 +17,10 @@ import urllib.request
 
 import pytest
 
+from tests._helpers import bound_port, read_file
+
 PYTHON = sys.executable
 
-WS_PORT = 19971
-WS_CAP_PORT = 19972
-STATIC_PORT = 19973
 
 MIB = 1024 * 1024
 
@@ -43,21 +42,28 @@ def _run_script(body: str, timeout: float = 20) -> subprocess.CompletedProcess:
 
 
 class _Server:
-    def __init__(self, script: str, port: int):
+    """`script` in a subprocess; the script binds port 0, `port` is the one it bound."""
+
+    def __init__(self, script: str):
         fd, self.path = tempfile.mkstemp(prefix="pyronova_m1d_", suffix=".py")
         with os.fdopen(fd, "w") as f:
             f.write(textwrap.dedent(script))
-        self.port = port
-        self.proc = subprocess.Popen(
-            [PYTHON, self.path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
-        )
+        self.log_path = self.path + ".log"
+        with open(self.log_path, "w") as log:
+            self.proc = subprocess.Popen(
+                [PYTHON, self.path],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                preexec_fn=os.setsid,
+            )
+        try:
+            self.port = bound_port(read_file(self.log_path), self.proc, timeout=10)
+        except RuntimeError:
+            raise RuntimeError(f"server did not start:\n{self.stop()}") from None
         for _ in range(100):
             time.sleep(0.1)
             try:
-                urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1)
+                urllib.request.urlopen(f"http://127.0.0.1:{self.port}/health", timeout=1)
                 return
             except Exception:
                 if self.proc.poll() is not None:
@@ -67,9 +73,11 @@ class _Server:
     def stop(self) -> str:
         if self.proc.poll() is None:
             os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
-        out, _ = self.proc.communicate(timeout=10)
+        self.proc.wait(timeout=10)
+        out = read_file(self.log_path)()
         os.unlink(self.path)
-        return out.decode(errors="replace")
+        os.unlink(self.log_path)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -124,13 +132,13 @@ def health(req):
     return {{"ok": True}}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port={WS_PORT}, mode="default")
+    app.run(host="127.0.0.1", port=0, mode="default")
 """
 
 
 @pytest.fixture(scope="module")
 def ws_server():
-    s = _Server(WS_SERVER, WS_PORT)
+    s = _Server(WS_SERVER)
     yield s
     s.stop()
 
@@ -143,7 +151,7 @@ async def test_ws_default_max_message_size_closes_with_1009(ws_server):
     # No `async with`: the server closes this connection, and re-closing it from the
     # client's __aexit__ while its send is being torn down trips a websockets/asyncio
     # teardown race (`abort` on a transport whose loop is already gone).
-    ws = await websockets.connect(f"ws://127.0.0.1:{WS_PORT}/echo", max_size=None)
+    ws = await websockets.connect(f"ws://127.0.0.1:{ws_server.port}/echo", max_size=None)
     # The server may close while the client is still writing, so send can raise too.
     with pytest.raises(websockets.ConnectionClosed) as info:
         await ws.send("y" * (2 * MIB))
@@ -156,7 +164,7 @@ async def test_ws_default_max_message_size_closes_with_1009(ws_server):
 async def test_ws_small_message_still_echoes(ws_server):
     import websockets
 
-    async with websockets.connect(f"ws://127.0.0.1:{WS_PORT}/echo") as ws:
+    async with websockets.connect(f"ws://127.0.0.1:{ws_server.port}/echo") as ws:
         await ws.send("z" * 1000)
         assert await asyncio.wait_for(ws.recv(), timeout=5) == "echo: 1000"
 
@@ -166,7 +174,7 @@ async def test_ws_send_over_max_message_size_raises_value_error(ws_server):
     """cced8c2 queued any size; the outgoing cap counted messages, not bytes."""
     import websockets
 
-    async with websockets.connect(f"ws://127.0.0.1:{WS_PORT}/big-send", max_size=None) as ws:
+    async with websockets.connect(f"ws://127.0.0.1:{ws_server.port}/big-send", max_size=None) as ws:
         await ws.send("go")
         reply = await asyncio.wait_for(ws.recv(), timeout=5)
     assert reply.startswith("ValueError: "), reply[:200]
@@ -178,7 +186,7 @@ async def test_ws_recv_does_not_drop_binary(ws_server):
     """cced8c2: recv() silently skipped a binary message."""
     import websockets
 
-    async with websockets.connect(f"ws://127.0.0.1:{WS_PORT}/strict") as ws:
+    async with websockets.connect(f"ws://127.0.0.1:{ws_server.port}/strict") as ws:
         await ws.send(b"\x01\x02\x03")
         await ws.send("hi")
         assert await asyncio.wait_for(ws.recv(), timeout=5) == "binary:3"
@@ -190,7 +198,7 @@ async def test_ws_recv_message_returns_str_or_bytes(ws_server):
     """cced8c2: recv_message returned a ("text"|"binary", data) tuple."""
     import websockets
 
-    async with websockets.connect(f"ws://127.0.0.1:{WS_PORT}/kinds") as ws:
+    async with websockets.connect(f"ws://127.0.0.1:{ws_server.port}/kinds") as ws:
         await ws.send(b"\x00")
         assert await asyncio.wait_for(ws.recv(), timeout=5) == "bytes"
         await ws.send("t")
@@ -213,7 +221,7 @@ def health(req):
     return {{"ok": True}}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port={WS_CAP_PORT}, mode="default")
+    app.run(host="127.0.0.1", port=0, mode="default")
 """
 
 
@@ -222,9 +230,9 @@ async def test_ws_connection_cap_answers_503_then_frees_the_slot():
     """cced8c2 spawned an OS thread per connection with no cap."""
     import websockets
 
-    server = _Server(WS_CAP_SERVER, WS_CAP_PORT)
+    server = _Server(WS_CAP_SERVER)
     try:
-        url = f"ws://127.0.0.1:{WS_CAP_PORT}/hold"
+        url = f"ws://127.0.0.1:{server.port}/hold"
         async with websockets.connect(url) as first:
             await first.send("ping")
             assert await asyncio.wait_for(first.recv(), timeout=5) == "pong"
@@ -292,15 +300,15 @@ def static_server(static_tree):
     os.environ["PYRONOVA_TEST_M1D_STATIC_ROOT"] = root
     from tests.apps.m1d_static import app
 
-    c = TestClient(app, port=STATIC_PORT)
+    c = TestClient(app)
     yield c
     c.close()
     del os.environ["PYRONOVA_TEST_M1D_STATIC_ROOT"]
 
 
-def _raw_get(path: str) -> tuple[int, bytes]:
+def _raw_get(port: int, path: str) -> tuple[int, bytes]:
     """Send the path byte-for-byte: http clients may normalise `%2e%2e`."""
-    conn = http.client.HTTPConnection("127.0.0.1", STATIC_PORT, timeout=5)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
     try:
         conn.request("GET", path)
         resp = conn.getresponse()
@@ -311,7 +319,7 @@ def _raw_get(path: str) -> tuple[int, bytes]:
 
 def test_static_percent_decodes_the_path(static_server):
     """cced8c2 looked up `my%20file.txt` literally → 404."""
-    status, body = _raw_get("/static/my%20file.txt")
+    status, body = _raw_get(static_server.port, "/static/my%20file.txt")
     assert (status, body) == (200, b"spaced")
 
 
@@ -327,38 +335,38 @@ def test_static_percent_decodes_the_path(static_server):
 )
 def test_static_encoded_traversal_is_forbidden(static_server, path):
     """cced8c2 never decoded the path, so an encoded `..` was not seen as traversal."""
-    status, body = _raw_get(path)
+    status, body = _raw_get(static_server.port, path)
     assert status == 403, (status, body)
     assert b"TOP-SECRET" not in body
 
 
 def test_static_encoded_absolute_path_cannot_replace_the_root(static_server, static_tree):
     base, _ = static_tree
-    status, body = _raw_get("/static/%2f" + base.lstrip("/").replace("/", "%2f") + "%2fsecret.txt")
+    status, body = _raw_get(static_server.port, "/static/%2f" + base.lstrip("/").replace("/", "%2f") + "%2fsecret.txt")
     assert status == 404, (status, body)
     assert b"TOP-SECRET" not in body
 
 
 def test_static_nul_byte_is_bad_request(static_server):
-    status, _ = _raw_get("/static/a%00b.txt")
+    status, _ = _raw_get(static_server.port, "/static/a%00b.txt")
     assert status == 400
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
 def test_static_permission_denied_is_403_not_404(static_server):
     """cced8c2 turned every IO error into a silent 404."""
-    status, _ = _raw_get("/static/locked.txt")
+    status, _ = _raw_get(static_server.port, "/static/locked.txt")
     assert status == 403
 
 
 def test_static_io_error_is_500_not_404(static_server):
     """A symlink loop in the root is a server misconfiguration: 500, not 'missing'."""
-    status, _ = _raw_get("/static/loop")
+    status, _ = _raw_get(static_server.port, "/static/loop")
     assert status == 500
 
 
 def test_static_missing_file_is_still_404(static_server):
-    status, _ = _raw_get("/static/nope.txt")
+    status, _ = _raw_get(static_server.port, "/static/nope.txt")
     assert status == 404
 
 
@@ -465,7 +473,7 @@ def heavy(req):
 
 # Main interpreter: this measures the main GIL, and workers would re-run this unguarded
 # script (TestClient included).
-c = TestClient(app, port=19974, mode="gil")
+c = TestClient(app, mode="gil")
 assert c.get("/heavy").status_code == 200
 first = get_gil_metrics()
 second = get_gil_metrics()

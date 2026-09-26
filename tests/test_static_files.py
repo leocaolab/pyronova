@@ -34,7 +34,7 @@ def static_dir():
 def client(static_dir):
     from tests.apps.static_site import app
 
-    c = TestClient(app, port=19879)
+    c = TestClient(app)
     yield c
     c.close()
 
@@ -126,7 +126,7 @@ def test_static_symlink_out_of_root_refused(static_dir):
     # Its own module: a worker serves one app per module.
     from tests.apps.static_symlink import app
 
-    c = TestClient(app, port=19896)
+    c = TestClient(app)
     try:
         resp = c.get("/s/trap.txt")
         # Accept any refusal path:

@@ -14,7 +14,6 @@ from __future__ import annotations
 import os
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
@@ -26,6 +25,7 @@ import pytest
 
 from pyronova import Pyronova
 from pyronova.testing import TestClient
+from tests._helpers import listening_ports, read_file
 from tests.apps.m5_followup_sibling import add_routes
 
 # Module level: sub-interpreter workers rebuild it by executing this file, and this file
@@ -53,12 +53,6 @@ HOST = "127.0.0.1"
 SERVE_TIMEOUT_S = 30
 
 
-def _unused_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((HOST, 0))
-        return s.getsockname()[1]
-
-
 @pytest.mark.parametrize("tpc", ["1", "0"], ids=["tpc", "pool"])
 def test_cli_run_serves_an_app_importing_a_module_next_to_it(tpc):
     # The console script: its `sys.path[0]` is the venv's `bin`, and `pyronova run` puts
@@ -80,28 +74,34 @@ def test_cli_run_serves_an_app_importing_a_module_next_to_it(tpc):
             def root(req):
                 return {"greeting": helper.GREETING}
             """))
-    port = _unused_port()
-    proc = subprocess.Popen(
-        [cli, "run", "app:app", "--host", HOST, "--port", str(port), "--workers", "2"],
-        cwd=project,
-        env={**os.environ, "PYRONOVA_TPC": tpc},
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    log_path = os.path.join(project, "server.log")
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(
+            [cli, "run", "app:app", "--host", HOST, "--port", "0", "--workers", "2"],
+            cwd=project,
+            env={**os.environ, "PYRONOVA_TPC": tpc},
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
     try:
         body = None
         deadline = time.monotonic() + SERVE_TIMEOUT_S
         while time.monotonic() < deadline and proc.poll() is None:
+            ports = listening_ports(read_file(log_path)())
+            if not ports:
+                time.sleep(0.1)
+                continue
             try:
-                with urllib.request.urlopen(f"http://{HOST}:{port}/", timeout=2) as r:
+                with urllib.request.urlopen(f"http://{HOST}:{ports[0]}/", timeout=2) as r:
                     body = r.read().decode()
                 break
             except OSError:
                 time.sleep(0.1)
         if body is None:
             proc.kill()
-            out = proc.communicate(timeout=10)[0]
+            proc.wait(timeout=10)
+            out = read_file(log_path)()
             pytest.fail(f"server did not serve (exit {proc.returncode}); output:\n{out}")
         assert "from helper" in body
     finally:
@@ -112,6 +112,4 @@ def test_cli_run_serves_an_app_importing_a_module_next_to_it(tpc):
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
-        if proc.stdout is not None:
-            proc.stdout.close()
         shutil.rmtree(project, ignore_errors=True)

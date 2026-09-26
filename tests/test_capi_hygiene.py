@@ -28,38 +28,46 @@ import signal
 
 import pytest
 
+from tests._helpers import bound_port, read_file
+
 PYTHON = sys.executable
 
 
-def _launch(script: str, port: int) -> subprocess.Popen:
-    """Start a Pyronova server with `script` contents, wait for /health."""
+def _launch(script: str) -> tuple[subprocess.Popen, int]:
+    """Start a Pyronova server with `script` contents on port 0, wait for /health.
+    Returns the process and the port it bound."""
     # Pyronova needs `__main__.__file__` to locate the user script for its
     # sub-interp loader. `python -c` leaves __file__ unset, so we write
     # the script to a temp file and run it as a module file.
     tf = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
     tf.write(script)
     tf.close()
-    proc = subprocess.Popen(
-        [PYTHON, tf.name],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env={**os.environ, "PYRONOVA_PORT": str(port)},
-    )
+    log_path = tf.name + ".log"
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(
+            [PYTHON, tf.name],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "PYRONOVA_PORT": "0"},
+        )
     proc._script_path = tf.name  # type: ignore[attr-defined]
+    try:
+        port = bound_port(read_file(log_path), proc, timeout=15)
+    except RuntimeError as e:
+        proc.kill()
+        proc.wait()
+        raise RuntimeError(f"server failed to start:\n{e}") from None
     deadline = time.time() + 15
     while time.time() < deadline:
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=0.5) as r:
                 if r.status == 200:
-                    return proc
+                    return proc, port
         except Exception:
             time.sleep(0.1)
     proc.kill()
-    try:
-        out, err = proc.communicate(timeout=2)
-    except subprocess.TimeoutExpired:
-        out, err = b"", b""
-    raise RuntimeError(f"server failed to start:\n{err.decode(errors='replace')}")
+    proc.wait()
+    raise RuntimeError(f"server failed to start:\n{read_file(log_path)()}")
 
 
 def _kill(proc: subprocess.Popen) -> None:
@@ -71,6 +79,10 @@ def _kill(proc: subprocess.Popen) -> None:
         proc.wait()
     path = getattr(proc, "_script_path", None)
     if path:
+        try:
+            os.unlink(path + ".log")
+        except FileNotFoundError:
+            pass
         try:
             os.unlink(path)
         except OSError:
@@ -126,8 +138,7 @@ if __name__ == '__main__':
 
 def test_pydict_next_mutating_str_does_not_crash():
     """Handler returning a dict with mutating __str__ must not crash Pyronova."""
-    port = 8931
-    proc = _launch(REENTRANCY_SERVER, port)
+    proc, port = _launch(REENTRANCY_SERVER)
     try:
         # Hammer the tricky route. If the fix is wrong, the server
         # segfaults within a handful of requests.
@@ -198,8 +209,7 @@ if __name__ == '__main__':
 
 def test_handler_returns_weird_object_server_stays_up():
     """Server survives a handler returning an unexpected object type."""
-    port = 8932
-    proc = _launch(INSTANCECHECK_SERVER, port)
+    proc, port = _launch(INSTANCECHECK_SERVER)
     try:
         for _ in range(50):
             try:
@@ -256,8 +266,7 @@ if __name__ == '__main__':
 
 
 def test_pyronovarequest_constructed_with_wrong_types_does_not_crash():
-    port = 8933
-    proc = _launch(WRONG_TYPE_SERVER, port)
+    proc, port = _launch(WRONG_TYPE_SERVER)
     try:
         for _ in range(50):
             try:
@@ -295,8 +304,7 @@ if __name__ == '__main__':
 
 
 def test_path_params_are_url_decoded():
-    port = 8934
-    proc = _launch(URL_DECODE_SERVER, port)
+    proc, port = _launch(URL_DECODE_SERVER)
     try:
         # %20 → space
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/user/john%20doe", timeout=2) as r:
@@ -344,8 +352,7 @@ if __name__ == '__main__':
 
 
 def test_async_before_request_hook_does_not_short_circuit():
-    port = 8935
-    proc = _launch(ASYNC_HOOK_SERVER, port)
+    proc, port = _launch(ASYNC_HOOK_SERVER)
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/hi", timeout=2) as r:
             body = r.read()

@@ -22,7 +22,8 @@ import httpx
 import pytest
 from websockets.sync.client import connect
 
-from conftest import _free_port, fork_panic_lines
+from conftest import fork_panic_lines
+from tests._helpers import bound_port, read_file
 
 pytestmark = pytest.mark.skipif(
     sys.platform not in ("linux", "darwin"), reason="own-GIL sub-interpreters"
@@ -87,16 +88,16 @@ def test_main_side_routes_survive_workers_executing_engine(tmp_path, tpc):
     """TPC: GIL bridge threads + WebSocket upgrade on a worker-bound TPC thread.
     Pool: `spawn_blocking` GIL path + WebSocket upgrade on a tstate-less Tokio worker +
     LoopGuard thread-local destructors on Tokio blocking threads."""
-    port = _free_port()
-    base = f"http://127.0.0.1:{port}"
     log_path = str(tmp_path / "server.log")
-    env = dict(os.environ, L2_PORT=str(port), RUST_BACKTRACE="0", PYRONOVA_TPC=tpc)
+    env = dict(os.environ, L2_PORT="0", RUST_BACKTRACE="0", PYRONOVA_TPC=tpc)
     with open(log_path, "w") as log:
         proc = subprocess.Popen(
             [sys.executable, os.path.join(HERE, "_l2_main_side_app.py")],
             env=env, stdout=log, stderr=subprocess.STDOUT,
         )
     try:
+        port = bound_port(read_file(log_path), proc)
+        base = f"http://127.0.0.1:{port}"
         _wait_up(base, proc, log_path)
         # The premise: workers really executed the engine.
         assert httpx.get(base + "/w", timeout=5).json() == {"real_engine": True}
