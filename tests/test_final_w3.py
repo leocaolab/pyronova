@@ -16,6 +16,7 @@ The panic test needs a `--features fault_injection` build (skipped otherwise).
 from __future__ import annotations
 
 import ast
+import logging
 import os
 import re
 import signal
@@ -660,6 +661,87 @@ def test_a_stale_symlinked_clone_is_removed_not_followed(tmp_path):
     dst = ns["_iso_clone_lib"]("lib", str(worker_dir), {})
     assert Path(dst).read_bytes() == b"v1"
     assert (target / "keep.txt").read_text() == "keep"
+
+
+# A clone lives in the temp dir, whose cleaner deletes files it takes for unused: a
+# clone missing a file must be re-cloned, not reused (it broke every worker's import of
+# pydantic_core until the cache was deleted by hand).
+
+def _package_site(site):
+    pkg = site / "lib"
+    (pkg / "__pycache__").mkdir(parents=True)
+    (pkg / "__init__.py").write_text("from .core import x\n")
+    (pkg / "core.py").write_text("x = 1\n")
+    (pkg / "_ext.cpython-314-x.so").write_bytes(b"\0" * 64)
+    (pkg / "__pycache__" / "core.cpython-314.pyc").write_bytes(b"pyc")
+    return pkg
+
+
+def _clone_package(tmp_path, pkg2dist=None):
+    src = _package_site(tmp_path / "site")
+    worker_dir = tmp_path / "w0"
+    worker_dir.mkdir()
+    ns = _bootstrap_ns(_iso_resolve_src=lambda lib: str(src))
+    clone = lambda: Path(ns["_iso_clone_lib"]("lib", str(worker_dir), pkg2dist or {}))
+    return src, worker_dir, clone
+
+
+@pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason="cp -c / --reflink")
+def test_a_clone_missing_a_file_is_recloned_with_a_warning(tmp_path, caplog):
+    _, _, clone = _clone_package(tmp_path)
+    first = clone()
+    (first / "__init__.py").unlink()  # what the temp-dir cleaner did
+
+    with caplog.at_level(logging.WARNING, logger="pyronova.isolate"):
+        second = clone()
+
+    assert (second / "__init__.py").read_text() == "from .core import x\n"
+    damaged = [r.getMessage() for r in caplog.records if "damaged" in r.getMessage()]
+    assert len(damaged) == 1 and "__init__.py is missing" in damaged[0], caplog.text
+
+
+@pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason="cp -c / --reflink")
+def test_a_whole_clone_is_reused_even_without_its_pycache(tmp_path, caplog):
+    _, _, clone = _clone_package(tmp_path)
+    first = clone()
+    inode = (first / "_ext.cpython-314-x.so").stat().st_ino
+    for pyc in (first / "__pycache__").iterdir():
+        pyc.unlink()
+
+    with caplog.at_level(logging.WARNING, logger="pyronova.isolate"):
+        second = clone()
+
+    # Reused: same inode, so macOS doesn't verify the library's signature again.
+    assert (second / "_ext.cpython-314-x.so").stat().st_ino == inode
+    assert "damaged" not in caplog.text
+
+
+@pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason="cp -c / --reflink")
+def test_a_clone_with_a_source_only_manifest_is_recloned(tmp_path):
+    src, worker_dir, clone = _clone_package(tmp_path)
+    first = clone()
+    st = src.stat()
+    # The manifest before clones listed their files: the source signature alone.
+    (worker_dir / "lib.sig").write_text("%d\0%d" % (st.st_mtime_ns, st.st_size))
+    (first / "core.py").unlink()
+
+    second = clone()
+
+    assert (second / "core.py").read_text() == "x = 1\n"
+
+
+@pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason="cp -c / --reflink")
+def test_a_vendored_libs_clone_missing_a_file_is_recloned(tmp_path):
+    src, worker_dir, clone = _clone_package(tmp_path, {"lib": ["lib-dist"]})
+    vendored = src.parent / "lib_dist.libs"
+    vendored.mkdir()
+    (vendored / "libblas.so.3").write_bytes(b"\0" * 32)
+    clone()
+    (worker_dir / "lib_dist.libs" / "libblas.so.3").unlink()
+
+    clone()
+
+    assert (worker_dir / "lib_dist.libs" / "libblas.so.3").stat().st_size == 32
 
 
 # ---------------------------------------------------------------------------

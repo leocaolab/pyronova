@@ -251,34 +251,79 @@ def _iso_remove(path):
         os.remove(path)
 
 
+def _iso_clone_files(clone):
+    """The files of a clone as {relative path: size} ("" for a single-file clone).
+    `__pycache__` is left out: Python writes there at runtime, and losing it costs a
+    recompile, not an import."""
+    import os
+    if not os.path.isdir(clone) or os.path.islink(clone):
+        return {"": os.lstat(clone).st_size}
+    files = {}
+    for root, dirs, names in os.walk(clone):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        for name in names:
+            path = os.path.join(root, name)
+            files[os.path.relpath(path, clone)] = os.lstat(path).st_size
+    return files
+
+
+def _iso_clone_stale(clone, manifest_path, source_sig):
+    """Why the existing `clone` can't be reused, as `(damaged, reason)`, or None if it
+    can. Its manifest must name the current source, and every file the clone was made
+    with must still be there at its size (`damaged`): the clone root sits in the temp
+    dir, whose cleaner deletes files it takes for unused (a `.py` loaded from its
+    `.pyc` is only stat'ed, never read)."""
+    import os, json
+    try:
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+    except FileNotFoundError:
+        return False, "it has no manifest"
+    except ValueError:
+        return False, "its manifest is not the current format"
+    if manifest.get("source") != source_sig:
+        return False, "the library changed"
+    for rel, size in manifest.get("files", {}).items():
+        path = os.path.join(clone, rel) if rel else clone
+        try:
+            now = os.lstat(path).st_size
+        except FileNotFoundError:
+            return True, f"{path} is missing"
+        if now != size:
+            return True, f"{path} is {now} bytes, cloned as {size}"
+    return None
+
+
 def _iso_clone_lib(lib, worker_dir, pkg2dist):
     """Clone `lib` (and its vendored `.libs`) into `worker_dir`. Returns the
     cloned destination path (dir or file), or None if the lib can't be resolved.
 
-    Freshness: a per-lib `<basename>.sig` manifest records the source signature.
-    An existing clone is reused only if the manifest still matches — a lib upgrade
-    (mtime/size change) forces a re-clone. This covers reactively-added libs the
-    bucket signature can't see, and makes declared-lib upgrades safe regardless of
-    the bucket keying."""
-    import os, subprocess, platform
+    Freshness: each clone has a `<basename>.sig` manifest with its source's signature
+    and the clone's files. An existing clone is reused only if the source is unchanged
+    (a lib upgrade forces a re-clone) and the clone is still whole (a file deleted from
+    it forces a re-clone, with a warning naming the file). This covers reactively-added
+    libs the bucket signature can't see, and makes declared-lib upgrades safe regardless
+    of the bucket keying."""
+    import os, subprocess, platform, json
     src = _iso_resolve_src(lib)
     if src is None:
         return None
-    st = os.stat(src)
-    cur_sig = "%d\0%d" % (st.st_mtime_ns, st.st_size)
     clone = ["cp", "-c", "-R"] if platform.system() == "Darwin" else ["cp", "--reflink=auto", "-R"]
 
-    def _clone(s, d, sig_path=None):
+    def _clone(s, d, manifest_path):
+        st = os.stat(s)
+        source_sig = "%d\0%d" % (st.st_mtime_ns, st.st_size)
         if os.path.lexists(d):
-            if sig_path is None:
-                return  # vendored .libs: no manifest, reuse as-is
-            try:
-                with open(sig_path) as f:
-                    if f.read() == cur_sig:
-                        return  # up-to-date clone, inodes already verified
-            except FileNotFoundError:
-                pass  # no manifest yet: treat the clone as stale
-            _iso_remove(d)  # stale (lib upgraded) — re-clone
+            stale = _iso_clone_stale(d, manifest_path, source_sig)
+            if stale is None:
+                return  # up-to-date clone, inodes already verified
+            damaged, why = stale
+            if damaged:
+                _logging.getLogger("pyronova.isolate").warning(
+                    "auto-isolate: the clone of %r at %s is damaged (%s); cloning it again",
+                    lib, d, why,
+                )
+            _iso_remove(d)
         # Clone into a temp dir and atomically rename it into place, so a
         # first-ever concurrent boot never observes a half-written copy.
         tmp = "%s.tmp-%d" % (d, os.getpid())
@@ -297,9 +342,10 @@ def _iso_clone_lib(lib, worker_dir, pkg2dist):
             if not os.path.lexists(d):
                 raise
             _iso_remove(tmp)  # lost the race to another boot — use theirs
-        if sig_path is not None:
-            with open(sig_path, "w") as f:
-                f.write(cur_sig)
+        manifest_tmp = "%s.tmp-%d" % (manifest_path, os.getpid())
+        with open(manifest_tmp, "w") as f:
+            json.dump({"source": source_sig, "files": _iso_clone_files(d)}, f)
+        os.replace(manifest_tmp, manifest_path)
 
     base_name = os.path.basename(src)
     dst = os.path.join(worker_dir, base_name)
@@ -317,7 +363,8 @@ def _iso_clone_lib(lib, worker_dir, pkg2dist):
     for ln in libs_names:
         vendored = os.path.join(parent, ln + ".libs")
         if os.path.isdir(vendored):
-            _clone(vendored, os.path.join(worker_dir, os.path.basename(vendored)))
+            vendored_dst = os.path.join(worker_dir, os.path.basename(vendored))
+            _clone(vendored, vendored_dst, vendored_dst + ".sig")
     return dst
 
 

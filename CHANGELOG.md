@@ -77,6 +77,13 @@ and engine config is parsed once at startup.
 
 ### Fixed
 
+- **A per-worker C-extension clone missing files was reused forever.** Clones are cached
+  in the temp dir, whose cleaner can delete files from them; the cache only checked
+  that the source library was unchanged, so every worker then failed to import it
+  (e.g. `pydantic_core._pydantic_core does not support loading in subinterpreters`)
+  until the cache was deleted by hand. Each clone's manifest now lists its files; a
+  clone missing a file (or with one of another size) is cloned again, with a warning
+  naming the file. Vendored `<dist>.libs` clones are checked the same way.
 - A panic on the `gil=True` bridge is a logged 500, not a dead thread.
 - `ContextVar` writes from an async hook or handler reach the rest of the request.
 - `model=` routes also get path params; the handler signature is checked at

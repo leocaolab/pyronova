@@ -71,12 +71,14 @@ passed, 2 skipped). A skip of any other kind is a failure until explained.
 
 ```bash
 maturin develop --release --features bench,fault_injection
-pytest tests/ -q -rs --ignore=tests/e2e
+pytest tests/ -q -rs --ignore=tests/e2e \
+  --deselect tests/test_review_m6.py::test_default_build_has_no_bench_methods
 ```
 
 Pass: 0 failed, and no skip names the `bench` or `fault_injection` feature. The full
 suite runs here, not a hand-picked list: CI's feature step selects tests by file and
-`-k`, and misses feature-gated tests in other files. Rebuild without features
+`-k`, and misses feature-gated tests in other files. The deselected test asserts the
+*default* build has no bench methods; step 3 runs it. Rebuild without features
 (`maturin develop --release`) before step 6.
 
 ### 5. Suspected flaky test
@@ -100,7 +102,8 @@ C-extension-in-sub-interpreter regressions the test suite can't. Look at what ho
 
 ```bash
 lsof -i :8000 -sTCP:LISTEN          # stop a stale Pyronova server if one is there
-rm -rf /tmp/pyronova-isolate
+# clones live in $TMPDIR/pyronova-isolate-<uid> (or PYRONOVA_ISOLATE_DIR); a cold start
+# clones afresh, a warm one reuses and re-verifies them. Either is a valid soak.
 PYRONOVA_WORKERS=16 .venv/bin/python examples/stress_grill.py > /tmp/grill.log 2>&1 &
 # wait until GET :8000/grill is 200 (cold start on mac takes minutes: each cloned .dylib is verified)
 wrk -t8 -c128 -d10s http://127.0.0.1:8000/grill      # warm-up
