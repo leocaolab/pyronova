@@ -11,27 +11,33 @@ Now handler exceptions are taken as PyO3 errors and logged through Rust's
 handler that raises does not spam stderr.
 """
 
-import io
+import os
+import signal
 import subprocess
 import sys
 import textwrap
 
+import httpx
 
-def test_raising_handler_does_not_spam_stderr():
+from tests._helpers import bound_port, poll_until, read_file
+
+
+def test_raising_handler_does_not_spam_stderr(tmp_path):
     """Run a child Pyronova process that serves a route which raises, hit
-    it once, and verify stderr stays quiet. The child runs with
+    it a few times, and verify stderr stays quiet. The child runs with
     `mode="subinterp"` so the PyErr_Print path is the one that would
     have been hit before the fix.
+
+    The server runs from a script file, not `python -c`: workers re-run the
+    app's `__file__`, so `app.run()` needs one to serve at all.
 
     Tolerance: we don't require *zero* stderr bytes — Pyronova's startup
     prints a banner and the tracing subscriber may emit one-line
     warnings. We require that there's no raw Python traceback in
     stderr (those are the 10-20+ lines of noise the bug produced).
     """
-    script = textwrap.dedent("""
-        import os
-        os.environ["PYRONOVA_WORKER"] = ""
-        import threading, time, urllib.request
+    script = tmp_path / "raising_app.py"
+    script.write_text(textwrap.dedent("""
         from pyronova import Pyronova
 
         app = Pyronova()
@@ -44,43 +50,41 @@ def test_raising_handler_does_not_spam_stderr():
         def boom(req):
             raise RuntimeError("deliberate test failure")
 
-        def main():
-            t = threading.Thread(
-                target=lambda: app.run(host="127.0.0.1", port=0, mode="subinterp"),
-                daemon=True,
-            )
-            t.start()
-            # Bound on port 0: read the port it got.
-            for _ in range(60):
-                if app._servers:
-                    break
-                time.sleep(0.1)
-            servers = list(app._servers)
-            base = f"http://127.0.0.1:{servers[0].port}" if servers else "http://127.0.0.1:0"
-            for _ in range(60):
-                time.sleep(0.1)
-                try:
-                    urllib.request.urlopen(base + "/", timeout=1)
-                    break
-                except Exception:
-                    continue
-            # Trigger the raising handler a few times.
-            for _ in range(5):
-                try:
-                    urllib.request.urlopen(base + "/boom", timeout=2).read()
-                except Exception:
-                    pass
+        if __name__ == "__main__":
+            app.run(host="127.0.0.1", port=0, mode="subinterp")
+    """))
+    stdout_path = tmp_path / "stdout.log"
+    stderr_path = tmp_path / "stderr.log"
+    with open(stdout_path, "w") as out, open(stderr_path, "w") as err:
+        proc = subprocess.Popen(
+            [sys.executable, str(script)],
+            stdout=out, stderr=err, cwd=str(tmp_path), start_new_session=True,
+        )
+    read_stdout, read_stderr = read_file(str(stdout_path)), read_file(str(stderr_path))
+    try:
+        port = bound_port(lambda: read_stdout() + read_stderr(), proc)
+        base = f"http://127.0.0.1:{port}"
 
-        main()
-    """)
+        def up():
+            try:
+                return httpx.get(base + "/", timeout=2).status_code == 200
+            except httpx.HTTPError:
+                return False
 
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        capture_output=True,
-        timeout=30,
-        text=True,
-    )
-    combined = result.stderr + result.stdout
+        poll_until(up, timeout=30, what="the server answering GET /")
+        # Trigger the raising handler a few times.
+        for _ in range(5):
+            assert httpx.get(base + "/boom", timeout=5).status_code == 500
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGINT)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=5)
+
+    combined = read_stderr() + read_stdout()
     # The signature of PyErr_Print is multi-line Python traceback:
     #   Traceback (most recent call last):
     #     File "...", line ...

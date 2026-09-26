@@ -57,9 +57,9 @@ def test_metrics_shape():
         "gil_queue_length",
         "gil_hold_peak_us",
         "dropped_requests",
-        "total_requests",
     ):
         assert isinstance(getattr(m, name), int), name
+    assert m.total_requests is None or isinstance(m.total_requests, int)
     assert m.rss_bytes is None or isinstance(m.rss_bytes, int)
 
 

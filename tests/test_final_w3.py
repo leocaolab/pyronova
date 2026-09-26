@@ -339,8 +339,8 @@ def test_a_non_response_on_the_async_path_is_logged_as_the_typed_error():
         out = srv.stop()
     failed = [line for line in out.splitlines() if '"path":"/stream"' in line]
     assert failed, out[-3000:]
-    assert ('"error":"a sub-interpreter handler returned a Stream; streaming responses need '
-            'gil=True, stream=True on the route"') in failed[0], failed[0]
+    assert ('"error":"a sub-interpreter handler returned a Stream; a Stream response is only '
+            'served from the main interpreter, so register the route with gil=True"') in failed[0], failed[0]
 
 
 def test_a_failing_fetcher_ends_the_engine_once_instead_of_retrying():
