@@ -698,7 +698,8 @@ def test_stream_from_worker_is_a_loud_500(tmp_path):
     finally:
         rc = s.stop()
     assert r.status_code == 500
-    assert "gil=True, stream=True" in s.log(), s.log()[-3000:]
+    assert ("a Stream response is only served from the main interpreter, so register the "
+            "route with gil=True") in s.log(), s.log()[-3000:]
     assert rc == 0
     _no_panics(s)
 
