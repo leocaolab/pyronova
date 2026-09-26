@@ -249,3 +249,118 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Plain decimal text as `decode` writes it: no leading zeros, no `-0`.
+    fn canonical_decimal() -> impl Strategy<Value = String> {
+        (
+            any::<bool>(),
+            "0|[1-9][0-9]{0,40}",
+            proptest::option::of("[0-9]{1,40}"),
+        )
+            .prop_map(|(negative, integer, fraction)| {
+                let unsigned = match fraction {
+                    Some(fraction) => format!("{integer}.{fraction}"),
+                    None => integer,
+                };
+                let is_zero = unsigned.bytes().all(|b| b == b'0' || b == b'.');
+                if negative && !is_zero {
+                    format!("-{unsigned}")
+                } else {
+                    unsigned
+                }
+            })
+    }
+
+    /// `text` without leading integer zeros or the sign of a zero: the same number as
+    /// `decode` writes it for a wire in Postgres's own normal form.
+    fn normal_form(text: &str) -> String {
+        let (negative, unsigned) = match text.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, text),
+        };
+        let (integer, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+        let integer = match integer.trim_start_matches('0') {
+            "" => "0",
+            trimmed => trimmed,
+        };
+        let is_zero = integer == "0" && fraction.bytes().all(|b| b == b'0');
+        let sign = if negative && !is_zero { "-" } else { "" };
+        if fraction.is_empty() {
+            format!("{sign}{integer}")
+        } else {
+            format!("{sign}{integer}.{fraction}")
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn canonical_text_round_trips(text in canonical_decimal()) {
+            let mut wire = Vec::new();
+            encode(&text, &mut wire).unwrap();
+            prop_assert_eq!(decode(&wire).unwrap(), text);
+        }
+
+        #[test]
+        fn the_wire_carries_no_leading_or_trailing_zero_group(text in canonical_decimal()) {
+            let mut wire = Vec::new();
+            encode(&text, &mut wire).unwrap();
+            let groups: Vec<u16> = wire[2 * HEADER_WORDS..]
+                .chunks(2)
+                .map(|b| u16::from_be_bytes([b[0], b[1]]))
+                .collect();
+            prop_assert_eq!(usize::from(u16::from_be_bytes([wire[0], wire[1]])), groups.len());
+            prop_assert!(groups.iter().all(|&g| g < NBASE));
+            prop_assert!(groups.first().is_none_or(|&g| g != 0));
+            prop_assert!(groups.last().is_none_or(|&g| g != 0));
+        }
+
+        #[test]
+        fn any_text_encodes_or_is_refused_without_panicking(text in "\\PC{0,50}") {
+            let mut wire = Vec::new();
+            if encode(&text, &mut wire).is_ok() {
+                prop_assert!(decode(&wire).is_ok());
+            }
+        }
+
+        #[test]
+        fn any_wire_decodes_or_is_refused_and_a_decoded_value_is_stable(
+            weight in -10i16..10,
+            sign in prop_oneof![
+                Just(SIGN_POSITIVE),
+                Just(SIGN_NEGATIVE),
+                Just(SIGN_NAN),
+                Just(SIGN_POS_INFINITY),
+                Just(SIGN_NEG_INFINITY),
+                any::<u16>(),
+            ],
+            dscale in prop_oneof![0u16..40, any::<u16>()],
+            digits in proptest::collection::vec(prop_oneof![9 => 0u16..NBASE, 1 => any::<u16>()], 0..8),
+            cut in any::<prop::sample::Index>(),
+        ) {
+            let mut wire = Vec::new();
+            write_words(&mut wire, &[digits.len() as u16, weight as u16, sign, dscale]);
+            write_words(&mut wire, &digits);
+            // Sometimes truncated: the header promises more than the buffer holds.
+            if cut.index(4) == 0 {
+                wire.truncate(cut.index(wire.len() + 1));
+            }
+            let Ok(text) = decode(&wire) else {
+                return Ok(());
+            };
+            let mut again = Vec::new();
+            // A wire scale past what Postgres shows is readable but not writable.
+            if encode(&text, &mut again).is_ok() {
+                let expected = match text.as_str() {
+                    "NaN" | "Infinity" | "-Infinity" => text.clone(),
+                    number => normal_form(number),
+                };
+                prop_assert_eq!(decode(&again).unwrap(), expected);
+            }
+        }
+    }
+}

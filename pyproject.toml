@@ -33,6 +33,7 @@ test = [
     "msgpack",
     "pydantic-settings>=2",
     "watchfiles",
+    "hypothesis",
 ]
 
 [project.scripts]

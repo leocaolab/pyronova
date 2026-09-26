@@ -790,4 +790,110 @@ mod tests {
         let resp = try_static_file("/static/loop", &dirs).await.unwrap();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
+
+    // ── Traversal properties ───────────────────────────────────────
+
+    use proptest::prelude::*;
+
+    /// A dot, literal or percent-encoded in either case.
+    fn dot() -> impl Strategy<Value = &'static str> {
+        prop_oneof![Just("."), Just("%2e"), Just("%2E")]
+    }
+
+    /// A separator, literal or percent-encoded (it decodes to one).
+    fn slash() -> impl Strategy<Value = &'static str> {
+        prop_oneof![Just("/"), Just("%2f"), Just("%2F")]
+    }
+
+    /// A request segment an attacker would try: names, `.`, `..`, backslashes, NUL.
+    fn segment() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "[a-z]{1,6}(\\.txt)?",
+            Just("public.txt".to_owned()),
+            Just("secret.txt".to_owned()),
+            Just("link".to_owned()),
+            Just("out".to_owned()),
+            Just("%00".to_owned()),
+            Just("..\\\\".to_owned()),
+            Just("%5c..".to_owned()),
+            dot().prop_map(str::to_owned),
+            (dot(), dot()).prop_map(|(a, b)| format!("{a}{b}")),
+        ]
+    }
+
+    fn rel_path() -> impl Strategy<Value = String> {
+        proptest::collection::vec((segment(), slash()), 1..8).prop_map(|parts| {
+            parts
+                .into_iter()
+                .enumerate()
+                .map(|(i, (seg, sep))| if i == 0 { seg } else { format!("{sep}{seg}") })
+                .collect()
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn a_candidate_path_stays_under_the_root(rel in rel_path()) {
+            let root = Path::new("/srv/public");
+            if let Ok(path) = candidate_path(root, &rel) {
+                let under = path.strip_prefix(root).expect("under the root");
+                prop_assert!(
+                    under.components().all(|c| matches!(c, std::path::Component::Normal(_))),
+                    "{:?} -> {:?}", rel, path
+                );
+            }
+        }
+
+        #[test]
+        fn a_dot_dot_segment_in_any_spelling_is_refused(
+            before in proptest::collection::vec("[a-z]{1,4}", 0..3),
+            dots in (dot(), dot()),
+            sep in slash(),
+            after in proptest::collection::vec("[a-z]{1,4}", 0..3),
+        ) {
+            let parent = format!("{}{}", dots.0, dots.1);
+            let rel = before
+                .iter()
+                .map(String::as_str)
+                .chain([parent.as_str()])
+                .chain(after.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(sep);
+            prop_assert!(matches!(candidate_path(Path::new("/srv"), &rel), Err(StaticError::Traversal)), "{:?}", rel);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// End to end: whatever the request path, a file outside the root is never served,
+        /// through `..`, encodings, or a symlink planted in the root.
+        #[cfg(unix)]
+        #[test]
+        fn no_request_path_serves_a_file_outside_the_root(rel in rel_path()) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let base = tempdir();
+            let root = base.path().join("root");
+            let out = base.path().join("out");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::create_dir_all(&out).unwrap();
+            std::fs::write(root.join("public.txt"), b"PUBLIC").unwrap();
+            std::fs::write(out.join("secret.txt"), b"SECRET").unwrap();
+            std::fs::write(base.path().join("secret.txt"), b"SECRET").unwrap();
+            std::os::unix::fs::symlink(&out, root.join("link")).unwrap();
+            let mounts = vec![StaticMount::new("/static", &root.to_string_lossy()).unwrap()];
+
+            let response = runtime.block_on(try_static_file(&format!("/static/{rel}"), &mounts));
+            if let Some(response) = response {
+                let body = runtime
+                    .block_on(http_body_util::BodyExt::collect(response.into_body()))
+                    .unwrap()
+                    .to_bytes();
+                prop_assert_ne!(&body[..], b"SECRET", "{:?}", rel);
+            }
+        }
+    }
 }

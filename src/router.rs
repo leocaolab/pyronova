@@ -625,3 +625,129 @@ mod template_tests {
         assert_eq!(template_params("/:8080"), Ok(vec![]));
     }
 }
+
+#[cfg(test)]
+mod template_proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// One segment of a generated route: its template text, the text a request puts
+    /// there, and the parameter it binds, if any.
+    #[derive(Clone, Debug)]
+    struct Segment {
+        template: String,
+        path: String,
+        param: Option<(String, String)>,
+    }
+
+    fn literal() -> impl Strategy<Value = Segment> {
+        prop_oneof![
+            "[a-z0-9._-]{1,8}".prop_map(|s| (s.clone(), s)),
+            // Escaped braces match literal braces.
+            "[a-z]{1,4}".prop_map(|s| (format!("{s}{{{{x}}}}"), format!("{s}{{x}}"))),
+        ]
+        .prop_map(|(template, path)| Segment {
+            template,
+            path,
+            param: None,
+        })
+    }
+
+    fn param(index: usize) -> impl Strategy<Value = Segment> {
+        (
+            "[a-z]{0,3}",
+            "[a-z_][a-z0-9_]{0,6}",
+            proptest::option::of("\\.[a-z]{1,3}"),
+            "[a-zA-Z0-9]{1,8}",
+        )
+            .prop_map(move |(prefix, name, suffix, value)| {
+                // Unique per route: a name bound twice is the router's error, not ours.
+                let name = format!("{name}{index}");
+                let suffix = suffix.unwrap_or_default();
+                Segment {
+                    template: format!("{prefix}{{{name}}}{suffix}"),
+                    path: format!("{prefix}{value}{suffix}"),
+                    param: Some((name, value)),
+                }
+            })
+    }
+
+    type Route = (Vec<Segment>, Option<(String, String)>);
+
+    fn route() -> impl Strategy<Value = Route> {
+        let segments = proptest::collection::vec(any::<bool>(), 0..6).prop_flat_map(|kinds| {
+            kinds
+                .into_iter()
+                .enumerate()
+                .map(|(i, is_param)| {
+                    if is_param {
+                        param(i).boxed()
+                    } else {
+                        literal().boxed()
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+        let catch_all = proptest::option::of(("[a-z]{1,6}", "[a-z0-9]{1,5}(/[a-z0-9]{1,5}){0,3}"));
+        (segments, catch_all)
+    }
+
+    proptest! {
+        #[test]
+        fn template_params_names_what_the_router_binds((segments, catch_all) in route()) {
+            let mut template: String = segments.iter().map(|s| format!("/{}", s.template)).collect();
+            let mut path: String = segments.iter().map(|s| format!("/{}", s.path)).collect();
+            let mut expected: Vec<(String, String)> =
+                segments.iter().filter_map(|s| s.param.clone()).collect();
+            if let Some((name, rest)) = catch_all {
+                let name = format!("{name}_rest");
+                template.push_str(&format!("/{{*{name}}}"));
+                path.push_str(&format!("/{rest}"));
+                expected.push((name, rest));
+            }
+            if template.is_empty() {
+                template.push('/');
+                path.push('/');
+            }
+
+            let names = template_params(&template).unwrap();
+            let expected_names: Vec<&str> = expected.iter().map(|(n, _)| n.as_str()).collect();
+            prop_assert_eq!(&names, &expected_names);
+
+            let mut router = Router::new();
+            router.insert(template.as_str(), ()).unwrap();
+            let matched = router.at(&path).unwrap();
+            let bound: Vec<(String, String)> = matched
+                .params
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            prop_assert_eq!(bound, expected);
+        }
+
+        #[test]
+        fn a_colon_identifier_segment_is_refused_anywhere(
+            before in "(/[a-z]{1,5}){0,3}",
+            name in "[a-zA-Z_][a-zA-Z0-9_]{0,6}",
+            after in "(/[a-z]{1,5}){0,3}",
+        ) {
+            let template = format!("{before}/:{name}{after}");
+            prop_assert_eq!(
+                template_params(&template),
+                Err(TemplateError::ColonParam { name })
+            );
+        }
+
+        #[test]
+        fn any_path_yields_names_it_contains_without_panicking(path in "[/{}*:a-z0-9]{0,30}") {
+            if let Ok(names) = template_params(&path) {
+                for name in names {
+                    prop_assert!(
+                        path.contains(&format!("{{{name}}}")) || path.contains(&format!("{{*{name}}}")),
+                        "{name:?} not in {path:?}"
+                    );
+                }
+            }
+        }
+    }
+}
