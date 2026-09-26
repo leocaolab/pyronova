@@ -17,13 +17,13 @@ use hyper::{Request, Response};
 
 use crate::body::{body_channel, stream_body_feeder, BoxBody, REQUEST_BUDGET};
 use crate::bridge::main_bridge::{GilWorkItem, MainInterpBridge, TryDispatchError};
+use crate::conn_driver::TpcContext;
 use crate::error::{refuse, Refusal, RequestLabel, RequestTag};
-use crate::python::interp::SubInterpreterWorker;
+use crate::python::worker::SubInterpreterWorker;
 use crate::request_head::{Body, RequestHead};
 use crate::router::{Call, HandlerKind, RequestBody, RouteId, Target};
 use crate::site::Site;
 use crate::types::PyronovaRequest;
-use crate::worker::TpcContext;
 
 use super::pipeline::{
     await_reply, await_streamed_reply, collect_body, fail, finish, preprocess, AcceptEncoding,
