@@ -122,7 +122,7 @@ zero errors, each sub-interpreter has its own kernel instance and does not crash
   and declare `PER_INTERPRETER_GIL_SUPPORTED` (like `_Request` in `pyronova_request_type.rs`).
 - **numpy / orjson / lxml**: one physical copy per worker (memory for isolation); this is
   also the best isolation strategy for free-threading (no shared-state bugs to worry about).
-- **Cost of the override**: it's a process-wide switch that also lets unsafe extensions like
+- **Cost of the override**: it's an interpreter-wide switch that, left on, also lets unsafe extensions like
   numpy *attempt* to load (numpy still fails on its own global state). Pair with crash
   isolation in production (a crashing sub-interpreter must not take the supervisor down).
 

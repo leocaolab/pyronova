@@ -27,10 +27,11 @@ Python versions, unit tests, lint. It never claims the build is
 | **ci-compile** | `--profile dev` | off | GitHub Actions | Compile-only smoke on Python 3.14, no stress. |
 
 Rule of thumb: **release and canary share the exact same codegen.**
-`leak_detect` only adds a conditional `counter!` increment at
-`PyObjRef::Drop`; the rest of the binary is identical. So any
+`leak_detect` only adds a refcount sample (`leak_detect::record_drop`)
+where a worker lets go of a request's `Request`, and two request
+counters in the worker pool; the rest of the binary is identical. So any
 performance delta we see between canary soak and the eventual
-release comes from one call site — known and bounded.
+release comes from those call sites — known and bounded.
 
 ## Release gate
 

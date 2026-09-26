@@ -134,9 +134,10 @@ These are framework-core and can't be disabled:
 
 ### `leak_detect`
 
-Per-object Drop counters for sub-interpreter lifecycle audits. Adds a
-`metrics` crate counter increment on every `PyObjRef` drop — not
-production-safe at 400k rps.
+Refcount histogram for sub-interpreter lifecycle audits. Adds a
+`metrics` crate counter increment, sampling the refcount of every
+request's `Request` as a worker lets go of it — not production-safe at
+400k rps.
 
 Build:
 

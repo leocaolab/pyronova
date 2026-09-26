@@ -121,32 +121,21 @@ Python's default `logging.StreamHandler` does synchronous `write()` to stderr wh
 
 ### Solution
 
-Pyronova hijacks Python's root logger in both the main interpreter and every sub-interpreter:
+Pyronova routes Python's root logger to Rust in the main interpreter and in every
+sub-interpreter, with one handler class, `RustLogHandler` (`python/pyronova/_log_bridge.py`).
+The main interpreter imports it (`app.py`); a worker's bootstrap runs the same source before
+the package can be imported, tagged with the worker's id:
 
-**Main interpreter** (`app.py`):
 ```python
-class PyronovaRustHandler(logging.Handler):
+class RustLogHandler(logging.Handler):
     def emit(self, record):
-        emit_python_log(           # PyO3 FFI → Rust
-            levelno=record.levelno,
-            name=record.name,
-            message=record.getMessage(),
-            pathname=record.pathname,
-            lineno=record.lineno,
-        )
-```
-
-**Sub-interpreters** (`_bootstrap.py`):
-```python
-class _PyronovaRustHandler(logging.Handler):
-    def emit(self, record):
-        _emit_python_log(              # pyronova.engine.emit_python_log, the same function main uses
+        self._sink(                    # pyronova.engine.emit_python_log
             record.levelno,
             record.name,
-            record.getMessage(),
+            msg,                       # getMessage(), plus the traceback of logger.exception
             record.pathname or "",
             record.lineno or 0,
-            self._worker_id,
+            self._worker_id,           # None on the main interpreter
         )
 ```
 
@@ -173,7 +162,6 @@ class _PyronovaRustHandler(logging.Handler):
 | `src/lib.rs` | Registered `logging` module + functions |
 | `src/app.rs` | Startup/shutdown → `tracing::info!`, conn errors → `tracing::warn!` |
 | `src/handlers.rs` | Access log with `latency_us`, `method`, `path`, `status`, `mode` |
-| `src/interp.rs` | *(historical)* `pyronova_emit_log_cfunc` C-FFI for sub-interpreters — removed in Layer 2; workers now import the real engine and call `emit_python_log` |
 | `src/monitor.rs` | GIL watchdog → `tracing::warn!` |
 | `src/websocket.rs` | WS errors → `tracing::error!`/`tracing::warn!` |
 

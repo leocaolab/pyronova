@@ -120,32 +120,19 @@ Python 默认的 `logging.StreamHandler` 在持有 GIL 时同步 `write()` 到 s
 
 ### 解决方案
 
-Pyronova 在主解释器和每个子解释器中劫持 Python 的 root logger：
+主解释器和每个子解释器用同一个 handler 类 `RustLogHandler`（`python/pyronova/_log_bridge.py`）。
+主解释器直接 import（`app.py`）；worker 的 bootstrap 在能 import 包之前执行同一份源码，并带上 worker id：
 
-**主解释器** (`app.py`)：
 ```python
-class PyronovaRustHandler(logging.Handler):
+class RustLogHandler(logging.Handler):
     def emit(self, record):
-        emit_python_log(           # PyO3 FFI → Rust
-            levelno=record.levelno,
-            name=record.name,
-            message=record.getMessage(),
-            pathname=record.pathname,
-            lineno=record.lineno,
-        )
-```
-
-**子解释器** (`_bootstrap.py`)：
-```python
-class _PyronovaRustHandler(logging.Handler):
-    def emit(self, record):
-        _emit_python_log(              # 即 pyronova.engine.emit_python_log，与主解释器用的是同一个函数
+        self._sink(                    # 即 pyronova.engine.emit_python_log
             record.levelno,
             record.name,
-            record.getMessage(),
+            msg,                       # getMessage()，logger.exception 时附上 traceback
             record.pathname or "",
             record.lineno or 0,
-            self._worker_id,
+            self._worker_id,           # 主解释器为 None
         )
 ```
 
@@ -172,7 +159,6 @@ class _PyronovaRustHandler(logging.Handler):
 | `src/lib.rs` | 注册 `logging` 模块 + 函数 |
 | `src/app.rs` | 启动/关闭 → `tracing::info!`，连接错误 → `tracing::warn!` |
 | `src/handlers.rs` | 访问日志：`latency_us`、`method`、`path`、`status`、`mode` |
-| `src/interp.rs` | *（历史）* 子解释器用的 `pyronova_emit_log_cfunc` C-FFI —— Layer 2 已删除；worker 现在导入真 engine，直接调用 `emit_python_log` |
 | `src/monitor.rs` | GIL 看门狗 → `tracing::warn!` |
 | `src/websocket.rs` | WebSocket 错误 → `tracing::error!`/`tracing::warn!` |
 
