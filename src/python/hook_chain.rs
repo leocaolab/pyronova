@@ -29,7 +29,7 @@ pub(crate) fn main_response(value: Bound<'_, PyAny>) -> Result<ResponseData, Res
 }
 
 /// A worker's [`ToResponse`]: the same mapping, except that a worker can't stream, so a
-/// `Stream` is an error (streaming needs `gil=True, stream=True`).
+/// `Stream` is an error (a streamed response needs `gil=True`).
 pub(crate) fn worker_response(value: Bound<'_, PyAny>) -> Result<ResponseData, ResponseError> {
     if value.is_instance_of::<crate::python::stream::PyronovaStream>() {
         return Err(ResponseError::StreamInWorker);

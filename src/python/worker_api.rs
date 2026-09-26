@@ -257,7 +257,7 @@ pub(crate) fn _worker_timed_out(job: &Bound<'_, AsyncJob>) -> PyResult<()> {
 
 /// A handler's (or hook's) return value as a `Response`, with the one mapping every
 /// interpreter uses, so after-request hooks see a `Response` on every path. A value that
-/// is no response (a `Stream`: streaming needs `gil=True, stream=True`) raises
+/// is no response (a `Stream`: a streamed response needs `gil=True`) raises
 /// [`ResponseInvalid`] carrying the error.
 #[pyfunction]
 pub(crate) fn _worker_to_response(py: Python<'_>, value: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
