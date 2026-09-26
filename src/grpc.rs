@@ -462,12 +462,48 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_stalled_body_is_deadline_exceeded() {
-        assert_eq!(
-            GrpcError::BodyTimedOut.status().header_value(),
-            HeaderValue::from_static("4")
+    /// A body that stops arriving is given up after `REQUEST_BUDGET`, as
+    /// `DEADLINE_EXCEEDED` (the paused clock advances once the connection idles).
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_body_is_deadline_exceeded() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = std::sync::Mutex::new(Some(tx));
+        let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+            let tx = tx.lock().unwrap().take();
+            async move {
+                let started = tokio::time::Instant::now();
+                let read = read_message(req.into_body(), 1024).await;
+                if let Some(tx) = tx {
+                    tx.send((read, started.elapsed())).ok();
+                }
+                Ok::<_, std::convert::Infallible>(Response::new(
+                    http_body_util::Empty::<Bytes>::new(),
+                ))
+            }
+        });
+        tokio::spawn(
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(hyper_util::rt::TokioIo::new(server_io), service),
         );
+
+        // Promises an 8-byte body, sends the first 3, then nothing (the writer stays open).
+        let (_client_read, mut client_write) = tokio::io::split(client_io);
+        client_write
+            .write_all(b"POST /x HTTP/1.1\r\nhost: x\r\ncontent-length: 8\r\n\r\n\x00\x00\x00")
+            .await
+            .unwrap();
+        let (read, waited) = tokio::time::timeout(2 * REQUEST_BUDGET, rx)
+            .await
+            .expect("the body read gave up by its deadline")
+            .unwrap();
+
+        let err = read.unwrap_err();
+        assert!(matches!(err, GrpcError::BodyTimedOut), "{err:?}");
+        assert_eq!(err.status(), GrpcStatus::DeadlineExceeded);
+        assert!(waited >= REQUEST_BUDGET, "{waited:?}");
     }
 
     #[tokio::test]
