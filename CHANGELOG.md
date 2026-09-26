@@ -1,5 +1,90 @@
 # Changelog
 
+## v2.10.0 (2026-09-26) — One request pipeline, typed errors, per-app settings (review cced8c2)
+
+A structural rework from the cced8c2 code review (`docs/design/code-review-cced8c2-roadmap.md`,
+`docs/design/code-review-final-rubric.md`): the three serving paths (GIL, sub-interpreter
+pool, TPC) share one request pipeline, failures are typed and carry their real cause,
+and engine config is parsed once at startup.
+
+### Breaking
+
+- **Route templates take only `{name}` / `{*name}`.** A `:name` segment is a registration
+  error that points to `{name}` (it used to be accepted).
+- **5xx bodies no longer carry exception text.** Every 5xx body is
+  `{"error": "Internal Server Error", "request_id": ...}`; the exception and traceback go
+  to the log under the same request id. 4xx bodies carry the reason. Applies to
+  handlers, hooks, rpc, health, mcp and crud.
+- **Bad engine config is a startup error.** Every `PYRONOVA_*` env var and `mode` is
+  parsed once in `run()`; a bad value raises naming the raw text instead of falling back
+  to a default. Invalid logging config and invalid compression settings raise
+  `ValueError`.
+- **Registration is sealed once a run starts.** Adding routes or hooks afterwards (e.g.
+  from `on_startup`) raises; workers only run what the script registered.
+- **`/mcp` and `@app.rpc` CSRF check.** Only the decoded body types are accepted (415
+  otherwise), and a cross-site `Origin` is 403 unless listed in `app.trusted_origins`.
+- **The gRPC benchmark endpoint is opt-in** (`app.enable_grpc_benchmark()`); user
+  `application/grpc*` routes are no longer intercepted.
+- **Benchmark harnesses are behind the `bench` cargo feature** and are not in the
+  default wheel (`maturin develop --release --features bench` for `benchmarks/`).
+- **`Metrics.total_requests` is `None`** unless `PYRONOVA_METRICS=1`; RSS fields are
+  `None` where the platform can't sample them. Peaks reset with `reset_peaks()`.
+- **`TestClient` takes a `Pyronova`** and runs it on the production serving path over a
+  real socket; it raises the server's real error.
+- **`cookies`**: `expires` takes an aware `datetime`; `samesite` is the `SameSite` enum.
+- **`uploads`**: a malformed multipart body raises `MultipartError`.
+- **`db`**: `connect()` with the same DSN but different settings raises; a parameter
+  that can't be encoded as its declared type raises `ParamError` (a `TypeError` and a
+  `ValueError`).
+
+### Changed
+
+- **One request pipeline** (`handlers/pipeline.rs`) and one `Request` constructor for
+  every serving path: CORS, access log, body limits, admission and timeouts behave the
+  same on GIL, pool and TPC. One access-log line per request, written by Rust.
+- **On TPC, `async def` routes run on the async worker pool**, off the TPC thread, so a
+  slow await doesn't block the thread and the 504 is on time. `def` routes stay inline.
+- **Typed errors with one request id per request**: a failure is logged once where it
+  happens with `req.request_id` and rendered once at the edge.
+- **Per-app settings**: `max_body_size`, the WebSocket caps and compression live in the
+  app's own config, so two apps in one process don't share them.
+- **Request budget**: a buffered or streamed body in total, plus the handler, gets 30 s,
+  then 504; a stalled body is 408.
+- **A port in use is `OSError(EADDRINUSE)` from `start()`** again: listeners are probe-bound
+  without `SO_REUSEPORT`, then bound before any thread or worker starts.
+- **One response mapping** and a real header multimap (`Headers`): repeated headers are
+  kept.
+- **WebSocket**: `ws.request` is a `Request`, `before_request` runs before the 101 (a hook
+  response rejects the upgrade), and connections, message size and queued bytes are
+  capped.
+- **Static files** are contained to the mount (no `..`, no symlink escape) and the cache
+  revalidates on `(mtime, len)` per request.
+- **Workers** hold their handlers and hooks as owned references released on the
+  worker's own thread; workers start from the main interpreter's `sys.path`; start
+  errors are typed.
+- `req.json()` and JSON columns decode with isojson (wide integers stay exact).
+
+### Added
+
+- `Server` from `PyronovaApp.start()`: `Server.port` (the bound port), `serve()`,
+  `shutdown()`; each server of an app stops independently.
+- Public exports: `Headers`, `Metrics`, `reset_peaks`, `LogLevel`, `Compression`,
+  `SameSite`, `MultipartError`, `RouteInfo`, `FastRouteInfo`.
+- `enable_logging(level=...)` sets the level explicitly.
+- `DbError::Connect` carries `.sqlstate`; crud answers DB errors by type (409 / 422 with
+  the reason).
+- MCP tool arguments are checked against the schema.
+
+### Fixed
+
+- A panic on the `gil=True` bridge is a logged 500, not a dead thread.
+- `ContextVar` writes from an async hook or handler reach the rest of the request.
+- `model=` routes also get path params; the handler signature is checked at
+  registration.
+- Clone failures in `app.isolate(...)` surface; the clone root is private to the user.
+- Dev reload re-runs the real command and watches the app's own directory.
+- The benchmark harnesses no longer leak or report `Ok` after a panic.
+
 ## v2.9.0 (2026-09-25) — Python 3.14; isojson 0.2 (native datetime and numpy)
 
 ### Changed
