@@ -35,17 +35,14 @@ pub(crate) struct PyronovaRequest {
     pub(crate) client_ip_addr: IpAddr,
     /// The request's correlation id (`req.request_id`), written once by the pipeline.
     pub(crate) request_id: RequestId,
-    /// Stored as Bytes (ref-counted, zero-copy from hyper).
+    /// Reference-counted: shares hyper's buffer, no copy.
     pub(crate) body_bytes: Bytes,
     /// `req.stream`: the streamed body of a `stream=True` route, handed out once.
     pub(crate) body_stream: crate::body::StreamSlot,
-    /// Cached parse of the query string. `form_urlencoded::parse + collect`
-    /// costs ~100-200 ns for a two-param query and building a fresh
-    /// Python dict on top is another ~500 ns. OnceLock matches the
-    /// `query_all_cache` pattern: parse once, return ref on subsequent
-    /// accesses.
+    /// The query string parsed on first access (first value per key); a handler reading
+    /// several params pays for one parse.
     pub(crate) query_cache: OnceLock<HashMap<String, String>>,
-    /// Cached multi-value parse — same rationale as `query_cache`.
+    /// The query string parsed on first access, every value per key.
     pub(crate) query_all_cache: OnceLock<HashMap<String, Vec<String>>>,
 }
 
@@ -205,7 +202,7 @@ impl PyronovaRequest {
             .transpose()
     }
 
-    /// Zero-copy: validates UTF-8 on the Bytes slice, creates Python str directly.
+    /// The body as `str`; `ValueError` if it isn't UTF-8.
     fn text<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyString>> {
         let s = std::str::from_utf8(&self.body_bytes)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -219,12 +216,8 @@ impl PyronovaRequest {
         crate::json::loads(py, &self.body_bytes)
     }
 
-    /// Look up a single query parameter by name without building the full map.
-    ///
-    /// Uses the already-computed cache when available. On a cold cache this
-    /// scans the raw query string once — cheaper than building a HashMap for
-    /// a single lookup. First-wins on duplicate keys (same policy as
-    /// `query_params`).
+    /// One query parameter by name, without building the full map on a cold cache. The
+    /// first value wins on duplicate keys, as in `query_params`.
     fn query_param(&self, key: &str) -> Option<Cow<'_, str>> {
         if let Some(cache) = self.query_cache.get() {
             return cache.get(key).map(|v| Cow::Borrowed(v.as_str()));
@@ -254,16 +247,10 @@ impl PyronovaRequest {
         Ok(dict)
     }
 
-    // ── Buffer protocol: zero-copy `memoryview(req)` into the body ──────
+    // ── Buffer protocol: `memoryview(req)` / `np.frombuffer(req)` read the body in place ──
     //
-    // Lets big-body handlers view the Rust-owned body `Bytes` with no copy:
-    // `memoryview(req)` / `np.frombuffer(req, dtype=...)` point straight at
-    // our buffer, unlike `req.body` which materializes a `PyBytes` (a
-    // memcpy). Read-only, 1-D, itemsize 1, format "B". The view takes a
-    // strong ref to `req` (`view.obj`), so the body outlives the view — our
-    // instance (and its `Bytes`) can only drop after the memoryview
-    // releases that ref. This is the on-ramp for large / columnar payloads
-    // (file uploads, AI-agent bodies, and a future Arrow zero-copy body).
+    // `req.body` copies into a `bytes`; this doesn't. Read-only, 1-D, itemsize 1, format
+    // "B". The view holds a strong ref to `req` (`view.obj`), so the body outlives it.
     unsafe fn __getbuffer__(
         slf: Bound<'_, Self>,
         view: *mut ffi::Py_buffer,
@@ -281,10 +268,8 @@ impl PyronovaRequest {
             ));
         }
 
-        // `frozen` ⇒ `Bound::get` yields `&Self` without a borrow guard.
-        // `body_bytes` is heap-owned by this instance at a stable address,
-        // kept alive by the strong ref we stash in `view.obj` below, so the
-        // raw pointer stays valid for the view's whole lifetime.
+        // `body_bytes` is owned by this (frozen) instance at a stable address and kept alive
+        // by the ref stashed in `view.obj` below, so the pointer is valid for the view's life.
         let data: &[u8] = &slf.get().body_bytes;
         (*view).buf = data.as_ptr() as *mut std::ffi::c_void;
         (*view).len = data.len() as ffi::Py_ssize_t;
@@ -311,7 +296,6 @@ impl PyronovaRequest {
         };
         (*view).suboffsets = std::ptr::null_mut();
         (*view).internal = std::ptr::null_mut();
-        // Hand the view a strong ref to keep `req` (and its body) alive.
         (*view).obj = slf.into_ptr();
         Ok(())
     }

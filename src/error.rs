@@ -447,7 +447,7 @@ pub(crate) mod tests {
         let err = refuse(Refusal::Timeout);
         let after_refuse = crate::monitor::DROPPED_REQUESTS.load(Relaxed);
         assert!(after_refuse > before);
-        // Logging (and rendering, in `handlers::error`) no longer counts.
+        // Logging (and rendering, in `handlers::error`) does not count.
         let id = RequestId::mint();
         let logged = captured_log_value(|| err.log(&tag(&id)));
         assert!(matches!(

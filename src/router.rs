@@ -1,3 +1,6 @@
+//! The route table: registered routes, hooks, static mounts and pre-built responses, and
+//! the lookup that resolves a request to the handler that runs it and where.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -154,8 +157,8 @@ fn colon_param(segment: &str) -> Option<&str> {
 pub(crate) struct RouteId(usize);
 
 impl RouteId {
-    /// The position in registration order, which is the same in every interpreter (the
-    /// worker tables are checked against main's; Layer 2, C3).
+    /// The position in registration order, which is the same in every interpreter (each
+    /// worker's table is checked against main's [`RouteSignature`]).
     pub(crate) fn index(self) -> usize {
         self.0
     }
@@ -234,7 +237,7 @@ pub(crate) struct RouteTable {
     pub(crate) fast_responses: HashMap<String, HashMap<String, FastResponse>>,
     /// Route, before-hook and after-hook counts when `Pyronova.run()` began, i.e. the part
     /// of the table the script registered. Everything after it (`/mcp`, logging hooks,
-    /// startup-hook routes) exists only on main. Set once, on main (Layer 2, FR-2).
+    /// startup-hook routes) exists only on main. Set once, on main.
     pub(crate) sealed: Option<Sealed>,
 }
 
@@ -246,10 +249,10 @@ pub(crate) struct Sealed {
     pub(crate) after_hooks: usize,
 }
 
-/// The routes and hook counts a worker's script must register, as plain values (Layer 2,
-/// C3). Main computes it from its sealed table before creating workers; a worker compares
-/// its own whole table against it. Plain values, so a worker's init, which runs with the
-/// worker's thread state current, never touches main's `Py<T>` handlers (M4 review N3).
+/// The routes and hook counts a worker's script must register. Main computes it from its
+/// sealed table before creating workers; a worker compares its own whole table against it.
+/// Plain values, so a worker's init, which runs with the worker's thread state current,
+/// never touches main's `Py<T>` handlers.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RouteSignature {
     /// Per route index: `(METHOD, path, gil)`.
@@ -524,7 +527,8 @@ fn allow_value<'a>(methods: impl Iterator<Item = &'a str>) -> Option<HeaderValue
 }
 
 /// Per route (registration order): whether it runs on main, and whether it is `async def`
-/// on a worker. The shape the worker split and the startup banners read.
+/// on a worker; plus how many stream their body. The worker split and the startup banners
+/// read it.
 pub(crate) struct RouteShape {
     pub(crate) gil: Vec<bool>,
     pub(crate) is_async: Vec<bool>,

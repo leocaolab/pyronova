@@ -4,10 +4,9 @@
 //! engine a validated [`Settings`]; a run serves it from its `SiteConfig`. When disabled
 //! the hot path is one `Option` check.
 //!
-//! Negotiates with the client's `Accept-Encoding` (parsing q-values and
-//! `identity;q=0`), applies an allowlist to content-types (skips images,
-//! octet-stream, already-compressed types), and honors handler-supplied
-//! `Content-Encoding` (a handler returning pre-compressed bytes is never
+//! Negotiates with the client's `Accept-Encoding` (q-values, `*`), applies an allowlist
+//! to content-types (skips images, octet-stream, already-compressed types), and honors
+//! handler-supplied `Content-Encoding` (a handler returning pre-compressed bytes is never
 //! double-compressed). A large body, or one for a slow codec setting, is compressed on
 //! the blocking pool so it never stalls a tokio worker.
 
@@ -24,9 +23,11 @@ use crate::types::ResponseData;
 // Per-request compression output buffer pool
 // ---------------------------------------------------------------------------
 
-// Same bounded-pool pattern as the JSON serializer's BUFFER_POOL.
-// Buffers up to 4 MiB are recycled; larger ones are dropped to bound
-// memory. 32 slots comfortably covers a 16-worker deployment.
+/// A recycled buffer larger than this is dropped instead, so the pool's memory is bounded.
+const POOL_MAX_BUF_BYTES: usize = 4 << 20;
+/// Buffers kept for reuse; enough for every thread of a 16-worker server.
+const POOL_SLOTS: usize = 32;
+
 static COMPRESS_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
 struct PooledCompressBuf(Vec<u8>);
@@ -40,10 +41,10 @@ impl AsRef<[u8]> for PooledCompressBuf {
 impl Drop for PooledCompressBuf {
     fn drop(&mut self) {
         let mut v = std::mem::take(&mut self.0);
-        if v.capacity() <= 4 << 20 {
+        if v.capacity() <= POOL_MAX_BUF_BYTES {
             v.clear();
             let mut pool = COMPRESS_POOL.lock();
-            if pool.len() < 32 {
+            if pool.len() < POOL_SLOTS {
                 pool.push(v);
             }
         }
@@ -274,9 +275,8 @@ impl Coding {
 /// Parse `Accept-Encoding` and return the server-preferred algorithm the
 /// client accepts. Server preference: brotli > gzip.
 fn negotiate(accept_encoding: &str, allowed: Algos) -> Option<Coding> {
-    // Track per-algo max q seen (default 1.0 if listed without q-value).
-    // identity q=0 is respected for completeness but we only return Some
-    // when one of our algorithms is acceptable, so it's informational.
+    // Per-algo max q seen (1.0 if listed without a q-value); -1 = not listed. `identity` is
+    // not negotiated: with no shared coding the body goes out uncompressed.
     let mut br_q = -1.0f32;
     let mut gz_q = -1.0f32;
     let mut star_q = -1.0f32;
@@ -294,9 +294,7 @@ fn negotiate(accept_encoding: &str, allowed: Algos) -> Option<Coding> {
                     if let Some(value) = strip_prefix_ignore_ascii_case(p, "q=") {
                         // Malformed q-value → 0.0 (disabled), not 1.0 (max preference).
                         q = value.trim().parse().unwrap_or(0.0);
-                        // First q= wins; duplicate params (e.g. `br;q=1.0;q=0.0`)
-                        // have undefined semantics, so don't let a later write
-                        // silently flip the preference. Take the first, stop.
+                        // The first q= wins: a later duplicate must not flip the preference.
                         break;
                     }
                 }
@@ -304,7 +302,6 @@ fn negotiate(accept_encoding: &str, allowed: Algos) -> Option<Coding> {
             }
             None => (part, 1.0),
         };
-        // eq_ignore_ascii_case avoids a heap allocation on every token.
         if name.eq_ignore_ascii_case("br") {
             br_q = br_q.max(q);
         } else if name.eq_ignore_ascii_case("gzip") || name.eq_ignore_ascii_case("x-gzip") {
@@ -588,7 +585,6 @@ mod tests {
 
     #[test]
     fn negotiate_wildcard_q_zero_excludes() {
-        // "*;q=0, gzip" — explicitly listed gzip wins, brotli excluded by wildcard
         assert_eq!(negotiate("*;q=0, gzip", Algos::Both), Some(Coding::Gzip));
     }
 

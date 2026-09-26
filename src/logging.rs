@@ -1,13 +1,9 @@
-//! Pyronova logging engine — zero-cost tracing with non-blocking I/O.
+//! The process's tracing subscriber (`init_logger`), and the bridge Python `logging`
+//! records cross into it (`emit_python_log`).
 //!
-//! Provides:
-//! - `init_logger`: installs (first call) or reconfigures (later calls) the process-wide
-//!   tracing subscriber, writing through a non-blocking writer
-//! - `emit_python_log`: receives Python `logging` calls via FFI, routes to tracing
-//!
-//! Key: uses `tracing-appender::non_blocking` to avoid StdoutLock contention.
-//! Without this, 220k QPS access log would starve Tokio worker threads on
-//! the global stdout mutex.
+//! Every line is written by a background thread (`tracing_appender::non_blocking`): at
+//! hundreds of thousands of access-log lines a second, Tokio workers writing stderr
+//! themselves would serialize on its lock.
 
 use std::str::FromStr;
 
@@ -237,8 +233,6 @@ fn fmt_layer(format: LogFormat, writer: tracing_appender::non_blocking::NonBlock
 }
 
 fn install(config: &LoggerConfig) -> Result<Installed, LoggerError> {
-    // Non-blocking writer: all log I/O happens on a dedicated background thread.
-    // Tokio workers never block on stderr — they just push into a channel.
     let (writer, guard) = tracing_appender::non_blocking(std::io::stderr());
     let (filter_layer, filter) = reload::Layer::new(config.filter()?);
     let (format_layer, fmt) = reload::Layer::new(fmt_layer(config.format, writer.clone()));
@@ -419,10 +413,10 @@ macro_rules! dispatch_python_log {
 
 /// Receive a Python logging record and route it through Rust tracing.
 ///
-/// Called from `PyronovaRustHandler.emit()` in each interpreter (main + sub-interpreters)
-/// with the record's numeric `levelno`. The actual filtering is done by `EnvFilter`.
-/// `worker_id=None` (the main interpreter) records no `worker` field at all, so a
-/// main-interpreter line can't pass for worker 0's (Layer 2, E2E-11).
+/// Called from `pyronova._log_bridge.RustLogHandler.emit()` in every interpreter with the
+/// record's numeric `levelno`; `EnvFilter` does the filtering. `worker_id=None` (the main
+/// interpreter) records no `worker` field at all, so a main-interpreter line can't pass
+/// for worker 0's.
 #[pyfunction]
 #[pyo3(signature = (levelno, name, message, pathname, lineno, worker_id=None))]
 pub fn emit_python_log(

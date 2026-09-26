@@ -1,4 +1,5 @@
-//! PyronovaWebSocket support — async Tokio ↔ sync Python bridge via channels.
+//! WebSocket connections: a Tokio message pump on one side, a synchronous Python handler
+//! on its own OS thread on the other, joined by two queues.
 //!
 //! Every resource a client can make the server hold is bounded: connections (each
 //! holds one OS thread for its Python handler) by `max_connections`, message and frame
@@ -576,9 +577,8 @@ async fn answer_upgrade(
     };
 
     // The hooks run on the connection's thread before the 101; the handler runs there
-    // after it, in the same request context. In TPC mode this function runs on a worker's
-    // thread, bound to that worker's interpreter; the handler and hooks are main's, and run
-    // on the connection's own thread, attached to main (Layer 2, C4).
+    // after it, in the same request context. The handler and hooks are main's; in TPC mode
+    // this function runs on a thread bound to a worker's interpreter, so they can't run here.
     let (ends, handler_ends) = connection_channels(limits);
     let (verdict_tx, verdict_rx) = oneshot::channel();
     let accept_encoding = AcceptEncoding::of(&head);
@@ -677,7 +677,7 @@ fn connection_channels(limits: WsLimits) -> (ConnEnds, HandlerEnds) {
 ///
 /// Contract: WebSocket handlers and hooks live in the main interpreter. The thread has no
 /// thread state, so it attaches to main explicitly, with one thread state for the
-/// connection's life (Layer 2, C4). Not `main_attach`: this thread can outlive the server
+/// connection's life. Not `main_attach`: this thread can outlive the server
 /// run whose context `main_attach` reads. The site clone is dropped inside the attach.
 fn spawn_handler_thread(
     site: SharedSite,
@@ -732,11 +732,11 @@ fn serve_connection(
     let request = match hooks {
         Ok((request, None)) => request,
         Ok((_, Some(response))) => {
-            let _ = verdict.send(Verdict::Reject(Ok(response)));
+            verdict.send(Verdict::Reject(Ok(response))).ok();
             return;
         }
         Err(e) => {
-            let _ = verdict.send(Verdict::Reject(Err(e.log(&label.tag()))));
+            verdict.send(Verdict::Reject(Err(e.log(&label.tag())))).ok();
             return;
         }
     };
@@ -752,8 +752,6 @@ fn serve_connection(
     if let Err(e) = run_handler(py, &handler, ws) {
         log_handler_error(&e, &label.tag());
     }
-    // Drop the handler under the GIL, not via PyO3's pending-drop path.
-    drop(handler);
 }
 
 /// Why a WebSocket handler ended with an error. The connection was already upgraded, so

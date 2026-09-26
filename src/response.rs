@@ -18,23 +18,20 @@ pub(crate) const SERVER_HEADER: &str = concat!("Pyronova/", env!("CARGO_PKG_VERS
 const JSON: HeaderValue = HeaderValue::from_static("application/json");
 const TEXT: HeaderValue = HeaderValue::from_static("text/plain; charset=utf-8");
 const OCTET_STREAM: HeaderValue = HeaderValue::from_static("application/octet-stream");
+/// `Retry-After` on an overload 503, in seconds: overload is transient.
+const OVERLOAD_RETRY_AFTER_SECS: HeaderValue = HeaderValue::from_static("1");
 
 // ---------------------------------------------------------------------------
 // isojson-backed serializer (required dep: always available)
 // ---------------------------------------------------------------------------
 
-// Cached `dumps(obj)` wrapper compiled once per interpreter via PyModule::from_code.
-//
-// Per interpreter: `PyOnceLock` is per-interpreter with the PyO3 fork, so each sub-interpreter
-// caches its own function. A process-global `std::sync::OnceLock<Py<_>>` here handed the first
-// interpreter's function (and module) to every other one.
+// The `dumps(obj)` wrapper, compiled once per interpreter: `PyOnceLock` is per-interpreter
+// with the PyO3 fork, and one interpreter's function must never be called from another.
 static JSON_HELPER: pyo3::sync::PyOnceLock<pyo3::Py<pyo3::PyAny>> = pyo3::sync::PyOnceLock::new();
 
 fn get_or_init_json_dumps(py: Python<'_>) -> pyo3::PyResult<pyo3::Bound<'_, pyo3::PyAny>> {
     JSON_HELPER
         .get_or_try_init(py, || {
-            // PyModule::from_code gives correct module-level scoping: _isojson and _default are
-            // in the module's __dict__, so the dumps closure sees them.
             let module = pyo3::types::PyModule::from_code(
                 py,
                 c"import isojson as _isojson\n\ndef _default(obj):\n    if isinstance(obj, (set, frozenset)):\n        return list(obj)\n    raise TypeError(f'not serializable: {type(obj).__name__}')\n\ndef dumps(obj):\n    return _isojson.dumps(obj, default=_default)\n",
@@ -215,9 +212,7 @@ pub(crate) fn error_response(msg: &str, request_id: &RequestId) -> Response<Full
     )
 }
 
-/// `{"error": msg}` for a 4xx, serialized via serde_json. Hand-rolling the escape (only
-/// handling `"`) would leak backslashes, control chars, and newlines into the payload —
-/// the classic "minimal escape hides a JSON injection" bug.
+/// `{"error": msg}` for a 4xx; serde_json escapes `msg`, which may carry client input.
 fn error_json_body(msg: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({ "error": msg }))
         .unwrap_or_else(|_| br#"{"error":"serialization failed"}"#.to_vec())
@@ -240,7 +235,7 @@ pub(crate) fn overloaded_response(msg: &str, request_id: &RequestId) -> Response
         server_error_body(msg, request_id),
     );
     resp.headers_mut()
-        .insert(hyper::header::RETRY_AFTER, HeaderValue::from_static("1"));
+        .insert(hyper::header::RETRY_AFTER, OVERLOAD_RETRY_AFTER_SECS);
     resp
 }
 
@@ -355,8 +350,6 @@ mod tests {
 
     #[test]
     fn error_response_escapes_control_chars_and_backslashes() {
-        // Previously the hand-rolled escape only handled `"`; a backslash
-        // or a newline in `msg` produced invalid JSON. serde_json fixes it.
         let resp = error_response("back\\slash\nnewline\ttab", &RequestId::mint());
         let body = String::from_utf8(body_bytes(resp)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("must parse");

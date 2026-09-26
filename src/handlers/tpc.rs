@@ -47,7 +47,7 @@ pub(crate) async fn handle_request_tpc_inline(
             run_inline(site, &context.worker, prepared, route).await
         }
         // Off this thread, so the handler's awaits overlap other requests and its budget
-        // is enforced on time (decision Q1).
+        // is enforced on time.
         Call::Worker(route, kind @ HandlerKind::Async) => match &context.async_pool {
             Some(pool) => serve_on_pool(pool, site, prepared, route, kind).await,
             None => no_async_pool(site, prepared),
@@ -112,7 +112,6 @@ async fn call_inline(
     let request = PyronovaRequest::new(head, body);
     let called = Instant::now();
 
-    // Acquire the TPC thread's sub-interp GIL, run the handler, release.
     // SAFETY: this TPC thread is the one its worker was rebound to, and no thread state is
     // current between requests.
     let result = unsafe { worker.borrow_mut().serve(route, request) };

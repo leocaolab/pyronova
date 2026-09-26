@@ -51,7 +51,7 @@ pub(crate) struct StreamInfo {
 /// Calls `loop.close()` when the thread dies, so orphaned loops don't leak FDs or tasks.
 /// The close re-attaches to the loop's own interpreter explicitly: the thread may have no
 /// thread state by then, and once several interpreters have executed the engine a bare
-/// `Python::attach` there is refused (Layer 2, C4).
+/// `Python::attach` there is refused.
 ///
 /// Safety: guards against the Py_Finalize race — if the interpreter is already finalized
 /// when the thread exits, the loop is leaked instead of touched.
@@ -196,7 +196,7 @@ pub(crate) async fn build_main_http_response(
 }
 
 // ---------------------------------------------------------------------------
-// Shared: call handler with full middleware chain (runs in blocking thread)
+// Shared: call a main-interpreter handler with its hooks
 // ---------------------------------------------------------------------------
 
 /// Runs `target`'s handler on the main interpreter with the before/after hooks, all in one
@@ -210,12 +210,7 @@ pub(crate) fn call_handler_with_hooks(
 ) -> Result<MainReply, Logged> {
     use std::sync::atomic::Ordering::Relaxed;
 
-    // Track GIL queue: +1 before acquiring, -1 after acquiring
     crate::monitor::GIL_QUEUE_LENGTH.fetch_add(1, Relaxed);
-
-    // Passive GIL contention measurement: record the wall-clock time spent
-    // waiting to acquire the GIL. This replaces the active watchdog probe —
-    // measures real request latency instead of artificial contention.
     let gil_wait_start = std::time::Instant::now();
 
     // The request as its error log line names it; `sky_req` moves into its `Request`.
@@ -231,7 +226,6 @@ pub(crate) fn call_handler_with_hooks(
                 .unwrap_or_else(|e| Err(HandlerError::python(py, Stage::Setup, &e)))
         });
 
-        // Record GIL hold time before releasing GIL
         crate::monitor::GIL_HOLD_MAX_US.fetch_max(hold_start.elapsed().as_micros() as u64, Relaxed);
         result.map_err(|e| e.log(&label.tag()))
     })
@@ -254,8 +248,7 @@ fn run_with_hooks(
     }
     let value = chain.handler(routes.handler(target), &req)?;
 
-    // A `Stream` (SSE) goes out as a streaming body. `is_instance_of` is a single C
-    // pointer compare, no string alloc.
+    // A `Stream` (SSE) goes out as a streaming body.
     if value.is_instance_of::<PyronovaStream>() {
         return Ok(MainReply::Stream(stream_info(&value)?));
     }
@@ -289,10 +282,7 @@ pub(crate) fn build_stream_response(info: StreamInfo) -> Response<BoxBody> {
         tokio_stream::wrappers::ReceiverStream::new(info.rx).map(|result| result.map(Frame::data));
 
     let body = StreamBody::new(stream);
-    // The SSE channel item type is `Result<Bytes, std::convert::Infallible>`
-    // (see `StreamInfo.rx`), so this body's error is uninhabited and can never
-    // be produced. `match e {}` is the total, panic-free conversion to the
-    // boxed body's `hyper::Error`.
+    // The channel's error type is `Infallible`: `match e {}` converts it without a panic path.
     let boxed: BoxBody = BoxBody::new(body.map_err(|e| match e {}));
 
     // The stream's headers were validated when it was made; its own values replace the

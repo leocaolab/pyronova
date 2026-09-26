@@ -15,10 +15,8 @@
 //! rpc   GetSum (SumRequest) returns (SumReply);
 //! ```
 //!
-//! That's ~20 lines of varint I/O plus an HTTP/2 frame-with-trailers
-//! response — cheaper in binary size and compile time than pulling in
-//! the tonic stack. If the Arena spec ever adds streaming or a richer
-//! message we can revisit.
+//! That is a few lines of varint I/O plus an HTTP/2 frame-with-trailers response,
+//! cheaper in binary size and compile time than the tonic stack.
 //!
 //! Transport notes
 //! ---------------
@@ -158,9 +156,11 @@ async fn read_message(body: Incoming, limit: usize) -> Result<Bytes, GrpcError> 
     unframe(collected)
 }
 
+/// `[compressed flag: u8][length: u32 BE]` before every gRPC message.
+const HEADER_LEN: usize = 5;
+
 /// `[compressed flag: u8][length: u32 BE][message]` → message.
 fn unframe(framed: Bytes) -> Result<Bytes, GrpcError> {
-    const HEADER_LEN: usize = 5;
     if framed.len() < HEADER_LEN {
         return Err(GrpcError::ShortFrame { len: framed.len() });
     }
@@ -245,9 +245,9 @@ fn skip_field(field: u64, wire_type: u8, input: &[u8]) -> Result<&[u8], DecodeEr
     input.get(len..).ok_or(DecodeError::Truncated { field })
 }
 
-/// Prefix a message with the 5-byte gRPC frame header.
+/// Prefix a message with the gRPC frame header.
 fn frame(message: &[u8]) -> Bytes {
-    let mut framed = BytesMut::with_capacity(5 + message.len());
+    let mut framed = BytesMut::with_capacity(HEADER_LEN + message.len());
     framed.put_u8(0);
     framed.put_u32(message.len() as u32);
     framed.extend_from_slice(message);
@@ -289,8 +289,6 @@ fn grpc_reply(data: Option<Bytes>, status: GrpcStatus, message: Option<&str>) ->
     ));
     let boxed: BoxBody = body.boxed();
 
-    // Build infallibly: Response::new defaults to 200 OK, and inserting a
-    // 'static header value never errors — no unwrap / panic path.
     let mut response = Response::new(boxed);
     response
         .headers_mut()

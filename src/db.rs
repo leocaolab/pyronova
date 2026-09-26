@@ -20,17 +20,11 @@
 //!   * failures are `DbError`; queries raise `DatabaseError` with `.sqlstate` (`error`).
 //!
 //! Architecture notes:
-//!   * Using a dedicated tokio runtime rather than the hyper server's
-//!     runtime avoids cross-runtime coupling and keeps DB I/O off the
-//!     accept loop. Callers hand the future to that runtime with
-//!     `run_on_db_rt` and wait on a std channel. They never call
-//!     `Runtime::block_on`, which panics on a thread already inside a
+//!   * The pool runs on its own tokio runtime, not the server's, so DB I/O stays off the
+//!     accept loop. Callers hand the future to it with `run_on_db_rt` and wait on a std
+//!     channel, never `Runtime::block_on`, which panics on a thread already inside a
 //!     Tokio context (a TPC worker runs its handlers inside one).
-//!   * `py.detach()` around the wait so the GIL is released during DB I/O.
-//!     That's the whole point — other Python threads make progress while
-//!     this one waits on the wire.
-//!   * sqlx::PgPool is `Clone`-via-`Arc` internally, so the static
-//!     reference works fine from arbitrary threads and sub-interpreters.
+//!   * The wait releases the GIL (`py.detach()`), so other Python threads run meanwhile.
 
 mod cell;
 mod error;
@@ -55,29 +49,24 @@ use crate::run_context::{attach_to, main_attach, Interp};
 use error::{DbError, Reconfigured, TaskError};
 use param::PyParam;
 
-/// Channel capacity for `PgCursor`. 8 rows in flight keeps memory
-/// bounded while allowing enough prefetch to hide server-round-trip
-/// latency on the common case of a fast Python consumer.
+/// Rows in flight to a `PgCursor`: bounded memory, with enough prefetch to hide the
+/// server round trip from a fast consumer.
 const CURSOR_CAPACITY: usize = 8;
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 10;
 const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Worker threads of the `pyronova-db` runtime: they only drive socket I/O.
+const DB_RUNTIME_THREADS: usize = 2;
 
 static PG_POOL: OnceLock<Connected> = OnceLock::new();
 static PG_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 pub(crate) fn runtime() -> &'static Runtime {
-    // .expect() panic crosses FFI into Python → UB. The arc db-4 fix
-    // recommendation was a signature change to PyResult, but `runtime()`
-    // is called from many internal sites; keeping the &'static return.
-    // Build failure during init is fatal anyway — converting to abort
-    // via `eprintln + std::process::abort()` makes the failure mode
-    // explicit and avoids the unwind-into-FFI UB. In practice tokio
-    // multi_thread Builder::build only fails on syscall exhaustion
-    // (threads, fds) at process startup, which is unrecoverable.
+    // A runtime that can't be built (threads or fds exhausted) is unrecoverable: abort
+    // with the reason rather than unwind a panic into Python.
     PG_RUNTIME.get_or_init(|| {
         match tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(DB_RUNTIME_THREADS)
             .thread_name("pyronova-db")
             .enable_all()
             .build()
@@ -385,9 +374,8 @@ fn run_awaitable<'py>(
 
 const FETCH_ITER: &str = "fetch_iter";
 
-/// Message sent from the cursor's background driver task to the
-/// Python-facing iterator. `None` on the receiver == EOF (sender
-/// dropped at end of stream or on connection loss).
+/// A message from the cursor's driver task to the iterator. The channel closing (the
+/// driver finished or failed) is EOF.
 enum CursorMsg {
     Row(PgRow),
     /// The last message: the driver stops after an error.
@@ -429,11 +417,9 @@ async fn stream_rows(
 
 /// Streaming result-set iterator. Constructed by `PgPool.fetch_iter(sql, ...)`.
 ///
-/// Memory contract: at most `CURSOR_CAPACITY` rows (8) are buffered in the channel
-/// plus at most `CURSOR_CAPACITY` in `buf`, and 1 PyDict is live on the Python side
-/// (the one just yielded from `__next__`). This bounds memory at O(1), compared with
-/// `fetch_all`, which peaks at O(2N) (Rust Vec<PgRow> AND Python list<dict> both alive
-/// while the conversion loop runs).
+/// Memory contract: at most `CURSOR_CAPACITY` rows in the channel plus as many in `buf`,
+/// and the one dict just yielded: O(1), where `fetch_all` peaks at O(2N) (the rows and
+/// the list of dicts both alive during conversion).
 ///
 /// A dedicated task on the pool's tokio runtime drives the sqlx stream and pushes each
 /// row through a bounded async channel, so a slow consumer applies backpressure without
@@ -557,8 +543,7 @@ impl PgCursor {
         slf
     }
 
-    /// Pull the next row as a dict, or raise StopIteration at EOF,
-    /// or raise DatabaseError on a database error.
+    /// The next row as a dict; `StopIteration` at EOF, `DatabaseError` on a database error.
     fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let claimed = self.lock()?.claim();
         let turn = match claimed {
@@ -576,9 +561,7 @@ impl PgCursor {
         }
     }
 
-    /// Eager-drain helper: materialize every remaining row as a list
-    /// of dicts. Same API shape as `fetch_all` — useful for tests that
-    /// want to verify a cursor's contents without writing a loop.
+    /// Every remaining row, as a list of dicts (the shape `fetch_all` returns).
     fn to_list<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
         loop {
@@ -664,13 +647,8 @@ impl PgPool {
         run_blocking(py, Fetch::Execute, sql, params)
     }
 
-    /// Stream rows one at a time via an iterator cursor — keeps memory
-    /// O(1) instead of fetch_all's O(2N) peak (Rust Vec<PgRow> plus
-    /// Python list<dict> both alive simultaneously during conversion).
-    ///
-    /// Use for large result sets (data exports, full-table scans,
-    /// log paging). For typical API queries returning ≤ 50 rows,
-    /// `fetch_all` is simpler and the O(2N) peak is inconsequential.
+    /// Rows one at a time through a `PgCursor`, in O(1) memory (see there). For large
+    /// result sets; for a typical API query `fetch_all` is simpler.
     ///
     /// Python side:
     ///
@@ -695,17 +673,11 @@ impl PgPool {
     }
 
     // ----------------------------------------------------------------
-    // Async variants — return Python awaitables.
-    //
-    // `await pool.fetch_one_async(sql, ...)` from an `async def` handler. The query
-    // runs on the `pyronova-db` runtime and its result reaches the caller's asyncio
-    // loop through `await_on_loop` (see there).
-    //
-    // Why separate from the sync methods: a single method that returns a dict or a
-    // coroutine depending on where it is called is confusing and brittle. The
-    // explicit `_async` suffix makes the cost model obvious.
-    //
-    // Main interpreter only: workers keep these fail-closed (Layer 2 design, FR-9).
+    // Async variants: `await pool.fetch_one_async(sql, ...)` from an `async def` handler.
+    // The query runs on the `pyronova-db` runtime and its result reaches the caller's
+    // asyncio loop through `await_on_loop`. Separate methods, so one call never returns a
+    // dict in one place and a coroutine in another. Main interpreter only
+    // (`refuse_async_in_worker`).
     // ----------------------------------------------------------------
 
     #[pyo3(signature = (sql, *params))]
@@ -750,11 +722,11 @@ impl PgPool {
 }
 
 // ---------------------------------------------------------------------------
-// Async results for any interpreter (Layer 2, C9)
+// Async results
 // ---------------------------------------------------------------------------
 
-/// `*_async` is main-interpreter only for now (Layer 2 design, FR-9). The message is the one
-/// the worker bootstrap already gives.
+/// `*_async` runs on the main interpreter only: a worker gets `NotImplementedError`
+/// naming the sync method and `gil=True`.
 fn refuse_async_in_worker(py: Python<'_>, name: &str) -> PyResult<()> {
     if Interp::current(py).is_main() {
         return Ok(());
@@ -770,7 +742,7 @@ fn refuse_async_in_worker(py: Python<'_>, name: &str) -> PyResult<()> {
 ///
 /// The result is delivered by attaching to the interpreter captured here, never by a bare
 /// attach from a runtime thread: once more than one interpreter has executed the engine, the
-/// PyO3 fork refuses those (Layer 2 spike, R-3). `pyo3-async-runtimes` did exactly that.
+/// PyO3 fork refuses those (which rules out `pyo3-async-runtimes`).
 ///
 /// - The asyncio future is set from its own loop, through `call_soon_threadsafe`, and only
 ///   if it isn't done yet: a cancelled caller is left alone.
@@ -779,7 +751,7 @@ fn refuse_async_in_worker(py: Python<'_>, name: &str) -> PyResult<()> {
 ///   its payload (`TaskError::Panicked`); one in `convert` is caught in `Delivery`.
 /// - A closed loop can't be reached; the result is dropped and the failure is logged.
 ///
-/// Concurrency: queries run on the 2-thread `pyronova-db` runtime (`runtime()`); results are
+/// Concurrency: queries run on the `pyronova-db` runtime (`runtime()`); results are
 /// delivered from its blocking pool, so a busy GIL never stalls a runtime thread.
 fn await_on_loop<'py, T, F, C>(py: Python<'py>, fut: F, convert: C) -> PyResult<Bound<'py, PyAny>>
 where
@@ -801,15 +773,16 @@ where
             Ok(done) => done,
             Err(join_error) => Err(DbError::from(TaskError::from(join_error))),
         };
-        // A failure here only means the runtime is shutting down; `delivery` was moved into
-        // the closure, and its Drop completes the future either way.
-        let _ = tokio::task::spawn_blocking(move || {
+        // Err only when the runtime is shutting down; `delivery` was moved into the
+        // closure, and its Drop completes the future either way.
+        tokio::task::spawn_blocking(move || {
             delivery.complete(move |py| match result {
                 Ok(value) => convert(py, value),
                 Err(e) => Err(e.into_pyerr(py)),
             });
         })
-        .await;
+        .await
+        .ok();
     });
     py_fut.call_method1("add_done_callback", (AbortOnCancel(abort),))?;
     Ok(py_fut)
@@ -971,7 +944,7 @@ mod tests {
         assert_eq!(v, 7);
     }
 
-    /// The failure `recv_batch` replaces: what `PgCursor.__next__` used to call.
+    /// Why `recv_batch` exists: `blocking_recv` in a TPC worker's context panics.
     #[test]
     #[should_panic(expected = "Cannot block the current thread from within a runtime")]
     fn blocking_recv_panics_in_a_tokio_context() {
@@ -981,7 +954,7 @@ mod tests {
         });
     }
 
-    /// The failure `run_on_db_rt` replaces: what the sync `PgPool` methods used to call.
+    /// Why `run_on_db_rt` exists: `block_on` in a TPC worker's context panics.
     #[test]
     #[should_panic(expected = "Cannot start a runtime from within a runtime")]
     fn block_on_panics_in_a_tokio_context() {
@@ -989,9 +962,9 @@ mod tests {
     }
 }
 
-/// Code review cced8c2, M1c: task failures keep their cause; pool settings are checked.
+/// Task failures keep their cause; pool settings are checked.
 #[cfg(test)]
-mod review_m1c_tests {
+mod pool_settings_tests {
     use super::*;
 
     #[test]

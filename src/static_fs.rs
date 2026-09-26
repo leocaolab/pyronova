@@ -1,3 +1,7 @@
+//! Static files: request paths under a mount served from its directory, contained to it
+//! (no `..`, no symlink out, no symlink swapped in after the check), cached in memory and
+//! revalidated per request.
+
 use bytes::Bytes;
 use dashmap::DashMap;
 use http_body_util::Full;
@@ -10,16 +14,13 @@ use std::sync::OnceLock;
 use std::time::SystemTime;
 use tokio::io::AsyncReadExt;
 
-/// Maximum size (in bytes) of a static file served out of memory.
-/// Files larger than this are refused with 413 to avoid OOM on pathological
-/// requests (multi-GB files in the static dir, etc.).
-const MAX_STATIC_FILE_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB
+/// Largest static file served, in bytes; a bigger one is refused with 413, since the
+/// whole file is read into memory.
+const MAX_STATIC_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Soft cap on the in-memory static-file cache. Once the cache grows past
-/// this many cumulative bytes, new files are served without being cached
-/// (old entries stay — we don't evict). At 128 MiB the cap comfortably
-/// holds any reasonable static site without letting a misconfigured root
-/// blow the RSS budget.
+/// Soft cap on the in-memory static-file cache, in bytes. Past it, files not yet cached
+/// are served uncached; entries leave only when their file changes or disappears. Holds
+/// any reasonable static site without letting a misconfigured root blow the RSS budget.
 const STATIC_CACHE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 
 // ─── Mounts, parsed once at registration ───────────────────────────────────
@@ -190,8 +191,8 @@ impl Stamp {
 }
 
 /// Cache entry: the file bytes, precomputed content-type, and the stamp of the version
-/// read. We cache on the canonical path so symlinks inside the static root resolve to
-/// the same entry as their target.
+/// read. Keyed on the canonical path, so a symlink inside the static root shares its
+/// target's entry.
 #[derive(Clone)]
 struct CachedFile {
     bytes: Bytes,
@@ -223,8 +224,7 @@ fn cache_bytes() -> &'static std::sync::atomic::AtomicU64 {
 fn cache_insert(path: PathBuf, entry: CachedFile) {
     use std::sync::atomic::Ordering::Relaxed;
     let len = entry.bytes.len() as u64;
-    // Atomically reserve space: fetch_add first, then check the new total.
-    // If we overshoot the soft cap, roll back and skip caching.
+    // Reserve first, then check: concurrent inserts can't both slip under the cap.
     if cache_bytes().fetch_add(len, Relaxed) + len > STATIC_CACHE_MAX_BYTES {
         cache_bytes().fetch_sub(len, Relaxed);
         return;
@@ -286,10 +286,8 @@ fn content_type(path: &Path) -> &'static str {
 /// Serve `req_path` from the first mount that has it. `None` means no mount has the
 /// file, so routing answers.
 ///
-/// Per-request cost: the root is canonical from registration, so a request pays one
-/// `canonicalize` (the candidate) instead of two. Decoding scans the relative path once
-/// and allocates only if it contains `%`; the candidate `PathBuf` is the one allocation
-/// the old `join` also made.
+/// Per-request cost: one `canonicalize` (the root is canonical from registration) and one
+/// `stat`; decoding allocates only if the path contains `%`.
 pub(crate) async fn try_static_file(
     req_path: &str,
     mounts: &[StaticMount],
@@ -326,9 +324,7 @@ async fn serve(root: &Path, rel: &str) -> Result<Option<Response<Full<Bytes>>>, 
         return Ok(None);
     };
 
-    // Cache hit: reuse the shared Bytes (Arc clone, zero-copy). Benchmark-grade static
-    // profiles hit the same 20 files from thousands of connections per second; without
-    // this cache every request re-reads its file into a fresh Vec<u8>.
+    // A hit shares the cached bytes: a hot file is not re-read per request.
     if let Some(entry) = current.and_then(|stamp| cached(&path, stamp)) {
         return Ok(Some(ok_response_bytes(entry.content_type, entry.bytes)));
     }
@@ -441,8 +437,7 @@ async fn read_regular_file(path: &Path) -> Result<Option<(Bytes, Option<Stamp>)>
         });
     }
 
-    // Belt + braces: even if the metadata-reported size was stale for any reason,
-    // `take()` enforces the byte cap on the read itself.
+    // The file may grow after the stat: `take` caps the read itself.
     let mut contents = Vec::with_capacity(metadata.len() as usize);
     let read = file
         .take(MAX_STATIC_FILE_BYTES)
@@ -478,10 +473,8 @@ fn is_symlink_refusal(_: &io::Error) -> bool {
 
 // ─── Responses ──────────────────────────────────────────────────────────────
 //
-// Built from constant header values + a fixed body, so they cannot fail in practice
-// and `.expect` is used instead of bubbling a Result. `nosniff` is added to every
-// response to prevent MIME-type sniffing attacks when users upload content into the
-// static directory.
+// Built from constant, valid header values, so `.expect` can't fire. `nosniff` on every
+// response: a user-uploaded file in the static directory must not be sniffed as HTML.
 
 fn error_response(e: &StaticError) -> Response<Full<Bytes>> {
     Response::builder()
@@ -673,8 +666,6 @@ mod tests {
         {
             let file = std::fs::File::create(&big).unwrap();
             file.set_len(big_len).unwrap();
-            // `file` drops here, ensuring metadata is flushed before the
-            // async try_static_file reads it.
         }
 
         let dirs = vec![StaticMount::new("/static", &tmp.path().to_string_lossy()).unwrap()];
@@ -691,9 +682,7 @@ mod tests {
             .is_none());
     }
 
-    // Minimal tempdir helper: avoid pulling in a dep just for tests.
-    // Uses a process-global atomic counter (not a clock) so two calls in
-    // rapid succession are guaranteed distinct paths.
+    // A counter, not a clock: two calls in quick succession get distinct paths.
     use std::sync::atomic::{AtomicU64, Ordering};
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -705,7 +694,8 @@ mod tests {
             std::process::id(),
             n
         ));
-        let _ = std::fs::remove_dir_all(&base); // clean stale from prior crashed run
+        // A crashed earlier run may have left it; absent is the usual case.
+        std::fs::remove_dir_all(&base).ok();
         std::fs::create_dir_all(&base).unwrap();
         TempDir { path: base }
     }
@@ -719,11 +709,12 @@ mod tests {
     }
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
+            // Best-effort cleanup of a temp dir.
+            std::fs::remove_dir_all(&self.path).ok();
         }
     }
 
-    // ── Review cced8c2 M1d-4 ───────────────────────────────────────
+    // ── Mounts and candidate paths ─────────────────────────────────
 
     #[test]
     fn candidate_path_decodes_and_refuses_encoded_traversal() {

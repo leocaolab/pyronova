@@ -25,9 +25,7 @@ pub(crate) type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Err
 
 #[inline]
 pub(crate) fn full_body(resp: Response<Full<Bytes>>) -> Response<BoxBody> {
-    // `Full<Bytes>::Error` is `std::convert::Infallible` (uninhabited) — this
-    // body can never yield an error. `match e {}` is the compiler-proven total
-    // conversion to the boxed body's `hyper::Error`, with no runtime panic path.
+    // `Full`'s error type is `Infallible`: `match e {}` converts it without a panic path.
     resp.map(|b| b.map_err(|e| match e {}).boxed())
 }
 

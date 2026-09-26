@@ -167,10 +167,11 @@ pub(crate) fn build_acceptor(
     cert_path: &str,
     key_path: &str,
 ) -> Result<Arc<TlsAcceptor>, TlsError> {
-    // rustls needs a default crypto provider installed before any ServerConfig
-    // is built. Idempotent — `install_default` errors if already installed, so
-    // we ignore the result.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    // rustls needs a process default crypto provider before any ServerConfig is built.
+    // Err only when one is already installed (a previous server run), which is as good.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
 
     let certs = load_certs(Path::new(cert_path))?;
     let key = load_key(Path::new(key_path))?;
@@ -179,8 +180,6 @@ pub(crate) fn build_acceptor(
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
 
-    // Advertise HTTP/2 and HTTP/1.1 via ALPN. hyper_util::server::conn::auto
-    // selects the right protocol based on the negotiated ALPN value.
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(Arc::new(TlsAcceptor::from(Arc::new(cfg))))
@@ -188,12 +187,9 @@ pub(crate) fn build_acceptor(
 
 /// Perform the TLS handshake and wrap the result in `MaybeTlsStream::Tls`.
 ///
-/// Bounded by [`HANDSHAKE_TIMEOUT`] — defense against TLS
-/// Slowloris attacks where a peer opens a TCP connection then dribbles
-/// ClientHello bytes one per 30 s, pinning a file descriptor and an
-/// async task indefinitely. With 65k half-open connections a single
-/// laptop can exhaust the server's fd budget without ever finishing
-/// a handshake; the timeout closes the loop.
+/// Bounded by [`HANDSHAKE_TIMEOUT`]: a peer dribbling its ClientHello (TLS Slowloris)
+/// would otherwise hold a file descriptor and a task forever, and enough of them exhaust
+/// the server's fd budget.
 async fn wrap_tls(
     acceptor: &TlsAcceptor,
     stream: TcpStream,
@@ -252,23 +248,26 @@ mod tests {
 
     #[test]
     fn a_missing_cert_is_a_typed_open_error_naming_the_file() {
-        let err = build_acceptor("/nonexistent/m4-cert.pem", "/nonexistent/m4-key.pem")
-            .err()
-            .expect("no such file");
+        let err = build_acceptor(
+            "/nonexistent/missing-cert.pem",
+            "/nonexistent/missing-key.pem",
+        )
+        .err()
+        .expect("no such file");
         match &err {
             TlsError::Open { what, path, source } => {
                 assert_eq!(*what, "cert");
-                assert_eq!(path, Path::new("/nonexistent/m4-cert.pem"));
+                assert_eq!(path, Path::new("/nonexistent/missing-cert.pem"));
                 assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
             }
             other => panic!("expected TlsError::Open, got {other:?}"),
         }
-        assert!(err.to_string().contains("m4-cert.pem"), "{err}");
+        assert!(err.to_string().contains("missing-cert.pem"), "{err}");
     }
 
     #[test]
     fn an_empty_cert_file_says_so() {
-        let dir = std::env::temp_dir().join(format!("pyronova-m4-tls-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pyronova-tls-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let cert = dir.join("empty.pem");
         std::fs::write(&cert, b"").unwrap();

@@ -116,9 +116,8 @@ fn without_body(resp: Response<BoxBody>) -> Response<BoxBody> {
 
 // ─────────────────────────── preprocessing ───────────────────────────
 
-/// What preprocessing decided. A return value moved once per request and never stored,
-/// so the size gap between the variants costs nothing; boxing `Prepared` would cost an
-/// allocation on every dispatched request.
+/// What preprocessing decided.
+// Moved once per request, never stored: boxing `Prepared` would add an allocation per request.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Preprocessed {
     /// Answered without a handler (gRPC, fast path, static file, 405, 404), already

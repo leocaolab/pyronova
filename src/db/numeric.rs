@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn decodes_what_postgres_sends() {
-        // SELECT numeric_send(12.50::numeric(6,2)): 1 group, weight 0, scale 2 → [12, 5000].
+        // SELECT numeric_send(12.50::numeric(6,2)): 2 groups, weight 0, scale 2 → [12, 5000].
         let wire = [0, 2, 0, 0, 0, 0, 0, 2, 0, 12, 0x13, 0x88];
         assert_eq!(decode(&wire).unwrap(), "12.50");
         // SELECT numeric_send(0.000001): weight -2, scale 6 → [100].

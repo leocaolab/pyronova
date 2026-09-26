@@ -1,4 +1,4 @@
-//! A logged error as the response the client gets (decision D4): a 4xx body carries the
+//! A logged error as the response the client gets: a 4xx body carries the
 //! reason; a 5xx body is generic plus the request id, which is also on the log line
 //! holding the real error. The error itself is `crate::error`.
 

@@ -1,8 +1,5 @@
-//! SharedState — cross-sub-interpreter state sharing via DashMap.
-//!
-//! All sub-interpreters share the same Arc<DashMap> in Rust memory.
-//! Python code uses `app.state["key"] = value` / `app.state["key"]`.
-//! Values stored as `bytes::Bytes` (ref-counted, zero-cost clone).
+//! `SharedState` (`app.state`): a string/bytes key-value store every interpreter of one
+//! running app sees, held in Rust memory so no Python object crosses interpreters.
 
 use std::sync::Arc;
 
@@ -11,16 +8,11 @@ use dashmap::DashMap;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 
-/// High-concurrency shared key-value store backed by DashMap.
-///
-/// Thread-safe, lock-free reads for different keys, nanosecond latency.
-/// All sub-interpreters share the same underlying DashMap via Arc.
-/// Values are `Bytes` — clone is atomic refcount bump, not deep copy.
-/// The map behind a `SharedState`.
+/// The map behind a `SharedState`: sharded locks, so different keys don't contend.
 pub(crate) type SharedMap = Arc<DashMap<String, Bytes>>;
 
 /// The running app's map, handed to a worker before its script runs; one value per
-/// interpreter (Layer 2, C2). Unset on main and in any interpreter pyronova didn't create.
+/// interpreter. Unset on main and in any interpreter pyronova didn't create.
 static WORKER_MAP: pyo3::sync::PyOnceLock<SharedMap> = pyo3::sync::PyOnceLock::new();
 
 /// Why a worker interpreter could not get the running app's map.
@@ -52,8 +44,8 @@ fn text<'py>(py: Python<'py>, key: &str, value: &Bytes) -> PyResult<Bound<'py, P
 }
 
 /// The map a new `PyronovaApp` or `SharedState` uses: in a worker the running app's, so every
-/// interpreter sees the same values (FR-5); otherwise a fresh one, as before (TestClient apps
-/// in one process keep separate maps).
+/// interpreter sees the same values; otherwise a fresh one (TestClient apps in one process
+/// keep separate maps).
 pub(crate) fn map_for_new(py: Python<'_>) -> SharedMap {
     match WORKER_MAP.get(py) {
         Some(map) => Arc::clone(map),
@@ -67,7 +59,7 @@ pub(crate) struct SharedState {
 }
 
 impl SharedState {
-    /// Create a new SharedState with the given Arc (for sharing across workers).
+    /// A `SharedState` over an existing map (`app.state`).
     pub fn with_inner(inner: SharedMap) -> Self {
         SharedState { inner }
     }
@@ -158,12 +150,8 @@ impl SharedState {
         self.set(key, value);
     }
 
-    /// dict-like: state["key"]
-    ///
-    /// Raises `KeyError` only when the key is genuinely absent. When the key
-    /// exists but holds non-UTF-8 bytes (e.g. via `set_bytes`) this raises
-    /// `TypeError` instead, as every other text read does: the value is present
-    /// but not decodable as a string. Use `get_bytes` for raw access.
+    /// dict-like: state["key"]. `KeyError` only when the key is absent; a non-UTF-8 value
+    /// raises `TypeError`, as every text read does.
     fn __getitem__<'py>(&self, py: Python<'py>, key: &str) -> PyResult<Bound<'py, PyString>> {
         match self.inner.get(key) {
             None => Err(pyo3::exceptions::PyKeyError::new_err(key.to_string())),
@@ -182,10 +170,8 @@ impl SharedState {
 
     /// Atomic increment: returns the new value. Creates key with `amount` if missing.
     ///
-    /// If the existing value is not a valid UTF-8 integer this raises a
-    /// TypeError instead of silently resetting to 0 — overwriting opaque
-    /// bytes (e.g. a JSON blob someone stored with the same key) is a
-    /// trap that can corrupt application state irrecoverably.
+    /// An existing value that is not a UTF-8 integer raises `TypeError` rather than being
+    /// reset: it may be someone else's data under the same key.
     fn incr(&self, key: String, amount: i64) -> PyResult<i64> {
         let mut entry = self
             .inner
