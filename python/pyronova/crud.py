@@ -58,14 +58,14 @@ __all__ = ["register_crud"]
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# Longest ?limit= / ?offset= value parsed: a legitimate one has a handful of digits, and
+# int() on a million-digit string is a cheap way to burn server CPU.
+_MAX_QUERY_INT_DIGITS = 18
+
 
 def _validate_ident(name: str, role: str) -> str:
-    """Reject anything that could break out of an SQL identifier context.
-
-    Postgres will happily quote an identifier with ``"..."`` — even one with
-    nasty chars — but we'd rather fail loudly at registration than ship a
-    surprise later. Caller must whitelist the name themselves.
-    """
+    """Refuse, at registration, a name that is not a plain identifier: it is
+    interpolated into the SQL unquoted."""
     if not _IDENT_RE.match(name):
         raise ValueError(
             f"invalid SQL identifier for {role}: {name!r} "
@@ -96,7 +96,7 @@ def _json_object(req) -> "dict | _Rejected":
 def _query(req, what: str, call: Callable, *args) -> object:
     """Run one pool call for `req`. A failure the client caused is refused with
     the database's reason; any other failure is logged with the request id and
-    answered with a generic 500 carrying that id (decision D4).
+    answered with a generic 500 carrying that id.
 
     - ``IntegrityError`` (SQLSTATE class 23: duplicate key, NOT NULL, CHECK,
       foreign key; ``UniqueViolation`` is a subclass) → 409.
@@ -154,25 +154,12 @@ def register_crud(
         raise ValueError("prefix must not end with '/'")
 
     if not columns:
-        # Fail fast at registration. Without this, col_list = ", ".join([])
-        # produces "" and SQL becomes "SELECT  FROM {table}" — runtime DB
-        # syntax error far from the misconfig site (arc finding crud-5).
         raise ValueError("columns must not be empty")
     if len(set(columns)) != len(columns):
-        # Duplicates would generate `SELECT id, name, id FROM ...` and
-        # fail at query time (arc finding crud-6).
         raise ValueError(f"columns must be unique, got duplicates in {columns!r}")
     if not callable(id_type):
-        # id_type's Callable type hint isn't runtime-enforced. Catch
-        # the misconfig at registration instead of failing in every
-        # request handler with cryptic 'X object is not callable'
-        # (arc findings crud-9, crud-2).
         raise TypeError(f"id_type must be callable, got {type(id_type).__name__}")
-    # default_limit / max_limit hints aren't runtime-enforced either. A
-    # non-int (e.g. max_limit="1000") makes min(int(...), "1000") raise in
-    # *every* request, which the limit/offset except block then mislabels as
-    # a client "invalid limit/offset" 400 — blaming the caller for a
-    # registration-time misconfig (arc finding crud-84).
+    # A non-int limit would fail every request, reported as the client's bad ?limit=.
     if not isinstance(default_limit, int) or isinstance(default_limit, bool):
         raise TypeError(f"default_limit must be int, got {type(default_limit).__name__}")
     if not isinstance(max_limit, int) or isinstance(max_limit, bool):
@@ -197,10 +184,7 @@ def register_crud(
 
     col_list = ", ".join(columns)
     non_id_cols = [c for c in columns if c != id_column]
-    # The PUT handler can only update non-PK columns. If columns is just the
-    # PK, every PUT would hit the "include at least one of []" 422 with no way
-    # for a client to satisfy it — the route is permanently broken. Reject at
-    # registration so the misconfig surfaces at startup, not per-request.
+    # With only the PK no PUT could ever succeed.
     if not non_id_cols:
         raise ValueError(
             f"columns={columns!r} must include at least one non-PK column "
@@ -220,23 +204,17 @@ def register_crud(
             return _Rejected(Response(body={"error": f"invalid id: {e}"}, status_code=400))
 
     # --- GET /prefix --------------------------------------------------------
-    # All routes pinned to gil=True. The original reason is gone: workers now
-    # run the real PgPool, which never nests `block_on` in a Tokio context
-    # (Layer 2). Moving CRUD into workers is a separate change (design
-    # docs/design/real-engine-in-workers.md, non-goals).
+    # Every route runs on main (gil=True); running them in workers is out of scope of
+    # docs/design/real-engine-in-workers.md (non-goals).
     list_sql = f"SELECT {col_list} FROM {table} ORDER BY {id_column} LIMIT $1 OFFSET $2"
 
     @app.get(prefix, gil=True)
     def list_rows(req):
         q = req.query_params
         try:
-            # Bound the raw string length before parsing so a hostile client
-            # can't make us allocate / parse an arbitrarily huge integer
-            # (e.g. ?limit=9999...repeated millions of times). Any legitimate
-            # limit/offset fits comfortably in a handful of digits.
             raw_limit = q.get("limit", default_limit)
             raw_offset = q.get("offset", 0)
-            if len(str(raw_limit)) > 18 or len(str(raw_offset)) > 18:
+            if max(len(str(raw_limit)), len(str(raw_offset))) > _MAX_QUERY_INT_DIGITS:
                 raise ValueError("limit/offset too long")
             limit = max(1, min(int(raw_limit), max_limit))
             offset = max(int(raw_offset), 0)
@@ -266,9 +244,8 @@ def register_crud(
         return row
 
     # --- POST /prefix -------------------------------------------------------
-    # Insert with an arbitrary subset of columns from body. We build the
-    # column list dynamically from the intersection of body keys and the
-    # allowlist so the caller can't inject columns.
+    # The columns inserted are the body's keys that are in `columns`: the client can't
+    # name any other.
     @app.post(prefix, gil=True)
     def create_row(req):
         body = _json_object(req)

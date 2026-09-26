@@ -22,13 +22,8 @@ from urllib.parse import unquote_to_bytes
 
 
 def _split_header_params(value: str) -> list[str]:
-    """Split a header on top-level ``;`` separators, treating semicolons
-    inside a quoted-string as literal.
-
-    A naive ``value.split(";")`` corrupts any parameter whose quoted value
-    contains a semicolon, e.g. ``filename="report;2024.csv"`` (arc finding
-    uploads-71). RFC 2045 quoted-strings are honoured here.
-    """
+    """Split a header on top-level ``;`` separators; a ``;`` inside an RFC 2045
+    quoted-string (``filename="report;2024.csv"``) is literal."""
     parts: list[str] = []
     buf: list[str] = []
     in_quotes = False
@@ -57,7 +52,7 @@ def _split_header_params(value: str) -> list[str]:
 
 def _unquote_param(value: str) -> str:
     """Strip surrounding DQUOTEs and unescape ``\\"`` / ``\\\\`` per RFC 2045
-    quoted-string rules (arc finding uploads-73)."""
+    quoted-string rules."""
     value = value.strip()
     if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
         inner = value[1:-1]
@@ -82,14 +77,7 @@ def _unquote_param(value: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class UploadFile:
-    """A single uploaded file or form field.
-
-    Frozen because this is a DTO handed from the framework to user code.
-    A request's parsed `UploadFile` objects share memory with the raw
-    multipart buffer; letting a handler mutate `data` in place would
-    corrupt replay logging, after_request hooks, and any async task
-    still holding a reference. Immutable + slots is free and correct.
-    """
+    """A single uploaded file or form field."""
     name: str
     # Client-controlled: see the module docstring before using it in a path.
     filename: str | None
@@ -98,12 +86,7 @@ class UploadFile:
 
     @property
     def text(self) -> str:
-        # Uploaded bytes are arbitrary user content — may not be valid
-        # UTF-8 (binary files, mojibake, partial buffers). Use `replace`
-        # so calling .text on a binary upload yields a lossy string
-        # instead of crashing the request with UnicodeDecodeError
-        # (arc finding uploads-1). Callers who need strict decoding
-        # should work with .data directly.
+        # Lossy on purpose: an upload may be any bytes. Strict decoding: use `.data`.
         return self.data.decode("utf-8", errors="replace")
 
     @property
@@ -123,9 +106,8 @@ class MultipartError(ValueError):
 def parse_multipart(req) -> "dict[str, UploadFile | list[UploadFile]]":
     """Parse multipart/form-data from request.
 
-    Returns dict mapping field name → UploadFile.
-    For file fields, filename and content_type are set.
-    For text fields, filename is None.
+    Returns a dict of field name → ``UploadFile``, or a list of them when the field
+    appears more than once. A text field's ``filename`` is None.
 
     Raises MultipartError when the body is not well-formed multipart/form-data.
     """

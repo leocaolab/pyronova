@@ -58,13 +58,9 @@ __all__ = [
     "parse_multipart", "MultipartError", "UploadFile",
     "cached_json",
 ]
+from importlib.metadata import PackageNotFoundError, version as _get_version
+
 try:
-    from importlib.metadata import PackageNotFoundError, version as _get_version
     __version__ = _get_version("pyronova")
-except (ImportError, PackageNotFoundError):
-    # ImportError: importlib.metadata unavailable (ancient Python).
-    # PackageNotFoundError: running from a source checkout that was never
-    # installed. Both are expected "no metadata" cases; any other error
-    # (corrupt metadata, FS permission) should surface, not be hidden
-    # behind a silent "dev" default (arc finding init-6).
+except PackageNotFoundError:  # a source checkout that was never installed
     __version__ = "dev"

@@ -32,10 +32,8 @@ def _load_app(target: str) -> "Pyronova":
     """Resolve ``module[:attr]`` → Pyronova instance. Importing the module
     runs its top-level code, which registers routes on the app."""
     if ":" in target:
-        # A module:attr spec has exactly one colon. More than one (a:b:c)
-        # or a leading colon (:app) is a malformed target — fail with a
-        # clear message rather than a confusing ImportError downstream
-        # (arc findings cli-18, cli-21). Module names never contain colons.
+        # Module names never contain a colon: `a:b:c` or `:app` is a malformed target,
+        # named here rather than as a confusing ImportError later.
         if target.count(":") > 1:
             sys.exit(
                 f"pyronova: invalid target {target!r}: expected module:attr "
@@ -151,9 +149,6 @@ def main(argv: list[str] | None = None) -> None:
     try:
         from pyronova import __version__ as _v
     except (ImportError, AttributeError):
-        # Only swallow the genuinely-expected lookup failures (package not
-        # installed / __version__ absent). A broad `except Exception` here
-        # would mask real bugs behind a silent "dev" fallback (arc cli-19).
         _v = "dev"
     parser.add_argument("--version", action="version", version=f"pyronova {_v}")
     sub = parser.add_subparsers(dest="cmd", required=True)

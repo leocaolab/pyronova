@@ -174,7 +174,7 @@ def _client_error(status: int, reason: object):
 
 def _server_error(fn: Callable, req):
     """500 envelope: generic text and the request id; the exception goes to the log with
-    the same id (decision D4)."""
+    the same id (the policy in ``pyronova._errors``)."""
     from pyronova.engine import Response
 
     log_server_error(_log, req.request_id, "RPC handler %s raised", fn.__qualname__)
@@ -237,11 +237,8 @@ def rpc_decorator(app, path: str, proto_model=None):
             except _MalformedBody as e:
                 return _client_error(400, e.__cause__)
 
-        # Check if handler takes 2 args (req, data) or 1 (data).
-        # arc finding rpc-1: pre-fix the `>= 2` check failed for
-        # 0-param handlers (would call fn(data) → TypeError) and
-        # **kwargs-only handlers. Validate at registration so misuse
-        # surfaces at decorator time, not at first request.
+        # (req, data) or (data), decided and checked here, at registration, so a
+        # handler that can take neither fails now rather than on every request.
         sig = inspect.signature(fn)
         positional_or_keyword = [
             p for p in sig.parameters.values()
@@ -255,10 +252,6 @@ def rpc_decorator(app, path: str, proto_model=None):
                 "positional argument (data) or 2 (req, data); got 0"
             )
         takes_data = n_pos >= 2
-        # The wrapper only ever supplies (req, data) or (data). Any
-        # *additional* positional-or-keyword param without a default would
-        # therefore TypeError at first request, not at registration —
-        # check the upper bound too so misuse fails fast (arc finding rpc-43).
         _supplied = 2 if takes_data else 1
         _extra_required = [
             p.name for p in positional_or_keyword[_supplied:]
@@ -270,11 +263,6 @@ def rpc_decorator(app, path: str, proto_model=None):
                 f"argument(s) {_extra_required} beyond the (req, data) the "
                 "RPC dispatcher supplies; give them defaults or remove them"
             )
-
-        # An exception from the handler never crosses the wire: its message can embed
-        # filesystem paths, SQL, connection strings or config values. The client gets a
-        # generic 500 with the request id; the operator finds the exception and its
-        # traceback on the log line with the same id.
 
         def sync_wrapper(req):
             admitted = _admit(req)
@@ -299,13 +287,13 @@ def rpc_decorator(app, path: str, proto_model=None):
                 return _server_error(fn, req)
 
         handler = async_wrapper if is_async else sync_wrapper
-        # Name it after fn (sub-interp workers find a route's handler by name),
-        # but no __wrapped__: the route calls handler(req), not fn's signature.
+        # Named after fn, but no __wrapped__: the route calls handler(req), and path-param
+        # injection must not read fn's (req, data) signature through it.
         handler.__name__ = fn.__name__
         handler.__qualname__ = fn.__qualname__
         handler.__doc__ = fn.__doc__
 
-        # Register as POST route with gil=True (RPC typically needs full Python)
+        # On main: an RPC handler may use any library, not only sub-interpreter-safe ones.
         app._route("POST", path, handler, gil=True)
         return fn
 

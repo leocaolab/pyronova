@@ -2,7 +2,7 @@
 
 A worker runs the same program as the main interpreter: the user's script
 imports the real `pyronova` package and its engine. This bootstrap only
-prepares the interpreter for it (Layer 2, FR-10):
+prepares the interpreter for it:
 
 - routes Python `logging` through Rust `tracing` (`pyronova.engine.emit_python_log`),
   tagged with this worker's id;
@@ -33,36 +33,16 @@ _root.addHandler(_log_handler)
 # The root level is synced with Rust's filter at the end of this file, once the
 # engine is imported.
 
-# -- Smart GC: hand Python GC scheduling off to the Rust engine --------------
+# -- GC: cycle collection on the engine's schedule ----------------------------
 #
-# CPython's default GC triggers on a per-generation allocation threshold
-# (gc.get_threshold() = (700, 10, 10) by default). At 400k+ rps that
-# threshold is tripped HUNDREDS of times per second, each hit blocking
-# the current thread for generation-0 scan + possibly escalating to gen-1
-# or gen-2. On the request hot path this translates into P99 tail
-# latency spikes of 10-50ms even on an otherwise well-behaved workload.
-#
-# Fix: turn off CPython's automatic trigger entirely. The Rust engine
-# holds a cached `gc.collect` function pointer per sub-interp and fires
-# it at a configurable request-count interval (default 100_000, control
-# via `PYRONOVA_GC_THRESHOLD=N` — set 0 to disable scheduled collection
-# entirely on workloads that never accrete cycles).
-#
-# Ref counting still runs on every DECREF to zero, so non-cyclic garbage
-# is collected instantly. Only cycle-collection waits for the timer.
-# For the standard Pyronova request path (where Request + Response are
-# ref-counted to zero by tp_dealloc at the end of each handler), there
-# are effectively no cycles to collect — gc.collect() becomes a
-# zero-cost safety valve.
+# CPython's allocation-threshold trigger fires hundreds of times a second at high
+# request rates, each a pause on the request path (p99 spikes). The engine runs
+# `gc.collect()` on its own schedule instead (`GcMode` in src/config.rs,
+# `PYRONOVA_GC_MODE`); reference counting still frees non-cyclic garbage at once.
 try:
     import gc as _gc
     _gc.disable()
 except Exception:
-    # NEVER silently swallow. If gc.disable() fails, automatic GC stays
-    # on — at 400k RPS that means hundreds of generation-0 collections
-    # per second, each adding 10-50ms to P99 tail latency. Without this
-    # log the regression is invisible until production monitoring catches
-    # the tail spike. Emit at ERROR so it shows up in default log filters.
     _logging.getLogger("pyronova.bootstrap").error(
         "gc.disable() failed — CPython auto-GC remains active; "
         "expect P99 tail spikes at high RPS",
@@ -128,14 +108,10 @@ def _iso_resolve_src(lib):
     """On-disk source dir (package) or file (single-file ext) for `lib` in the
     ORIGINAL install, or None.
 
-    Searches sys.path without the isolate root. Once one lib is isolated, this
-    worker's clone dir is on sys.path, and it can already hold a clone of the
-    NEXT lib (clone dirs are reused across runs). Resolving to that clone made
-    `_iso_clone_lib` compare the clone against itself, find the signature
-    stale, rmtree it and copy from the path it had just deleted; the retry then
-    loaded the shared site-packages file (sklearn after scipy: "Interpreter
-    change detected - this module can only be loaded into one interpreter per
-    process").
+    Searches sys.path without the isolate root: once one lib is isolated, this
+    worker's clone dir is on sys.path and may already hold a clone of the NEXT lib
+    (clone dirs are reused across runs). Resolving to that clone would compare the
+    clone against itself, delete it and copy from the deleted path.
 
     Uses PathFinder (searches the given path directly, ignoring sys.modules)
     rather than importlib.util.find_spec: a single-phase extension re-init can
@@ -252,19 +228,12 @@ def _iso_worker_dir(seed_libs):
     worker_dir = os.path.join(base, "w%d" % idx)
     os.makedirs(worker_dir, exist_ok=True)
     _ISO["worker_dir"] = worker_dir
-    # NOTE: do NOT put worker_dir on sys.path here. The clone SOURCE must always
-    # resolve to the ORIGINAL install (site-packages), never to a prior clone —
-    # if worker_dir were on the path before cloning, on a warm restart
-    # `_iso_resolve_src` would find the existing clone and treat it as the source,
-    # and the freshness check would rmtree-then-cp it onto itself, destroying it.
-    # Path insertion happens in `_iso_ensure_on_path`, AFTER cloning.
     return worker_dir
 
 
 def _iso_ensure_on_path(worker_dir):
     """Put this worker's clone dir at the front of sys.path (once), so imports of
-    isolated libs resolve to the private copy. Called AFTER cloning — see the
-    ordering note in `_iso_worker_dir`."""
+    isolated libs resolve to the private copy."""
     import sys
     if not _ISO["path_inserted"]:
         sys.path.insert(0, worker_dir)
@@ -352,7 +321,7 @@ def _iso_clone_lib(lib, worker_dir, pkg2dist):
     return dst
 
 
-# pyronova itself is never cloned, evicted or re-executed (Layer 2, FR-11): its engine
+# pyronova itself is never cloned, evicted or re-executed: its engine
 # keeps process-wide state (the main-interpreter handle, the async worker registry, the
 # logger, the Postgres pool) that must exist once, and re-executing the package in a
 # worker would duplicate `pyronova.context.ctx` and its ContextVars.
@@ -478,8 +447,6 @@ def _pyronova_isolate_libs():
     pkg2dist = _iso_pkg2dist()
     cloned_any = False
     for lib in resolvable:
-        # Clone while worker_dir is NOT yet on sys.path, so each source resolves
-        # to the original install, not a sibling clone (warm-restart safety).
         if _iso_clone_lib(lib, worker_dir, pkg2dist) is not None:
             _ISO["isolated"].add(lib)
             cloned_any = True
@@ -752,7 +719,7 @@ class _IsolatingExtensionFinder:
     def find_spec(self, fullname, path, target=None):
         if _iso_is_pyronova(fullname):
             # The engine declares per-interpreter support and loads through CPython's
-            # own check; the loaders here never touch it (FR-11).
+            # own check; the loaders here never touch it.
             return None
         if path is None:
             spec = _machinery.BuiltinImporter.find_spec(fullname)
@@ -843,14 +810,14 @@ def _iso_import(name, globals=None, locals=None, fromlist=(), level=0):
                 top = (bad or outer).split(".")[0]
                 # One clone per package per statement: a package that still
                 # fails from its clone surfaces its real error, never loops.
-                # pyronova is never isolated (FR-11): its error surfaces as is.
+                # pyronova is never isolated: its error surfaces as is.
                 if not top or top == "pyronova" or top in cloned or not _iso_isolate(top):
                     raise
                 cloned.add(top)
                 # Drop the statement's partial import too, so the retry
                 # re-resolves it with the clone dir on sys.path. Never pyronova:
                 # the failed submodule is already out of sys.modules, and the
-                # package must stay the one this worker already executed (FR-11).
+                # package must stay the one this worker already executed.
                 if outer and outer != "pyronova":
                     _iso_evict(outer)
     finally:

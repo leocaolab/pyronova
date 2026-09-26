@@ -21,11 +21,10 @@ Usage::
 Order matters: ``@cached_json`` must sit **inside** ``@app.get`` so the
 framework sees the wrapped function, not the raw handler.
 
-Cache is per sub-interpreter (each TPC worker owns its own dict). With
-N workers a hot endpoint does up to N handler evaluations per TTL
-window; within the window every subsequent hit is a pure dict lookup.
-For cross-worker shared caching back this with ``app.state`` manually —
-a few extra Bytes copies, but one miss per TTL across the whole fleet.
+The cache is per interpreter (each sub-interpreter worker has its own dict):
+with N workers a hot endpoint runs its handler up to N times per TTL window,
+and every other hit in the window is a dict lookup. For one miss per TTL
+across all workers, cache in ``app.state`` yourself.
 
 A handler with path params works as usual (``def item(req, item_id)``): the
 wrapper passes them on, and the default key, the path, already tells
@@ -55,12 +54,9 @@ __all__ = ["cached_json"]
 
 _log = logging.getLogger("pyronova.cache")
 
-# Hard cap on per-handler cache entries. The cache is keyed by request
-# path (or a user key_fn), so a high-cardinality endpoint (/item/1,
-# /item/2, ...) or a hostile client cycling unique paths would otherwise
-# grow the dict without bound until the worker OOMs (arc finding cache-17).
-# On overflow we drop the whole dict — simple, allocation-free, and the
-# TTL is short so the rebuild cost is bounded.
+# Entries per handler. Keys come from the request, so a client cycling unique paths
+# would otherwise grow the dict until the worker runs out of memory. On overflow the
+# whole dict is dropped: the TTL is short, so refilling it is cheap.
 _MAX_ENTRIES = 10_000
 
 
@@ -89,9 +85,7 @@ def cached_json(ttl: float, key: Callable | None = None):
             return json.dumps(result, separators=(",", ":")).encode("utf-8")
 
         def _hit(k: str, now: float):
-            # Read under the lock: the async path is explicitly multi-thread
-            # (threading.Lock guards writes), so an unlocked .get() can tear
-            # against a concurrent resize (arc finding cache-16).
+            # Under the lock: one route's handler runs on several threads at once.
             with _lock:
                 entry = _cache.get(k)
             if entry is not None and entry[1] > now:
@@ -99,10 +93,8 @@ def cached_json(ttl: float, key: Callable | None = None):
             return None
 
         def _store(k: str, body: bytes) -> None:
-            # Expiry is measured from store time, not from request start —
-            # a handler slower than the TTL must not insert an
-            # already-stale entry that every later request re-computes
-            # (arc finding cache-15).
+            # From store time: a handler slower than the TTL must not store an entry
+            # that is already stale.
             expires = time.monotonic() + ttl
             with _lock:
                 if len(_cache) >= _MAX_ENTRIES and k not in _cache:
@@ -110,8 +102,7 @@ def cached_json(ttl: float, key: Callable | None = None):
                 _cache[k] = (body, expires)
 
         def _safe_key(req):
-            # A raising key_fn must degrade to an uncached call, not 500
-            # the request (arc finding cache-13).
+            # A raising key function costs the cache, not the request.
             try:
                 return key_fn(req), True
             except Exception:
@@ -130,9 +121,7 @@ def cached_json(ttl: float, key: Callable | None = None):
                 result = await handler(req, **path_params)
                 if isinstance(result, Response):
                     return result
-                # A non-serializable handler result must fall back to the
-                # framework's normal serialization path uncached, not raise
-                # out of the wrapper (arc finding cache-14).
+                # Not JSON-serializable here: the engine's own serialization answers it.
                 try:
                     body = _serialize(result)
                 except (TypeError, ValueError):
@@ -152,8 +141,7 @@ def cached_json(ttl: float, key: Callable | None = None):
                 if cached is not None:
                     return cached
             result = handler(req, **path_params)
-            # Handler returned an explicit Response — user is signalling
-            # a custom status / headers; don't cache, don't rewrap.
+            # An explicit Response (custom status / headers) is neither cached nor rewrapped.
             if isinstance(result, Response):
                 return result
             try:

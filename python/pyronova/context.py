@@ -35,14 +35,8 @@ from typing import Any
 
 _REQUEST_ID_KEY = "__pyronova_request_id__"
 
-# Sentinel marking "no per-request dict installed yet". Using a unique
-# object() rather than a shared empty `{}` as the ContextVar default means
-# the copy-on-write guard in set() keys on identity that nothing else can
-# forge: a caller cannot accidentally (or maliciously) store the sentinel,
-# so two requests can never end up sharing one mutable dict (arc finding
-# context-22). It also makes clear()/reset restore the true "unset" state
-# so the next set() allocates fresh instead of copying a stale `{}`
-# (arc finding context-23).
+# "No per-request dict yet": a private object, not a shared `{}` default, so no caller
+# can hold the default and two requests never share one mutable dict.
 _UNSET: Any = object()
 _current: ContextVar[Any] = ContextVar("pyronova_ctx", default=_UNSET)
 

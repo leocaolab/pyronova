@@ -238,10 +238,8 @@ class Pyronova:
         self._servers_lock = threading.Lock()
         self._servers: set = set()
         self._defined_in = _defining_module_file(self)
-        # Guards the idempotency check-then-set in the enable_* helpers so
-        # concurrent startup hooks/threads can't both pass the "already
-        # enabled?" check and double-register routes/hooks (arc findings
-        # app-36/37/38).
+        # Guards the enable_* helpers' check-then-set: two threads must not both pass
+        # "already enabled?" and register the routes/hooks twice.
         self._enable_lock = threading.Lock()
 
     @property
@@ -258,13 +256,7 @@ class Pyronova:
     @max_body_size.setter
     def max_body_size(self, size: int) -> None:
         """Set max request body size. Example: ``app.max_body_size = 50 * 1024 * 1024``"""
-        # Type hint is unenforced; explicit check so a non-int / negative
-        # value fails here (clear ValueError) instead of passing through
-        # to Rust and producing opaque behavior (arc finding app-10).
-        if not isinstance(size, int) or isinstance(size, bool):
-            raise TypeError(
-                f"max_body_size must be int, got {type(size).__name__}"
-            )
+        _require_int("max_body_size", size)
         if size < 0:
             raise ValueError(f"max_body_size must be non-negative, got {size}")
         self._engine.set_max_body_size(size)
@@ -430,7 +422,6 @@ class Pyronova:
         return self._engine.state
 
     # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
     # C-extension isolation (per-worker library copies)
     # ------------------------------------------------------------------
 
@@ -440,8 +431,8 @@ class Pyronova:
         ``orjson``), so extensions holding process-global state can run isolated
         across workers instead of colliding on "cannot load module more than once".
 
-        Call it at module top-level — it runs inside every sub-interpreter at
-        worker init (and is a no-op in the main interpreter). Declare a library's
+        Call it at module top-level, before ``run()``: each worker clones the
+        libraries recorded on the app before it runs the script. Declare a library's
         C dependencies too, e.g. ``app.isolate("numpy", "scipy", "scikit-learn")``,
         since each copy resolves imports from its own path first.
 
@@ -495,8 +486,8 @@ class Pyronova:
                 model=model.__name__ if model is not None else None,
                 is_async=inspect.iscoroutinefunction(fn),
             ))
-            # The bound callable, not fn: sub-interp workers find a route's
-            # handler by its module-global name, which must be what the route calls.
+            # The bound callable, not fn: calling the decorated name does what the
+            # route does (model validation, path-param injection).
             return bound
 
         return register(handler) if handler is not None else register
@@ -582,7 +573,7 @@ class Pyronova:
         if max_age:
             cors_headers["access-control-max-age"] = str(max_age)
 
-        # Handle preflight OPTIONS + add CORS headers to all responses
+        # Answers a preflight; the engine adds the CORS headers to every response.
         def _cors_before(req):
             if req.method == "OPTIONS":
                 return Response(body="", status_code=204, headers=cors_headers)
@@ -590,10 +581,8 @@ class Pyronova:
 
         self._engine.before_request(_cors_before)
 
-        # CORS response headers are applied in Rust layer only (handlers.rs)
-        # to avoid duplicate headers which violate W3C CORS spec.
-        # Pass full config so allow_credentials + expose_headers appear on
-        # every response (GET/POST/etc.), not just OPTIONS preflight.
+        # Only the engine adds CORS headers to responses (a second copy from a hook
+        # would duplicate them, which browsers reject).
         self._engine.set_cors_config(
             allow_origins,
             allow_methods,
@@ -978,7 +967,7 @@ class Pyronova:
             self._serve(settings, self._start)
         except WorkersAbandoned as e:
             # A live sub-interpreter makes finalization abort: this process can only
-            # exit, non-zero, without finalizing (Layer 2, design §12).
+            # exit, non-zero, without finalizing.
             print(f"pyronova: {e}; exiting without finalization", file=sys.stderr, flush=True)
             sys.stdout.flush()
             os._exit(1)
@@ -1233,7 +1222,7 @@ class _ServeSettings:
 
 
 def _env_int(name: str, default: str | None = None) -> int | None:
-    """An integer environment variable; the error names the variable (arc app-1, app-7)."""
+    """An integer environment variable; the error names the variable."""
     v = os.environ.get(name, default)
     if v is None:
         return None
@@ -1246,7 +1235,7 @@ def _env_int(name: str, default: str | None = None) -> int | None:
 
 
 def _env_ports(name: str) -> list[int] | None:
-    """A comma-separated port list environment variable; a bad entry is named (arc app-7)."""
+    """A comma-separated port list environment variable; a bad entry is named."""
     raw = os.environ.get(name)
     if not raw:
         return None

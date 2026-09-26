@@ -1,4 +1,4 @@
-"""The client-facing error policy (decision D4), for the handlers pyronova itself
+"""The client-facing error policy, for the handlers pyronova itself
 registers in Python (rpc, crud, health, mcp). The engine applies the same policy to
 every handler, hook and worker error.
 

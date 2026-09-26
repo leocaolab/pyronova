@@ -63,10 +63,8 @@ def _extract_schema(fn: Callable) -> dict:
     A parameter without a hint accepts any JSON value; one whose hint has no JSON form
     is a registration error naming it."""
     sig = inspect.signature(fn)
-    # NOTE: cannot use `fn.__annotations__` directly — this module (and any
-    # user module handling mcp.tool) commonly has `from __future__ import
-    # annotations`, which stores annotations as *strings* (`'int'`). Use
-    # typing.get_type_hints to evaluate the strings into real type objects.
+    # Not `fn.__annotations__`: under `from __future__ import annotations` those are
+    # strings (`'int'`).
     try:
         hints = typing.get_type_hints(fn)
     except NameError as e:
@@ -355,7 +353,7 @@ class MCPServer:
         description: str | None = None,
         mime_type: str = "application/json",
     ):
-        """Register a readable resource with URI template support."""
+        """Register a readable resource at an exact URI."""
 
         def register(fn: Callable) -> Callable:
             if uri in self._resources:
@@ -414,7 +412,7 @@ class MCPServer:
 
         ``request_id`` is the HTTP request's id: an internal error (-32603) reports it
         in ``error.data.request_id`` and logs it with the exception, so the two can be
-        matched up (decision D4). Without one (a direct call) the error has no ``data``.
+        matched up. Without one (a direct call) the error has no ``data``.
         """
         try:
             req = json.loads(body)
@@ -433,9 +431,8 @@ class MCPServer:
                 req.get("id"), JsonRpcCode.INVALID_REQUEST, "Invalid Request: jsonrpc must be '2.0'"
             )
 
-        # JSON-RPC 2.0 §4: absence of "id" means this is a notification —
-        # the server MUST NOT reply.  We return "" which the HTTP layer
-        # converts to a 204-like empty response.
+        # JSON-RPC 2.0 §4: no "id" makes it a notification, which gets no reply: "" (an
+        # empty HTTP body).
         is_notification = "id" not in req
         req_id = req.get("id")
         # §4: an id is a String, Number or Null; echoed back as is.
@@ -488,10 +485,6 @@ class MCPServer:
         except JsonRpcError as e:
             return "" if is_notification else self._error_response(req_id, e.code, e.message)
         except Exception:
-            # The full exception (with traceback) goes to the operator log.
-            # Do NOT echo str(e) to the client — a handler error can embed
-            # file paths, DSNs, or stack fragments that leak internals to an
-            # untrusted MCP caller (arc finding mcp-54).
             log_server_error(_log, request_id, "MCP handler %r raised", method)
             return "" if is_notification else self._error_response(
                 req_id, JsonRpcCode.INTERNAL_ERROR, "Internal error",

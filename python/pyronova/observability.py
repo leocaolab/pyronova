@@ -5,11 +5,12 @@ Two opt-in toggles on ``Pyronova``:
     app.enable_request_id()   # guarantees X-Request-ID on every response
     app.enable_metrics()      # GET /metrics → Prometheus text format
 
-Both ride on ``before_request`` / ``after_request`` hooks and keep state
-in ``app.state`` (the shared DashMap), so counters aggregate correctly
-across sub-interpreter workers.
+Both ride on ``before_request`` / ``after_request`` hooks. The metrics
+counters live in ``app.state``, the one map every interpreter shares: each
+sub-interpreter worker has its own Python globals, so a module-level dict
+would count per worker.
 
-Metrics exposed (v1, RED-style without histograms):
+Metrics exposed (RED-style, no histograms):
 
 - ``pyronova_http_requests_total`` — global request counter
 - ``pyronova_http_requests_by_class_total{class="2xx|3xx|4xx|5xx"}``
@@ -17,14 +18,8 @@ Metrics exposed (v1, RED-style without histograms):
 - ``pyronova_http_request_duration_seconds_sum``
 - ``pyronova_http_request_duration_seconds_count``
 
-(Latency is tracked as a running sum + count; compute avg via
-``sum / count`` in the dashboard. Per-bucket histograms are a v1.1
-upgrade.)
-
-Why ``app.state`` and not a Python dict: in sub-interpreter mode, each
-worker has its own Python globals, so a module-level ``defaultdict``
-would silently fragment counts per worker. ``app.state.incr`` is one
-atomic DashMap op shared by every interpreter.
+Latency is a running sum + count; the average is ``sum / count`` in the
+dashboard.
 """
 
 from __future__ import annotations
@@ -68,12 +63,8 @@ def install_request_id(app: "Pyronova", header: str) -> None:
         rid = _request_id.get()
         if rid is None:
             return resp
-        # HTTP header names are case-insensitive, but a Python dict is not.
-        # If resp.headers already carries any case-variant of this header
-        # (e.g. "X-Request-ID" vs our "x-request-id"), a naive {**, lower:
-        # rid} merge would emit BOTH as separate response headers. Drop any
-        # existing case-variant first, then set the canonical lower-case key
-        # (arc finding observability-45).
+        # Header names are case-insensitive but dict keys are not: drop any case variant
+        # already set, or the response would carry the header twice.
         merged = {k: v for k, v in resp.headers.items() if k.lower() != header_lower}
         merged[header_lower] = rid
         return Response(
@@ -100,10 +91,7 @@ def install_metrics(app: "Pyronova", path: str) -> None:
         if req.path == path:
             return resp
 
-        # Observability MUST NOT break the request. Wrap every counter
-        # touch so a transient state.incr failure (DashMap contention,
-        # value-type drift, etc.) logs and continues instead of raising
-        # into the response path (arc finding observability-2).
+        # Counting must not break the request: a failure is logged, the response kept.
         try:
             status = resp.status_code
             state.incr("_m:req:total", 1)
@@ -118,8 +106,6 @@ def install_metrics(app: "Pyronova", path: str) -> None:
                 state.incr("_m:lat:sum_us", int(elapsed_us))
                 state.incr("_m:lat:count", 1)
         except Exception:
-            # Log via stdlib (routed to Rust tracing in sub-interps);
-            # do NOT propagate.
             logging.getLogger("pyronova.observability").exception(
                 "metrics _after hook failed; request unaffected"
             )
@@ -186,5 +172,5 @@ def _render_prometheus(state) -> str:
     parts.append("# TYPE pyronova_http_request_duration_seconds_count counter")
     parts.append(f"pyronova_http_request_duration_seconds_count {count}")
 
-    parts.append("")  # trailing newline — Prometheus is tolerant but nicer
+    parts.append("")  # the text format ends the last line with a newline too
     return "\n".join(parts)

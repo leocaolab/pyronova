@@ -1,4 +1,4 @@
-"""Async Postgres support for Pyronova handlers.
+"""Postgres support for Pyronova handlers.
 
 Thin Python-side re-export of the Rust `PgPool` class. Initialize once at
 startup, then call `pool.fetch_one(...)`, `.fetch_all(...)`, `.fetch_scalar(...)`,
@@ -71,7 +71,7 @@ so an export-style handler looks like this:
                 yield json.dumps(row) + "\\n"
         return Stream(stream())
 
-Deferred to v2: transactions; automatic Pydantic model mapping.
+Not supported: transactions; mapping rows to Pydantic models.
 """
 
 from .engine import DatabaseError, IntegrityError, ParamError, PgCursor, PgPool, UniqueViolation

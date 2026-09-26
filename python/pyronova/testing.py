@@ -32,6 +32,7 @@ WebSocket::
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging as _logging
 import threading
@@ -72,13 +73,13 @@ class TestResponse:
     Attributes:
         status_code: HTTP status code.
         body: raw response body bytes.
-        headers: response headers (case-sensitive dict from urllib).
+        headers: response headers keyed by lower-case name; a header sent more than
+            once (e.g. Set-Cookie) is a list of its values, any other a plain string.
+            ``get_header_list()`` always gives a list.
     """
 
     status_code: int
     body: bytes
-    # Multi-valued headers (e.g. Set-Cookie) are stored as lists; all
-    # others remain plain strings. Use get_header_list() for the raw list.
     headers: dict[str, "str | list[str]"] = field(default_factory=dict)
 
     def get_header_list(self, name: str) -> list[str]:
@@ -231,15 +232,12 @@ class TestClient:
             if self._server is None:
                 continue
             try:
-                # Context manager guarantees the response is closed even if
-                # something raises after open() (arc finding testing-48).
                 with self._opener.open(f"{self.base_url}/", timeout=1):
                     pass
                 return
             except urllib.error.HTTPError as e:
-                # An HTTP error still proves the server is up. HTTPError is a
-                # file-like object holding an open socket — close it so the
-                # probe doesn't leak a connection (arc finding testing-49).
+                # An HTTP error still proves the server is up. It holds the open
+                # socket: close it so the probe doesn't leak a connection.
                 e.close()
                 return
             except (urllib.error.URLError, OSError):
@@ -338,12 +336,11 @@ class TestClient:
                     headers=_collapse_headers(resp.headers),
                 )
         except urllib.error.HTTPError as e:
-            # e.read() can itself raise (timeout / broken pipe while reading
-            # the error body). Degrade to an empty body rather than letting a
-            # different, undocumented exception escape (arc finding testing-50).
+            # Reading the error body can fail (timeout, connection reset): the status
+            # is still the answer, so the body is empty rather than the error escaping.
             try:
                 err_body = e.read()
-            except Exception:
+            except (OSError, http.client.HTTPException):
                 err_body = b""
             finally:
                 e.close()

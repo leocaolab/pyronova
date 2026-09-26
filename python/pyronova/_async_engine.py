@@ -1,7 +1,7 @@
 """Async engine — run in each async sub-interpreter worker (pool mode).
 
 It drives a Python asyncio event loop that runs the requests a fetcher thread pulls from
-Rust through `pyronova.engine._worker_recv` (Layer 2, C5). It runs as the module
+Rust through `pyronova.engine._worker_recv`. It runs as the module
 `__pyronova_async_engine__`, in its own namespace; Rust sets in it before it runs:
 
 - `WORKER_ID`: this worker's index (log records);
@@ -27,7 +27,7 @@ import pyronova.engine as _engine
 
 _log = logging.getLogger("pyronova.async")
 
-# Fetched once (M4 review N1e): the script has run, so the app's table is final.
+# Fetched once: the script has run, so the app's table is final.
 _HANDLERS = _engine._worker_app_handlers()
 _HOOKS = _engine._worker_app_hooks()
 _BEFORE_HOOKS, _AFTER_HOOKS = _HOOKS.before, _HOOKS.after
@@ -43,7 +43,7 @@ async def _call(fn, *args):
 async def _handle(handler, req):
     # Hooks and handler run in this request's own Task, so per-request state kept
     # in ContextVars (observability's request id, pyronova.context) stays apart
-    # from concurrent requests on this loop (FR-14). Same order and semantics as
+    # from concurrent requests on this loop. Same order and semantics as
     # every other path (`src/python/hook_chain.rs`): a before hook that returns
     # something short-circuits; after hooks get a Response and may replace it; a
     # hook that raises fails the request.
@@ -104,23 +104,16 @@ async def _pyronova_engine():
     t.start()
     try:
         # The fetcher returns when the inbox closes: at shutdown, or when this engine
-        # stops (below). No timeout: one used to start counting at worker start, ended
-        # the engine after 30 s of normal serving, and Py_EndInterpreter then blocked
-        # forever joining the still-running (non-daemon; sub-interpreters forbid daemon
-        # threads) fetcher.
+        # stops (below). No timeout: this join lasts the worker's whole serving life.
         await asyncio.to_thread(t.join)
     finally:
         # However the engine stops (shutdown, the fetcher failing, the loop dying), close
         # the inbox so the fetcher returns: the interpreter waits for it at its end.
         _engine._worker_close(CHANNEL)
-        # Graceful asyncio shutdown. Without this, Py_EndInterpreter would tear the VM
-        # down while pending tasks (background asyncio.create_task'd work) still hold
-        # FDs — orphan sockets, possible SIGSEGV during CPython's emergency task GC.
-        #
-        # 1. Cancel every task still pending on this loop (their jobs answer themselves).
-        # 2. Drain cancellations with gather(return_exceptions=True), bounded so a task
-        #    that ignores cancellation can't block Py_EndInterpreter forever.
-        # 3. Close async generators (asyncpg-style connection pools use them).
+        # Pending tasks (background `create_task` work) still hold sockets: cancel them
+        # (their jobs answer themselves) and close async generators before
+        # Py_EndInterpreter tears the loop down. The wait is bounded, so a task that
+        # ignores cancellation can't hold the interpreter's end forever.
         loop = asyncio.get_running_loop()
         pending = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
         for task in pending:
