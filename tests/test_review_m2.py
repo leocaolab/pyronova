@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import select
 import signal
 import socket
 import subprocess
@@ -215,29 +216,48 @@ def dropped(req):
 """ + RUN
 
 
+def _reply_head(s: socket.socket) -> tuple[int, dict]:
+    """The status and headers of the response on `s`."""
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    status_line, *header_lines = data.split(b"\r\n\r\n", 1)[0].decode().split("\r\n")
+    headers = dict(line.split(": ", 1) for line in header_lines)
+    return int(status_line.split()[1]), {k.lower(): v for k, v in headers.items()}
+
+
 def test_pool_admission_rejects_large_bodies_past_the_permit_budget():
     """Regression coverage (behavioural) for the pool's admission gate: a large body takes
     a permit before a byte of it is read; with every permit held, the next one is a 503
-    that carries CORS and is counted as dropped. One sync worker → 128 permits."""
+    that carries CORS and is counted as dropped. One sync worker → 128 permits.
+
+    129 heads for 128 permits, no body sent: exactly one is refused. Which one depends on
+    the order the heads are served in, and Linux spreads connections over several accept
+    loops, so the test does not pick it."""
     srv = Server(ADMISSION_SCRIPT, "pool", workers=1)
-    held = []
+    conns = []
     try:
-        for _ in range(128):
+        for _ in range(129):
             s = socket.create_connection((HOST, srv.port), timeout=10)
             s.sendall(b"POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\n\r\n")
-            held.append(s)
-        # The held connections take their permits as their heads arrive.
-        status, body, headers = settle(
-            lambda: srv.request("/upload", method="POST", body=b"x" * 100000),
-            lambda reply: reply[0] == 503,
-            timeout=10,
-        )
-        assert status == 503, body
+            conns.append(s)
+        # The ones holding a permit wait for their body, so the refused one is the only
+        # connection with a reply.
+        first, _, _ = select.select(conns, [], [], 10)
+        assert first, "no connection was refused"
+        more, _, _ = select.select([s for s in conns if s not in first], [], [], 1)
+        replied = first + more
+        assert len(replied) == 1, f"{len(replied)} connections got a reply"
+        status, headers = _reply_head(replied[0])
+        assert status == 503
         assert headers.get("access-control-allow-origin") == "https://app.example"
         status, body, _ = srv.request("/dropped")
         assert json.loads(body)["dropped"] >= 1
     finally:
-        for s in held:
+        for s in conns:
             s.close()
         srv.stop()
 
