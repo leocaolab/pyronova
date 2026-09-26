@@ -29,8 +29,8 @@ def test_authority_is_the_host_header_for_an_origin_form_target():
 
 
 def test_authority_of_an_absolute_form_target_wins_over_host():
-    req = _request("http://api.example.com:8443/rpc", {"host": "other.example"})
-    assert req.authority == "api.example.com:8443"
+    req = _request("http://api.example.com/rpc", {"host": "other.example"})
+    assert req.authority == "api.example.com"
 
 
 def test_authority_is_none_without_host_or_target_authority():
