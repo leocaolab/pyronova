@@ -1,141 +1,216 @@
-# Release pipeline design
+# Release process
 
-Goal: every shipped version of Pyronova has been
-**(a)** compiled in all supported configurations,
-**(b)** exercised under both unit tests and a real load generator,
-**(c)** validated against a recorded performance baseline, and
-**(d)** proven not to accumulate PyObjects under sustained load.
+The one spec for cutting a Pyronova release: what runs, where, and what counts as a
+pass. `.claude/commands/release.md` runs this checklist; it does not add steps of its
+own.
 
-Constraint: **GitHub Actions is not the right tool for (b)–(d).** Stress
-testing on a `ubuntu-latest` VM gives you a noise floor in the 30%
-range, and leak detection needs sustained load (tens of millions of
-requests) — GH's free minutes don't cover that. The bench + leak gate
-runs **locally on the owner's AMD 7840HS box** via `just` recipes,
-triggered manually before tagging.
+Every shipped version has been
+**(a)** tested on both release platforms (Linux x86_64, macOS arm64), including the
+feature-gated and platform-only tests,
+**(b)** soaked with real C extensions in sub-interpreters on both platforms,
+**(c)** measured against the recorded performance baseline, and
+**(d)** shown not to accumulate Python objects under sustained load.
 
-GitHub Actions keeps doing the cheap things: compile check across
-Python versions, unit tests, lint. It never claims the build is
-"release-ready"; `just release-gate` does.
+GitHub Actions covers compile, lint and the test suites; its 4-vCPU VMs are too noisy
+for (c) and too short for (d). CI green is necessary, never sufficient.
+
+**Fail closed.** If any step is red on either platform, stop: no merge, no tag. Report
+a table (step × platform → pass/fail with the number), and for a failure the real
+output, not a "failed" label.
+
+## Machines
+
+| Machine | Role |
+|---|---|
+| **mac** (local, Apple Silicon) | Dev box. Tests and grill soak. Its bench numbers are recorded, never compared to the Linux baseline. |
+| **bluewhale** (`ssh bluewhale`, AMD Ryzen 7 7840HS, 16 threads, Linux) | Baseline box: `benchmarks/baseline.json` was recorded here. Linux tests, grill soak, bench gate, leak gate. |
+
+On bluewhale, test the release commit in its own worktree
+(`git worktree add --detach ../pyre-<sha> <sha>`, own `.venv`), never by switching the
+checkout in `~/projects/pyre`. Raise the fd limit first: `ulimit -n 4096`.
+
+## Checklist
+
+Run on the release commit: the tip of the branch that will merge into `main`, with the
+version bump (step 9) already on it.
+
+### 1. CI green
+
+CI (`.github/workflows/ci.yml`) runs on a push to `main` or a pull request to `main`
+only, so open the PR (a draft is fine) to get a run. All four jobs pass: Unit tests,
+Integration tests (includes the `bench,fault_injection` build step), macOS, Rust lint.
+Wait on a run by the commit's **full** SHA (`gh run list --commit <full sha>`; a short
+SHA matches nothing).
+
+### 2. Rust checks — mac
+
+```bash
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+```
+
+### 3. Full test suite — both platforms, default release build
+
+```bash
+maturin develop --release
+pytest tests/ -q -rs --ignore=tests/e2e
+```
+
+Pass: 0 failed. Then audit every skip in the `-rs` summary; each must be one of:
+
+| Skip | Where it is expected |
+|---|---|
+| Linux-only (`/proc`), e.g. `test_subinterp_memory_regression.py` RSS soaks | mac |
+| Darwin-only (fanout topology) | Linux |
+| `bench` / `fault_injection` feature not built | default build (covered by step 4) |
+| Postgres tests without `PYRONOVA_TEST_PG_DSN` | when no database is set up |
+
+On Linux, `tests/test_subinterp_memory_regression.py` must show **9 passed** (on mac: 7
+passed, 2 skipped). A skip of any other kind is a failure until explained.
+
+### 4. Feature-gated tests — both platforms
+
+```bash
+maturin develop --release --features bench,fault_injection
+pytest tests/ -q -rs --ignore=tests/e2e
+```
+
+Pass: 0 failed, and no skip names the `bench` or `fault_injection` feature. The full
+suite runs here, not a hand-picked list: CI's feature step selects tests by file and
+`-k`, and misses feature-gated tests in other files. Rebuild without features
+(`maturin develop --release`) before step 6.
+
+### 5. Suspected flaky test
+
+A test that fails in CI but passes locally is not "flaky" until the cause is known.
+CI runners have 4 vCPUs; reproduce on bluewhale with the same core count and repeat:
+
+```bash
+for i in $(seq 20); do taskset -c 0-3 pytest tests/<file>.py -q -k <test> | tail -1; done
+```
+
+Then decide with evidence whether the test froze a wrong assumption (e.g. an order the
+server doesn't guarantee, a probe that disturbs what it measures) or the code is
+wrong. Report the finding before editing any existing test; don't retry CI until green.
+
+### 6. grill soak — both platforms
+
+numpy + scipy + scikit-learn + orjson, each isolated per worker; catches
+C-extension-in-sub-interpreter regressions the test suite can't. Look at what holds
+`:8000` before killing it; a stale server answers and fakes results.
+
+```bash
+lsof -i :8000 -sTCP:LISTEN          # stop a stale Pyronova server if one is there
+rm -rf /tmp/pyronova-isolate
+PYRONOVA_WORKERS=16 .venv/bin/python examples/stress_grill.py > /tmp/grill.log 2>&1 &
+# wait until GET :8000/grill is 200 (cold start on mac takes minutes: each cloned .dylib is verified)
+wrk -t8 -c128 -d10s http://127.0.0.1:8000/grill      # warm-up
+# RSS before: Linux /proc/<pid>/status VmRSS, mac `ps -o rss= -p <pid>`
+wrk -t8 -c128 -d60s http://127.0.0.1:8000/grill
+# RSS after
+```
+
+Pass: wrk prints no `Non-2xx` line, the server is still running, `/tmp/grill.log` has
+no panic / abort / double free / traceback, and RSS after is within 1% of RSS before.
+Record req/s and wrk timeouts (requests slower than wrk's 2 s) in the report.
+
+### 7. Performance gate — bluewhale
+
+```bash
+just bench-compare
+```
+
+Pass: the best of three 10 s runs is at least 95% of `benchmarks/baseline.json`.
+Compare against the baseline only; don't add ad-hoc control runs.
+
+The machine must be quiet: 1-minute load average below 1.5 and nothing compiling.
+Never bench right after a build on the same box (a release build saturates all 16
+threads and the load average lags); build, wait for the load to drop, then run.
+A run under load is discarded, not reported as a regression.
+
+On mac, run `benchmarks/bench_plaintext.py` with the same wrk command and record the
+number for the release notes; it does not gate.
+
+### 8. Leak gate — bluewhale
+
+```bash
+just canary-soak
+```
+
+Builds with `leak_detect`, serves `GET /` under `wrk -t4 -c100` for 5 minutes, dumps
+the `pyronova_drop_rc` histogram. Pass: the recipe prints `OK — no leak suspects`, i.e.
+no type outside the whitelist (below) was dropped at rc 2–8 more than the threshold
+number of times. Also check that the `pyronova.engine.Request` rc=1 count matches the
+request count wrk reports. Throughput here is not gated (step 7 is).
+
+Known recipe issue: the threshold is meant to be 10% of the requests, but the recipe
+reads `Requests/sec` from the server's stderr, where wrk's output isn't, so it always
+falls back to 10,000,000 requests: the threshold is a fixed 1,000,000 samples.
+
+Whitelist (legitimately rc≥2: interned or cached):
+
+```
+str, bytes, type, tuple, NoneType
+```
+
+### 9. Version and docs — on the release branch
+
+- `version` in `Cargo.toml`, then `cargo update -p pyronova-engine --offline` so
+  `Cargo.lock` agrees.
+- `CHANGELOG.md`: a `## vX.Y.Z (date) — summary` section; **Breaking** first, then
+  Changed / Added / Fixed. Every API name in it checked against the code.
+- `README.md`: a "What's new in vX.Y" section; supported Python and wheel platforms
+  stated where they appear.
+- `just version-sync` passes.
+
+Steps 1–8 run on the commit that contains these changes.
+
+### 10. Merge, tag, publish
+
+1. Merge the PR into `main`.
+2. Tag the merge commit on `main` and push the tag:
+   `git tag vX.Y.Z <main sha> && git push origin vX.Y.Z`.
+   The tag push runs `.github/workflows/release.yml`: wheels for Linux x86_64
+   (manylinux) and macOS arm64 on Python 3.14, plus the sdist, published to PyPI.
+   A published version can't be replaced, so push the tag only after steps 1–9 pass.
+3. Watch the run (`gh run watch`), then confirm PyPI lists the version with both wheels
+   and the sdist.
 
 ## Build configurations
 
-| Profile        | Cargo flags | `leak_detect` | Where it runs | Purpose |
-|----------------|-------------|---------------|---------------|---------|
-| **dev**        | `--profile dev` (default) | on | local + `pytest` | Fast iteration. Debug symbols, no LTO. Diagnostic hooks always live so a stray leak shows up immediately. |
-| **release**    | `--profile release` (LTO fat, codegen-units=1, strip) | **off** | shipped to PyPI | What end users get. Zero cost from any diagnostic — the `cfg`-gated code does not link. |
-| **canary**     | `--profile release` | **on** | local pre-release soak | Same compile flags as release, but with the leak counter wired up. If `just canary-soak` ever shows a rc≥2 growth curve on a non-whitelisted type, the release is held. |
-| **ci-compile** | `--profile dev` | off | GitHub Actions | Compile-only smoke on Python 3.14, no stress. |
+| Profile | Cargo features | Where it runs | Purpose |
+|---|---|---|---|
+| **release** | none | shipped to PyPI | What users get. |
+| **feature test** | `bench,fault_injection` | step 4, CI | Bench harnesses and fault injection for the tests that need them. Never shipped. |
+| **canary** | `leak_detect` | step 8 | Release codegen plus the drop-refcount sampler. |
 
-Rule of thumb: **release and canary share the exact same codegen.**
-`leak_detect` only adds a refcount sample (`leak_detect::record_drop`)
-where a worker lets go of a request's `Request`, and two request
-counters in the worker pool; the rest of the binary is identical. So any
-performance delta we see between canary soak and the eventual
-release comes from those call sites — known and bounded.
-
-## Release gate
-
-A tag is only cut after `just release-gate` passes. The gate is a
-**composition** of smaller recipes so you can run any single step
-during development without paying for the others.
-
-```
-just release-gate
-├── just check            # cargo check, both feature configs
-├── just test             # cargo test + pytest (unit + e2e)
-├── just bench-compare    # wrk against baseline, fail if regression > 5%
-├── just canary-soak      # 5-min wrk with leak_detect, fail if non-whitelist rc≥2 grows
-└── just version-sync     # Cargo.toml ↔ CHANGELOG.md ↔ latest git tag agree
-```
-
-Each recipe fails fast; `just release-gate` bails on the first
-failure. Total wall time on AMD 7840HS:
-
-| Step | Time |
-|---|---|
-| `check` (both configs) | ~3 min |
-| `test` | ~2 min |
-| `bench-compare` | ~1 min (3× 10s wrk) |
-| `canary-soak` | ~5 min |
-| `version-sync` | <1 s |
-| **Total** | **~11 min** |
+`leak_detect` only adds a refcount sample where a worker drops a request's `Request`,
+and two request counters; the rest of the binary is identical to release.
 
 ## Baseline management
 
-`bench-compare` reads from `benchmarks/baseline.json`. The file is
-committed to the repo. Updating it is a **conscious act**:
+`bench-compare` reads `benchmarks/baseline.json`, which is committed. Re-recording it
+is a deliberate act, on bluewhale, on a quiet machine:
 
 ```bash
-just bench-record > benchmarks/baseline.json
+just bench-record        # writes benchmarks/baseline.json
 git add benchmarks/baseline.json
-git commit -m "bench: record v1.4.6 baseline (AMD 7840HS, kernel 7.0)"
+git commit -m "bench: record baseline (<machine>, kernel <uname -r>, Python <version>)"
 ```
 
-The commit message documents the machine + kernel so future comparisons
-are apples-to-apples. The file includes:
+The file records machine, kernel, Python and time:
 
 ```json
 {
-  "machine": "AMD Ryzen 7 7840HS, 16 cores, Linux 7.0",
+  "machine": "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics",
+  "kernel": "7.0.0-10-generic",
   "python": "3.14.4",
-  "recorded_at": "2026-04-19T01:30:00Z",
-  "routes": {
-    "GET /": { "req_per_sec": 425000, "p99_us": 571 }
-  }
+  "recorded_at": "2026-04-19T22:20:05Z",
+  "routes": { "GET /": { "req_per_sec": 422976 } }
 }
 ```
 
-## Leak gate — what counts as a failure
+## `just release-gate`
 
-`just canary-soak` runs the leak-detect build for 5 minutes at 400k
-req/s, dumps the histogram, and fails if ANY of:
-
-1. A type not in the **expected-co-owner whitelist** has rc≥2 samples
-   growing (i.e., count increases between t=1m and t=5m snapshots).
-2. The total `dict` or `_Request` rc=1 drop count is less than
-   the request count ×0.9 (meaning we're losing instances before they
-   even reach the Drop path).
-3. RSS growth across the 5-minute soak is more than 100 KB (catch
-   arena creep independent of gc-visible objects).
-
-Whitelist:
-
-```
-# Interned / singleton-ish — always rc≥2 legitimately
-str    (interned short strings: "GET", "/", "", etc.)
-bytes  (empty body singleton)
-type   (class objects, re-referenced by every instance)
-tuple  (small-tuple cache)
-NoneType
-```
-
-Anything else showing sustained rc≥2 growth is a regression candidate
-and blocks the release until investigated.
-
-## What stays on GitHub
-
-Unchanged: `.github/workflows/ci.yml` keeps the compile-and-unit-test
-matrix on every PR. It's fast, catches compile regressions across
-Python versions, and doesn't claim to certify the release.
-
-`.github/workflows/release.yml` (tag-triggered wheel build + PyPI
-publish) still fires on `git push v*`. Idea: **only push the tag
-after `just release-gate` passes locally**. The GH release workflow
-assumes the local gate has been run; it doesn't re-validate.
-
-## Developer quickstart
-
-```bash
-# Normal day
-just test                 # iterate
-
-# Before pushing a significant change
-just check                # both configs compile
-just bench-compare        # no perf regression
-
-# Before cutting a tag
-just release-gate         # full local validation
-```
-
-If `release-gate` fails, the developer fixes the regression on a
-branch and re-runs. Only green results in a tag.
+`just release-gate` = `check` + `test` + `bench-compare` + `canary-soak` +
+`version-sync` on one box. On bluewhale it covers steps 3 (Linux), 7, 8 and part of 9;
+steps 1, 2, 4, 5, 6 and the mac side still run separately.

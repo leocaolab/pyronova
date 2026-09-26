@@ -12,6 +12,43 @@ Built on Per-Interpreter GIL (PEP 684) and a Rust async core, Pyronova runs Pyth
 - Sustained **400k QPS**: RSS grew **4 MB over 73.8M requests** in 180s
   (≈0 B/req). Zero errors, zero leaks.
 
+**Python 3.14 only.** `pip install pyronova` — wheels for Linux x86_64 and macOS arm64.
+
+### What's new in v2.10 (2026-09-26)
+
+A structural rework after a full code review. Upgrading? Read the **Breaking** list in
+[CHANGELOG.md](CHANGELOG.md) first: `:name` route segments, 5xx bodies and config errors
+changed.
+
+- **Same behaviour on every serving path.** The main interpreter, the sub-interpreter
+  pool and thread-per-core now share one request pipeline: CORS, access log, body
+  limits, admission (503) and timeouts (408 / 504) no longer differ by path.
+- **Errors you can trace, without leaking internals.** Every request has a
+  `req.request_id`. A 5xx answers `{"error": "Internal Server Error", "request_id": ...}`
+  and the full exception and traceback are logged once under that id; a 4xx carries
+  the reason.
+- **Config mistakes fail at startup.** Every `PYRONOVA_*` variable and `mode` is checked
+  when the server starts; a typo raises and names the bad value instead of silently
+  running with a default.
+- **`async def` on thread-per-core runs on the async pool**, so a slow `await` doesn't
+  hold a core and the 504 arrives on time.
+- **Per-app settings.** `max_body_size`, WebSocket caps and compression belong to each
+  app, so two apps in one process don't share them.
+- **Tests run the real server.** `TestClient` serves your app on the production serving
+  path over a real socket and raises the server's real error. A port already in use is
+  `OSError(EADDRINUSE)` at startup.
+- **Safer defaults.** `/mcp` and `@app.rpc` refuse cross-site requests (`Origin` check,
+  JSON only; allow more with `app.trusted_origins`); static files can't escape their
+  mount; WebSocket connections, message size and queued bytes are capped; the gRPC
+  benchmark endpoint is off unless `app.enable_grpc_benchmark()`.
+- **WebSocket upgrades run `before_request`** and expose `ws.request`, so auth hooks
+  apply to WebSockets too.
+
+### What's new in v2.9 (2026-09-25)
+
+- **Python 3.14 only**; 3.13's own `_datetime` crashes under concurrent sub-interpreters.
+- Handlers can return `datetime` / `date` / `time` (isojson 0.2 serializes them).
+
 ### What's new in v2.7 (2026-08-02)
 
 - **Your unmodified scientific-Python code runs in parallel — with almost no
@@ -474,7 +511,12 @@ Details and measurements: [docs/subinterp-c-extension-status.en.md §10](docs/su
 ## Install
 
 ```bash
-# From source (requires Rust toolchain + Python 3.14+)
+# Python 3.14; wheels for Linux x86_64 and macOS arm64
+pip install pyronova
+```
+
+```bash
+# From source (Rust toolchain + Python 3.14)
 git clone https://github.com/leocaolab/pyronova.git
 cd pyronova
 python -m venv .venv && source .venv/bin/activate
@@ -764,7 +806,7 @@ PYRONOVA_HOST=0.0.0.0 PYRONOVA_PORT=9000 PYRONOVA_WORKERS=16 PYRONOVA_LOG=1 pyth
 ## Monitoring
 
 ```bash
-PYRONOVA_METRICS=1 python app.py   # Enable GIL watchdog
+PYRONOVA_METRICS=1 python app.py   # also count requests (Metrics.total_requests; None when off)
 ```
 
 ## Testing
@@ -874,9 +916,9 @@ def analyze(req):
 sub-interpreter bug report as not planned ([numpy#27192](https://github.com/numpy/numpy/issues/27192)),
 and the feature request ([numpy#24755](https://github.com/numpy/numpy/issues/24755)) is open.
 
-### Python 3.14+ required
+### Python 3.14 only
 
-**What:** Pyronova requires Python 3.14 or later.
+**What:** Pyronova supports Python 3.14 only.
 
 **Why:** Per-Interpreter GIL (PEP 684) was introduced in Python 3.12, but
 v1.5.0 onwards uses `PyThreadState_GetUnchecked` and the new tstate
@@ -885,15 +927,15 @@ leak, so 3.12 can't run it. 3.13 is not supported either: its own `_datetime`
 crashes under concurrent strict sub-interpreters (measured 2026-09-24, isojson
 E2E-6), and Pyronova is tested and released on 3.14 only.
 
-**Workaround:** None. Python 3.14+ is required. Consider using [pyenv](https://github.com/pyenv/pyenv) to manage multiple Python versions.
+**Workaround:** None. Use Python 3.14; [pyenv](https://github.com/pyenv/pyenv) or `uv python install 3.14` can install it next to other versions.
 
-### Build from source
+### Wheels for two platforms
 
-**What:** Pyronova must be compiled from source using Rust and Maturin. No pre-built wheels on PyPI yet.
+**What:** PyPI wheels are built for Linux x86_64 (manylinux) and macOS arm64. Other
+platforms (Linux aarch64, macOS x86_64) build from the sdist, which needs a Rust
+toolchain.
 
-**Why:** The project is pre-release. PyPI binary wheels for multiple platforms require CI/CD infrastructure.
-
-**Workaround:** Install Rust (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`) and build with `maturin develop --release`.
+**Workaround:** Install Rust (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`); `pip install pyronova` then builds it.
 
 ### No OpenAPI auto-documentation
 
@@ -909,8 +951,8 @@ E2E-6), and Pyronova is tested and released on 3.14 only.
 
 ## Requirements
 
-- Python 3.14+ (PEP 684 sub-interpreters + `PyThreadState_GetUnchecked`)
-- Rust toolchain (build from source)
+- Python 3.14 (PEP 684 sub-interpreters + `PyThreadState_GetUnchecked`)
+- Rust toolchain only when building from source (no wheel for your platform)
 - macOS or Linux
 
 ## License
