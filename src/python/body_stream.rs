@@ -1,22 +1,11 @@
-//! Streaming request body — lets a handler consume `Incoming` body frames
-//! as they arrive, without buffering the whole body in memory.
+//! Streaming request body: a handler reads `req.stream`, a sync iterator of `bytes`
+//! chunks, as the body's frames arrive, without buffering the whole body.
 //!
-//! Opt-in per route via `@app.post("/path", gil=True, stream=True)`. The
-//! dispatcher skips collecting the body and instead spawns a feeder task
-//! (`body::stream_body_feeder`) that pushes each body frame into a **bounded**
-//! channel; the handler sees `req.stream` as a Python iterator yielding `bytes`
-//! chunks and terminating with `StopIteration` at the body's end.
-//!
-//! The bound propagates backpressure all the way to the TCP stack: if the Python
-//! handler is slow, the feeder's send waits, which stops `poll_frame` from being
-//! driven, and eventually the TCP receive window closes on the client side. The
-//! whole body arrives within the request budget, as a buffered one does.
-//!
-//! Scope:
-//!   * Only `gil=True` routes. Sub-interpreter request streaming is
-//!     deferred.
-//!   * Sync iterator only. `async for chunk in req.stream()` is deferred.
-//!   * `max_body_size` still bounds total ingest even when streaming.
+//! Opt-in per route via `@app.post("/path", gil=True, stream=True)`; only `gil=True`
+//! routes stream. A feeder task (`body::stream_body_feeder`) pushes frames into a
+//! bounded channel, so a slow handler stops the feeder, which stops polling the body,
+//! which closes the client's TCP window. `max_body_size` still bounds the total, and the
+//! whole body must arrive within the request budget, as a buffered one does.
 //!
 //! Error handling: a body the feeder gives up on (larger than `max_body_size`, too slow,
 //! a failed read) arrives as the same `BodyReject` a buffered body gets; reading it raises
@@ -163,7 +152,6 @@ impl PyronovaBodyStream {
             StreamState::Finished => return Err(PyStopIteration::new_err(py.None())),
             StreamState::Failed(failure) => return Err(failure.to_py(py)),
         };
-        // GIL released across the wait so unrelated Python threads keep running.
         match Received::of(py.detach(|| rx.blocking_recv())) {
             Received::Chunk(chunk) => Ok(PyBytes::new(py, &chunk).unbind()),
             Received::End => {
@@ -178,19 +166,15 @@ impl PyronovaBodyStream {
         }
     }
 
-    /// Read up to `n` bytes by concatenating chunks. Convenience over the
-    /// iterator protocol for code that wants `read(n)` semantics. Returns
-    /// `b""` at EOF. Note: may return fewer than `n` bytes if EOF arrives;
-    /// may return more than `n` bytes if the buffered chunk is larger (no
-    /// attempt to split frames).
+    /// Reads whole chunks until at least `n` bytes (or the body's end; all of it when `n`
+    /// is `None`). Returns `b""` at the end. Chunks are never split, so the result may be
+    /// longer than `n`.
     #[pyo3(signature = (n=None))]
     fn read(&self, py: Python<'_>, n: Option<usize>) -> PyResult<Py<PyBytes>> {
         let mut buf = Vec::<u8>::new();
         loop {
-            // Check the limit before pulling another chunk so that
-            // read(0) returns b"" without consuming any data (matching
-            // Python's file.read(0) contract), and so we never fetch a
-            // chunk we've already satisfied the request for.
+            // Checked before pulling a chunk, so `read(0)` consumes nothing (as
+            // `file.read(0)`).
             if let Some(limit) = n {
                 if buf.len() >= limit {
                     break;

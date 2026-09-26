@@ -2,7 +2,7 @@
 //! is the densest concentration of `unsafe` + raw `pyo3::ffi` in the codebase: creating and
 //! ending the interpreter, and moving its thread state between OS threads.
 //!
-//! A worker runs the same program as the main interpreter (Layer 2): its bootstrap sets up
+//! A worker runs the same program as the main interpreter: its bootstrap sets up
 //! logging, the GC policy and C-extension isolation, then the user's script executes as a
 //! real module and imports the real `pyronova` package and engine. The worker takes its
 //! handlers from the app that script registered routes on, checked index by index against
@@ -12,7 +12,7 @@
 //! the pool's sync workers) runs the hook chain from Rust on its own event loop; an
 //! [`AsyncEngine`] worker runs the async engine, which takes the handlers from the app
 //! itself. The role's references belong to the worker's interpreter and are released only
-//! by [`SubInterpreterWorker::end`], with its thread state current (FR-19).
+//! by [`SubInterpreterWorker::end`], with its thread state current.
 
 use std::cell::Cell;
 use std::ffi::{CStr, CString};
@@ -335,10 +335,8 @@ pub(crate) struct WorkerSpec<'a> {
     pub(crate) expected: &'a RouteSignature,
     pub(crate) shared_state: &'a crate::state::SharedMap,
     /// Collect once this many requests ran since the last collect; 0 disables the count
-    /// trigger (use when you've verified your handler graph creates no cycles —
-    /// ref-counting handles everything else instantly). From the GC config
-    /// (`GcConfig::count_trigger`): the threshold in count mode, the OOM failsafe in idle
-    /// mode, 0 in off mode.
+    /// trigger. `GcConfig::count_trigger`: the threshold in count mode, the OOM failsafe in
+    /// idle mode, 0 in off mode.
     pub(crate) gc_threshold: u64,
     /// The served app's limits; a worker whose script set others says they are ignored.
     pub(crate) limits: crate::site::Limits,
@@ -634,7 +632,7 @@ impl<R: Role> SubInterpreterWorker<R> {
     }
 
     /// Ends this worker's sub-interpreter: with its thread state current, release every
-    /// reference the worker holds, then `Py_EndInterpreter` (Layer 2, FR-19).
+    /// reference the worker holds, then `Py_EndInterpreter`.
     ///
     /// Works from the worker's own thread (normal shutdown, no thread state current) and
     /// from the thread that created it (a failed start, possibly with main's thread state
@@ -667,7 +665,7 @@ impl<R: Role> SubInterpreterWorker<R> {
     }
 
     /// Ends the worker on the thread that served it, once nothing on that thread uses it
-    /// any more (FR-19). A thread abandoned past shutdown may run this after
+    /// any more. A thread abandoned past shutdown may run this after
     /// `Py_Finalize`; the worker is abandoned then.
     pub(crate) fn end_on_own_thread(self) {
         // SAFETY: always safe to call.
@@ -680,7 +678,7 @@ impl<R: Role> SubInterpreterWorker<R> {
     }
 
     /// Ends every worker in `workers` on the calling (creating) thread: the clean-up of a
-    /// start that failed after some workers were built (FR-19).
+    /// start that failed after some workers were built.
     ///
     /// # Safety
     /// As for [`Self::end`], on the thread that created the workers, before any of them was
@@ -831,7 +829,7 @@ fn run_engine(py: Python<'_>, worker: usize, inbox: AsyncInbox) -> Result<(), As
 
 /// The init, in the new worker's interpreter (`py` is its token): the bootstrap, the
 /// script, the JSON serializer, then the role from the app the script registered on,
-/// checked index by index against main's table (FR-3, FR-4).
+/// checked index by index against main's table.
 fn prepare<R: Role>(
     py: Python<'_>,
     worker: usize,
@@ -847,7 +845,7 @@ fn prepare<R: Role>(
     let program = spec.program;
 
     // Before the script runs: a `PyronovaApp` or `SharedState` it creates in this
-    // interpreter must see the running app's map (Layer 2, C2 / FR-5).
+    // interpreter must see the running app's map.
     crate::state::hand_to_worker(py, spec.shared_state)?;
 
     // Before anything is imported: the bootstrap and the script resolve their imports
@@ -857,7 +855,7 @@ fn prepare<R: Role>(
         .map_err(setup("setting sys.path to main's"))?;
 
     // The bootstrap (logging bridge, GC policy, C-extension isolation) in its own
-    // namespace, with this worker's id (FR-20) and the libraries to isolate.
+    // namespace, with this worker's id (for its log records) and the libraries to isolate.
     const BOOTSTRAP_FILE: &str = "pyronova/_bootstrap.py";
     let bootstrap = new_module(py, BOOTSTRAP_MODULE, None)
         .and_then(|m| {
@@ -886,7 +884,7 @@ fn prepare<R: Role>(
 
     // The user's script as a real module, compiled with its own path so tracebacks
     // point at it, `from __future__` imports work, and `typing.get_type_hints` finds
-    // the module in `sys.modules` (FR-20).
+    // the module in `sys.modules`.
     let script_module = new_module(py, SCRIPT_MODULE, Some(&program.script_path))
         .map_err(setup("creating the script module"))?;
     exec_in(py, &program.script, &program.script_path, &script_module)
@@ -1082,20 +1080,15 @@ unsafe fn with_current_tstate<T>(f: impl for<'py> FnOnce(Python<'py>) -> T) -> T
     f(Python::assume_attached())
 }
 
-/// RAII guard: ensures GIL is released even if a panic occurs mid-handler.
-/// Without this, a panic after `PyEval_RestoreThread` but before `PyEval_SaveThread`
-/// would leave the GIL permanently locked, causing deadlock on the next request
-/// and eventual segfault from corrupted thread state.
-///
-/// The saved thread state is written back to `tstate_cell` on drop, so the caller
-/// can retrieve it even after a panic unwind.
+/// Holds a sub-interpreter's GIL; releasing it on drop, so a panic mid-handler can't leave
+/// the GIL locked (the next request would deadlock). The saved thread state is written
+/// back to `tstate_cell` on drop, so the caller has it even after an unwind.
 struct SubInterpGilGuard<'a> {
     tstate_cell: &'a Cell<*mut ffi::PyThreadState>,
 }
 
 impl<'a> SubInterpGilGuard<'a> {
-    /// Acquire the sub-interpreter's GIL. On drop, releases it and writes
-    /// the saved tstate back to `tstate_cell`.
+    /// Acquires the sub-interpreter's GIL.
     ///
     /// # Safety
     /// `tstate` is a saved thread state usable on this thread, and no thread state is
@@ -1111,50 +1104,20 @@ impl<'a> SubInterpGilGuard<'a> {
 
 impl Drop for SubInterpGilGuard<'_> {
     fn drop(&mut self) {
-        // SAFETY: we always hold the GIL when this guard exists.
-        // SaveThread releases it and returns the saved tstate for next acquire.
+        // SAFETY: the GIL is held while this guard exists.
         unsafe {
             self.tstate_cell.set(ffi::PyEval_SaveThread());
         }
     }
 }
 
-/// Rebind the worker's sub-interp tstate to THIS OS thread.
+/// Replaces the worker's thread state (created on the building thread) with a fresh one
+/// bound to the calling thread, and returns it saved.
 ///
-/// # The Bug
-///
-/// `SubInterpreterWorker::new` runs on the main thread. It calls
-/// `Py_NewInterpreterFromConfig`, which creates a tstate on the
-/// creator's OS thread, runs the init script, then `PyEval_SaveThread`'s
-/// it. The worker thread picks up that saved tstate and does
-/// `PyEval_RestoreThread` / `PyEval_SaveThread` per request.
-///
-/// This pattern works — but leaks ~1 KB per request under sustained
-/// load. Measured with a pure-C reproducer (no Rust, no Pyronova,
-/// no hyper, just PyDict alloc/decref + attach/detach loop):
-///
-///   variant=0 (SHARED tstate across threads)   B/iter = 997
-///   variant=1 (FRESH tstate via PyThreadState_New)  B/iter = 0
-///
-/// CPython's tstate carries per-OS-thread state (GIL reacquisition
-/// bookkeeping, some pymalloc bindings) that accumulates when a
-/// tstate created on one OS thread is repeatedly attached/detached
-/// on a different OS thread. The fix is to give each worker its
-/// OWN tstate, bound to its OS thread from the first attach.
-///
-/// # The Fix
-///
-/// On worker entry:
-///   1. Attach the creator's tstate (`worker.tstate`) briefly.
-///   2. Create a fresh tstate via `PyThreadState_New(interp)` — this
-///      tstate is bound to THIS OS thread.
-///   3. Swap it in; clear + delete the creator's tstate.
-///   4. Use the fresh tstate for all request handling.
-///
-/// On worker exit, attach the fresh tstate and `Py_EndInterpreter`,
-/// which destroys the sub-interp and all remaining tstates for it.
-///
-/// See docs/memory-leak-investigation-2026-04-19.md for the bisection.
+/// A thread state created on one OS thread and attached/detached on another accumulates
+/// per-thread bookkeeping: a pure-C reproducer leaks ~1 KB per attach cycle (997 B/iter
+/// shared vs 0 B/iter with a `PyThreadState_New` on the serving thread). See
+/// docs/memory-leak-investigation-2026-04-19.md.
 ///
 /// # Safety
 /// `creator_tstate` is the worker's saved thread state, not yet bound to another thread,
@@ -1162,7 +1125,6 @@ impl Drop for SubInterpGilGuard<'_> {
 unsafe fn rebind_tstate_to_current_thread(
     creator_tstate: *mut ffi::PyThreadState,
 ) -> *mut ffi::PyThreadState {
-    // Attach creator tstate so we can call PyThreadState_New.
     ffi::PyEval_RestoreThread(creator_tstate);
     let interp = ffi::PyInterpreterState_Get();
     let fresh = ffi::PyThreadState_New(interp);
@@ -1180,13 +1142,10 @@ unsafe fn rebind_tstate_to_current_thread(
         );
         return ffi::PyEval_SaveThread();
     }
-    // Swap to fresh tstate. Returns the previous current tstate = creator.
     let prev = ffi::PyThreadState_Swap(fresh);
     debug_assert_eq!(prev, creator_tstate);
-    // Dispose of the creator tstate from this thread.
     ffi::PyThreadState_Clear(creator_tstate);
     ffi::PyThreadState_Delete(creator_tstate);
-    // Release GIL; hand back the fresh tstate for future attach cycles.
     ffi::PyEval_SaveThread()
 }
 

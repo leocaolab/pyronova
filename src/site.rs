@@ -1,5 +1,5 @@
-//! What one server run serves: the frozen route table plus the per-run settings applied
-//! to every response (CORS, access log). Built once when `run()` starts; read-only after.
+//! What one server serves: the frozen route table and the app's settings (CORS, access
+//! log, limits, compression). Built once by `start()`; read-only after.
 
 use std::cell::Cell;
 use std::num::NonZeroU64;
@@ -34,7 +34,7 @@ pub(crate) struct SiteConfig {
     pub(crate) ws_connections: crate::websocket::OpenConnections,
 }
 
-/// Default max request body size (10 MB). Configurable via `app.max_body_size`.
+/// Default max request body size, in bytes (10 MiB); `app.max_body_size` sets it.
 const DEFAULT_MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 /// An app's limits. Each app has its own (set through its `PyronovaApp`), so two apps in
@@ -55,7 +55,7 @@ impl Limits {
     /// One line per setter whose value in a worker's script (`in_worker`) differs from
     /// the served app's (`self`, the main interpreter's), naming the call and both values;
     /// empty when they agree. A worker's app is never served, so such a call has no effect
-    /// and the worker says so (FR-17).
+    /// and the worker says so.
     pub(crate) fn ignored_in_worker(&self, in_worker: &Limits) -> Vec<String> {
         let mut ignored = Vec::new();
         let mut differ = |call: &str, worker: usize, served: usize| {

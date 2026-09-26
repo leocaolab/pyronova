@@ -81,8 +81,7 @@ impl PyronovaApp {
 
     /// Gives each sub-interpreter worker its own private copy of these C-extension
     /// libraries, cloned by the worker's bootstrap before the script runs. `pyronova`
-    /// itself can't be isolated: one shared copy of it and its engine is required
-    /// (FR-11).
+    /// itself can't be isolated: one shared copy of it and its engine is required.
     fn isolate(&mut self, libraries: Vec<String>) -> PyResult<()> {
         if libraries.iter().any(|lib| lib == "pyronova") {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -101,7 +100,7 @@ impl PyronovaApp {
     /// The worker threads this app's servers abandoned (still running past the shutdown
     /// grace period), taken: a second call returns none. Their interpreters are alive, and
     /// finalizing with a live sub-interpreter aborts, so `Pyronova.run()` exits non-zero
-    /// without finalizing when there are any (Layer 2, N8).
+    /// without finalizing when there are any.
     fn _take_abandoned_workers(&self) -> Vec<AbandonedWorker> {
         std::mem::take(&mut *self.abandoned.lock())
     }
@@ -117,14 +116,8 @@ impl PyronovaApp {
         expose_headers: Option<String>,
         allow_credentials: bool,
     ) -> PyResult<()> {
-        // W3C Fetch / CORS forbids `Access-Control-Allow-Origin: *`
-        // together with `Access-Control-Allow-Credentials: true` —
-        // browsers reject the response client-side regardless of
-        // what the server sends. The server still returns 200 which
-        // makes this a particularly nasty debugging pit (200 logs,
-        // client-visible failure). Warn at config time so the
-        // misconfiguration is visible in the logs where the user
-        // looks first.
+        // Browsers reject `*` with credentials (Fetch spec) while the server logs 200:
+        // say so where the user looks first.
         if allow_credentials && origin.trim() == "*" {
             tracing::warn!(
                 target: "pyronova::server",
@@ -201,7 +194,7 @@ impl PyronovaApp {
     }
 
     /// Set this app's max request body size in bytes; a larger body is answered 413.
-    /// Default: 10 MB. Per app: another app in the process keeps its own.
+    /// Default: 10 MiB. Per app: another app in the process keeps its own.
     fn set_max_body_size(&mut self, size: usize) {
         self.limits.max_body_bytes = size;
     }
@@ -230,17 +223,9 @@ impl PyronovaApp {
         self.limits.ws.max_connections
     }
 
-    /// Register a fast-path route — a response that never enters Python.
-    ///
-    /// For routes with a constant body (health checks, `/robots.txt`,
-    /// `/pipeline` probe endpoints, maintenance pages) the Python handler
-    /// dispatch is pure overhead: GIL acquisition, handler call,
-    /// serialization, all for the same bytes every time. `add_fast_response`
-    /// stores the fully-built response at registration time; the accept
-    /// loop serves it directly without any Python involvement.
-    ///
-    /// The match is exact `(method, path)` — no path params, no glob.
-    /// Path-parameterized routes still need a real handler.
+    /// Registers a constant response for an exact `(method, path)` (no path params), built
+    /// now and served without entering Python: for health checks, `/robots.txt` and the
+    /// like. A second registration of the same pair raises `ValueError`.
     #[pyo3(signature = (
         method,
         path,
@@ -273,11 +258,6 @@ impl PyronovaApp {
         })?;
         let mut routes = self.routes.write();
         let bucket = routes.fast_responses.entry(method_key.clone()).or_default();
-        // Reject duplicate (method, path) registrations instead of silently
-        // discarding the previous one. add_route already errors on duplicate
-        // routes; mirror that so a double-registration (hot reload, plugin)
-        // surfaces a clear error rather than losing the first one with no
-        // diagnostic (arc finding app-53).
         if bucket.contains_key(&path_key) {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "fast response already registered for {method_key} {path_key}"
@@ -300,7 +280,7 @@ impl PyronovaApp {
     /// Marks the end of the script's registrations. `Pyronova` calls it once, on the main
     /// interpreter, when it prepares its first server and before anything registered at
     /// run time (`/mcp`, logging hooks, startup hooks). Idempotent, because the engine's
-    /// own `run()` seals an unsealed table too: the first boundary stays (Layer 2, FR-2).
+    /// own `run()` seals an unsealed table too: the first boundary stays.
     /// A worker is never sealed: its table is the script's registrations.
     fn _seal_registrations(&self, py: Python<'_>) -> PyResult<()> {
         if !crate::run_context::on_main(py) {
@@ -314,12 +294,12 @@ impl PyronovaApp {
 
     /// The script workers execute, when it isn't `__main__.__file__`: `pyronova run
     /// module:app` runs `cli.py` as `__main__`, and workers must execute the app's module
-    /// instead (Layer 2, N15).
+    /// instead.
     fn set_script_path(&mut self, path: String) {
         self.script_path = Some(path);
     }
 
-    /// Access the shared state (cross-sub-interpreter, nanosecond latency).
+    /// The app's shared state: one map for every interpreter of the process.
     #[getter]
     fn state(&self) -> SharedState {
         SharedState::with_inner(Arc::clone(&self.shared_state))
@@ -327,7 +307,7 @@ impl PyronovaApp {
 
     #[pyo3(signature = (path, handler, gil=false))]
     fn get(slf: &Bound<'_, Self>, path: &str, handler: Py<PyAny>, gil: bool) -> PyResult<()> {
-        Self::register_route(slf, "GET", path, handler, gil, false)
+        Self::register_route(slf, "GET", path, handler, RouteFlags { gil, stream: false })
     }
 
     #[pyo3(signature = (path, handler, gil=false, stream=false))]
@@ -338,7 +318,7 @@ impl PyronovaApp {
         gil: bool,
         stream: bool,
     ) -> PyResult<()> {
-        Self::register_route(slf, "POST", path, handler, gil, stream)
+        Self::register_route(slf, "POST", path, handler, RouteFlags { gil, stream })
     }
 
     #[pyo3(signature = (path, handler, gil=false, stream=false))]
@@ -349,12 +329,18 @@ impl PyronovaApp {
         gil: bool,
         stream: bool,
     ) -> PyResult<()> {
-        Self::register_route(slf, "PUT", path, handler, gil, stream)
+        Self::register_route(slf, "PUT", path, handler, RouteFlags { gil, stream })
     }
 
     #[pyo3(signature = (path, handler, gil=false))]
     fn delete(slf: &Bound<'_, Self>, path: &str, handler: Py<PyAny>, gil: bool) -> PyResult<()> {
-        Self::register_route(slf, "DELETE", path, handler, gil, false)
+        Self::register_route(
+            slf,
+            "DELETE",
+            path,
+            handler,
+            RouteFlags { gil, stream: false },
+        )
     }
 
     #[pyo3(signature = (method, path, handler, gil=false, stream=false))]
@@ -366,7 +352,7 @@ impl PyronovaApp {
         gil: bool,
         stream: bool,
     ) -> PyResult<()> {
-        Self::register_route(slf, method, path, handler, gil, stream)
+        Self::register_route(slf, method, path, handler, RouteFlags { gil, stream })
     }
 
     fn before_request(slf: &Bound<'_, Self>, handler: Py<PyAny>) -> PyResult<()> {
@@ -428,6 +414,7 @@ impl PyronovaApp {
         host=None, port=None, workers=None, mode=None, io_workers=None,
         tls_cert=None, tls_key=None, extra_tls_ports=None,
     ))]
+    // One parameter per Python keyword argument of `start()`.
     #[allow(clippy::too_many_arguments)]
     fn start(
         &self,
@@ -442,8 +429,8 @@ impl PyronovaApp {
         extra_tls_ports: Option<Vec<u16>>,
     ) -> PyResult<Server> {
         // A worker executes the whole script, so an unguarded `app.run()` in a raw-engine
-        // script reaches here inside the worker's init. Serving from there would start a
-        // server inside a worker (Layer 2, N10); `Pyronova.run()` returns before this.
+        // script reaches here inside the worker's init, which must not start a server;
+        // `Pyronova.run()` returns before this.
         if !crate::run_context::on_main(py) {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "PyronovaApp.run() was called inside a sub-interpreter worker. Workers execute \
@@ -460,14 +447,12 @@ impl PyronovaApp {
             workers: positive("workers", workers)?,
             io_workers: positive("io_workers", io_workers)?,
         };
-        let addr = socket_addr(host.unwrap_or("127.0.0.1"), port.unwrap_or(8000))?;
+        let addr = socket_addr(host.unwrap_or(DEFAULT_HOST), port.unwrap_or(DEFAULT_PORT))?;
         let env = EnvConfig::from_env()?;
         let mode = mode.map(Mode::from_arg).transpose()?.unwrap_or(Mode::Gil);
         let cpus = Cpus::detect();
         let topology = Topology::resolve(mode, &env, sizing, cpus).map_err(ConfigError::from)?;
 
-        // Build TLS acceptor once at startup if both paths are provided.
-        // Either both or neither — single path is a configuration error.
         let tls_acceptor = match (tls_cert, tls_key) {
             (Some(cert), Some(key)) => Some(
                 crate::tls::build_acceptor(cert, key)
@@ -491,10 +476,8 @@ impl PyronovaApp {
         crate::monitor::init_metrics_flag(env.metrics);
 
         // A raw-engine script never calls `_seal_registrations`; seal here so every served
-        // table has the script's boundary that workers compare against (Layer 2, FR-2).
+        // table has the script's boundary that workers compare against.
         self.seal_if_unsealed();
-        // Freeze route table: extract from RwLock into read-only Arc.
-        // After this point, no more route registration — zero-lock reads.
         let site: SharedSite = Arc::new(self.snapshot(py));
 
         // Every listener is bound before any thread or worker exists: a port in use is
@@ -528,6 +511,7 @@ impl PyronovaApp {
         host=None, port=None, workers=None, mode=None, io_workers=None,
         tls_cert=None, tls_key=None, extra_tls_ports=None,
     ))]
+    // One parameter per Python keyword argument of `run()`.
     #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
@@ -587,7 +571,7 @@ impl PyronovaApp {
         )?;
 
         // The sites hold main-interpreter `Py<T>`s: the last reference to each is this
-        // one, dropped here, attached, after the bench threads are joined (FR-6).
+        // one, dropped here, attached, after the bench threads are joined.
         let sites_keepalive = sites.clone();
         let paired = workers.into_iter().zip(sites).collect();
         let duration = std::time::Duration::from_secs(duration_s);
@@ -638,6 +622,10 @@ impl PyronovaApp {
         Ok((measured.requests, measured.elapsed.as_secs_f64(), port))
     }
 }
+
+/// The address `start()` binds when `host` / `port` are not given.
+const DEFAULT_HOST: &str = "127.0.0.1";
+const DEFAULT_PORT: u16 = 8000;
 
 /// `workers=None` means one per physical core; zero workers has nothing to measure.
 #[cfg(feature = "bench")]
@@ -810,8 +798,7 @@ impl ServerRun {
     fn serve(self, py: Python<'_>) -> PyResult<()> {
         // The route table holds main-interpreter `Py<T>`s. Worker, bridge and Tokio
         // threads hold clones and may drop theirs anywhere, including at runtime shutdown;
-        // this one is the last, dropped when `serve` returns, on this thread, attached
-        // (FR-6).
+        // this one is the last, dropped when `serve` returns, on this thread, attached.
         let _site_keepalive = Arc::clone(&self.site);
         if self.stop.is_cancelled() {
             // Stopped before it served (e.g. `TestClient.close()` during its start):
@@ -974,7 +961,7 @@ fn run_gil(py: Python<'_>, run: ServerRun, io_threads: NonZeroUsize) -> PyResult
 impl PyronovaApp {
     /// In a worker, the app the script registers routes or hooks on is the one the worker
     /// serves: the first registration records it, and a registration on a second app is an
-    /// error (Layer 2, FR-4; decision Q-2 (a)). Raw `PyronovaApp()` scripts and `Pyronova`
+    /// error. Raw `PyronovaApp()` scripts and `Pyronova`
     /// apps work the same way. A no-op on the main interpreter.
     fn serve_in_worker(slf: &Bound<'_, Self>) -> PyResult<()> {
         worker_app::record(slf.as_any(), Self::worker_routes)
@@ -1004,14 +991,13 @@ impl PyronovaApp {
         method: &str,
         path: &str,
         handler: Py<PyAny>,
-        gil: bool,
-        stream: bool,
+        flags: RouteFlags,
     ) -> PyResult<()> {
         let py = slf.py();
         let name = handler.getattr(py, "__name__")?.extract::<String>(py)?;
         Self::serve_in_worker(slf)?;
         slf.borrow_mut()
-            .add_route(method, path, handler, name, gil, stream, py)
+            .add_route(py, method, path, handler, name, flags)
     }
 
     fn app_source(&self) -> AppSource {
@@ -1023,8 +1009,7 @@ impl PyronovaApp {
         }
     }
 
-    /// Records the script's registration boundary unless one is already set; idempotent
-    /// (Layer 2, FR-2).
+    /// Records the script's registration boundary unless one is already set; idempotent.
     fn seal_if_unsealed(&self) {
         let mut routes = self.routes.write();
         if routes.sealed.is_none() {
@@ -1053,20 +1038,17 @@ impl PyronovaApp {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn add_route(
         &mut self,
+        py: Python<'_>,
         method: &str,
         path: &str,
         handler: Py<PyAny>,
         handler_name: String,
-        gil: bool,
-        stream: bool,
-        py: Python<'_>,
+        RouteFlags { gil, stream }: RouteFlags,
     ) -> PyResult<()> {
-        // Auto-detect if handler is async def (also check __call__ for class-based views).
-        // A failing check fails the registration: guessing "sync" would dispatch an async
-        // handler to the sync pool.
+        // `__call__` too, for class-based views. A failing check fails the registration:
+        // guessing "sync" would dispatch an async handler to the sync pool.
         let inspect = py.import("inspect")?;
         let is_coroutine_function = |f: &Bound<'_, PyAny>| -> PyResult<bool> {
             inspect.call_method1("iscoroutinefunction", (f,))?.extract()
@@ -1088,7 +1070,7 @@ impl PyronovaApp {
         })?;
 
         let mut routes = self.routes.write();
-        // Workers only know the routes the script registered (Layer 2, FR-2). A route added
+        // Workers only know the routes the script registered. A route added
         // after `run()` began, e.g. from an `on_startup` hook, exists only on main.
         if routes.sealed.is_some() && !gil {
             return Err(RegistrationSealed::new_err(format!(
@@ -1218,7 +1200,7 @@ type TpcServe = fn(
 ) -> Result<(), crate::tpc::ServeError>;
 
 /// The TPC sub-interpreter server: `threads` TPC threads, each owning a worker that runs
-/// the `def` routes inline; `async def` routes on an async pool (decision Q1), so their
+/// the `def` routes inline; `async def` routes on an async pool, so their
 /// awaits overlap and their 504 is sent on time; `gil=True` routes and the fallback on the
 /// main-interpreter bridge.
 fn serve_tpc_workers(
@@ -1309,7 +1291,7 @@ fn serve_tpc_workers(
     py.detach(|| {
         let served = serve(listeners, cpus.logical.get(), server, stop);
         // The TPC threads are joined, so these are the last references: the async pool
-        // joins its workers, the bridge its threads (FR-6).
+        // joins its workers, the bridge its threads.
         end_async_pool(async_pool, async_threads);
         if let Some(bridge) = bridge {
             crate::bridge::main_bridge::MainInterpBridge::shutdown_join(bridge);
@@ -1355,7 +1337,7 @@ fn build_pool(
 
 /// Builds `n` TPC sub-interpreter workers, in order, on the main thread: each runs the
 /// app's script and must register `site`'s routes. If worker `i` fails, the workers already
-/// built are ended here, on the thread that created them (FR-19), before the error is
+/// built are ended here, on the thread that created them, before the error is
 /// raised. The workers come back with their thread state saved; the thread that
 /// serves one rebinds it first.
 fn build_workers(
@@ -1403,6 +1385,15 @@ impl PyronovaApp {
         }
         Ok(site)
     }
+}
+
+/// A route's `gil=` and `stream=` registration arguments.
+#[derive(Clone, Copy, Debug)]
+struct RouteFlags {
+    /// Runs on the main interpreter.
+    gil: bool,
+    /// The handler reads the request body as it arrives (`req.stream`).
+    stream: bool,
 }
 
 /// A route's `gil` / `stream` / handler-kind combination that no serving path runs.

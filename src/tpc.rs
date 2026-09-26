@@ -8,11 +8,8 @@
 //! handlers go to the async worker pool. `PYRONOVA_TPC=0` serves through the
 //! multi-thread pool instead (`app.rs`).
 //!
-//! Why no `Send` bounds on the per-connection future? Because
-//! `LocalSet::spawn_local` runs the task on the same OS thread that
-//! owns the LocalSet — no cross-thread move ever happens. This is also
-//! why we don't pay work-stealing cost on this path: there is no other
-//! worker to steal from.
+//! A connection never leaves its thread (`LocalSet::spawn_local`), so its future needs
+//! no `Send` and there is no work stealing.
 
 use std::future::Future;
 use std::rc::Rc;
@@ -44,11 +41,8 @@ use crate::websocket;
 /// How long a TPC thread's in-flight connections get to finish after a stop.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Log line emitted once on startup so operators can see the TPC topology.
-///
-/// `site` is used to surface the gil / async / sub-interp split so the
-/// operator knows up front how many routes will go through the
-/// main_bridge versus the per-thread TPC fleet.
+/// Logs and prints the TPC topology once at startup, with how many routes run on the main
+/// bridge, the async pool and the TPC threads.
 fn log_startup(
     mode: &str,
     bound: &[Bound],
@@ -278,7 +272,7 @@ pub(crate) fn run_tpc_gil(
             Err(source) => {
                 shutdown.cancel();
                 // Their failures, if any, are logged there; the spawn is the cause.
-                let _logged = join_all(handles);
+                join_all(handles).ok();
                 return Err(ServeError::Spawn { thread, source });
             }
         }
@@ -421,8 +415,7 @@ impl Shared {
 /// thread exists: the thread rebinds it, wraps it in its [`TpcContext`], runs `serve`,
 /// and ends it there. If a spawn fails, the threads already running are stopped and
 /// joined, and every worker not handed over — the failed thread's included — is ended
-/// here, on the thread that built them (FR-19). A thread whose `serve` fails stops the
-/// server.
+/// here, on the thread that built them. A thread whose `serve` fails stops the server.
 fn spawn_worker_threads<T, F, Fut>(
     name: &str,
     handoffs: Vec<(SubInterpreterWorker, T)>,
@@ -477,7 +470,7 @@ where
             Err(source) => {
                 shutdown.cancel();
                 // Their failures, if any, are logged there; the spawn is the cause.
-                let _logged = join_all(handles);
+                join_all(handles).ok();
                 let unsent = std::iter::once(handoff)
                     .chain(pending.map(|(_, h)| h))
                     .map(|(worker, _)| worker);
@@ -553,19 +546,14 @@ type FannedOut = (
     Option<Arc<tokio_rustls::TlsAcceptor>>,
 );
 
-/// Darwin-only TPC topology: one accept thread feeds N worker threads
-/// through per-worker bounded mpsc queues, round-robin. Preserves the
-/// current-thread runtime + LocalSet + sub-interp-per-worker model; the
-/// only change is where the TcpStream comes from. Pays one cross-thread
-/// wake per TCP connection, which is amortized to ~0 under HTTP keep-
-/// alive (one wake serves the connection's full request lifetime).
-/// Count or off GC only (`Topology::supports`): there is no idle tick here.
+/// Darwin-only TPC topology (`PYRONOVA_TPC_DARWIN=fanout`): one accept thread hands
+/// connections round-robin to the worker threads through bounded per-worker queues, at
+/// one cross-thread wake per connection. Count or off GC only (`Topology::supports`):
+/// there is no idle tick here.
 ///
-/// Darwin's kqueue-backed `SO_REUSEPORT` routes ~all traffic to one listener
-/// (last-socket-wins). The per-thread-listener topology stays the default anyway because
-/// localhost benchmarking shows it still wins: fanout's cross-thread wake cost plus
-/// client/server CPU contention on one machine outweighs the distribution benefit. This
-/// one is an opt-in (`PYRONOVA_TPC_DARWIN=fanout`) for real-NIC testing.
+/// Darwin's `SO_REUSEPORT` sends nearly all traffic to one listener, which this spreads;
+/// it is opt-in because on localhost benchmarks the per-thread listeners still win (the
+/// wake cost plus client/server CPU contention outweigh the spread).
 #[cfg(target_os = "macos")]
 pub(crate) fn run_fanout(
     listeners: BoundListeners,
@@ -573,12 +561,8 @@ pub(crate) fn run_fanout(
     mut server: TpcServer,
     shutdown: CancellationToken,
 ) -> Result<(), ServeError> {
-    // Bounded per-worker inbox. Capacity is a load-shedding threshold:
-    // when a worker falls behind and its inbox fills, the acceptor
-    // drops new connections (TCP RST to the client) rather than
-    // hoarding file descriptors or queuing unbounded backlog. 1024
-    // gives ample slack for burst smoothing while keeping worst-case
-    // FD usage bounded at n_threads * 1024.
+    // Connections queued per worker; past it the acceptor drops new ones (RST), so open
+    // file descriptors stay bounded at n_threads × this.
     const WORKER_INBOX_CAP: usize = 1024;
 
     let n_threads = server.workers.len();
@@ -626,7 +610,8 @@ pub(crate) fn run_fanout(
         Ok(handle) => handles.push((thread, handle)),
         Err(source) => {
             shutdown.cancel();
-            let _logged = join_all(handles);
+            // Their failures, if any, are logged there; the spawn is the cause.
+            join_all(handles).ok();
             return Err(ServeError::Spawn { thread, source });
         }
     }
@@ -656,9 +641,6 @@ async fn fanout_accept_loop(
                         continue;
                     }
                 };
-                // Round-robin. try_send with load shedding: if the chosen worker's inbox
-                // is full, drop the connection (kernel sends RST). Sheds cleanly under
-                // overload instead of hoarding FDs or spawning unbounded pending work.
                 match txs[next].try_send((stream, accepted.remote, accepted.tls)) {
                     Ok(()) => {}
                     Err(TrySendError::Full(_)) => {

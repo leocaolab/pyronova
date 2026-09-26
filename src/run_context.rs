@@ -1,4 +1,4 @@
-//! Explicit-interpreter attach for Rust threads (Layer 2, C2 + C4).
+//! Explicit-interpreter attach for Rust threads.
 //!
 //! Once more than one interpreter has executed the engine module, the PyO3 fork
 //! refuses a bare `Python::attach` (and a `Py<T>` drop) on a thread that has no
@@ -15,7 +15,7 @@
 //! Invariant: no Python-level operation on a main-interpreter object (attach, clone_ref,
 //! `Py<T>` drop) happens on a thread bound to a sub-interpreter (TPC threads, pool
 //! workers). `Arc<Site>` clones may pass through those threads as plain Rust values:
-//! `PyronovaApp::run` keeps the last clone and drops it on main, attached.
+//! `ServerRun::serve` keeps the last clone and drops it on main, attached.
 
 use std::sync::OnceLock;
 
@@ -69,7 +69,7 @@ pub(crate) fn capture_main(py: Python<'_>) {
     let here = Interp::current(py);
     // SAFETY: always safe to call.
     if here.raw == unsafe { ffi::PyInterpreterState_Main() } {
-        let _ = MAIN.set(here);
+        MAIN.get_or_init(|| here);
     }
 }
 
@@ -135,7 +135,7 @@ where
 /// # Panics
 ///
 /// If the thread is bound to a different interpreter, or if a thread state other than the
-/// thread's own is current (Layer 2, FR-6).
+/// thread's own is current.
 pub(crate) fn attach_to<F, R>(interp: Interp, f: F) -> R
 where
     F: for<'py> FnOnce(Python<'py>) -> R,

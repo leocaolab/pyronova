@@ -79,9 +79,9 @@ fn _route_params(path: &str) -> PyResult<Vec<String>> {
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("route {path}: {e}")))
 }
 
-/// Whether this code runs in a sub-interpreter worker, i.e. not in the main interpreter
-/// (Layer 2, FR-15). Replaces a process-wide environment variable, which leaked into
-/// child processes.
+/// Whether this code runs in a sub-interpreter worker, i.e. not in the main interpreter.
+/// Asked of the interpreter itself: an environment variable would leak into child
+/// processes.
 #[pyo3::pyfunction]
 fn _in_worker(py: Python<'_>) -> bool {
     !run_context::on_main(py)
@@ -89,8 +89,7 @@ fn _in_worker(py: Python<'_>) -> bool {
 
 #[pymodule]
 fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Remembers the main interpreter (no-op elsewhere), for threads that must attach to
-    // it explicitly (Layer 2, C4).
+    // No-op outside main; threads that enter Python later attach to it explicitly.
     run_context::capture_main(m.py());
     m.add_class::<app::PyronovaApp>()?;
     m.add_class::<app::Server>()?;
@@ -127,7 +126,7 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(workrequest_counts, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(_in_worker, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(_route_params, m)?)?;
-    // Called by the async engine in sub-interpreter workers (Layer 2, C5).
+    // The async engine's calls into Rust (`python::worker_api`).
     m.add_function(pyo3::wrap_pyfunction!(python::worker_api::_worker_recv, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(
         python::worker_api::_worker_close,

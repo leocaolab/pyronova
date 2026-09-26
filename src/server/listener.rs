@@ -6,40 +6,36 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-/// Enable TCP_QUICKACK on a stream (Linux only, no-op elsewhere).
-#[allow(unused_variables)]
+/// Enables TCP_QUICKACK on a stream (no delayed ACKs); a failure is logged.
+#[cfg(target_os = "linux")]
 pub(crate) fn setup_tcp_quickack(stream: &tokio::net::TcpStream) {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::io::AsRawFd;
-        let fd = stream.as_raw_fd();
-        let val: libc::c_int = 1;
-        let rc = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_TCP,
-                libc::TCP_QUICKACK,
-                &val as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&val) as libc::socklen_t,
-            )
-        };
-        // Capture errno immediately after the syscall, before the branch test
-        // or anything else can clobber the thread-local errno.
-        let errno = std::io::Error::last_os_error();
-        // Mirror the TCP_DEFER_ACCEPT handling in create_reuseport_listener:
-        // a silent failure here disables the latency optimization (delayed
-        // ACKs creep back in) with no trace, making it look mysteriously
-        // absent under load. Log so the missing knob is observable.
-        if rc != 0 {
-            tracing::warn!(
-                target: "pyronova::server",
-                ?errno,
-                "setsockopt(TCP_QUICKACK) failed; delayed-ACK latency \
-                 optimization is disabled on this socket"
-            );
-        }
+    use std::os::unix::io::AsRawFd;
+    let val: libc::c_int = 1;
+    // SAFETY: a live socket fd; `val` outlives the call and its size is passed.
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_TCP,
+            libc::TCP_QUICKACK,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&val) as libc::socklen_t,
+        )
+    };
+    // Read before anything else can overwrite errno.
+    let errno = std::io::Error::last_os_error();
+    if rc != 0 {
+        tracing::warn!(
+            target: "pyronova::server",
+            ?errno,
+            "setsockopt(TCP_QUICKACK) failed; delayed-ACK latency \
+             optimization is disabled on this socket"
+        );
     }
 }
+
+/// TCP_QUICKACK is Linux-only.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn setup_tcp_quickack(_stream: &tokio::net::TcpStream) {}
 
 /// A listening socket that could not be set up: the step that failed, on which address,
 /// with the OS error (`source().kind()` tells e.g. `AddrInUse`).
@@ -55,8 +51,8 @@ pub(crate) struct ListenerError {
 /// Backlog of the listening socket: large, to avoid SYN drops at 200k+ QPS.
 const LISTEN_BACKLOG: i32 = 8192;
 
-/// Create a TCP listener with SO_REUSEPORT (kernel load-balanced accept)
-/// and a large backlog to avoid SYN drops under extreme load.
+/// Creates a TCP listener with SO_REUSEPORT (the kernel spreads connections over every
+/// listener on the port) and a large backlog.
 pub(crate) fn create_reuseport_listener(
     addr: SocketAddr,
 ) -> Result<std::net::TcpListener, ListenerError> {
@@ -75,8 +71,6 @@ pub(crate) fn create_reuseport_listener(
         .set_reuse_address(true)
         .map_err(failed("set_reuse_address"))?;
 
-    // SO_REUSEPORT: allows multiple listeners on the same port.
-    // Kernel distributes incoming connections across all listeners.
     #[cfg(not(windows))]
     socket
         .set_reuse_port(true)
@@ -88,21 +82,16 @@ pub(crate) fn create_reuseport_listener(
 
     socket.bind(&addr.into()).map_err(failed("bind"))?;
 
-    // TCP_DEFER_ACCEPT (Linux only): don't wake the accept loop on the
-    // bare three-way handshake — wait until the client actually sends
-    // the first byte of the HTTP request. A cold-connect flood
-    // otherwise spins up Tokio tasks that immediately block in hyper's
-    // header-read (or, if no data ever arrives, burn a file descriptor
-    // until the header_read_timeout fires 10s later — see app.rs's
-    // AutoBuilder config). Timeout arg is seconds after SYN-ACK before
-    // the kernel gives up and delivers the bare accept anyway; keeping
-    // it modest so half-open connections still surface within the
-    // header-read budget.
+    // TCP_DEFER_ACCEPT: the accept loop wakes on the request's first byte, not the bare
+    // handshake, so a cold-connect flood doesn't hold a task and an fd per connection until
+    // the header-read timeout. The kernel delivers a silent connection anyway after the
+    // same timeout, so it still surfaces within the header-read budget.
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
         let fd = socket.as_raw_fd();
-        let secs: libc::c_int = 10;
+        let secs = crate::conn_driver::HEADER_READ_TIMEOUT.as_secs() as libc::c_int;
+        // SAFETY: a live socket fd; `secs` outlives the call and its size is passed.
         let rc = unsafe {
             libc::setsockopt(
                 fd,
@@ -112,13 +101,8 @@ pub(crate) fn create_reuseport_listener(
                 std::mem::size_of_val(&secs) as libc::socklen_t,
             )
         };
-        // Capture errno immediately after the syscall, before the branch test
-        // or anything else can clobber the thread-local errno.
+        // Read before anything else can overwrite errno.
         let errno = std::io::Error::last_os_error();
-        // Silent failure here disables the DoS mitigation the doc
-        // comment above describes (cold-connect floods burning FDs).
-        // Log so the missing optimization is observable instead of
-        // mysteriously absent at scale (arc finding listener-2).
         if rc != 0 {
             tracing::warn!(
                 target: "pyronova::server",
@@ -251,7 +235,7 @@ fn probe_free(addr: SocketAddr) -> Result<SocketAddr, ListenerError> {
 impl BoundListeners {
     /// Binds `copies` `SO_REUSEPORT` sockets for each spec: one group per accept loop, so
     /// the kernel spreads connections over the loops. Each port is first proven free
-    /// ([`probe_free`], decision G4); a port 0 is resolved by that probe and every copy
+    /// ([`probe_free`]); a port 0 is resolved by that probe and every copy
     /// joins the port the kernel picked. Any failure (e.g. `AddrInUse`) is returned here,
     /// before a thread or worker exists.
     pub(crate) fn bind(specs: &[ListenerSpec], copies: usize) -> Result<Self, ListenerError> {
@@ -285,7 +269,7 @@ pub(crate) struct Accepted {
 }
 
 /// One accept loop's listeners (a group of [`BoundListeners`]) as one stream of
-/// connections. Replaces one `select!` arm per listener.
+/// connections.
 pub(crate) struct AcceptSource {
     listeners: Vec<(tokio::net::TcpListener, Option<Acceptor>)>,
     /// Where the next poll starts, so a busy listener can't starve the others.
@@ -352,59 +336,55 @@ impl AcceptSource {
     }
 }
 
-/// Back off when accept() fails. Critical for EMFILE/ENFILE (file-descriptor
-/// exhaustion) — a bare `continue` on these errors spins the accept loop at
-/// 100% CPU because the next accept() call fails immediately. Sleeping a few
-/// hundred ms lets short-lived fds close and gives the OS room to recover.
-/// Transient per-connection errors (ECONNABORTED etc.) get a tiny yield to
-/// avoid degenerate tight loops without meaningfully delaying legitimate traffic.
+/// Backs off after a failed accept(), which is logged. Out of file descriptors, the next
+/// accept() fails at once, so retrying immediately spins at 100% CPU; the longer pause
+/// lets fds close. A per-connection error (ECONNABORTED) only gets a short one.
 pub(crate) async fn handle_accept_error(e: &std::io::Error) {
-    let backoff_ms = if is_resource_exhaustion(e) {
+    let backoff = if is_resource_exhaustion(e) {
         tracing::error!(
             target: "pyronova::server",
             error = %e,
-            "accept() resource exhaustion — backing off 250ms",
+            "accept() resource exhaustion — backing off {EXHAUSTION_BACKOFF:?}",
         );
-        250
+        EXHAUSTION_BACKOFF
     } else {
         tracing::warn!(target: "pyronova::server", error = %e, "accept() error");
-        10
+        TRANSIENT_BACKOFF
     };
-    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+    tokio::time::sleep(backoff).await;
 }
 
-/// Whether an accept() error signals resource exhaustion (out of file
-/// descriptors / socket handles / kernel buffers) versus a transient
-/// per-connection error. `raw_os_error()` returns platform-native codes,
-/// so the constants must be matched per-platform: Unix errnos here, the
-/// `WSAE*` WinSock codes on Windows (e.g. WSAEMFILE=10024, *not* the CRT
-/// EMFILE=24 returned for non-socket errors).
+/// Pause after an accept() that failed for lack of fds, sockets or kernel memory.
+const EXHAUSTION_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+/// Pause after an accept() that failed for one connection's reason.
+const TRANSIENT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Whether an accept() error is resource exhaustion (out of file descriptors, socket
+/// handles or kernel buffers) rather than one connection's error. `raw_os_error()` is
+/// platform-native: errnos on Unix, WinSock `WSAE*` codes on Windows.
 fn is_resource_exhaustion(e: &std::io::Error) -> bool {
-    match e.raw_os_error() {
-        Some(code) => {
-            #[cfg(unix)]
-            {
-                matches!(
-                    code,
-                    libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM
-                )
-            }
-            #[cfg(windows)]
-            {
-                // WSAEMFILE (no more socket handles), WSAENOBUFS (no buffer
-                // space). Windows has no socket-level ENFILE/ENOMEM analogue.
-                const WSAEMFILE: i32 = 10024;
-                const WSAENOBUFS: i32 = 10055;
-                matches!(code, WSAEMFILE | WSAENOBUFS)
-            }
-            #[cfg(not(any(unix, windows)))]
-            {
-                let _ = code;
-                false
-            }
-        }
-        None => false,
-    }
+    e.raw_os_error().is_some_and(is_exhaustion_code)
+}
+
+#[cfg(unix)]
+fn is_exhaustion_code(code: i32) -> bool {
+    matches!(
+        code,
+        libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM
+    )
+}
+
+#[cfg(windows)]
+fn is_exhaustion_code(code: i32) -> bool {
+    // No more socket handles, no buffer space; WinSock has no ENFILE/ENOMEM analogue.
+    const WSAEMFILE: i32 = 10024;
+    const WSAENOBUFS: i32 = 10055;
+    matches!(code, WSAEMFILE | WSAENOBUFS)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_exhaustion_code(_code: i32) -> bool {
+    false
 }
 
 #[cfg(test)]

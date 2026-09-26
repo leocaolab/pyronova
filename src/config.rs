@@ -115,7 +115,7 @@ const DEFAULT_GC_IDLE_MS: NonZeroU64 = NonZeroU64::new(100).unwrap();
 /// releases the GIL for its peers.
 const DEFAULT_BRIDGE_WORKERS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 /// Bridge queue slots per bridge thread when the capacity isn't set.
-const BRIDGE_QUEUE_PER_WORKER: usize = 16;
+const BRIDGE_QUEUE_PER_WORKER: NonZeroUsize = NonZeroUsize::new(16).unwrap();
 
 /// A variable that is set but doesn't parse.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -151,9 +151,9 @@ pub(crate) enum DarwinTopology {
 }
 
 /// GC scheduling mode, parsed once at startup from `PYRONOVA_GC_MODE` (unset = count):
-///   - `count` — the count trigger inside `SubInterpreterWorker::call_handler` fires
-///     `gc.collect()` every `PYRONOVA_GC_THRESHOLD` requests per worker. Simple,
-///     predictable, can collide with bursty traffic.
+///   - `count` — each worker runs `gc.collect()` every `PYRONOVA_GC_THRESHOLD` requests it
+///     serves (`SubInterpreterWorker::serve`). Predictable, can collide with bursty
+///     traffic.
 ///   - `idle` — the TPC accept loop collects once a worker has run requests and then
 ///     none for a full `PYRONOVA_GC_IDLE_MS` tick (default 100ms), so the pause lands in
 ///     a lull. The worker's count trigger becomes the OOM failsafe at
@@ -483,9 +483,7 @@ impl EnvConfig {
         let workers = positive(BRIDGE_WORKERS_ENV)?.unwrap_or(DEFAULT_BRIDGE_WORKERS);
         let capacity = match positive(BRIDGE_CAPACITY_ENV)? {
             Some(capacity) => capacity,
-            None => workers.saturating_mul(
-                NonZeroUsize::new(BRIDGE_QUEUE_PER_WORKER).expect("a positive constant"),
-            ),
+            None => workers.saturating_mul(BRIDGE_QUEUE_PER_WORKER),
         };
 
         const FLAG: &str = "expected 1 or 0";

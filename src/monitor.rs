@@ -1,30 +1,16 @@
-//! Passive GIL contention monitor + decoupled RSS sampler.
+//! Engine metrics: GIL contention, request counters, and process RSS.
 //!
-//! Previous design used an active watchdog thread that acquired the GIL every
-//! 10ms to probe contention. This caused two problems:
-//!
-//! 1. **Observer effect**: the probe itself competes for the GIL, creating
-//!    artificial contention and context switches (~5-10% throughput loss under
-//!    heavy Python workloads).
-//! 2. **Shutdown segfault**: the detached watchdog thread could outlive
-//!    Py_Finalize, causing use-after-free on the global interpreter state.
-//!
-//! New design (Haskell bracket-inspired):
-//! - **GIL metrics** are collected passively on the real request path — each
-//!   `call_handler_with_hooks` records GIL acquisition wait time as a
-//!   byproduct. Zero overhead when idle, zero artificial contention.
-//! - **RSS sampling** runs in a separate non-GIL thread while a server with metrics
-//!   serves ([`RssSampling`]); the last one to stop joins it.
+//! GIL waits are measured on the real request path, by the main-interpreter handler call
+//! (`handlers::call_handler_with_hooks`) as it acquires the GIL, so measuring adds no
+//! contention of its own. RSS comes from a sampler thread that takes no GIL and runs only
+//! while a server with metrics serves ([`RssSampling`]): the last one to stop joins it,
+//! so it never outlives `Py_Finalize`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crossbeam_utils::CachePadded;
 use pyo3::prelude::*;
-
-// ---------------------------------------------------------------------------
-// GIL contention metrics (updated passively by request handlers)
-// ---------------------------------------------------------------------------
 
 /// Last GIL acquisition wait time (microseconds)
 pub static GIL_LATENCY_LAST_US: AtomicU64 = AtomicU64::new(0);
@@ -46,40 +32,31 @@ pub static GIL_QUEUE_LENGTH: std::sync::atomic::AtomicIsize =
 /// Peak business handler GIL hold time (microseconds, reset on read)
 pub static GIL_HOLD_MAX_US: AtomicU64 = AtomicU64::new(0);
 
-// Hot-path counters: CachePadded to avoid false sharing across CPU cores.
-// Each counter gets its own 64-byte cache line.
+// Hot-path counters, each on its own cache line (no false sharing between them).
 
 /// Requests dropped due to backpressure (503 overloaded)
 pub static DROPPED_REQUESTS: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
 /// Total requests processed
 pub static TOTAL_REQUESTS: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
 
-/// Master kill-switch for hot-path metrics. Read once at startup from
-/// `PYRONOVA_METRICS` (same env var that gates the RSS sampler). When
-/// false, per-request `fetch_add` on TOTAL_REQUESTS is skipped — a
-/// cache-line that was being ping-ponged across every core on every
-/// request goes cold, reclaiming the last cross-core atomic in the
-/// TPC inline hot path. Users running in production with metrics
-/// dashboards flip PYRONOVA_METRICS=1 and pay the ~30ns/req back.
+/// Whether hot-path metrics are recorded (`PYRONOVA_METRICS`, which also gates the RSS
+/// sampler). Off, no request touches `TOTAL_REQUESTS`: one atomic every core would
+/// otherwise bump on every request.
 static METRICS_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Set the metrics kill-switch (`PYRONOVA_METRICS`, parsed by `config::EnvConfig`).
-/// Called at every `run()` startup. Idempotent.
+/// Sets the metrics switch (`PYRONOVA_METRICS`, parsed by `config::EnvConfig`), on every
+/// server start. Process-wide: the latest start's value wins.
 pub fn init_metrics_flag(on: bool) {
     METRICS_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Whether hot-path metrics (TOTAL_REQUESTS etc.) should be recorded.
-/// Branch-predicted false in the default path — a no-op after the
-/// first iteration of the JIT trace.
+/// Whether hot-path metrics (`TOTAL_REQUESTS`) are recorded.
 #[inline(always)]
 pub fn metrics_enabled() -> bool {
     METRICS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Increment TOTAL_REQUESTS iff metrics are enabled. Preferred over
-/// `TOTAL_REQUESTS.fetch_add` at hot-path call sites — the default-off
-/// branch completely skips the cross-core atomic.
+/// Counts a request in `TOTAL_REQUESTS` when metrics are on.
 #[inline(always)]
 pub fn count_request() {
     if metrics_enabled() {
@@ -87,18 +64,10 @@ pub fn count_request() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Passive GIL measurement (called from handlers.rs)
-// ---------------------------------------------------------------------------
-
 /// A GIL wait longer than this is logged as congestion.
 const GIL_CONGESTED_WARN_US: u64 = 50_000;
 
-/// Record a GIL acquisition wait time. Called from `call_handler_with_hooks`
-/// immediately after `Python::attach` succeeds.
-///
-/// This replaces the active watchdog probe — measures real request latency
-/// instead of artificial contention from a background thread.
+/// Records one GIL acquisition wait; a wait past [`GIL_CONGESTED_WARN_US`] is logged.
 #[inline]
 pub fn record_gil_wait(wait_us: u64) {
     GIL_LATENCY_LAST_US.store(wait_us, Ordering::Relaxed);
@@ -114,10 +83,6 @@ pub fn record_gil_wait(wait_us: u64) {
         );
     }
 }
-
-// ---------------------------------------------------------------------------
-// Decoupled RSS sampler (no GIL, deterministic shutdown)
-// ---------------------------------------------------------------------------
 
 /// The sampler thread, shared by every server serving with metrics: the first
 /// [`RssSampling::start`] spawns it, the last one's drop stops and joins it.
@@ -181,8 +146,7 @@ impl Drop for RssSampling {
     }
 }
 
-/// RSS doesn't change fast enough to warrant more frequent sampling, and the sampler
-/// does no GIL work.
+/// RSS doesn't change fast enough to warrant more frequent sampling.
 const RSS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 fn sample_rss_until_stopped(stop: std::sync::mpsc::Receiver<()>) {
@@ -213,10 +177,8 @@ fn sample_rss_until_stopped(stop: std::sync::mpsc::Receiver<()>) {
     tracing::debug!(target: "pyronova::server", "RSS sampler stopped");
 }
 
-/// Return the OS page size in bytes at runtime.
-///
-/// `/proc/self/statm` reports RSS in pages; the page size is 4 KiB on x86_64
-/// but 16 KiB or 64 KiB on aarch64 Linux.
+/// The OS page size in bytes, read at run time: `/proc/self/statm` counts pages, which are
+/// 4 KiB on x86_64 but 16 or 64 KiB on aarch64 Linux.
 #[cfg(target_os = "linux")]
 fn page_size_bytes() -> std::io::Result<u64> {
     // SAFETY: sysconf(_SC_PAGESIZE) takes no pointers; it returns -1 on failure.
@@ -224,7 +186,7 @@ fn page_size_bytes() -> std::io::Result<u64> {
     u64::try_from(ps).map_err(|_| std::io::Error::last_os_error())
 }
 
-/// Current process RSS in bytes (platform-specific, zero dependencies).
+/// Current process RSS in bytes.
 fn get_rss_bytes() -> std::io::Result<u64> {
     #[cfg(target_os = "macos")]
     {
@@ -265,7 +227,7 @@ fn get_rss_bytes() -> std::io::Result<u64> {
     }
 }
 
-// macOS: minimal FFI for task_info (avoids libc crate dependency)
+// macOS `task_info(MACH_TASK_BASIC_INFO)`, declared here.
 #[cfg(target_os = "macos")]
 #[repr(C)]
 struct libc_mach_task_basic_info {
@@ -301,10 +263,6 @@ unsafe fn mach_task_self_info(info: &mut libc_mach_task_basic_info, count: &mut 
         count,
     )
 }
-
-// ---------------------------------------------------------------------------
-// Python-facing metrics API
-// ---------------------------------------------------------------------------
 
 /// A snapshot of the engine's counters. Reading one has no side effect; peaks are
 /// cleared only by `reset_peaks()`.

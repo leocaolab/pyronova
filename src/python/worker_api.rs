@@ -1,5 +1,5 @@
-//! The engine functions a sub-interpreter worker's async engine (`_async_engine.py`) calls
-//! (Layer 2, C5): pull the next request from its inbox, answer it (a response, an
+//! The engine functions a sub-interpreter worker's async engine (`_async_engine.py`)
+//! calls: pull the next request from its inbox, answer it (a response, an
 //! exception, a timeout), turn a handler's return value into a `Response`, and get the
 //! worker app's handlers and hooks.
 //!
@@ -8,8 +8,8 @@
 //! worker of a pool that is gone finds its inbox closed. Each request comes as an
 //! [`AsyncJob`] that carries where its answer goes: dropping one unanswered answers it.
 //!
-//! PyO3 does the argument parsing; a Rust panic becomes a `RuntimeError` (not PyO3's
-//! `PanicException`, a `BaseException`), logged here.
+//! A Rust panic here becomes a logged `RuntimeError` naming the call, not PyO3's
+//! `PanicException`.
 
 use parking_lot::Mutex;
 use pyo3::exceptions::{PyBaseException, PyException as PyExceptionType, PyRuntimeError};
@@ -257,7 +257,7 @@ pub(crate) fn _worker_timed_out(job: &Bound<'_, AsyncJob>) -> PyResult<()> {
 
 /// A handler's (or hook's) return value as a `Response`, with the one mapping every
 /// interpreter uses, so after-request hooks see a `Response` on every path. A value that
-/// is no response (a `Stream`: streaming needs `gil=True, stream=True`, FR-16) raises
+/// is no response (a `Stream`: streaming needs `gil=True, stream=True`) raises
 /// [`ResponseInvalid`] carrying the error.
 #[pyfunction]
 pub(crate) fn _worker_to_response(py: Python<'_>, value: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {

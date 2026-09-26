@@ -1,4 +1,4 @@
-//! The app a worker's script registered on (Layer 2, C3).
+//! The app a worker's script registered on.
 //!
 //! A worker serves the one app its script registers routes or hooks on: the first
 //! registration records it here, and the worker reads its routes once the script has run.
@@ -48,8 +48,8 @@ struct Recorded {
 static WORKER_APP: PyOnceLock<Recorded> = PyOnceLock::new();
 
 /// Records `app` as the one this worker serves, on its first registration. Registering on
-/// a second app is an error (Layer 2, FR-4; decision Q-2 (a)). A no-op on the main
-/// interpreter.
+/// a second app is an error: a worker serves one app, checked against main's. A no-op on
+/// the main interpreter.
 pub(crate) fn record(app: &Bound<'_, PyAny>, read: ReadRoutes) -> PyResult<()> {
     let py = app.py();
     if crate::run_context::on_main(py) {

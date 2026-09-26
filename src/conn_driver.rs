@@ -33,10 +33,8 @@ use crate::websocket;
 /// HTTP/2 has its own frame/settings timeouts in the h2 crate.
 pub(crate) const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// LocalSet-compatible hyper executor. `spawn_local` means the
-/// spawned future doesn't need `Send` — which is the whole point of
-/// TPC (one OS thread, no work stealing, `Rc<RefCell<_>>` handler
-/// state).
+/// hyper executor for a TPC thread's `LocalSet`: connection futures hold the thread's
+/// `Rc`s, so they are not `Send`.
 #[derive(Clone, Copy)]
 pub(crate) struct LocalExec;
 
@@ -64,7 +62,7 @@ pub(crate) struct TpcContext {
 
 impl TpcContext {
     /// Ends the worker on this, its own, thread once every connection task holding the
-    /// context is gone (FR-19). A context still shared is leaked, with an error.
+    /// context is gone. A context still shared is leaked, with an error.
     pub(crate) fn end(context: Rc<TpcContext>) {
         match Rc::try_unwrap(context) {
             Ok(context) => context.worker.into_inner().end_on_own_thread(),
@@ -78,17 +76,9 @@ impl TpcContext {
     }
 }
 
-/// Classify a connection-driver error as a benign client disconnect:
-/// the peer closed/reset/aborted the socket, or hyper saw a partial
-/// message because the peer went away. These are normal under load
-/// and shouldn't be logged as server errors.
-///
-/// Walks the error source chain and matches on the typed
-/// `hyper::Error` predicates and `io::ErrorKind` rather than
-/// substring-matching the `Display` text. Substring matching is
-/// fragile across hyper/dependency versions and, worse, suppresses
-/// unrelated compound errors that merely contain one of the magic
-/// phrases (e.g. `"TLS handshake failed: connection reset by peer"`).
+/// Whether a connection-driver error is the client going away (closed, reset, aborted,
+/// or a message cut short), which is normal under load and not logged. Decided from the
+/// typed `hyper::Error` predicates and `io::ErrorKind`s along the source chain.
 fn is_benign_disconnect(err: &(dyn std::error::Error + 'static)) -> bool {
     use std::io::ErrorKind;
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);

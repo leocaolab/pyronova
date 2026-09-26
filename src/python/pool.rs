@@ -15,10 +15,7 @@ use crate::types::{PyronovaRequest, ResponseData};
 /// What a worker sends back for a request: its response, or its error, logged.
 pub(crate) type WorkReply = tokio::sync::oneshot::Sender<Result<ResponseData, Logged>>;
 
-// ---------------------------------------------------------------------------
-// Work item for channel-based dispatch
-// ---------------------------------------------------------------------------
-
+/// A request queued for a pool worker.
 pub(crate) struct WorkRequest {
     pub route: crate::router::RouteId,
     /// Which worker kind runs it: the sync pool or the async engine's.
@@ -36,14 +33,9 @@ impl WorkRequest {
     }
 }
 
-// Diagnostic: count WorkRequest creates vs worker-completes. Gated
-// behind `leak_detect` because hitting two shared atomics on every
-// request is an NUMA disaster on many-core boxes — a single shared
-// AtomicU64 pings its cache line across every CCD on a Threadripper /
-// EPYC on every `fetch_add`, silently capping throughput regardless of
-// how many workers we spawn. The public `workrequest_counts()`
-// Python export keeps its shape: returns (0, 0) when the feature is
-// off, real values when diagnostics are compiled in.
+// Created vs completed `WorkRequest`s, for leak diagnostics. Behind `leak_detect`: a shared
+// atomic bumped on every request bounces its cache line across every core and caps
+// throughput. Without the feature `workrequest_counts()` returns (0, 0).
 #[cfg(feature = "leak_detect")]
 static WR_CREATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "leak_detect")]
@@ -83,10 +75,6 @@ impl WorkRequest {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Worker split
-// ---------------------------------------------------------------------------
 
 /// How the pool divides its workers: `def` handlers run on sync workers, `async def`
 /// handlers on async workers (the async engine's event loop), never the other way round.
@@ -158,10 +146,6 @@ pub(crate) fn split_workers_for_routes(
     )
 }
 
-// ---------------------------------------------------------------------------
-// Channel-based Interpreter Pool
-// ---------------------------------------------------------------------------
-
 /// Why the sub-interpreter pool could not start.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PoolError {
@@ -188,8 +172,7 @@ impl PoolError {
 
 /// A worker thread a pool shutdown gave up on (still running after the grace period), with
 /// what it was running. Its interpreter is still alive, and finalizing with a live
-/// sub-interpreter aborts, so `Pyronova.run()` exits non-zero instead (Layer 2, design §12,
-/// M4 review N8).
+/// sub-interpreter aborts, so `Pyronova.run()` exits non-zero instead.
 #[pyclass(module = "pyronova.engine", frozen, get_all)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AbandonedWorker {
@@ -222,6 +205,9 @@ impl std::fmt::Display for AbandonedWorker {
 /// `running` value of a worker that isn't running a handler.
 const IDLE: usize = usize::MAX;
 
+/// Work-queue capacity per worker, in requests; a full queue answers 503.
+const QUEUE_SLOTS_PER_WORKER: usize = 128;
+
 /// How long a worker thread gets to finish its request and end its interpreter once the
 /// pool is closed.
 const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -232,10 +218,10 @@ const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub(crate) struct InterpreterPool {
     sync_work_tx: crossbeam_channel::Sender<WorkRequest>,
     async_work_tx: Option<crossbeam_channel::Sender<WorkRequest>>,
-    /// Admission-control gate: one permit per slot in the work channels. Callers take one
-    /// before collecting a large request body, so an over-capacity surge of uploads
-    /// doesn't pile N × max_body_size up in RAM while waiting for a full queue; the permit
-    /// is held until the response is ready (`handle_request_subinterp`).
+    /// Admission gate for large bodies: a request whose body is past the handler's skip
+    /// size (`ADMISSION_SKIP_BYTES`) takes a permit before or while buffering it and holds
+    /// it until its response is ready, so a surge of uploads can't pile N × max_body_size
+    /// up in RAM. Small bodies take none, so a permit does not reserve a queue slot.
     pub(crate) submit_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
@@ -266,13 +252,17 @@ impl InterpreterPool {
     ) -> Result<(Self, PoolThreads), PoolError> {
         let n = split.total();
         let has_any_async = split.async_workers > 0;
-        let (sync_work_tx, sync_work_rx) = crossbeam_channel::bounded::<WorkRequest>(n * 128);
-        let (async_work_tx, async_work_rx) = crossbeam_channel::bounded::<WorkRequest>(n * 128);
-        // One permit per queue slot of the channels in use, so a permit-holder always finds
-        // a slot when it reaches `submit`.
-        let total_permits = n * 128 * if has_any_async { 2 } else { 1 };
+        let (sync_work_tx, sync_work_rx) =
+            crossbeam_channel::bounded::<WorkRequest>(n * QUEUE_SLOTS_PER_WORKER);
+        let (async_work_tx, async_work_rx) =
+            crossbeam_channel::bounded::<WorkRequest>(n * QUEUE_SLOTS_PER_WORKER);
+        // At most as many large bodies buffered as the channels in use have slots.
+        let total_permits = n * QUEUE_SLOTS_PER_WORKER * if has_any_async { 2 } else { 1 };
 
-        let (sync_workers, async_workers) = build_workers(split, spec)?;
+        let Built {
+            sync_workers,
+            async_workers,
+        } = build_workers(split, spec)?;
         let pool = InterpreterPool {
             sync_work_tx,
             async_work_tx: has_any_async.then_some(async_work_tx),
@@ -288,8 +278,9 @@ impl InterpreterPool {
                 .collect(),
         };
 
-        // If a spawn fails, the workers not yet handed to a thread are ended here (FR-19),
-        // and the ones already running are stopped (the pool closes) and joined.
+        // If a spawn fails, the workers not yet handed to a thread are ended here, on their
+        // creating thread, and the ones already running are stopped (the pool closes) and
+        // joined.
         let mut sync_pending = sync_workers.into_iter().enumerate();
         while let Some((i, worker)) = sync_pending.next() {
             let running = Arc::new(AtomicUsize::new(IDLE));
@@ -343,21 +334,11 @@ impl InterpreterPool {
 }
 
 /// Builds the sync workers, then the async ones, in index order on this (the main) thread.
-/// If one fails, the ones built so far are ended here, on their creating thread (FR-19).
+/// If one fails, the ones built so far are ended here, on their creating thread.
 ///
 /// # Safety
 /// As for [`InterpreterPool::new`].
-#[allow(clippy::type_complexity)]
-unsafe fn build_workers(
-    split: WorkerSplit,
-    spec: &WorkerSpec<'_>,
-) -> Result<
-    (
-        Vec<SubInterpreterWorker>,
-        Vec<SubInterpreterWorker<AsyncEngine>>,
-    ),
-    PoolError,
-> {
+unsafe fn build_workers(split: WorkerSplit, spec: &WorkerSpec<'_>) -> Result<Built, PoolError> {
     let mut sync_workers = Vec::with_capacity(split.sync_workers);
     for i in 0..split.sync_workers {
         match SubInterpreterWorker::new(i, spec) {
@@ -379,7 +360,16 @@ unsafe fn build_workers(
             }
         }
     }
-    Ok((sync_workers, async_workers))
+    Ok(Built {
+        sync_workers,
+        async_workers,
+    })
+}
+
+/// The workers [`build_workers`] created, not yet on their threads.
+struct Built {
+    sync_workers: Vec<SubInterpreterWorker>,
+    async_workers: Vec<SubInterpreterWorker<AsyncEngine>>,
 }
 
 /// A start that failed spawning worker `index`'s thread: closes the pool, so the threads
@@ -465,7 +455,6 @@ impl WorkerThread {
             target: "pyronova::server",
             "worker thread {abandoned} did not exit within {timeout:?}; abandoning it",
         );
-        // Leak the JoinHandle — the OS reclaims the thread at process exit.
         std::mem::forget(self.handle);
         Some(abandoned)
     }
@@ -490,8 +479,7 @@ fn serve_sync(
     unsafe { worker.bind_to_this_thread() };
 
     for req in rx.iter() {
-        // Skip requests whose caller already timed out (504): don't spend CPU on dead
-        // requests during a backlog.
+        // The caller already timed out (504): don't spend a backlog's CPU on it.
         if req.response_tx.is_closed() {
             WorkRequest::inc_completed();
             continue;
@@ -506,8 +494,8 @@ fn serve_sync(
         let result = unsafe { worker.serve(route, request) };
         running.store(IDLE, Ordering::Relaxed);
 
-        // The caller may have given up (504) meanwhile; the error is logged either way.
-        let _ = reply.send(result.map_err(|e| e.log(&label.tag())));
+        // Unsent only if the caller gave up (504) meanwhile; the error is logged either way.
+        reply.send(result.map_err(|e| e.log(&label.tag()))).ok();
         WorkRequest::inc_completed();
     }
 
@@ -616,7 +604,8 @@ mod shutdown_tests {
         let handle = std::thread::Builder::new()
             .name(name.to_string())
             .spawn(move || {
-                let _ = release.recv();
+                // Returns (with `Err`) once the test drops the sender.
+                release.recv().ok();
             })
             .unwrap();
         WorkerThread {

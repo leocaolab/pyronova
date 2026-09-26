@@ -25,50 +25,36 @@ fn logical_cpu_count() -> NonZeroUsize {
     std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
 }
 
-/// Pin the current OS thread to a specific CPU core if one is
-/// available. Silently no-ops on platforms where `core_affinity`
-/// can't enumerate (e.g. restricted containers with no CPU mask
-/// visibility); in that case the OS scheduler still gets us
-/// statistically-close-to-core-local execution on the per-thread
-/// runtime because the runtime never migrates tasks, only the
-/// kernel can move the thread.
+/// Pins the calling thread to `core_id`, if given. Pinning is an optimization: where the
+/// OS refuses (a restricted container, macOS) the thread runs unpinned, logged at debug.
 pub(crate) fn try_pin_current(core_id: Option<core_affinity::CoreId>) {
-    if let Some(c) = core_id {
-        let _ = core_affinity::set_for_current(c);
+    if let Some(core) = core_id {
+        if !core_affinity::set_for_current(core) {
+            tracing::debug!(target: "pyronova::server", core = core.id, "could not pin the thread to its core");
+        }
     }
 }
 
-/// macOS-only: bump the calling thread's QoS class to
-/// USER_INTERACTIVE. core_affinity::set_for_current is a silent
-/// no-op on Darwin (no public CPU-pinning API), so without this
-/// the scheduler is free to park TPC threads on E-cores for
-/// power savings — fatal under TPC because there is no work-
-/// stealing across threads. USER_INTERACTIVE tells the scheduler
-/// to keep us on P-cores and ignore power hints, at the cost of
-/// giving up energy-efficiency on idle machines. Acceptable
-/// tradeoff for a throughput-first server.
+/// macOS: raises the calling thread's QoS class to `USER_INTERACTIVE`, which keeps it on
+/// the performance cores. Darwin has no CPU pinning, and a TPC thread parked on an
+/// efficiency core has no peer to steal its work.
 #[cfg(target_os = "macos")]
 pub(crate) fn elevate_thread_qos_macos() {
     use std::os::raw::c_int;
-    // Opaque qos_class_t. 0x21 == QOS_CLASS_USER_INTERACTIVE per
-    // <sys/qos.h>. Keeping the constant inline avoids pulling in
-    // the whole qos.h shim; the value has been stable since 10.10.
+    // `QOS_CLASS_USER_INTERACTIVE` in <sys/qos.h>.
     const QOS_CLASS_USER_INTERACTIVE: c_int = 0x21;
     extern "C" {
         fn pthread_set_qos_class_self_np(qos_class: c_int, relative_priority: c_int) -> c_int;
     }
-    unsafe {
-        let rc = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-        // A failure here can park TPC threads on E-cores; log it so the throughput drop
-        // has a visible cause.
-        if rc != 0 {
-            tracing::warn!(
-                target: "pyronova::server",
-                rc,
-                "pthread_set_qos_class_self_np failed; TPC thread may be \
-                 scheduled on E-cores — expect throughput collapse"
-            );
-        }
+    // SAFETY: sets the calling thread's own QoS class; no pointers.
+    let rc = unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
+    if rc != 0 {
+        tracing::warn!(
+            target: "pyronova::server",
+            rc,
+            "pthread_set_qos_class_self_np failed; TPC thread may be \
+             scheduled on E-cores — expect throughput collapse"
+        );
     }
 }
 
@@ -76,21 +62,13 @@ pub(crate) fn elevate_thread_qos_macos() {
 #[inline(always)]
 pub(crate) fn elevate_thread_qos_macos() {}
 
-/// Count physical CPU cores to size the TPC pool.
+/// Physical CPU cores, which size the TPC pool; the logical count where they can't be
+/// read.
 ///
-/// Linux: parses /sys/devices/system/cpu/cpu*/topology/thread_siblings_list —
-/// the number of unique sibling groups equals the physical core count,
-/// stripping SMT.
-///
-/// macOS: queries `hw.perflevel0.physicalcpu` via sysctl. On Apple
-/// Silicon perflevel0 is the performance-core cluster; the efficiency
-/// cores at perflevel1 are deliberately excluded. Running a TPC
-/// thread on an E-core tanks single-connection throughput to ~1/3,
-/// and with no work-stealing that request is stuck — so the whole
-/// tail latency collapses. Sizing to P-core count keeps every TPC
-/// thread on a fast cluster.
-///
-/// Other platforms: falls back to logical core count.
+/// Linux: the distinct `thread_siblings_list`s under /sys/devices/system/cpu (SMT
+/// siblings count once). macOS: `hw.perflevel0.physicalcpu`, the performance cores only:
+/// a TPC thread on an efficiency core serves about a third as fast, and nothing steals its
+/// work.
 #[cfg(target_os = "linux")]
 pub(crate) fn physical_core_count() -> NonZeroUsize {
     use std::collections::HashSet;

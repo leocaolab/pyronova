@@ -1,11 +1,8 @@
-//! SSE (Server-Sent Events) streaming response support.
+//! Streaming responses (Server-Sent Events): a handler returns a `Stream`, and each
+//! `send` / `send_event` on it becomes a chunk of the response body.
 //!
-//! Handler returns a `PyronovaStream` object, then calls `stream.send("data")`
-//! in a loop. Each send pushes a chunk to the HTTP response body.
-//!
-//! Resource lifecycle: `close()` performs deterministic channel teardown,
-//! independent of Python GC timing. This prevents zombie TCP connections
-//! when PyronovaStream is held by long-lived Python references.
+//! `close()` ends the response at once, whatever still references the stream: waiting
+//! for Python's GC to drop it would hold the client's connection open.
 
 use bytes::Bytes;
 use hyper::header::HeaderValue;
@@ -15,20 +12,16 @@ use tokio::sync::mpsc;
 
 use crate::types::{header_text, header_value, ResponseHeaders};
 
-/// Upper bound on buffered stream chunks before `send()` rejects.
-///
-/// Previously the channel was unbounded — a slow client plus a fast
-/// producer would buffer forever and OOM the process. Bounded backs
-/// that pressure up to the caller, who can slow down, skip, or bail.
+/// Chunks buffered for a slow client before `send()` raises `BlockingIOError`, so a fast
+/// producer backs off instead of growing the buffer without bound.
 const STREAM_CHANNEL_CAP: usize = 1024;
 
 type StreamItem = Result<Bytes, std::convert::Infallible>;
 
-/// Python-facing stream object. Handler calls send()/send_event()/close().
+/// A streamed response body a handler writes to (`send`, `send_event`, `close`).
 #[pyclass(frozen, name = "Stream", module = "pyronova.engine")]
 pub(crate) struct PyronovaStream {
-    // Wrapped in Option so close() can deterministically drop the Sender,
-    // decoupling channel lifetime from Python GC (Haskell bracket pattern).
+    /// `None` once `close()` dropped the sender, which ends the response.
     tx: std::sync::Mutex<Option<mpsc::Sender<StreamItem>>>,
     rx: std::sync::Mutex<Option<mpsc::Receiver<StreamItem>>>,
     pub(crate) content_type: HeaderValue,
@@ -40,10 +33,10 @@ pub(crate) struct PyronovaStream {
 
 #[pymethods]
 impl PyronovaStream {
-    /// Create a new SSE stream. Channel is created immediately so send() works right away.
+    /// Creates a stream (`text/event-stream` by default). `headers` as for `Response`: a
+    /// name maps to a `str` or a list of `str`; a bad one is a `TypeError` / `ValueError`
+    /// naming it.
     #[new]
-    /// `headers` as for `Response`: a name maps to a `str` or a list of `str`; a bad one is
-    /// a `TypeError` / `ValueError` naming it.
     #[pyo3(signature = (content_type=None, status_code=200, headers=None))]
     fn new(
         content_type: Option<&str>,
@@ -78,21 +71,18 @@ impl PyronovaStream {
         self.headers.to_py(py)
     }
 
-    /// Send raw data chunk. Returns BlockingIOError when the channel is
-    /// full (slow client); the caller should back off before retrying.
-    /// Uses try_send to preserve sync semantics — blocking on a Tokio
-    /// mpsc.send() from the Python handler thread would require async.
+    /// Sends a raw chunk. Never blocks: raises `BlockingIOError` when the buffer is full
+    /// (slow client), and the caller backs off before retrying.
     fn send(&self, data: &str) -> PyResult<()> {
         self.push(Bytes::copy_from_slice(data.as_bytes()))
     }
 
-    /// Send an SSE event: `event: {event}\ndata: {data}\n\n`
+    /// Sends an SSE event: `id:` and `event:` lines if given, one `data:` line per line of
+    /// `data`, then a blank line.
     #[pyo3(signature = (data, event=None, id=None))]
     fn send_event(&self, data: &str, event: Option<&str>, id: Option<&str>) -> PyResult<()> {
-        // SSE field values for `id` and `event` must not contain CR or LF —
-        // a newline in either injects arbitrary SSE fields (e.g. injecting
-        // "data: attacker-controlled" by embedding "\ndata: ..." in an event name).
-        // Per RFC 8895 the id and event fields are single-line.
+        // A line break in `id` or `event` would inject arbitrary SSE fields (WHATWG HTML,
+        // server-sent events: every field is one line).
         if let Some(id) = id {
             if id.contains(['\n', '\r']) {
                 return Err(pyo3::exceptions::PyValueError::new_err(
@@ -123,16 +113,13 @@ impl PyronovaStream {
             msg.push_str(line);
             msg.push('\n');
         }
-        msg.push('\n'); // End of event
+        msg.push('\n');
         self.push(Bytes::from(msg))
     }
 
-    /// Deterministic channel teardown — drops the Sender immediately,
-    /// causing the Tokio Receiver to see channel-closed and end the HTTP
-    /// response. Does not depend on Python GC timing.
+    /// Ends the response now; a later `send` raises `ConnectionError`.
     fn close(&self) {
-        let mut lock = self.tx.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = lock.take();
+        drop(self.tx.lock().unwrap_or_else(|e| e.into_inner()).take());
     }
 }
 
@@ -168,7 +155,7 @@ impl PyronovaStream {
         }
     }
 
-    /// Take the receiver (called once by Rust handler to start streaming).
+    /// The body's receiving end; `Some` only the first time.
     pub(crate) fn take_rx(&self) -> Option<mpsc::Receiver<StreamItem>> {
         self.rx.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
