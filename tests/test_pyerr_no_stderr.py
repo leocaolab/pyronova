@@ -91,7 +91,10 @@ def test_raising_handler_does_not_spam_stderr(tmp_path):
     #   RuntimeError: deliberate test failure
     # If any of those appear raw (not JSON-encoded inside a tracing
     # record), the old path has leaked back in.
-    traceback_lines = combined.count("Traceback (most recent call last):")
+    traceback_lines = sum(
+        line.lstrip().startswith("Traceback (most recent call last):")
+        for line in combined.splitlines()
+    )
     # Allow 0–1 occurrences (CPython occasionally logs on interp
     # shutdown no matter what we do); > 1 is the regression.
     assert traceback_lines <= 1, (
